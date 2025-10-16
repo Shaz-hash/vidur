@@ -44,6 +44,38 @@ class VLLMV1ReplicaScheduler(BaseReplicaScheduler):
         # by the executor.
         self.scheduled_req_ids: set[str] = set()
 
+        print("VLLM SCHEDULER CALLED!")
+
+
+    # --- NEW: small helper to read current free KV blocks robustly
+    def _kv_free_blocks(self) -> int:
+        """
+        Try to obtain free-blocks directly from the KV cache manager.
+        Fallback: derive from usage if a direct API is not available.
+        """
+        kvm = self._kv_cache_manager
+        # Preferred: explicit API if your manager has it
+        if hasattr(kvm, "free_blocks"):
+            try:
+                return int(kvm.free_blocks())
+            except Exception:
+                pass
+        # Fallback from usage ratio if exposed
+        if hasattr(kvm, "num_gpu_blocks") and hasattr(kvm, "usage"):
+            used = int(round(kvm.usage * kvm.num_gpu_blocks))
+            return int(kvm.num_gpu_blocks - used)
+        # Last resort: assume BaseReplicaScheduler also tracks allocation
+        # (only if you know these fields exist)
+        if hasattr(self, "_config") and hasattr(self, "_num_allocated_blocks"):
+            return int(self._config.num_blocks - self._num_allocated_blocks)
+        # If none are available, return -1 as a sentinel
+        return -1
+
+
+
+
+
+
     @property
     def memory_usage_percent(self) -> float:
         return self._kv_cache_manager.usage * 100
@@ -214,6 +246,22 @@ class VLLMV1ReplicaScheduler(BaseReplicaScheduler):
             ),
             [],
         )
+        # If a real batch was created, annotate it:
+        if scheduler_output.batch is not None:
+            try:
+                # print("here!")
+                scheduler_output.batch.kv_free_blocks_before = self._kv_free_blocks()
+                # print("scheduler_output KV BLOCKS : ", scheduler_output.batch.kv_free_blocks_before)
+            except Exception:
+                scheduler_output.batch.kv_free_blocks_before = None
+            scheduler_output.batch.request_ids_in_batch = ";".join(
+                str(r.id) for r in scheduled_reqs
+            )
+        
+
+
+
+
         # TODO(nitin): Immediately updating num_processed_tokens for the request is important for
         #  sequence pipeline parallelism and multi-step scheduling.
         # However, this is not done here to protect the invariant that num_processed_tokens is updated only after batch end.
@@ -236,6 +284,12 @@ class VLLMV1ReplicaScheduler(BaseReplicaScheduler):
         return len(self._waiting_queue) + len(self._running) == 0
 
     def on_batch_end(self, batch: Batch) -> None:
+
+        try:
+            batch.kv_free_blocks_after = self._kv_free_blocks()
+        except Exception:
+            batch.kv_free_blocks_after = None
+
         self._num_running_batches -= 1
         new_running: List[Request] = []
 

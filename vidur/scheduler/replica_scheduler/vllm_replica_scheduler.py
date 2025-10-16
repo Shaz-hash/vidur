@@ -20,9 +20,19 @@ class VLLMReplicaScheduler(BaseReplicaScheduler):
         # Memory requirements are handled explicitly by the scheduler
         self._max_batch_size = self._config.batch_size_cap
         self._max_micro_batch_size = self._config.batch_size_cap // self._num_stages
+        print("VLLM Batch Size here : ", self._max_batch_size , self._max_micro_batch_size)
         self._watermark_blocks = int(
             self._config.watermark_blocks_fraction * self._config.num_blocks
         )
+
+    # --- NEW: small helper to read current free KV blocks
+    def _kv_free_blocks(self) -> int:
+        # num_blocks and _num_allocated_blocks are already tracked by BaseReplicaScheduler
+        return self._config.num_blocks - self._num_allocated_blocks
+
+
+
+
 
     def on_batch_end(self, batch: Batch) -> None:
         self._num_running_batches -= 1
@@ -32,6 +42,18 @@ class VLLMReplicaScheduler(BaseReplicaScheduler):
                 self.free(request.id)
             else:
                 self._preempted_requests.append(request)
+
+        # --- NEW: annotate "after" snapshot on the batch
+        try:
+            batch.kv_free_blocks_after = self._kv_free_blocks()
+        except Exception:
+            # leave silently if something changes in allocator plumbing
+            pass
+
+    
+
+
+
 
     def _can_allocate_request(self, request: Request) -> bool:
         if request.id not in self._allocation_map:
@@ -48,6 +70,11 @@ class VLLMReplicaScheduler(BaseReplicaScheduler):
 
         # vllm requires at least one block to be available
         return self._config.num_blocks - self._num_allocated_blocks >= 1
+    
+
+
+
+
 
     def _allocate_request(self, request: Request) -> None:
         if request.id not in self._allocation_map:
@@ -102,7 +129,19 @@ class VLLMReplicaScheduler(BaseReplicaScheduler):
             num_batch_tokens += next_num_tokens
 
         if requests:
-            return Batch(self._replica_id, requests, num_tokens)
+
+            batch = Batch(self._replica_id, requests, num_tokens)
+
+            # --- NEW: annotate "before" KV and the request IDs chosen for this batch
+            try:
+                batch.kv_free_blocks_before = self._kv_free_blocks()
+            except Exception:
+                batch.kv_free_blocks_before = None
+
+            # join as semicolon-separated string; friendlier for CSV
+            batch.request_ids_in_batch = ";".join(str(r.id) for r in requests)
+
+            return batch
 
         # Safer to sort preempted_requests to maintain FIFO order
         self._preempted_requests.sort(key=lambda r: r.arrived_at)
@@ -133,4 +172,14 @@ class VLLMReplicaScheduler(BaseReplicaScheduler):
         if not requests:
             return
 
-        return Batch(self._replica_id, requests, num_tokens)
+        batch = Batch(self._replica_id, requests, num_tokens)
+
+        # --- NEW: annotate "before" KV and request IDs for the preempted path too
+        try:
+            batch.kv_free_blocks_before = self._kv_free_blocks()
+        except Exception:
+            batch.kv_free_blocks_before = None
+
+        batch.request_ids_in_batch = ";".join(str(r.id) for r in requests)
+
+        return batch

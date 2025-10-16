@@ -122,6 +122,27 @@ class ReplicaMetricsStore:
         self._batch_metrics_time_distribution_per_batch: Dict[
             BatchMetricsTimeDistribution, DataSeries
         ] = {}
+
+        # --- NEW: extra per-batch columns to be merged into batch_metrics.csv
+        self._batch_extras_per_batch: Dict[str, DataSeries] = {
+            "kv_free_blocks_before": DataSeries(
+                BATCH_ID_STR, "kv_free_blocks_before",
+                self._config.subsamples, self._config.save_table_to_wandb, self._config.store_plots
+            ),
+            "kv_free_blocks_after": DataSeries(
+                BATCH_ID_STR, "kv_free_blocks_after",
+                self._config.subsamples, self._config.save_table_to_wandb, self._config.store_plots
+            ),
+            "batch_request_ids": DataSeries(
+                BATCH_ID_STR, "batch_request_ids",
+                self._config.subsamples, self._config.save_table_to_wandb, self._config.store_plots
+            ),
+        }
+
+
+
+
+
         for metric_name in BatchMetricsTimeDistribution:
             self._batch_metrics_time_distribution[metric_name] = CDFSketch(
                 metric_name.value,
@@ -545,6 +566,23 @@ class ReplicaMetricsStore:
         for request in batch.requests:
             self._update_per_token_execution_times(time, request, batch)
 
+        # --- NEW: stash scheduler-populated batch attributes into our extra DataSeries
+        # We rely on the scheduler to annotate the Batch object:
+        #   batch.kv_free_blocks_before
+        #   batch.kv_free_blocks_after
+        #   batch.request_ids_in_batch  (semicolon-joined)
+        if self._config.store_batch_metrics:
+            if hasattr(batch, "kv_free_blocks_before") and batch.kv_free_blocks_before is not None:
+                self._batch_extras_per_batch["kv_free_blocks_before"].put(batch.id, batch.kv_free_blocks_before)
+
+            if hasattr(batch, "kv_free_blocks_after") and batch.kv_free_blocks_after is not None:
+                self._batch_extras_per_batch["kv_free_blocks_after"].put(batch.id, batch.kv_free_blocks_after)
+
+            if hasattr(batch, "request_ids_in_batch") and batch.request_ids_in_batch is not None:
+                self._batch_extras_per_batch["batch_request_ids"].put(batch.id, batch.request_ids_in_batch)
+
+
+
         if not self._config.store_batch_metrics:
             return
 
@@ -656,10 +694,16 @@ class ReplicaMetricsStore:
         return self.get_merged_df(all_request_metrics, REQUEST_ID_STR)
 
     def get_batch_metrics_df(self):
+        # Assembing the newer columns here 
         all_batch_metrics = list(
             self._batch_metrics_count_distribution_per_batch.values()
-        ) + list(self._batch_metrics_time_distribution_per_batch.values())
+        ) + list(self._batch_metrics_time_distribution_per_batch.values()) \
+        + list(self._batch_extras_per_batch.values())  # <-- NEW
         return self.get_merged_df(all_batch_metrics, BATCH_ID_STR)
+        # all_batch_metrics = list(
+        #     self._batch_metrics_count_distribution_per_batch.values()
+        # ) + list(self._batch_metrics_time_distribution_per_batch.values())
+        # return self.get_merged_df(all_batch_metrics, BATCH_ID_STR)
 
     def get_operation_metrics_df(self):
         all_operation_metrics = list(self._operation_metrics_per_batch.values()) + list(
