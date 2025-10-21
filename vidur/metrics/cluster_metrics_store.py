@@ -94,6 +94,30 @@ class ClusterMetricsStore:
             config=self._simulation_config.to_dict(),
         )
 
+
+    def _store_batch_request_details(self, base_plot_path: str):
+        if not self._config.store_batch_metrics:
+            return
+
+        # Keep behavior consistent with batch_metrics.csv:
+        if self._config.keep_individual_batch_metrics:
+            brd_df = pd.DataFrame()
+            for _, store in self._replica_metric_stores.items():
+                brd_df = pd.concat(
+                    [brd_df, store.get_batch_request_details_df()],
+                    ignore_index=True
+                )
+
+            # Only write if we have rows
+            if not brd_df.empty:
+                self._save_as_csv(
+                    df=brd_df,
+                    base_path=self._config.output_dir,
+                    file_name="Batch_requests_details",  # -> Batch_requests_details.csv
+                )
+
+
+
     def _save_as_csv(
         self,
         df: pd.DataFrame,
@@ -349,6 +373,10 @@ class ClusterMetricsStore:
         self._cluster_metric_store.store_metrics(dir_plot_path, sim_time)
         self._store_request_metrics(dir_plot_path)
         self._store_batch_metrics(dir_plot_path)
+
+        # NEW: write per-(batch, request) details CSV in the same pass as batch metrics
+        self._store_batch_request_details(dir_plot_path)
+
         self._store_token_metrics(dir_plot_path)
         self._store_operation_metrics(dir_plot_path)
         self._store_utilization_metrics(dir_plot_path)

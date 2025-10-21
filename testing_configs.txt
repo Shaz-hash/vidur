@@ -24,24 +24,20 @@ python -m vidur.main \
 
 
 
-
-python -m vidur.main \
---time_limit 10800 \
---replica_config_model_name meta-llama/Meta-Llama-3-8B \
---replica_config_device h100 \
---replica_config_network_device h100_dgx \
---cluster_config_num_replicas 8 \
---replica_config_tensor_parallel_size 1 \
---replica_config_num_pipeline_stages 1 \
---request_generator_config_type synthetic \
---synthetic_request_generator_config_num_requests 128 \
---length_generator_config_type trace \
---trace_request_length_generator_config_trace_file ./data/processed_traces/mooncake_conversation_trace.csv \
---interval_generator_config_type poisson \
---poisson_request_interval_generator_config_qps 8.0 \
---global_scheduler_config_type round_robin \
---replica_scheduler_config_type vllm \
---metrics_config_write_metrics \
---metrics_config_store_operation_metrics \
---metrics_config_keep_individual_batch_metrics \
---cache_config_enable_prefix_caching
+great work !
+now i need to store more granular data for each of the request that was added into this batch.
+so i am thinking of generating a new csv that is called
+Batch_requests_details.csv
+this will tell me the state of each of the request that is after executing that batch. 
+For example :
+i will store the following rows in this file :
+batch_id,
+request_ids of all the requests whether they were added into the batch or not ,
+SLO_type of each of the request its string. For now for prefill consider it as TTFT, for decode consider it as TBT, SLO remaining time. this will be in miliseconds but now just let it be 0. 
+only_in_queue? i.e. the request has never been added into any of the previous batch 
+added in the last batch ? i.e. whether this request was added in the batch id thats on its row 
+request_type : prefill or decode after running the batch 
+context length in kv cache so far :
+prefill length of this request
+remaining prefill length for this reques (this will be 0 for the decode request)
+For now, trace the files and steps that will be needed for this to happen and then we will move on to the coding side. 

@@ -1,0 +1,2 @@
+Request Id,request_inter_arrival_delay,request_num_tokens,request_num_prefill_tokens,request_num_decode_tokens,request_pd_ratio,request_arrived_at,replica
+0,0.185878,7770.000000,7270.000000,500.000000,14.540000,0.185878,0

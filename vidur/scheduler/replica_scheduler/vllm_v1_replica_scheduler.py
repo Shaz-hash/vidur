@@ -28,6 +28,8 @@ class VLLMV1ReplicaScheduler(BaseReplicaScheduler):
         self._max_micro_batch_size = self._config.batch_size_cap // self._num_stages
 
         # Create the KV Cache manager
+        # NOTE TO MYSELF : 
+        # This part is KV memory manager. Some params allow for the prefix caching which in our case will be default 
         self._kv_cache_manager = ReplicaKVCacheManager(
             block_size=self._cache_config.block_size,
             num_gpu_blocks=self._cache_config.num_blocks,
@@ -44,33 +46,74 @@ class VLLMV1ReplicaScheduler(BaseReplicaScheduler):
         # by the executor.
         self.scheduled_req_ids: set[str] = set()
 
+        # new--> Tracks whether a request has *ever* been scheduled at least once
+        self._ever_scheduled: set[str] = set()
+
         print("VLLM SCHEDULER CALLED!")
 
 
-    # --- NEW: small helper to read current free KV blocks robustly
     def _kv_free_blocks(self) -> int:
         """
-        Try to obtain free-blocks directly from the KV cache manager.
-        Fallback: derive from usage if a direct API is not available.
+        Return how many KV cache blocks are currently free on this replica.
+        Prefer a manager API if it exists; otherwise derive from usage/num_gpu_blocks.
         """
         kvm = self._kv_cache_manager
-        # Preferred: explicit API if your manager has it
         if hasattr(kvm, "free_blocks"):
             try:
                 return int(kvm.free_blocks())
             except Exception:
                 pass
-        # Fallback from usage ratio if exposed
         if hasattr(kvm, "num_gpu_blocks") and hasattr(kvm, "usage"):
             used = int(round(kvm.usage * kvm.num_gpu_blocks))
             return int(kvm.num_gpu_blocks - used)
-        # Last resort: assume BaseReplicaScheduler also tracks allocation
-        # (only if you know these fields exist)
-        if hasattr(self, "_config") and hasattr(self, "_num_allocated_blocks"):
-            return int(self._config.num_blocks - self._num_allocated_blocks)
-        # If none are available, return -1 as a sentinel
-        return -1
+        # As a last resort, fall back to BaseReplicaScheduler counters if you keep them:
+        if hasattr(self, "_cache_config") and hasattr(self._cache_config, "num_blocks") and hasattr(self, "_num_allocated_blocks"):
+            return int(self._cache_config.num_blocks - self._num_allocated_blocks)
+        return -1  # sentinel if nothing available
 
+    def _snapshot_batch_start_counters(self) -> dict:
+        # 1) Requests still waiting after selection
+        try:
+            waiting_count = len(self._waiting_queue)
+        except TypeError:
+            # if not len()-able, adapt to your queue API:
+            waiting_count = self._waiting_queue.size()  # or similar
+
+        # 2) Initiated but not completed: those already running and not completed
+        initiated_not_completed = sum(1 for r in self._running if not r.completed)
+
+        # 3) Classify decode vs prefill across ALL live requests
+        all_known = list(self._requests.values())
+
+        def is_decode(r: Request) -> bool:
+            if getattr(r, "completed", False):
+                return False
+            return bool(getattr(r, "has_started_decode", False) or getattr(r, "is_prefill_complete", False))
+
+        def is_initiated(r: Request) -> bool:
+            return (r.id in self.scheduled_req_ids) or getattr(r, "num_processed_tokens", 0) > 0 or (r in self._running)
+
+        num_decode_phase_total = sum(1 for r in all_known if is_decode(r))
+        num_prefill_queue_total = sum(1 for r in all_known if (not is_decode(r)) and (not r.completed))
+
+        # 4) Not initiated but still in waiting queue
+        try:
+            waiting_iterable = list(self._waiting_queue)
+        except TypeError:
+            waiting_iterable = getattr(self._waiting_queue, "_items", [])  # adjust to your queue impl
+        num_not_initiated_in_queue = sum(1 for r in waiting_iterable if not is_initiated(r))
+
+        # 5) Total live requests at batch start (exclude completed)
+        total_requests_batch_start = sum(1 for r in all_known if not r.completed)
+
+        return {
+            "num_requests_not_selected": waiting_count,
+            "num_requests_initiated_not_completed": initiated_not_completed,
+            "num_decode_phase_total": num_decode_phase_total,
+            "num_prefill_queue_total": num_prefill_queue_total,
+            "num_not_initiated_in_queue": num_not_initiated_in_queue,
+            "total_requests_batch_start": total_requests_batch_start,
+        }
 
 
 
@@ -124,6 +167,8 @@ class VLLMV1ReplicaScheduler(BaseReplicaScheduler):
         req_index = 0
         while req_index < len(self._running) and token_budget > 0:
             request: Request = self._running[req_index]
+
+
             if request.id in self.scheduled_req_ids:
                 req_index += 1
                 continue
@@ -162,6 +207,17 @@ class VLLMV1ReplicaScheduler(BaseReplicaScheduler):
             # Schedule the request.
             scheduled_reqs.append(request)
             self.scheduled_req_ids.add(request.id)
+
+            ## To flag the requests that have been scheduled so far in the history :
+            # new-->
+            # self._ever_scheduled.add(request.id)   
+
+            #  # --> new :
+            # if not hasattr(self, "_ever_scheduled"):
+            #     self._ever_scheduled = set()
+            self._ever_scheduled.add(request.id)
+
+            
             num_scheduled_tokens[request.id] = num_new_tokens
             token_budget -= num_new_tokens
             req_index += 1
@@ -214,7 +270,9 @@ class VLLMV1ReplicaScheduler(BaseReplicaScheduler):
                 self._running.append(request)
                 self.scheduled_req_ids.add(request.id)
                 scheduled_reqs.append(request)
-                assert not request.scheduled
+                #new-->
+                self._ever_scheduled.add(request.id)  
+                assert not request.scheduled     
                 num_scheduled_tokens[request.id] = num_new_tokens
                 token_budget -= num_new_tokens
                 # Update the number of processed tokens for the request
@@ -250,7 +308,15 @@ class VLLMV1ReplicaScheduler(BaseReplicaScheduler):
         if scheduler_output.batch is not None:
             try:
                 # print("here!")
+                snapshot = self._snapshot_batch_start_counters()
                 scheduler_output.batch.kv_free_blocks_before = self._kv_free_blocks()
+                scheduler_output.batch.num_requests_not_selected           = snapshot["num_requests_not_selected"]
+                scheduler_output.batch.num_requests_initiated_not_completed = snapshot["num_requests_initiated_not_completed"]
+                scheduler_output.batch.num_decode_phase_total              = snapshot["num_decode_phase_total"]
+                scheduler_output.batch.num_prefill_queue_total             = snapshot["num_prefill_queue_total"]
+                scheduler_output.batch.num_not_initiated_in_queue          = snapshot["num_not_initiated_in_queue"]
+                scheduler_output.batch.total_requests_batch_start          = snapshot["total_requests_batch_start"]
+
                 # print("scheduler_output KV BLOCKS : ", scheduler_output.batch.kv_free_blocks_before)
             except Exception:
                 scheduler_output.batch.kv_free_blocks_before = None
@@ -284,6 +350,46 @@ class VLLMV1ReplicaScheduler(BaseReplicaScheduler):
         return len(self._waiting_queue) + len(self._running) == 0
 
     def on_batch_end(self, batch: Batch) -> None:
+
+
+        #--> new
+        # ---- Build per-request rows BEFORE we mutate state / free KV ----
+        rows = []
+        added_ids = {r.id for r in batch.requests}
+
+        # If you also want to include requests that completed in *this* batch,
+        # collect them before freeing; otherwise the registry below is enough.
+        all_live = list(self._requests.values())
+
+        for req in all_live:
+            # KV context length so far
+            _, num_computed_tokens = self._kv_cache_manager.get_computed_blocks(req)
+
+            in_decode = bool(getattr(req, "has_started_decode", False) or getattr(req, "is_prefill_complete", False))
+            slo_type = "TBT" if in_decode else "TTFT"
+
+            prefill_len = req.num_prefill_tokens
+            prefill_remaining = 0 if in_decode else max(prefill_len - num_computed_tokens, 0)
+
+            rows.append({
+                "batch_id": batch.id,
+                "request_id": req.id,
+                "slo_type": slo_type,
+                "slo_remaining_ms": 0,  # stub for now
+                "only_in_queue": (req.id not in self._ever_scheduled),
+                "added_in_last_batch": (req.id in added_ids),
+                "request_type_after_batch": ("decode" if in_decode else "prefill"),
+                "kv_context_len_tokens": num_computed_tokens,
+                "prefill_len_tokens": prefill_len,
+                "prefill_remaining_tokens": prefill_remaining,
+            })
+
+        # Stash on batch for the metrics store to consume
+        batch._request_details_rows = rows
+
+        if not hasattr(batch, "_request_details_rows"):
+            batch._request_details_rows = []
+
 
         try:
             batch.kv_free_blocks_after = self._kv_free_blocks()

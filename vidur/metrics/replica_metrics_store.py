@@ -96,6 +96,14 @@ class ReplicaMetricsStore:
             )
 
         # Initialise batch metrics
+
+        # --> new Collect per-(batch, request) rows for Batch_requests_details.csv
+        self._batch_request_details_rows: List[dict] = []
+      
+
+        # Track which requests have ever been scheduled (if scheduler doesn’t pass it)
+        self._ever_scheduled_req_ids: set[str] = set()
+
         self._batch_metrics_count_distribution: Dict[
             BatchMetricsCountDistribution, CDFSketch
         ] = {}
@@ -123,7 +131,8 @@ class ReplicaMetricsStore:
             BatchMetricsTimeDistribution, DataSeries
         ] = {}
 
-        # --- NEW: extra per-batch columns to be merged into batch_metrics.csv
+  
+        # --- NEW / EXTEND: extra per-batch columns to be merged into batch_metrics.csv
         self._batch_extras_per_batch: Dict[str, DataSeries] = {
             "kv_free_blocks_before": DataSeries(
                 BATCH_ID_STR, "kv_free_blocks_before",
@@ -137,9 +146,33 @@ class ReplicaMetricsStore:
                 BATCH_ID_STR, "batch_request_ids",
                 self._config.subsamples, self._config.save_table_to_wandb, self._config.store_plots
             ),
+
+            # --- NEW snapshot counters at batch start ---
+            "num_requests_not_selected": DataSeries(
+                BATCH_ID_STR, "num_requests_not_selected",
+                self._config.subsamples, self._config.save_table_to_wandb, self._config.store_plots
+            ),
+            "num_requests_initiated_not_completed": DataSeries(
+                BATCH_ID_STR, "num_requests_initiated_not_completed",
+                self._config.subsamples, self._config.save_table_to_wandb, self._config.store_plots
+            ),
+            "num_decode_phase_total": DataSeries(
+                BATCH_ID_STR, "num_decode_phase_total",
+                self._config.subsamples, self._config.save_table_to_wandb, self._config.store_plots
+            ),
+            "num_prefill_queue_total": DataSeries(
+                BATCH_ID_STR, "num_prefill_queue_total",
+                self._config.subsamples, self._config.save_table_to_wandb, self._config.store_plots
+            ),
+            "num_not_initiated_in_queue": DataSeries(
+                BATCH_ID_STR, "num_not_initiated_in_queue",
+                self._config.subsamples, self._config.save_table_to_wandb, self._config.store_plots
+            ),
+            "total_requests_batch_start": DataSeries(
+                BATCH_ID_STR, "total_requests_batch_start",
+                self._config.subsamples, self._config.save_table_to_wandb, self._config.store_plots
+            ),
         }
-
-
 
 
 
@@ -258,6 +291,54 @@ class ReplicaMetricsStore:
                 )
             )
             self._replica_mfu[stage_idx].put(0, 0)
+
+
+    def add_batch_request_details(self, batch: Batch):
+        """
+        Build per-request rows AFTER this batch executes.
+
+        - If the scheduler attached batch._request_details_rows (full snapshot across live requests),
+        prefer those and just tag the replica.
+        - Otherwise, fall back to synthesizing rows only for requests in this batch.
+        """¬
+        # 1) Prefer scheduler-provided comprehensive rows
+        if hasattr(batch, "_request_details_rows") and batch._request_details_rows:
+            for row in batch._request_details_rows:
+                row["replica"] = self._replica_id
+                # maintain ever-scheduled set if the scheduler sent rows for requests in the batch
+                if "request_id" in row:
+                    self._ever_scheduled_req_ids.add(row["request_id"])
+            self._batch_request_details_rows.extend(batch._request_details_rows)
+            return
+
+        # 2) Fallback: synthesize minimal info for requests in *this* batch only
+        for req in getattr(batch, "requests", []):
+            was_ever_scheduled = (req.id in self._ever_scheduled_req_ids)
+
+            row = {
+                "batch_id": batch.id,
+                "request_id": req.id,
+                "slo_type": "TTFT" if not req.is_prefill_complete else "TBT",
+                "slo_remaining_ms": 0,
+                "only_in_queue": (not was_ever_scheduled),
+                "added_in_last_batch": True,  # fallback path cannot know others
+                "request_type_after_batch": "decode" if getattr(req, "has_started_decode", False) else "prefill",
+                "kv_context_len_tokens": getattr(req, "num_processed_tokens", 0),
+                "prefill_len_tokens": getattr(req, "num_prefill_tokens", 0),
+                "prefill_remaining_tokens": max(
+                    0,
+                    getattr(req, "num_prefill_tokens", 0) - getattr(req, "num_processed_tokens", 0),
+                ),
+                "replica": self._replica_id,
+            }
+            self._batch_request_details_rows.append(row)
+
+            # now record that this request has been scheduled at least once
+            self._ever_scheduled_req_ids.add(req.id)
+
+
+
+
 
     @if_write_metrics
     def on_request_arrival(self, request: Request) -> None:
@@ -581,6 +662,34 @@ class ReplicaMetricsStore:
             if hasattr(batch, "request_ids_in_batch") and batch.request_ids_in_batch is not None:
                 self._batch_extras_per_batch["batch_request_ids"].put(batch.id, batch.request_ids_in_batch)
 
+            if hasattr(batch, "num_requests_not_selected"):
+                self._batch_extras_per_batch["num_requests_not_selected"].put(batch.id, batch.num_requests_not_selected)
+            if hasattr(batch, "num_requests_initiated_not_completed"):
+                self._batch_extras_per_batch["num_requests_initiated_not_completed"].put(batch.id, batch.num_requests_initiated_not_completed)
+            if hasattr(batch, "num_decode_phase_total"):
+                self._batch_extras_per_batch["num_decode_phase_total"].put(batch.id, batch.num_decode_phase_total)
+            if hasattr(batch, "num_prefill_queue_total"):
+                self._batch_extras_per_batch["num_prefill_queue_total"].put(batch.id, batch.num_prefill_queue_total)
+            if hasattr(batch, "num_not_initiated_in_queue"):
+                self._batch_extras_per_batch["num_not_initiated_in_queue"].put(batch.id, batch.num_not_initiated_in_queue)
+            if hasattr(batch, "total_requests_batch_start"):
+                self._batch_extras_per_batch["total_requests_batch_start"].put(batch.id, batch.total_requests_batch_start)
+
+        # --- NEW: collect per-request details rows if the scheduler attached them
+        # if (
+        #     self._config.store_batch_metrics
+        #     and hasattr(batch, "_request_details_rows")
+        #     and batch._request_details_rows
+        # ):
+        #     # tag replica and stash
+        #     for row in batch._request_details_rows:
+        #         row["replica"] = self._replica_id
+        #     self._batch_request_details_rows.extend(batch._request_details_rows)
+
+
+        # #  --- New: function call to make accumulate the rows :
+        self.add_batch_request_details(batch)
+
 
 
         if not self._config.store_batch_metrics:
@@ -670,22 +779,45 @@ class ReplicaMetricsStore:
                     base_plot_path, f"{dataseries._y_name}_time_series", COUNT_STR
                 )
 
-    def get_merged_df(
-        self,
-        dataseries_list: List[DataSeries],
-        key_to_join: str,
-    ):
-        dfs = [dataseries.to_df() for dataseries in dataseries_list]
-        assert all([df[key_to_join].is_unique for df in dfs])
-        # assert all([len(df) == len(dfs[0]) for df in dfs])
+    # def get_merged_df(
+    #     self,
+    #     dataseries_list: List[DataSeries],
+    #     key_to_join: str,
+    # ):
+    #     dfs = [dataseries.to_df() for dataseries in dataseries_list]
+    #     assert all([df[key_to_join].is_unique for df in dfs])
+    #     # assert all([len(df) == len(dfs[0]) for df in dfs])
 
-        # https://stackoverflow.com/questions/53645882/pandas-merging-101/65167327#65167327
-        merged_df = pd.concat(
-            [df.set_index(key_to_join) for df in dfs], axis=1, join="inner"
-        ).reset_index()
+    #     # https://stackoverflow.com/questions/53645882/pandas-merging-101/65167327#65167327
+    #     merged_df = pd.concat(
+    #         [df.set_index(key_to_join) for df in dfs], axis=1, join="inner"
+    #     ).reset_index()
 
+    #     merged_df["replica"] = self._replica_id
+    #     return merged_df
+
+    def get_merged_df(self, dataseries_list: List[DataSeries], key_to_join: str):
+        # Build frames and drop empties
+        frames = []
+        for ds in dataseries_list:
+            df = ds.to_df()
+            if df is None or df.empty:
+                continue
+            # ensure uniqueness for non-empty frames
+            assert df[key_to_join].is_unique
+            frames.append(df.set_index(key_to_join))
+
+        if not frames:
+            # No data yet -> return an empty shell with the join key + replica
+            return pd.DataFrame(columns=[key_to_join, "replica"])
+
+        # Use OUTER join so missing series don't drop batches
+        merged_df = pd.concat(frames, axis=1, join="outer").reset_index()
         merged_df["replica"] = self._replica_id
         return merged_df
+
+
+
 
     def get_request_metrics_df(self):
         all_request_metrics = list(
@@ -704,6 +836,24 @@ class ReplicaMetricsStore:
         #     self._batch_metrics_count_distribution_per_batch.values()
         # ) + list(self._batch_metrics_time_distribution_per_batch.values())
         # return self.get_merged_df(all_batch_metrics, BATCH_ID_STR)
+
+    ## --> New : to create our new csv file : batch_request.csv 
+    def get_batch_request_details_df(self) -> pd.DataFrame:
+        cols = [
+            "batch_id","request_id","slo_type","slo_remaining_ms",
+            "only_in_queue","added_in_last_batch","request_type_after_batch",
+            "kv_context_len_tokens","prefill_len_tokens","prefill_remaining_tokens",
+            "replica",
+        ]
+        if not self._batch_request_details_rows:
+            return pd.DataFrame(columns=cols)
+        df = pd.DataFrame(self._batch_request_details_rows)
+        for c in cols:
+            if c not in df.columns:
+                df[c] = None
+        return df[cols]
+
+
 
     def get_operation_metrics_df(self):
         all_operation_metrics = list(self._operation_metrics_per_batch.values()) + list(
@@ -727,15 +877,34 @@ class ReplicaMetricsStore:
             )
         return replica_mfu_dict
 
+    # def get_prefix_cache_stats(self):
+    #     cached_tokens_stats = self._request_metrics_histogram[
+    #         RequestMetricsHistogram.REQUEST_PREFILL_TOKENS_CACHED
+    #     ].get_stats()
+    #     total_tokens_stats = self._request_metrics_histogram[
+    #         RequestMetricsHistogram.REQUEST_PREFILL_TOKENS
+    #     ].get_stats()
+    #     return {
+    #         "cached_tokens_sum": int(cached_tokens_stats["sum"]),
+    #         "total_tokens_sum": int(total_tokens_stats["sum"]),
+    #         "hit_ratio": cached_tokens_stats["sum"] / total_tokens_stats["sum"],
+    #     }
+
+
     def get_prefix_cache_stats(self):
-        cached_tokens_stats = self._request_metrics_histogram[
+        cached_stats = self._request_metrics_histogram[
             RequestMetricsHistogram.REQUEST_PREFILL_TOKENS_CACHED
-        ].get_stats()
-        total_tokens_stats = self._request_metrics_histogram[
+        ].get_stats() or {}
+        total_stats = self._request_metrics_histogram[
             RequestMetricsHistogram.REQUEST_PREFILL_TOKENS
-        ].get_stats()
+        ].get_stats() or {}
+
+        cached_sum = int(cached_stats.get("sum", 0) or 0)
+        total_sum  = int(total_stats.get("sum", 0) or 0)
+        hit_ratio = (cached_sum / total_sum) if total_sum > 0 else 0.0
+
         return {
-            "cached_tokens_sum": int(cached_tokens_stats["sum"]),
-            "total_tokens_sum": int(total_tokens_stats["sum"]),
-            "hit_ratio": cached_tokens_stats["sum"] / total_tokens_stats["sum"],
+            "cached_tokens_sum": cached_sum,
+            "total_tokens_sum": total_sum,
+            "hit_ratio": hit_ratio,
         }

@@ -1,0 +1,2 @@
+Batch Id,mlp_up_proj,mlp_activation,mlp_down_proj,mlp_down_proj_all_reduce,attn_pre_proj,attn_post_proj,attn_post_proj_all_reduce,attn_prefill,attn_kv_cache_save,attn_decode,attn_rope,pipeline_send_recv,add,input_layernorm,post_attention_layernorm,schedule,sample_e2e,prepare_inputs_e2e,model_execution_e2e,process_model_outputs,ray_comm_time,replica
+0,0.176398,0.022004,0.084450,0.000000,0.045401,0.031989,0.000000,0.064582,0.211820,0.000000,0.005994,0.000000,0.008200,0.007000,0.007000,0.000000,0.000000,0.000000,21.143599,0.000000,0.000000,0
