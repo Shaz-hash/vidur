@@ -63,3 +63,9 @@ class TraceRequestIntervalGenerator(BaseRequestIntervalGenerator):
         self.next_request_idx += 1
 
         return inter_request_time
+
+    def _snapshot_extra_state(self) -> dict:
+        return {"next_request_idx": int(self.next_request_idx)}
+
+    def _restore_extra_state(self, snapshot: dict) -> None:
+        self.next_request_idx = int(snapshot.get("next_request_idx", self.next_request_idx))

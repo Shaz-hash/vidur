@@ -1,5 +1,8 @@
+# from collections import deque
+# from typing import Optional
+
 from collections import deque
-from typing import Optional
+from typing import Optional, Dict, Any, Deque, List
 
 from vidur.config import SyntheticRequestGeneratorConfig
 from vidur.entities import Request
@@ -11,6 +14,8 @@ from vidur.request_generator.request_length_generator_registry import (
     RequestLengthGeneratorRegistry,
 )
 
+
+_SNAP_VERSION_SYNTHETIC_EXTRA = 1
 
 class SyntheticRequestGenerator(BaseRequestGenerator):
     def __init__(self, config: SyntheticRequestGeneratorConfig):
@@ -71,3 +76,47 @@ class SyntheticRequestGenerator(BaseRequestGenerator):
             self._generate_next_request()
 
         return self.requests.popleft() if len(self.requests) > 0 else None
+
+    def _snapshot_extra_state(self) -> dict:
+            extra: Dict[str, Any] = {
+                "__v__": _SNAP_VERSION_SYNTHETIC_EXTRA,
+                "requests": [req.id for req in self.requests],
+                "last_arrived_at": float(self.last_arrived_at),
+                "num_requests_generated": int(self.num_requests_generated),
+                # Optional identity for safety:
+                "interval_gen_type": type(self.request_interval_generator).__name__,
+                "length_gen_type": type(self.request_length_generator).__name__,
+            }
+            if hasattr(self.request_interval_generator, "snapshot_state"):
+                extra["interval_gen"] = self.request_interval_generator.snapshot_state()
+            if hasattr(self.request_length_generator, "snapshot_state"):
+                extra["length_gen"] = self.request_length_generator.snapshot_state()
+            return extra
+
+    def _restore_extra_state(self, snapshot: dict, request_lookup: Dict[int, Request]) -> None:
+        v = int(snapshot.get("__v__", 1))
+        if v != _SNAP_VERSION_SYNTHETIC_EXTRA:
+            # add migrations here when schema changes
+            raise ValueError(f"SyntheticRequestGenerator extra snapshot version mismatch: got {v}, expected {_SNAP_VERSION_SYNTHETIC_EXTRA}")
+
+        self.last_arrived_at = float(snapshot.get("last_arrived_at", 0.0))
+        self.num_requests_generated = int(snapshot.get("num_requests_generated", 0))
+        self.requests = deque(request_lookup[rid] for rid in snapshot.get("requests", []))
+
+        # Optional: sanity check generator identities to catch config drift
+        if "interval_gen_type" in snapshot:
+            expect = snapshot["interval_gen_type"]
+            actual = type(self.request_interval_generator).__name__
+            if actual != expect and hasattr(self.request_interval_generator, "restore_state"):
+                # You can choose to warn or raise; raising is safest for determinism.
+                raise ValueError(f"Interval generator type mismatch: saved {expect}, got {actual}")
+        if "length_gen_type" in snapshot:
+            expect = snapshot["length_gen_type"]
+            actual = type(self.request_length_generator).__name__
+            if actual != expect and hasattr(self.request_length_generator, "restore_state"):
+                raise ValueError(f"Length generator type mismatch: saved {expect}, got {actual}")
+
+        if "interval_gen" in snapshot and hasattr(self.request_interval_generator, "restore_state"):
+            self.request_interval_generator.restore_state(snapshot["interval_gen"])
+        if "length_gen" in snapshot and hasattr(self.request_length_generator, "restore_state"):
+            self.request_length_generator.restore_state(snapshot["length_gen"])

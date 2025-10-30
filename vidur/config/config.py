@@ -298,6 +298,14 @@ class SloConfig:
         default=None,
         metadata={"help": "Target Min TTFT"},
     )
+    decode_time_slo: Optional[float] = field(
+        default=None,
+        metadata={"help": "Decode SLO (TBT) in seconds."},
+    )
+    completion_time_slo: Optional[float] = field(
+        default=None,
+        metadata={"help": "Time-to-complete SLO (TTC) in seconds."},
+    )
 
 
 @dataclass

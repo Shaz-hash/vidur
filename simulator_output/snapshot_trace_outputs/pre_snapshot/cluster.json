@@ -1,0 +1,1 @@
+{"id": 1, "num_replicas": 1, "replicas": [{"id": "0", "num_pipeline_stages": 1, "num_tensor_parallel_workers": 1}]}

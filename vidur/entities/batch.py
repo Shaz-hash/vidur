@@ -1,4 +1,6 @@
-from typing import List
+# --- tidy imports ---
+from dataclasses import dataclass, asdict
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -6,6 +8,10 @@ from vidur.entities.base_entity import BaseEntity
 from vidur.entities.request import Request
 from vidur.logger import init_logger
 from vidur.types.replica_id import ReplicaId
+from vidur.utils.snapshot_utils import to_primitive_tree
+
+
+_SNAP_VERSION_BATCH = 1
 
 logger = init_logger(__name__)
 
@@ -27,6 +33,31 @@ def check_completed(func):
         return func(self, *args, **kwargs)
 
     return wrapper
+
+
+"""For Simulator Snapshot : """
+@dataclass(frozen=True)
+class BatchSnapshot:
+    __v__: int
+    id: int
+    replica_id: int
+    request_ids: List[int]          # order matters
+    num_tokens: List[int]           # order matches request_ids
+    scheduled: bool
+    completed: bool
+    scheduled_at: Optional[float]
+    completed_at: Optional[float]
+    # Optional debug/metrics fields if you sometimes attach them:
+    kv_free_blocks_before: Optional[int] = None
+    kv_free_blocks_after: Optional[int] = None
+    request_ids_in_batch: Optional[str] = None
+    num_requests_not_selected: Optional[int] = None
+    num_requests_initiated_not_completed: Optional[int] = None
+    num_decode_phase_total: Optional[int] = None
+    num_prefill_queue_total: Optional[int] = None
+    num_not_initiated_in_queue: Optional[int] = None
+    total_requests_batch_start: Optional[int] = None
+
 
 
 class Batch(BaseEntity):
@@ -193,3 +224,113 @@ class Batch(BaseEntity):
             "num_prefill_tokens": self.num_prefill_tokens,
             "num_decode_tokens": self.num_decode_tokens,
         }
+
+    # --- Snapshot helpers -------------------------------------------------
+
+    # --- in Batch.snapshot_state ---
+    def snapshot_state(self) -> Dict[str, Any]:
+        # Safely normalize replica id to a plain int for the snapshot
+        rid = int(getattr(self._replica_id, "id", self._replica_id))
+        snap = BatchSnapshot(
+            __v__=_SNAP_VERSION_BATCH,
+            id=int(self._id),
+            replica_id=rid,                               # <-- was int(self._replica_id)
+            request_ids=[r.id for r in self._requests],
+            num_tokens=list(self._num_tokens),
+            scheduled=bool(self._scheduled),
+            completed=bool(self._completed),
+            scheduled_at=float(self._scheduled_at) if self._scheduled_at is not None else None,
+            completed_at=float(self._completed_at) if self._completed_at is not None else None,
+            kv_free_blocks_before=getattr(self, "kv_free_blocks_before", None),
+            kv_free_blocks_after=getattr(self, "kv_free_blocks_after", None),
+            request_ids_in_batch=getattr(self, "request_ids_in_batch", None),
+            num_requests_not_selected=getattr(self, "num_requests_not_selected", None),
+            num_requests_initiated_not_completed=getattr(self, "num_requests_initiated_not_completed", None),
+            num_decode_phase_total=getattr(self, "num_decode_phase_total", None),
+            num_prefill_queue_total=getattr(self, "num_prefill_queue_total", None),
+            num_not_initiated_in_queue=getattr(self, "num_not_initiated_in_queue", None),
+            total_requests_batch_start=getattr(self, "total_requests_batch_start", None),
+        )
+        return to_primitive_tree(asdict(snap))
+
+    # --- in Batch.from_snapshot ---
+    @classmethod
+    def from_snapshot(cls, snap: Dict[str, Any], request_lookup: Dict[int, Request]) -> "Batch":
+        assert int(snap["__v__"]) == _SNAP_VERSION_BATCH, "Batch snapshot version mismatch"
+
+        req_ids = list(snap["request_ids"])
+        num_tokens = list(snap["num_tokens"])
+        assert len(req_ids) == len(num_tokens), "request_ids/num_tokens length mismatch"
+
+        req_objs: List[Request] = []
+        for rid in req_ids:
+            assert isinstance(rid, int), "request_ids must be ints"
+            assert rid in request_lookup, f"unknown request id {rid} in BatchSnapshot"
+            req_objs.append(request_lookup[rid])
+
+        # Re-wrap the stored int back into a ReplicaId for the constructor
+        replica_id_obj = ReplicaId(int(snap["replica_id"]))   # <-- was int(...)
+
+        batch = cls(
+            replica_id=replica_id_obj,
+            requests=req_objs,
+            num_tokens=num_tokens,
+        )
+        batch._id = int(snap["id"])
+        batch._scheduled = bool(snap["scheduled"])
+        batch._completed = bool(snap["completed"])
+        batch._scheduled_at = snap.get("scheduled_at", None)
+        batch._completed_at = snap.get("completed_at", None)
+
+        if "kv_free_blocks_before" in snap:
+            batch.kv_free_blocks_before = snap["kv_free_blocks_before"]
+        if "kv_free_blocks_after" in snap:
+            batch.kv_free_blocks_after = snap["kv_free_blocks_after"]
+        if "request_ids_in_batch" in snap:
+            batch.request_ids_in_batch = snap["request_ids_in_batch"]
+        if "num_requests_not_selected" in snap:
+            batch.num_requests_not_selected = snap["num_requests_not_selected"]
+        if "num_requests_initiated_not_completed" in snap:
+            batch.num_requests_initiated_not_completed = snap["num_requests_initiated_not_completed"]
+        if "num_decode_phase_total" in snap:
+            batch.num_decode_phase_total = snap["num_decode_phase_total"]
+        if "num_prefill_queue_total" in snap:
+            batch.num_prefill_queue_total = snap["num_prefill_queue_total"]
+        if "num_not_initiated_in_queue" in snap:
+            batch.num_not_initiated_in_queue = snap["num_not_initiated_in_queue"]
+        if "total_requests_batch_start" in snap:
+            batch.total_requests_batch_start = snap["total_requests_batch_start"]
+
+        return batch
+
+
+
+    @classmethod
+    def restore_state(cls, snap: Dict[str, Any], request_lookup: Dict[int, Request]) -> "Batch":
+        """Kept for API compatibility: construct via from_snapshot()."""
+        return cls.from_snapshot(snap, request_lookup)
+
+
+
+
+    # def snapshot_state(self) -> dict:
+    #     """Capture a lightweight copy of the mutable batch state."""
+    #     state = {key: clone_mutable(value) for key, value in self.__dict__.items()}
+    #     state["_requests"] = [request.id for request in self._requests]
+    #     return state
+
+    # @classmethod
+    # def restore_state(cls, snapshot: dict, request_lookup: dict[int, Request]) -> "Batch":
+    #     """Rebuild a ``Batch`` instance from a snapshot and request map."""
+    #     request_objs = [request_lookup[req_id] for req_id in snapshot["_requests"]]
+
+    #     batch = cls(snapshot["_replica_id"], request_objs, snapshot["_num_tokens"])
+    #     for key, value in snapshot.items():
+    #         if key == "_requests":
+    #             setattr(batch, key, list(request_objs))
+    #         else:
+    #             setattr(batch, key, clone_mutable(value))
+
+    #     batch._id = snapshot["_id"]
+    #     type(batch)._id = max(type(batch)._id, batch._id)
+    #     return batch

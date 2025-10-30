@@ -3,6 +3,65 @@ from typing import List, Optional, Tuple
 from vidur.entities.base_entity import BaseEntity
 from vidur.logger import init_logger
 from vidur.types.replica_id import ReplicaId
+# from vidur.utils.snapshot_utils import clone_mutable
+
+
+from dataclasses import dataclass, asdict
+from typing import Any, Dict, Optional, List
+from vidur.utils.snapshot_utils import to_primitive_tree  # the primitive normalizer we discussed
+
+_SNAP_VERSION_REQ = 1  # bump if you ever change fields/semantics
+
+
+@dataclass(frozen=True)
+class RequestSnapshot:
+    __v__: int
+    id: int
+    arrived_at: float
+    queued_at: float
+    replica_id: Optional[int]
+
+    # size + progress
+    num_prefill_tokens: int
+    num_prefill_tokens_cached: int
+    num_decode_tokens: int
+    num_processed_tokens: int
+
+    # prefix caching aux
+    block_hash_ids: Optional[List[int]]
+    block_size: Optional[int]
+
+    # flags
+    scheduled: bool
+    preempted: bool
+    completed: bool
+    is_prefill_complete: bool
+
+    # counts
+    num_restarts: int
+
+    # timing / metrics
+    scheduled_at: float
+    preempted_time: float
+    completed_at: float
+    prefill_completed_at: float
+    scheduling_delay: float
+    execution_time: float
+    model_execution_time: float
+    latest_stage_scheduled_at: float
+    latest_stage_completed_at: float
+    latest_iteration_scheduled_at: float
+    latest_iteration_completed_at: float
+    latest_iteration_scheduling_delay: float
+
+    # SLO / session
+    prefill_slo_time: Optional[float]
+    decode_slo_time: float
+    completion_slo_time: float
+    session_id: Optional[int]
+
+
+
 
 logger = init_logger(__name__)
 
@@ -75,6 +134,8 @@ class Request(BaseEntity):
         self._completed_at = 0
         self._prefill_completed_at = 0
         self._prefill_slo_time = None
+        self._decode_slo_time = -1.0
+        self._completion_slo_time = -1.0
         self._latest_stage_scheduled_at = 0
         self._latest_stage_completed_at = 0
         self._latest_iteration_scheduled_at = 0
@@ -259,6 +320,22 @@ class Request(BaseEntity):
         self._prefill_slo_time = value
 
     @property
+    def decode_slo_time(self) -> float:
+        return self._decode_slo_time
+
+    @decode_slo_time.setter
+    def decode_slo_time(self, value: float) -> None:
+        self._decode_slo_time = value
+
+    @property
+    def completion_slo_time(self) -> float:
+        return self._completion_slo_time
+
+    @completion_slo_time.setter
+    def completion_slo_time(self, value: float) -> None:
+        self._completion_slo_time = value
+
+    @property
     def has_started_decode(self) -> bool:
         return self._num_processed_tokens > self._num_prefill_tokens + 1
 
@@ -394,4 +471,137 @@ class Request(BaseEntity):
             "preempted": self._preempted,
             "completed": self._completed,
             "num_restarts": self._num_restarts,
+            "decode_slo_time": self._decode_slo_time,
+            "completion_slo_time": self._completion_slo_time,
         }
+
+    # --- Snapshot helpers -------------------------------------------------
+    # def snapshot_state(self) -> dict:
+    #     """Capture a lightweight copy of the mutable request state."""
+    #     return {key: clone_mutable(value) for key, value in self.__dict__.items()}
+
+    # def restore_state(self, state: dict) -> None:
+    #     """Restore the request to a previous state captured via ``snapshot_state``."""
+    #     for key, value in state.items():
+    #         setattr(self, key, clone_mutable(value))
+
+    # --- Snapshot helpers (REPLACE THE OLD ONES) --------------------------
+
+    def snapshot_state(self) -> Dict[str, Any]:
+        """Return a JSON-friendly, minimal snapshot of this Request's logical state."""
+        # replica_id=int(self._replica_id) if self._replica_id is not None else None,
+        rid = None
+        if self._replica_id is not None:
+            # prefer .id if present; otherwise fall back
+            rid = int(getattr(self._replica_id, "id", self._replica_id))
+
+        snap = RequestSnapshot(
+            __v__=_SNAP_VERSION_REQ,
+            id=int(self._id),
+            arrived_at=float(self._arrived_at),
+            queued_at=float(self._queued_at),
+            replica_id = rid,
+            num_prefill_tokens=int(self._num_prefill_tokens),
+            num_prefill_tokens_cached=int(self._num_prefill_tokens_cached),
+            num_decode_tokens=int(self._num_decode_tokens),
+            num_processed_tokens=int(self._num_processed_tokens),
+
+            block_hash_ids=list(self._block_hash_ids) if self._block_hash_ids is not None else None,
+            block_size=int(self._block_size) if self._block_size is not None else None,
+
+            scheduled=bool(self._scheduled),
+            preempted=bool(self._preempted),
+            completed=bool(self._completed),
+            is_prefill_complete=bool(self._is_prefill_complete),
+
+            num_restarts=int(self._num_restarts),
+
+            scheduled_at=float(self._scheduled_at),
+            preempted_time=float(self._preempted_time),
+            completed_at=float(self._completed_at),
+            prefill_completed_at=float(self._prefill_completed_at),
+            scheduling_delay=float(self._scheduling_delay),
+            execution_time=float(self._execution_time),
+            model_execution_time=float(self._model_execution_time),
+            latest_stage_scheduled_at=float(self._latest_stage_scheduled_at),
+            latest_stage_completed_at=float(self._latest_stage_completed_at),
+            latest_iteration_scheduled_at=float(self._latest_iteration_scheduled_at),
+            latest_iteration_completed_at=float(self._latest_iteration_completed_at),
+            latest_iteration_scheduling_delay=float(self._latest_iteration_scheduling_delay),
+
+            prefill_slo_time=float(self._prefill_slo_time) if self._prefill_slo_time is not None else None,
+            decode_slo_time=float(self._decode_slo_time),
+            completion_slo_time=float(self._completion_slo_time),
+            session_id=int(self._session_id) if self._session_id is not None else None,
+        )
+        # normalize/validate primitives for safety
+        return to_primitive_tree(asdict(snap))
+
+    @staticmethod
+    def from_snapshot(s: Dict[str, Any]) -> "Request":
+        """Construct a new Request object from a snapshot dict."""
+        assert int(s["__v__"]) == _SNAP_VERSION_REQ, "Request snapshot version mismatch"
+
+        req = Request.__new__(Request)
+
+        req._arrived_at = float(s["arrived_at"])
+        req._num_prefill_tokens = int(s["num_prefill_tokens"])
+        req._num_decode_tokens = int(s["num_decode_tokens"])
+        req._block_hash_ids = (
+            list(s["block_hash_ids"]) if s.get("block_hash_ids") is not None else None
+        )
+        req._block_size = int(s["block_size"]) if s.get("block_size") is not None else None
+        req._session_id = int(s["session_id"]) if s.get("session_id") is not None else None
+
+        # Set identity & basic timeline first
+        req._id = int(s["id"])
+        req._queued_at = float(s["queued_at"])
+
+        # Replica note: assign directly to bypass the "not scheduled" assert
+        # req._replica_id = int(s["replica_id"]) if s.get("replica_id") is not None else None
+
+        from vidur.types.replica_id import ReplicaId
+        req._replica_id = (
+            ReplicaId(int(s["replica_id"])) if s.get("replica_id") is not None else None
+        )
+
+        # Sizes & progress
+        req._num_prefill_tokens = int(s["num_prefill_tokens"])
+        req._num_prefill_tokens_cached = int(s["num_prefill_tokens_cached"])
+        req._num_decode_tokens = int(s["num_decode_tokens"])
+        req._num_processed_tokens = int(s["num_processed_tokens"])
+
+        # Flags & counters
+        req._scheduled = bool(s["scheduled"])
+        req._preempted = bool(s["preempted"])
+        req._completed = bool(s["completed"])
+        req._is_prefill_complete = bool(s["is_prefill_complete"])
+        req._num_restarts = int(s["num_restarts"])
+
+        # Timing/metrics
+        req._scheduled_at = float(s["scheduled_at"])
+        req._preempted_time = float(s["preempted_time"])
+        req._completed_at = float(s["completed_at"])
+        req._prefill_completed_at = float(s["prefill_completed_at"])
+        req._scheduling_delay = float(s["scheduling_delay"])
+        req._execution_time = float(s["execution_time"])
+        req._model_execution_time = float(s["model_execution_time"])
+        req._latest_stage_scheduled_at = float(s["latest_stage_scheduled_at"])
+        req._latest_stage_completed_at = float(s["latest_stage_completed_at"])
+        req._latest_iteration_scheduled_at = float(s["latest_iteration_scheduled_at"])
+        req._latest_iteration_completed_at = float(s["latest_iteration_completed_at"])
+        req._latest_iteration_scheduling_delay = float(s["latest_iteration_scheduling_delay"])
+
+        # SLO
+        req._prefill_slo_time = float(s["prefill_slo_time"]) if s.get("prefill_slo_time") is not None else None
+        req._decode_slo_time = float(s.get("decode_slo_time", -1.0))
+        req._completion_slo_time = float(s.get("completion_slo_time", -1.0))
+
+        return req
+
+    def restore_state(self, s: Dict[str, Any]) -> None:
+        """Mutate this Request to match a snapshot."""
+        rebuilt = Request.from_snapshot(s)
+        # Copy fields over (keeps object identity stable if external maps hold this instance)
+        self.__dict__.update(rebuilt.__dict__)
+

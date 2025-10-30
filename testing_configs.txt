@@ -4,7 +4,7 @@ python -m vidur.main \
 --replica_config_model_name meta-llama/Meta-Llama-3-8B \
 --replica_config_device h100 \
 --replica_config_network_device h100_dgx \
---cluster_config_num_replicas 8 \
+--cluster_config_num_replicas 1 \
 --replica_config_tensor_parallel_size 1 \
 --replica_config_num_pipeline_stages 1 \
 --request_generator_config_type synthetic \
@@ -12,7 +12,7 @@ python -m vidur.main \
 --length_generator_config_type trace \
 --trace_request_length_generator_config_trace_file ./data/processed_traces/mooncake_conversation_trace.csv \
 --interval_generator_config_type poisson \
---poisson_request_interval_generator_config_qps 8.0 \
+--poisson_request_interval_generator_config_qps 2.0 \
 --global_scheduler_config_type round_robin \
 --replica_scheduler_config_type vllm_v1 \
 --vllm_v1_scheduler_config_chunk_size 512 \
@@ -20,7 +20,10 @@ python -m vidur.main \
 --metrics_config_write_metrics \
 --metrics_config_store_operation_metrics \
 --metrics_config_keep_individual_batch_metrics \
---cache_config_enable_prefix_caching
+--cache_config_enable_prefix_caching \
+--slo_config_decode_time_slo 1 \
+--slo_config_completion_time_slo 10
+
 
 
 
@@ -41,3 +44,37 @@ context length in kv cache so far :
 prefill length of this request
 remaining prefill length for this reques (this will be 0 for the decode request)
 For now, trace the files and steps that will be needed for this to happen and then we will move on to the coding side. 
+
+
+python3 - <<'PY'
+import vidur.entities.request
+print("✅ Request imported successfully")
+PY
+
+
+
+TESTING CONFIG :
+
+python -m vidur.main \
+--time_limit 10800 \
+--replica_config_model_name meta-llama/Meta-Llama-3-8B \
+--replica_config_device h100 \
+--replica_config_network_device h100_dgx \
+--cluster_config_num_replicas 1 \
+--replica_config_tensor_parallel_size 1 \
+--replica_config_num_pipeline_stages 1 \
+--request_generator_config_type synthetic \
+--synthetic_request_generator_config_num_requests 128 \
+--length_generator_config_type trace \
+--trace_request_length_generator_config_trace_file ./data/processed_traces/mooncake_conversation_trace.csv \
+--interval_generator_config_type poisson \
+--poisson_request_interval_generator_config_qps 2.0 \
+--global_scheduler_config_type round_robin \
+--replica_scheduler_config_type vllm_v1 \
+--vllm_v1_scheduler_config_chunk_size 512 \
+--vllm_v1_scheduler_config_batch_size_cap 512 \
+--metrics_config_write_metrics \
+--metrics_config_store_operation_metrics \
+--metrics_config_keep_individual_batch_metrics \
+--metrics_config.enable_chrome_trace = False \
+--cache_config_enable_prefix_caching

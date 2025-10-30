@@ -1,7 +1,7 @@
 import copy
 import json
 import os
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import pandas as pd
 import wandb
@@ -65,19 +65,133 @@ class ClusterMetricsStore:
         )
 
         # We use str(replica_id) as the key to avoid JSON encoding issues inside wandb.log
-        self._replica_metric_stores = {
-            str(replica_id): ReplicaMetricsStore(
+        self._replica_metric_stores: Dict[str, ReplicaMetricsStore] = {}
+        self._replica_metric_store_aliases: Dict[str, ReplicaMetricsStore] = {}
+
+        for replica_id in replicas.keys():
+            store = ReplicaMetricsStore(
                 simulation_config=self._simulation_config,
                 replica_id=replica_id,
             )
-            for replica_id in replicas.keys()
-        }
+            canonical_key = self._canonical_replica_key(replica_id)
+            self._replica_metric_stores[canonical_key] = store
+            self._register_metric_aliases_for_replica(replica_id, store)
 
         self._wandb_project = self._config.wandb_project
         self._wandb_group = self._config.wandb_group
         self._wandb_run_name = self._config.wandb_run_name
 
         self._init_wandb()
+
+    def register_replica_alias(
+        self,
+        alias_key: object,
+        replica_id: Optional[ReplicaId] = None,
+        store: Optional[ReplicaMetricsStore] = None,
+    ) -> None:
+        if store is None and replica_id is not None:
+            try:
+                store = self._get_replica_metrics_store(replica_id)
+            except KeyError:
+                store = None
+
+        if store is None:
+            stores = list(self._replica_metric_stores.values())
+            if stores:
+                first_store = stores[0]
+                if all(s is first_store for s in stores):
+                    store = first_store
+
+        if store is None:
+            alias_stores = list(self._replica_metric_store_aliases.values())
+            if alias_stores:
+                first_store = alias_stores[0]
+                if all(s is first_store for s in alias_stores):
+                    store = first_store
+
+        if store is None and self._replica_metric_stores:
+            store = next(iter(self._replica_metric_stores.values()))
+
+        if store is not None:
+            self._register_metric_alias(alias_key, store)
+
+    def _canonical_replica_key(self, replica_id: ReplicaId) -> str:
+        if hasattr(replica_id, "id"):
+            try:
+                return str(int(replica_id.id))
+            except Exception:
+                pass
+        return str(replica_id)
+
+    def _register_metric_aliases_for_replica(
+        self, replica_id: ReplicaId, store: ReplicaMetricsStore
+    ) -> None:
+        keys = {
+            self._canonical_replica_key(replica_id),
+            str(replica_id),
+            repr(replica_id),
+        }
+        if hasattr(replica_id, "id"):
+            try:
+                keys.add(str(int(replica_id.id)))
+            except Exception:
+                pass
+        if hasattr(replica_id, "_id"):
+            try:
+                keys.add(str(int(replica_id._id)))
+            except Exception:
+                pass
+        for key in keys:
+            self._register_metric_alias(key, store)
+
+    def _register_metric_alias(
+        self, alias_key: object, store: ReplicaMetricsStore
+    ) -> None:
+        self._replica_metric_store_aliases[str(alias_key)] = store
+
+    def _get_replica_metrics_store(self, replica_id: ReplicaId) -> ReplicaMetricsStore:
+        canonical = self._canonical_replica_key(replica_id)
+        if canonical in self._replica_metric_stores:
+            return self._replica_metric_stores[canonical]
+
+        candidate_keys = [
+            canonical,
+            str(replica_id),
+            repr(replica_id),
+        ]
+        if hasattr(replica_id, "id"):
+            try:
+                candidate_keys.append(str(int(replica_id.id)))
+            except Exception:
+                pass
+        if hasattr(replica_id, "_id"):
+            try:
+                candidate_keys.append(str(int(replica_id._id)))
+            except Exception:
+                pass
+
+        for key in candidate_keys:
+            store = self._replica_metric_store_aliases.get(str(key))
+            if store:
+                return store
+
+        stores = list(self._replica_metric_stores.values())
+        if stores:
+            first_store = stores[0]
+            if all(s is first_store for s in stores):
+                return first_store
+
+        alias_stores = list(self._replica_metric_store_aliases.values())
+        if alias_stores:
+            first_store = alias_stores[0]
+            if all(s is first_store for s in alias_stores):
+                return first_store
+
+        known_keys = sorted(self._replica_metric_store_aliases.keys())
+        raise KeyError(
+            f"Replica metrics store not found for {replica_id}. "
+            f"Known keys include: {known_keys[:10]}"
+        )
 
     def _init_wandb(self):
         if (
@@ -385,14 +499,14 @@ class ClusterMetricsStore:
         self, time: float, batch, replica_id: ReplicaId, memory_usage_percent: float
     ):
         self._cluster_metric_store.on_batch_end(time, batch, memory_usage_percent)
-        self._replica_metric_stores[str(replica_id)].on_batch_end(
+        self._get_replica_metrics_store(replica_id).on_batch_end(
             time, batch, memory_usage_percent
         )
 
     def on_batch_stage_end(
         self, batch_stage, time: float, replica_id: ReplicaId, stage_id: int
     ):
-        self._replica_metric_stores[str(replica_id)].on_batch_stage_end(
+        self._get_replica_metrics_store(replica_id).on_batch_stage_end(
             batch_stage, time, stage_id
         )
 
@@ -403,7 +517,7 @@ class ClusterMetricsStore:
         batches: List[Batch],
         memory_usage_percent: float,
     ):
-        self._replica_metric_stores[str(replica_id)].on_replica_schedule(
+        self._get_replica_metrics_store(replica_id).on_replica_schedule(
             time, memory_usage_percent
         )
         newly_scheduled_requests = [
@@ -413,7 +527,7 @@ class ClusterMetricsStore:
             if request.scheduled_at == time
         ]
         for request in newly_scheduled_requests:
-            self._replica_metric_stores[str(request.replica_id)].on_request_arrival(
+            self._get_replica_metrics_store(request.replica_id).on_request_arrival(
                 request
             )
 
@@ -425,7 +539,7 @@ class ClusterMetricsStore:
         batch_stage,
         execution_time: float,
     ):
-        self._replica_metric_stores[str(replica_id)].on_replica_stage_schedule(
+        self._get_replica_metrics_store(replica_id).on_replica_stage_schedule(
             time, stage_id, batch_stage, execution_time
         )
 
@@ -434,4 +548,4 @@ class ClusterMetricsStore:
 
     def on_request_end(self, request: Request):
         self._cluster_metric_store.on_request_end(request)
-        self._replica_metric_stores[str(request.replica_id)].on_request_end(request)
+        self._get_replica_metrics_store(request.replica_id).on_request_end(request)

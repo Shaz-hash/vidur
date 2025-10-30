@@ -97,3 +97,9 @@ class TraceRequestLengthGenerator(BaseRequestLengthGenerator):
             block_size=row["block_size"],
             session_id=row["session_id"],
         )
+
+    def _snapshot_extra_state(self) -> dict:
+        return {"next_request_idx": int(self.next_request_idx)}
+
+    def _restore_extra_state(self, snapshot: dict) -> None:
+        self.next_request_idx = int(snapshot.get("next_request_idx", self.next_request_idx))

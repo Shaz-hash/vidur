@@ -1,10 +1,13 @@
 import heapq
 from collections import deque
-from typing import Deque, List
+from typing import Deque, Dict, List, Tuple, Optional
 
 from vidur.entities.request import Request
 from vidur.scheduler.request_queue.base_request_queue import BaseRequestQueue
 from vidur.scheduler.request_queue.prioritised_request import PrioritizedRequest
+
+
+_SNAP_VERSION_FCFS = 1
 
 
 class FCFSRequestQueue(BaseRequestQueue):
@@ -41,3 +44,50 @@ class FCFSRequestQueue(BaseRequestQueue):
 
     def sort(self, requests: Deque[Request]) -> Deque[Request]:
         return deque(sorted(requests, key=lambda x: (x.arrived_at, x.id)))
+
+    # # --- Snapshot helpers -------------------------------------------------
+    # def snapshot_state(self) -> dict:
+    #     items: List[Tuple[int, float]] = [
+    #         (prioritized_request.request.id, prioritized_request.priority)
+    #         for prioritized_request in self._request_queue
+    #     ]
+    #     return {
+    #         "items": items,
+    #         "num_prefill_tokens": self._num_prefill_tokens,
+    #     }
+
+    # def restore_state(self, snapshot: dict, request_lookup: Dict[int, Request]) -> None:
+    #     self._request_queue = [
+    #         PrioritizedRequest(request_lookup[req_id], priority)
+    #         for req_id, priority in snapshot.get("items", [])
+    #     ]
+    #     heapq.heapify(self._request_queue)
+    #     self._num_prefill_tokens = snapshot.get("num_prefill_tokens", 0)
+
+    # --- Snapshot helpers -------------------------------------------------
+    def snapshot_state(self) -> dict:
+        # Minimal, JSON-safe snapshot. We only store request IDs.
+        return {
+            "__v__": _SNAP_VERSION_FCFS,
+            "request_ids": [pr.request.id for pr in self._request_queue],
+        }
+
+    def restore_state(self, snapshot: dict, request_lookup: Dict[int, Request]) -> None:
+        assert int(snapshot.get("__v__", 0)) == _SNAP_VERSION_FCFS, "FCFS snapshot version mismatch"
+
+        req_ids = list(snapshot.get("request_ids", []))
+        # Rebuild heap from requests (recompute priorities)
+        items: List[PrioritizedRequest] = []
+        for rid in req_ids:
+            if rid not in request_lookup:
+                raise KeyError(f"FCFS restore: unknown request id {rid}")
+            req = request_lookup[rid]
+            items.append(self._get_prioritized_request(req))
+
+        self._request_queue = items
+        heapq.heapify(self._request_queue)
+
+        # Recompute num_prefill_tokens to avoid drift
+        self._num_prefill_tokens = sum(pr.request.num_prefill_tokens for pr in self._request_queue)
+
+

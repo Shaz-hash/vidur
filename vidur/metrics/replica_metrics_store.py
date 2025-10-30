@@ -300,7 +300,7 @@ class ReplicaMetricsStore:
         - If the scheduler attached batch._request_details_rows (full snapshot across live requests),
         prefer those and just tag the replica.
         - Otherwise, fall back to synthesizing rows only for requests in this batch.
-        """¬
+        """
         # 1) Prefer scheduler-provided comprehensive rows
         if hasattr(batch, "_request_details_rows") and batch._request_details_rows:
             for row in batch._request_details_rows:
@@ -329,6 +329,8 @@ class ReplicaMetricsStore:
                     0,
                     getattr(req, "num_prefill_tokens", 0) - getattr(req, "num_processed_tokens", 0),
                 ),
+                "TBT SLO": getattr(req, "decode_slo_time", -1.0),
+                "TTC SLO": getattr(req, "completion_slo_time", -1.0),
                 "replica": self._replica_id,
             }
             self._batch_request_details_rows.append(row)
@@ -843,7 +845,7 @@ class ReplicaMetricsStore:
             "batch_id","request_id","slo_type","slo_remaining_ms",
             "only_in_queue","added_in_last_batch","request_type_after_batch",
             "kv_context_len_tokens","prefill_len_tokens","prefill_remaining_tokens",
-            "replica",
+            "TBT SLO","TTC SLO","replica",
         ]
         if not self._batch_request_details_rows:
             return pd.DataFrame(columns=cols)

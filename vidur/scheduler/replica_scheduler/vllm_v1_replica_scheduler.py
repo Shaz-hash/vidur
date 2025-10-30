@@ -1,15 +1,45 @@
+from dataclasses import dataclass
 from collections import deque
-from typing import Deque, Dict, List
+from typing import Deque, Dict, List, Set
 
 from vidur.entities.batch import Batch, Request
-from vidur.kv_cache.replica_kv_cache_manager import ReplicaKVCacheManager
+from vidur.kv_cache.replica_kv_cache_manager import (
+    ReplicaKVCacheManager,
+    ReplicaKVCacheManagerSnapshot,
+)
 from vidur.scheduler.replica_scheduler.base_replica_scheduler import (
     BaseReplicaScheduler,
 )
 from vidur.scheduler.replica_scheduler.replica_scheduler_output import (
     ReplicaSchedulerOutput,
 )
+from vidur.scheduler.replica_stage_scheduler.replica_stage_scheduler import (
+    ReplicaStageSchedulerSnapshot,
+)
 from vidur.types.request_queue_type import RequestQueueType
+
+
+_SNAP_VERSION_VLLM_V1 = 1
+
+
+@dataclass(frozen=True)
+class VLLMV1ReplicaSchedulerSnapshot:
+    __v__: int
+    # id -> Request.snapshot_state() dict (JSON-safe)
+    request_states: Dict[int, dict]
+    # waiting queue snapshot (JSON-safe dict)
+    waiting_queue_state: dict
+    # order matters for running list
+    running_request_ids: List[int]
+    # JSON-safe: sets as lists (we’ll cast back to sets on restore)
+    scheduled_req_ids: List[int]
+    ever_scheduled: List[int]
+    # KV snapshot (already JSON-safe dataclass/dict)
+    kv_cache_state: ReplicaKVCacheManagerSnapshot
+    # stage_id -> snapshot (JSON-safe dataclass/dict)
+    replica_stage_states: Dict[int, ReplicaStageSchedulerSnapshot]
+    num_running_batches: int
+    finished_req_ids: List[int]
 
 
 class VLLMV1ReplicaScheduler(BaseReplicaScheduler):
@@ -238,6 +268,19 @@ class VLLMV1ReplicaScheduler(BaseReplicaScheduler):
                 computed_blocks, num_computed_tokens = (
                     self._kv_cache_manager.get_computed_blocks(request)
                 )
+
+                # Guard against restored snapshots that leave an extra cached block.
+                if num_computed_tokens > request.num_prefill_tokens:
+                    overflow = num_computed_tokens - request.num_prefill_tokens
+                    blocks_to_drop = (overflow + self._cache_config.block_size - 1) // self._cache_config.block_size
+                    for _ in range(blocks_to_drop):
+                        if not computed_blocks:
+                            break
+                        computed_blocks.pop()
+                        num_computed_tokens -= self._cache_config.block_size
+                    num_computed_tokens = max(num_computed_tokens, request.num_prefill_tokens)
+
+
                 # Number of tokens to be scheduled.
                 # Using `request.num_prefill_tokens` is fine even for restarted requests
                 # because done decode tokens have been added to prefill tokens.
@@ -382,6 +425,8 @@ class VLLMV1ReplicaScheduler(BaseReplicaScheduler):
                 "kv_context_len_tokens": num_computed_tokens,
                 "prefill_len_tokens": prefill_len,
                 "prefill_remaining_tokens": prefill_remaining,
+                "TBT SLO": req.decode_slo_time,
+                "TTC SLO": req.completion_slo_time,
             })
 
         # Stash on batch for the metrics store to consume
@@ -421,3 +466,102 @@ class VLLMV1ReplicaScheduler(BaseReplicaScheduler):
         self._kv_cache_manager.free(request)
         self._kv_cache_manager.free_block_hashes(request)
         del self._requests[request.id]
+
+    # --- Snapshot helpers -------------------------------------------------
+    def snapshot_state(self) -> VLLMV1ReplicaSchedulerSnapshot:
+        # Per-request snapshots (only those known to this replica)
+        request_states = {
+            int(request_id): req.snapshot_state()
+            for request_id, req in self._requests.items()
+        }
+
+        waiting_queue_state = (
+            self._waiting_queue.snapshot_state()
+            if hasattr(self._waiting_queue, "snapshot_state")
+            else {}
+        )
+
+        stage_states = {
+            int(stage_id): stage_scheduler.snapshot_state()
+            for stage_id, stage_scheduler in self._replica_stage_schedulers.items()
+        }
+
+        return VLLMV1ReplicaSchedulerSnapshot(
+            __v__=_SNAP_VERSION_VLLM_V1,
+            request_states=request_states,
+            waiting_queue_state=waiting_queue_state,
+            running_request_ids=[int(r.id) for r in self._running],
+            scheduled_req_ids=[int(x) for x in self.scheduled_req_ids],
+            ever_scheduled=[int(x) for x in self._ever_scheduled],
+            kv_cache_state=self._kv_cache_manager.snapshot_state(),
+            replica_stage_states=stage_states,
+            num_running_batches=int(self._num_running_batches),
+            finished_req_ids=[int(x) for x in getattr(self, "finished_req_ids", set())],
+        )
+
+    def restore_state(
+        self,
+        snapshot: VLLMV1ReplicaSchedulerSnapshot,
+        request_lookup: Dict[int, Request],
+        batch_lookup: Dict[int, Batch],
+    ) -> None:
+        # Version check
+        assert (
+            int(snapshot.__v__) == _SNAP_VERSION_VLLM_V1
+        ), "VLLM v1 scheduler snapshot version mismatch"
+
+        # 1) Rebuild request registry and restore each Request’s internal state
+        rebuilt: Dict[int, Request] = {}
+        for req_id, req_state in snapshot.request_states.items():
+            req_obj = request_lookup[req_id]  # authoritative object from the sim
+            req_obj.restore_state(req_state)
+            rebuilt[int(req_id)] = req_obj
+        self._requests = rebuilt
+
+        # 2) Waiting queue
+        if hasattr(self._waiting_queue, "restore_state"):
+            self._waiting_queue.restore_state(
+                snapshot.waiting_queue_state, request_lookup
+            )
+
+        # 3) Running list (preserve order)
+        self._running = [request_lookup[rid] for rid in snapshot.running_request_ids]
+
+        # 4) Sets and counters
+        self.scheduled_req_ids = set(int(x) for x in snapshot.scheduled_req_ids)
+        self._ever_scheduled = set(int(x) for x in snapshot.ever_scheduled)
+        self._num_running_batches = int(snapshot.num_running_batches)
+        self.finished_req_ids = set(int(x) for x in snapshot.finished_req_ids)
+
+        # 5) Stage schedulers (now include active_batch_id in their snapshot)
+        for stage_id, stage_scheduler in self._replica_stage_schedulers.items():
+            stage_snapshot = snapshot.replica_stage_states.get(int(stage_id))
+            if stage_snapshot:
+                stage_scheduler.restore_state(stage_snapshot, batch_lookup)
+
+        # 6) KV cache
+        self._kv_cache_manager.restore_state(snapshot.kv_cache_state)
+
+        # 7) Align request KV/bookkeeping to restored cache state
+        for req_id, request in self._requests.items():
+            cached_blocks, cached_tokens = self._kv_cache_manager.get_computed_blocks(
+                request
+            )
+            if cached_tokens < 0:
+                cached_tokens = 0
+            if cached_tokens % self._cache_config.block_size != 0:
+                cached_tokens = (
+                    cached_tokens // self._cache_config.block_size
+                ) * self._cache_config.block_size
+            if cached_tokens > request.num_prefill_tokens:
+                cached_tokens = request.num_prefill_tokens
+
+            request._num_prefill_tokens_cached = cached_tokens
+            if request._num_processed_tokens < cached_tokens:
+                request._num_processed_tokens = cached_tokens
+
+        # (Optional) quick sanity:
+        assert all(
+            r.id in self._requests for r in self._running
+        ), "Running list references unknown requests"
+

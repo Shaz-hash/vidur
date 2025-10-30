@@ -1,4 +1,5 @@
-from typing import List
+from dataclasses import dataclass, asdict
+from typing import List, Dict, Optional, Any
 
 from vidur.entities.base_entity import BaseEntity
 from vidur.entities.execution_time import ExecutionTime
@@ -6,7 +7,11 @@ from vidur.entities.request import Request
 from vidur.logger import init_logger
 from vidur.types.replica_id import ReplicaId
 
+
 logger = init_logger(__name__)
+
+
+_SNAP_VERSION_BATCH_STAGE = 1
 
 
 # a decorator which checks if the request has been scheduled
@@ -19,6 +24,23 @@ def check_scheduled(func):
     return wrapper
 
 
+
+@dataclass(frozen=True)
+class BatchStageSnapshot:
+    __v__: int
+    id: int
+    batch_id: int
+    replica_id: int
+    stage_id: int
+    # ExecutionTime encoded as a plain dict
+    execution_time: Dict[str, Any]
+    request_ids: List[int]      # order matters
+    num_tokens: List[int]       # aligns with request_ids
+    scheduled: bool
+    scheduled_at: Optional[float]
+    completed_at: Optional[float]
+
+
 class BatchStage(BaseEntity):
     def __init__(
         self,
@@ -27,7 +49,8 @@ class BatchStage(BaseEntity):
         stage_id: int,
         execution_time: ExecutionTime,
         requests: List[Request],
-        num_tokens: List[Request],
+        # num_tokens: List[Request],
+        num_tokens: List[int],  # <-- FIXED TYPE
     ) -> None:
         self._id = BatchStage.generate_id()
 
@@ -144,3 +167,65 @@ class BatchStage(BaseEntity):
                 "requests": [request.to_dict() for request in self._requests],
             },
         }
+
+    # --- Snapshot helpers -------------------------------------------------
+    def snapshot_state(self) -> Dict[str, Any]:
+        """Return a JSON-friendly, minimal snapshot of this stage."""
+        snap = BatchStageSnapshot(
+            __v__=_SNAP_VERSION_BATCH_STAGE,
+            id=int(self._id),
+            batch_id=int(self._batch_id),
+            replica_id=int(self._replica_id),
+            stage_id=int(self._stage_id),
+            execution_time=self._execution_time.to_dict(),
+            request_ids=[r.id for r in self._requests],
+            num_tokens=list(self._num_tokens),
+            scheduled=bool(self._scheduled),
+            scheduled_at=float(self._scheduled_at) if self._scheduled_at is not None else None,
+            completed_at=float(self._completed_at) if self._completed_at is not None else None,
+        )
+        # Already primitives via .to_dict and lists of ints
+        return asdict(snap)
+
+    @classmethod
+    def from_snapshot(cls, snap: Dict[str, Any], request_lookup: Dict[int, Request]) -> "BatchStage":
+        assert int(snap["__v__"]) == _SNAP_VERSION_BATCH_STAGE, "BatchStage snapshot version mismatch"
+        req_ids = list(snap["request_ids"])
+        toks    = list(snap["num_tokens"])
+        assert len(req_ids) == len(toks), "BatchStage snapshot: request_ids/num_tokens length mismatch"
+
+        # Rebuild ExecutionTime without calling its constructor (to avoid extra logic).
+        et_dict = dict(snap["execution_time"])
+        et = ExecutionTime.__new__(ExecutionTime)
+        et.__dict__ = et_dict
+        # keep global id counter monotonic if ExecutionTime uses BaseEntity
+        if hasattr(ExecutionTime, "_id") and hasattr(et, "_id"):
+            ExecutionTime._id = max(ExecutionTime._id, et._id)
+
+        req_objs = [request_lookup[rid] for rid in snap["request_ids"]]
+
+        obj = cls(
+            batch_id=int(snap["batch_id"]),
+            replica_id=int(snap["replica_id"]),
+            stage_id=int(snap["stage_id"]),
+            execution_time=et,
+            requests=req_objs,
+            num_tokens=list(snap["num_tokens"]),
+        )
+        # identity + flags/timestamps (don’t call lifecycle hooks)
+        obj._id = int(snap["id"])
+        type(obj)._id = max(type(obj)._id, obj._id)
+
+        obj._scheduled = bool(snap["scheduled"])
+        obj._scheduled_at = snap.get("scheduled_at", None)
+        obj._completed_at = snap.get("completed_at", None)
+
+        # Derived fields from execution_time
+        obj._total_execution_time = et.total_time
+        obj._model_execution_time = et.model_time
+        return obj
+
+    @classmethod
+    def restore_state(cls, snap: Dict[str, Any], request_lookup: Dict[int, Request]) -> "BatchStage":
+        """Kept for API symmetry with other entities."""
+        return cls.from_snapshot(snap, request_lookup)
