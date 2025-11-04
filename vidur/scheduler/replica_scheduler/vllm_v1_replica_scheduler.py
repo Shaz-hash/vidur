@@ -81,6 +81,8 @@ class VLLMV1ReplicaScheduler(BaseReplicaScheduler):
 
         print("VLLM SCHEDULER CALLED!")
 
+        self._token_budget_overrides: Dict[int, int] = {}
+
 
     def _kv_free_blocks(self) -> int:
         """
@@ -162,8 +164,21 @@ class VLLMV1ReplicaScheduler(BaseReplicaScheduler):
         self._waiting_queue.push(request)
         self._requests[request.id] = request
 
+    def set_token_budget_overrides(self, overrides: Dict[int, int]):
+        self._token_budget_overrides = {
+            int(rid): max(0, int(tokens)) for rid, tokens in overrides.items()
+        }
+
     def _get_request_next_num_tokens(self, request: Request, token_budget: int) -> int:
         assert not request.completed
+
+        override = self._token_budget_overrides.get(request.id)
+        if override is not None:
+            override = max(0, min(int(override), token_budget))
+            if request.is_prefill_complete:
+                return min(override, 1)
+            remaining_prefill = request.num_prefill_tokens - request.num_processed_tokens
+            return max(0, min(override, remaining_prefill))
 
         # Calculate `next_num_tokens`
         if request.is_prefill_complete:
@@ -247,10 +262,16 @@ class VLLMV1ReplicaScheduler(BaseReplicaScheduler):
             #     self._ever_scheduled = set()
             self._ever_scheduled.add(request.id)
 
-            
+
             num_scheduled_tokens[request.id] = num_new_tokens
             token_budget -= num_new_tokens
             req_index += 1
+            if request.id in self._token_budget_overrides:
+                remaining = self._token_budget_overrides[request.id] - num_new_tokens
+                if remaining <= 0:
+                    self._token_budget_overrides.pop(request.id, None)
+                else:
+                    self._token_budget_overrides[request.id] = remaining
 
         # Use a temporary deque to collect requests that need to be skipped
         # and put back at the head of the waiting queue later
@@ -297,6 +318,11 @@ class VLLMV1ReplicaScheduler(BaseReplicaScheduler):
                     num_new_tokens = self._cache_config.block_size
                     computed_blocks.pop()
                 num_new_tokens = min(num_new_tokens, token_budget)
+                override = self._token_budget_overrides.get(request.id)
+                if override is not None:
+                    override = max(0, min(int(override), token_budget))
+                    remaining_prefill = request.num_prefill_tokens - num_computed_tokens
+                    num_new_tokens = min(override, remaining_prefill)
                 assert (
                     num_new_tokens > 0
                 ), f"num_new_tokens should be greater than 0 but got {num_new_tokens}"
@@ -320,6 +346,12 @@ class VLLMV1ReplicaScheduler(BaseReplicaScheduler):
                 token_budget -= num_new_tokens
                 # Update the number of processed tokens for the request
                 request.on_cache_hit(num_computed_tokens)
+                if request.id in self._token_budget_overrides:
+                    remaining = self._token_budget_overrides[request.id] - num_new_tokens
+                    if remaining <= 0:
+                        self._token_budget_overrides.pop(request.id, None)
+                    else:
+                        self._token_budget_overrides[request.id] = remaining
 
         # Put back any skipped requests at the head of the waiting queue
         if skipped_waiting_requests:
@@ -564,4 +596,3 @@ class VLLMV1ReplicaScheduler(BaseReplicaScheduler):
         assert all(
             r.id in self._requests for r in self._running
         ), "Running list references unknown requests"
-
