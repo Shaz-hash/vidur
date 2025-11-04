@@ -411,7 +411,8 @@ class Request(BaseEntity):
         if self._num_processed_tokens == self._num_prefill_tokens:
             self._is_prefill_complete = True
             # we get one decode token when the prefill processing completes
-            self._num_processed_tokens += 1
+            if self._num_decode_tokens > 0:
+                self._num_processed_tokens += 1
 
             # we must record the prefill completion time only in the first time
             # in the subsequent restarts, we keep adding the previously decoded

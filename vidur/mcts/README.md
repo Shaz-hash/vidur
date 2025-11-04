@@ -39,6 +39,7 @@ vidur/vidur/mcts/
 ├── config.py                   # constraint + search configuration objects
 ├── environment.py              # game state wrapper around the simulator
 ├── mcts.py                     # UCB1 search implementation
+├── prefill_calibrator.py       # generate/load baseline prefill timing tables
 └── README.md                   # this document
 ```
 
@@ -70,6 +71,22 @@ print(best_action)
 
 You can plug this into higher‑level optimisation loops by repeatedly applying
 `env.apply_actions(...)` on snapshots produced during the tree search.
+
+### Prefill timing profiles
+
+`prefill_calibrator.py` can be run directly to create the baseline prefill table
+used for SLO assignment:
+
+```
+python -m vidur.mcts.prefill_calibrator \
+  --step 64 \
+  --max_tokens 2048 \
+  --output data/prefill_profile.csv \
+  --time_limit 10800 ... (other SimulationConfig flags)
+```
+
+Passing `prefill_profile_path` in `MCTSConstraintConfig` will reuse a saved CSV;
+otherwise the environment generates the table on the fly.
 
 ## Notes and limitations
 

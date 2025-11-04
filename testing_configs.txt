@@ -78,3 +78,22 @@ python -m vidur.main \
 --metrics_config_keep_individual_batch_metrics \
 --metrics_config.enable_chrome_trace = False \
 --cache_config_enable_prefix_caching
+
+
+
+
+
+
+Callibrator configuration to run :
+python -m vidur.mcts.prefill_calibrator \
+  --output ./simulator_output/prefill_profile.csv \
+  --step 1024 \
+  --max_tokens 10240 \
+  --replica_config_model_name meta-llama/Meta-Llama-3-8B \
+  --replica_config_device h100 \
+  --replica_config_network_device h100_dgx \
+  --cluster_config_num_replicas 1 \
+  --replica_config_tensor_parallel_size 1 \
+  --replica_config_num_pipeline_stages 1 \
+  --global_scheduler_config_type round_robin \
+  --replica_scheduler_config_type vllm_v1

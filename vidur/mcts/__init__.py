@@ -6,6 +6,7 @@ from .environment import (
     VidurMCTSEnvironment,
     VidurMCTSState,
 )
+from .prefill_calibrator import PrefillProfile
 from .mcts import VidurMCTS
 
 __all__ = [
@@ -18,4 +19,5 @@ __all__ = [
     "VidurMCTSEnvironment",
     "VidurMCTSState",
     "VidurGameStats",
+    "PrefillProfile",
 ]

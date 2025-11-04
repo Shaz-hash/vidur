@@ -10,6 +10,7 @@ from vidur.events.request_arrival_event import RequestArrivalEvent
 from vidur.simulator import Simulator
 from vidur.utils.slo_manager import SLOManager
 from .config import MCTSConstraintConfig, MCTSExploreConfig
+from .prefill_calibrator import PrefillProfile
 
 
 ## These are the dimensions along which adversary will take an action. Some combination of these within constraints
@@ -17,7 +18,6 @@ from .config import MCTSConstraintConfig, MCTSExploreConfig
 class AdversaryRequestSpec:
     prefill_tokens: int
     decode_tokens: int
-    prefill_slo: float
     decode_slo: float
     completion_slo: float
 
@@ -81,6 +81,15 @@ class VidurMCTSEnvironment:
         self._cfg = explore_cfg
         self._slo_manager = SLOManager(base_simulator._config.slo_config)
         self._rng = random.Random(base_simulator._config.seed)
+        self._prefill_profile = PrefillProfile.load_or_generate(
+            base_simulator._config,
+            step=constraints.interval_request_size,
+            slowdown=constraints.prefill_slowdown,
+            path=constraints.prefill_profile_path,
+            max_tokens=constraints.max_request_tokens,
+        )
+        if self._constraints.max_request_tokens is None:
+            self._constraints.max_request_tokens = self._prefill_profile.max_tokens
 
     # ------------------------------------------------------------------ #
     # State helpers
@@ -104,7 +113,7 @@ class VidurMCTSEnvironment:
             num_requests = self._rng.randint(0, max_new)
             specs: List[AdversaryRequestSpec] = []
             for _ in range(num_requests):
-                total_budget = self._constraints.max_request_tokens
+                total_budget = self._max_request_tokens_allowed()
                 decode = self._sample_token_size(
                     min_size=self._constraints.interval_request_size,
                     max_size=total_budget - self._constraints.interval_request_size,
@@ -124,7 +133,6 @@ class VidurMCTSEnvironment:
                     AdversaryRequestSpec(
                         prefill_tokens=prefill,
                         decode_tokens=decode,
-                        prefill_slo=self._rng.choice(slo_opts.prefill_slos),
                         decode_slo=self._rng.choice(slo_opts.decode_slos),
                         completion_slo=self._rng.choice(slo_opts.completion_slos),
                     )
@@ -264,11 +272,10 @@ class VidurMCTSEnvironment:
             )
             req.decode_slo_time = spec.decode_slo
             req.completion_slo_time = spec.completion_slo
-            # Prefill SLO: reuse SLO manager to compute baseline TTFT 
-            ## ?? : This may not be accurate (to be continued later ignore this for now)...
-            self._slo_manager.set_slos(req) 
-            if spec.prefill_slo >= 0:
-                req.prefill_slo_time = spec.prefill_slo
+            self._slo_manager.set_slos(req)
+            base_prefill = self._prefill_profile.lookup(spec.prefill_tokens)
+            if base_prefill > 0:
+                req.prefill_slo_time = base_prefill
 
             sim._add_event(RequestArrivalEvent(time_now, req))
             state.stats.requests_generated += 1

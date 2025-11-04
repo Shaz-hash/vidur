@@ -185,7 +185,10 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         ]
 
     def _load_attention_df(self, file_path: str) -> pd.DataFrame:
-        df = pd.read_csv(file_path)
+        try:
+            df = pd.read_csv(file_path, low_memory=False)
+        except UnicodeDecodeError:
+            df = pd.read_csv(file_path, encoding="latin1", low_memory=False)
         df = df.drop_duplicates()
 
         df = df[
@@ -241,7 +244,10 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         return filtered_df
 
     def _read_input_file(self, file_path: str) -> pd.DataFrame:
-        df = pd.read_csv(file_path)
+        try:
+            df = pd.read_csv(file_path, low_memory=False)
+        except UnicodeDecodeError:
+            df = pd.read_csv(file_path, encoding="latin1", low_memory=False)
         df = df.drop_duplicates()
         return df
 
@@ -267,6 +273,10 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         df_with_derived_features["is_decode"] = (
             df_with_derived_features["prefill_chunk_size"] == 0
         )
+        if df_with_derived_features["is_prefill"].dtype != bool:
+            df_with_derived_features["is_prefill"] = df_with_derived_features[
+                "is_prefill"
+            ].apply(lambda v: str(v).strip().lower() in {"true", "1", "t"})
         assert (
             df_with_derived_features["is_decode"]
             == ~df_with_derived_features["is_prefill"]
