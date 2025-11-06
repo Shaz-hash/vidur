@@ -97,3 +97,23 @@ python -m vidur.mcts.prefill_calibrator \
   --replica_config_num_pipeline_stages 1 \
   --global_scheduler_config_type round_robin \
   --replica_scheduler_config_type vllm_v1
+
+
+  Command to run the MCTS simulation :
+
+  python -m vidur.mcts.run_mcts \
+  --mcts_iterations 5 \
+  --mcts_simulation_random_tries 2 \
+  --mcts_simulation_depth 4 \
+  --mcts_interval_request_size 1024 \
+  --mcts_max_request_tokens 10240 \
+  --mcts_prefill_profile simulator_output/prefill_profile.csv \
+  --mcts_log_csv simulator_output/test_mcts_trace.csv \
+  --replica_config_model_name meta-llama/Meta-Llama-3-8B \
+  --replica_config_device h100 \
+  --replica_config_network_device h100_dgx \
+  --cluster_config_num_replicas 1 \
+  --replica_config_tensor_parallel_size 1 \
+  --replica_config_num_pipeline_stages 1 \
+  --global_scheduler_config_type round_robin \
+  --replica_scheduler_config_type vllm_v1

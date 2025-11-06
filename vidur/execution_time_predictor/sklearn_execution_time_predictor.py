@@ -77,6 +77,22 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         ) = self._get_input_files()
         self._predictions = self._predict_from_models()
 
+    @staticmethod
+    def _lookup_with_fallback(
+        table: Dict[Tuple[int, ...], float], key: Tuple[int, ...]
+    ) -> float:
+        if key in table:
+            return table[key]
+        if not table:
+            raise KeyError("Prediction table is empty; cannot approximate value.")
+        closest_key = min(
+            table.keys(),
+            key=lambda existing: sum(
+                abs(existing[idx] - key[idx]) for idx in range(len(key))
+            ),
+        )
+        return table[closest_key]
+
     def get_batch_execution_time(
         self, batch: Batch, pipeline_stage: int
     ) -> ExecutionTime:
@@ -899,7 +915,9 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
     ) -> float:
         # don't use round up to the nearest multiple of 8 here, because we want to
         # predict the execution time for the exact number of tokens
-        return self._predictions["attn_kv_cache_save"][(batch.total_num_tokens,)]
+        return self._lookup_with_fallback(
+            self._predictions["attn_kv_cache_save"], (batch.total_num_tokens,)
+        )
 
     def _get_attention_decode_execution_time(
         self, batch: SklearnExecutionTimePredictorBatch
@@ -907,9 +925,11 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         if batch.decode_batch_size == 0:
             return 0
 
-        return self._predictions["attn_decode"][
-            (batch.decode_batch_size, batch.decode_avg_kv_cache_size)
-        ] * (
+        base = self._lookup_with_fallback(
+            self._predictions["attn_decode"],
+            (batch.decode_batch_size, batch.decode_avg_kv_cache_size),
+        )
+        return base * (
             1
             + self._attention_decode_batching_overhead_fraction
             * int(batch.decode_batch_size > 1)
@@ -921,9 +941,11 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         if batch.prefill_batch_size == 0:
             return 0
 
-        return self._predictions["attn_prefill"][
-            (batch.prefill_agg_kv_cache_size, batch.prefill_agg_chunk_size)
-        ] * (
+        base = self._lookup_with_fallback(
+            self._predictions["attn_prefill"],
+            (batch.prefill_agg_kv_cache_size, batch.prefill_agg_chunk_size),
+        )
+        return base * (
             1
             + self._attention_prefill_batching_overhead_fraction
             * int(batch.prefill_batch_size > 1)
@@ -933,13 +955,17 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         if self._config.skip_cpu_overhead_modeling:
             return 0
 
-        return self._predictions["schedule"][(batch.size,)]
+        return self._lookup_with_fallback(
+            self._predictions["schedule"], (batch.size,)
+        )
 
     def _get_sampler_e2e_time(self, batch: SklearnExecutionTimePredictorBatch) -> float:
         if self._config.skip_cpu_overhead_modeling:
             return 0
 
-        return self._predictions["sampler_e2e"][(batch.size,)]
+        return self._lookup_with_fallback(
+            self._predictions["sampler_e2e"], (batch.size,)
+        )
 
     def _get_prepare_inputs_e2e_time(
         self, batch: SklearnExecutionTimePredictorBatch
@@ -947,7 +973,9 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         if self._config.skip_cpu_overhead_modeling:
             return 0
 
-        return self._predictions["prepare_inputs_e2e"][(batch.size,)]
+        return self._lookup_with_fallback(
+            self._predictions["prepare_inputs_e2e"], (batch.size,)
+        )
 
     def _get_process_model_outputs_time(
         self, batch: SklearnExecutionTimePredictorBatch
@@ -955,13 +983,17 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         if self._config.skip_cpu_overhead_modeling:
             return 0
 
-        return self._predictions["process_model_outputs"][(batch.size,)]
+        return self._lookup_with_fallback(
+            self._predictions["process_model_outputs"], (batch.size,)
+        )
 
     def _get_ray_comm_time(self, batch: SklearnExecutionTimePredictorBatch) -> float:
         if self._config.skip_cpu_overhead_modeling:
             return 0
 
-        return self._predictions["ray_comm_time"][(batch.size,)]
+        return self._lookup_with_fallback(
+            self._predictions["ray_comm_time"], (batch.size,)
+        )
 
     def to_dict(self) -> dict:
         # Note(t-nitinkedia): A weakness is that we don't consider the grid search params for say the random_forest.

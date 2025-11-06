@@ -79,7 +79,7 @@ class VLLMV1ReplicaScheduler(BaseReplicaScheduler):
         # new--> Tracks whether a request has *ever* been scheduled at least once
         self._ever_scheduled: set[str] = set()
 
-        print("VLLM SCHEDULER CALLED!")
+        # print("VLLM SCHEDULER CALLED!")
 
         self._token_budget_overrides: Dict[int, int] = {}
 
@@ -210,11 +210,16 @@ class VLLMV1ReplicaScheduler(BaseReplicaScheduler):
 
         # First, schedule the RUNNING requests
         req_index = 0
+        print("TOKEN ALLOCATION ACCORDING TO THE TARGETED REQUESTS : ")
+        print(self._token_budget_overrides)
+
         while req_index < len(self._running) and token_budget > 0:
+            print("Request index is : ", req_index , " Number of running requests : ", len(self._running))
             request: Request = self._running[req_index]
 
 
             if request.id in self.scheduled_req_ids:
+                print("Request id : ", request.id,)
                 req_index += 1
                 continue
 
@@ -264,6 +269,7 @@ class VLLMV1ReplicaScheduler(BaseReplicaScheduler):
 
 
             num_scheduled_tokens[request.id] = num_new_tokens
+            print("RUNNING REQUEST ", request._id , " : ", " will be allocated ", num_new_tokens)
             token_budget -= num_new_tokens
             req_index += 1
             if request.id in self._token_budget_overrides:
@@ -272,6 +278,7 @@ class VLLMV1ReplicaScheduler(BaseReplicaScheduler):
                     self._token_budget_overrides.pop(request.id, None)
                 else:
                     self._token_budget_overrides[request.id] = remaining
+
 
         # Use a temporary deque to collect requests that need to be skipped
         # and put back at the head of the waiting queue later
@@ -327,6 +334,8 @@ class VLLMV1ReplicaScheduler(BaseReplicaScheduler):
                     num_new_tokens > 0
                 ), f"num_new_tokens should be greater than 0 but got {num_new_tokens}"
 
+
+                print("WAITING REQUEST ", request._id , " : ", " will be allocated ", num_new_tokens)
                 new_blocks = self._kv_cache_manager.allocate_slots(
                     request, num_new_tokens, computed_blocks
                 )
@@ -379,6 +388,7 @@ class VLLMV1ReplicaScheduler(BaseReplicaScheduler):
             ),
             [],
         )
+        print("Exited !")
         # If a real batch was created, annotate it:
         if scheduler_output.batch is not None:
             try:

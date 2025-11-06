@@ -43,7 +43,7 @@ vidur/vidur/mcts/
 └── README.md                   # this document
 ```
 
-There is no direct CLI yet.  A typical integration looks like:
+A typical programmatic integration looks like:
 
 ```python
 from vidur.simulator import Simulator
@@ -87,6 +87,52 @@ python -m vidur.mcts.prefill_calibrator \
 
 Passing `prefill_profile_path` in `MCTSConstraintConfig` will reuse a saved CSV;
 otherwise the environment generates the table on the fly.
+
+## CLI runner & CSV trace
+
+A small wrapper makes it easy to launch the MCTS loop from the command line and
+record every explored transition:
+
+```
+python -m vidur.mcts.run_mcts \
+  --mcts_iterations 50 \
+  --mcts_log_csv simulator_output/mcts_trace.csv \
+  --mcts_interval_request_size 1024 \
+  --mcts_max_request_tokens 10240 \
+  --mcts_prefill_profile simulator_output/prefill_profile.csv \
+  --replica_config_model_name meta-llama/Meta-Llama-3-8B \
+  --replica_config_device h100 \
+  --replica_config_network_device h100_dgx \
+  --cluster_config_num_replicas 1 \
+  --replica_config_tensor_parallel_size 1 \
+  --replica_config_num_pipeline_stages 1 \
+  --global_scheduler_config_type round_robin \
+  --replica_scheduler_config_type vllm_v1
+```
+
+The CSV emitted by the runner/logging hook contains one row per joint action
+(`phase="tree"` for nodes that became part of the search tree,
+`phase="rollout"` for stochastic simulations, and `phase="root"` for the
+initial snapshot).  Columns include:
+
+| Column                          | Meaning                                                                                  |
+| ------------------------------- | ---------------------------------------------------------------------------------------- |
+| `iteration`                     | MCTS iteration when the transition was generated (0 is the root snapshot).               |
+| `phase`                         | `root`, `tree`, or `rollout`.                                                            |
+| `depth`                         | Depth in the alternating game (root = 0).                                                |
+| `parent_node_id` / `node_id`    | Identifiers of the predecessor and the resulting state.                                  |
+| `player_to_act` / `next_player` | Player that acted to create the edge, and the player who will act next.                  |
+| `sim_time`                      | Simulator time after applying the joint action.                                          |
+| `requests_*` / `slo_*`          | Aggregated stats tracked by the environment (generated/completed/violations/lateness).   |
+| `objective_cost`                | Scalar cost used for back-propagation (`violations + avg_lateness`).                     |
+| `state_waiting_ids`             | Request IDs currently waiting in the replica queues.                                     |
+| `state_completed_request_ids`   | Requests marked completed so far.                                                        |
+| `adversary_requests`            | JSON payload describing each injected request (token sizes + SLOs).                      |
+| `adversary_prefill_slos`        | Prefill SLOs chosen for the injected requests (JSON array).                               |
+| `adversary_decode_slos`         | Decode SLOs chosen for the injected requests (JSON array).                                |
+| `controller_token_budget`       | Chunk/token budget chosen by the controller for this step.                               |
+| `controller_selected_ids`       | Request IDs prioritised by the controller (JSON array).                                  |
+| `controller_allocations`        | Per-request token allocations passed to the VLLM v1 scheduler (JSON object).             |
 
 ## Notes and limitations
 
