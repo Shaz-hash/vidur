@@ -91,6 +91,20 @@ __The simulator supports a plethora of parameters for different simulation scena
 
     ![Chrome Trace](./assets/chrome_trace.png)
 
+## MCTS Trace Visualization
+
+`vidur.mcts.run_mcts` writes a detailed CSV (`--mcts_log_csv`) for every tree expansion. The helper script below consumes that CSV and renders the game tree for any iteration while labelling each edge with its prefill/decode budget and highlighting the best response for both players (controller minimizes cost, adversary maximizes it). If you skip `--iteration`, the script automatically selects the most recent iteration present in the CSV.
+
+```bash
+python3 -m vidur.tools.trace_tree_viz \
+  --csv simulator_output/test_mcts_trace.csv \
+  --iteration 1 \
+  --max-depth 4 \
+  --output simulator_output/mcts_tree.html
+```
+
+If Plotly is installed the result is a fully interactive HTML file with hover tooltips; otherwise the script emits a lightweight SVG/HTML file with the same annotations plus a textual “best-response outline” in your terminal. Add `--include-rollouts` to plot rollout rows or adjust `--max-depth` to focus on shallow subtrees. To collapse everything into a single static timeline showing only the alternating adversary/controller moves along the best-response chain, pass `--mode best-path`. That mode now aggregates the rollout costs recorded for each action across all iterations seen in the log, so the adversary branch really is the highest-cost action observed to date and the controller branch is the lowest-cost response underneath it.
+
 ## Formatting Code
 
 To format code, execute the following command:

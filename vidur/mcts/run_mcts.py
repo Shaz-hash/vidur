@@ -31,17 +31,17 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default="simulator_output/mcts_trace.csv",
         help="Destination CSV capturing the explored actions/states.",
     )
-    parser.add_argument("--mcts_maximum_qps", type=int, default=4)
-    parser.add_argument("--mcts_interval_request_size", type=int, default=64)
-    parser.add_argument("--mcts_min_request_tokens", type=int, default=64)
+    parser.add_argument("--mcts_maximum_qps", type=int, default=12)
+    parser.add_argument("--mcts_interval_request_size", type=int, default=512)
+    parser.add_argument("--mcts_min_request_tokens", type=int, default=512)
     parser.add_argument("--mcts_max_request_tokens", type=int, default=None)
     parser.add_argument("--mcts_prefill_profile", type=str, default=None)
     parser.add_argument("--mcts_prefill_slowdown", type=float, default=1.0)
     parser.add_argument("--mcts_simulation_depth", type=int, default=4)
-    parser.add_argument("--mcts_simulation_random_tries", type=int, default=2)
-    parser.add_argument("--mcts_exploration_constant", type=float, default=1.4)
-    parser.add_argument("--mcts_max_branching", type=int, default=2)
-    parser.add_argument("--mcts_controller_budget_combs", type=int, default=50)
+    parser.add_argument("--mcts_simulation_random_tries", type=int, default=1)
+    parser.add_argument("--mcts_exploration_constant", type=float, default=4.0)
+    parser.add_argument("--mcts_max_branching", type=int, default=25)
+    parser.add_argument("--mcts_controller_budget_combs", type=int, default=10)
     parser.add_argument(
         "--mcts_prefill_slos",
         type=float,

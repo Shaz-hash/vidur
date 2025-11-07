@@ -80,7 +80,12 @@ def _decode_numpy_state(state: tuple) -> tuple:
 
 
 class Simulator:
-    def __init__(self, config: SimulationConfig, register_atexit: bool = True) -> None:
+    def __init__(
+        self,
+        config: SimulationConfig,
+        register_atexit: bool = True,
+        execution_time_predictor=None,
+    ) -> None:
         self._config: SimulationConfig = config
 
         self._time = 0
@@ -110,6 +115,12 @@ class Simulator:
             self._config.cluster_config.global_scheduler_config.get_type(),
             self._config,
             self._cluster.replicas,
+            execution_time_predictor=execution_time_predictor,
+        )
+        self._execution_time_predictor = (
+            execution_time_predictor
+            if execution_time_predictor is not None
+            else getattr(self._scheduler, "_execution_time_predictor", None)
         )
 
         self._init_event_queue()
@@ -398,7 +409,11 @@ class Simulator:
 
     def fork(self) -> "Simulator":
         snapshot = self.snapshot_state()
-        forked = Simulator(self._config, register_atexit=False)
+        forked = Simulator(
+            self._config,
+            register_atexit=False,
+            execution_time_predictor=self._execution_time_predictor,
+        )
         forked.restore_state(snapshot)
         return forked
 

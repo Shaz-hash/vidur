@@ -377,7 +377,9 @@ class VidurMCTS:
             if child.visits == 0:
                 score = float("inf")
             else:
-                exploit = -(child.cumulative_cost / child.visits)
+                mean_cost = child.cumulative_cost / child.visits
+                exploit = -mean_cost if node.player == "controller" else mean_cost
+                explore = self._cfg.exploration_constant * (math.log(node.visits) / child.visits)
                 explore = self._cfg.exploration_constant * math.sqrt(
                     math.log(node.visits) / child.visits
                 )

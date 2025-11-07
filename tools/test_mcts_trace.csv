@@ -1,0 +1,11 @@
+iteration,phase,depth,parent_node_id,node_id,player_to_act,next_player,sim_time,requests_in_system,requests_generated,requests_completed,slo_violations,avg_lateness,objective_cost,state_waiting_ids,state_completed_request_ids,adversary_requests,adversary_prefill_slos,adversary_decode_slos,controller_token_budget,controller_selected_ids,controller_allocations,controller_prefill_allocations,controller_decode_allocations,controller_prefill_total,controller_decode_total
+0,root,0,,root,adversary,adversary,0.0,0,0,0,0,0.0,0.0,[],[],[],[],[],,[],{},{},{},0,0
+1,tree,1,0,1,adversary,controller,0.0,0,0,0,0,0.0,0.0,[],[],[],[],[],,[],{},{},{},0,0
+1,rollout,1.5,1,rollout_1_1_0_0_0,controller,adversary,0.0,0,0,0,0,0.0,0.0,[],[],[],[],[],0,[],{},{},{},0,0
+1,rollout,2.0,rollout_1_1_0_0_0,rollout_1_1_0_0_1,adversary,controller,0.0,2,2,0,0,0.0,0.0,"[0, 1]",[],"[{""prefill_tokens"": 2048, ""decode_tokens"": 4096, ""prefill_slo"": 0.08703539953355875, ""decode_slo"": 0.005}, {""prefill_tokens"": 2048, ""decode_tokens"": 2048, ""prefill_slo"": 0.4351769976677938, ""decode_slo"": 0.002}]","[0.08703539953355875, 0.4351769976677938]","[0.005, 0.002]",,[],{},{},{},0,0
+1,rollout,2.5,rollout_1_1_0_0_1,rollout_1_1_0_1_0,controller,adversary,0.0413033954714313,2,2,0,0,0.0,0.0,"[0, 1]",[],[],[],[],1024,[0],"{""0"": 1024}","{""0"": 1024}",{},1024,0
+1,rollout,3.0,rollout_1_1_0_1_0,rollout_1_1_0_1_1,adversary,controller,0.0413033954714313,2,2,0,0,0.0,0.0,"[0, 1]",[],[],[],[],,[],{},{},{},0,0
+1,rollout,3.5,rollout_1_1_0_1_1,rollout_1_1_0_2_0,controller,adversary,0.16426366920976393,2,2,0,1,0.07722826967620518,1.0772282696762052,"[0, 1]",[],[],[],[],3072,"[0, 1]","{""1"": 2048, ""0"": 1024}","{""1"": 2048, ""0"": 1024}",{},3072,0
+1,rollout,4.0,rollout_1_1_0_2_0,rollout_1_1_0_2_1,adversary,controller,0.16426366920976393,2,2,0,1,0.07722826967620518,1.0772282696762052,"[0, 1]",[],[],[],[],,[],{},{},{},0,0
+1,rollout,4.5,rollout_1_1_0_2_1,rollout_1_1_0_3_0,controller,adversary,0.1717572689867778,2,2,0,2,0.042607734615116445,2.0426077346151166,"[0, 1]",[],[],[],[],1,[0],"{""0"": 1}",{},"{""0"": 1}",0,1
+1,rollout,5.0,rollout_1_1_0_3_0,rollout_1_1_0_3_1,adversary,controller,0.1717572689867778,2,2,0,2,0.042607734615116445,2.0426077346151166,"[0, 1]",[],[],[],[],,[],{},{},{},0,0

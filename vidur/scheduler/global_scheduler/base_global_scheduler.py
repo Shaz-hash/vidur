@@ -27,7 +27,12 @@ _SNAP_VERSION_GLOBAL_SCHED = 1
 
 
 class BaseGlobalScheduler(ABC):
-    def __init__(self, config: SimulationConfig, replicas: Dict[ReplicaId, Replica]):
+    def __init__(
+        self,
+        config: SimulationConfig,
+        replicas: Dict[ReplicaId, Replica],
+        execution_time_predictor=None,
+    ):
         self._config = config
         self._replicas = replicas
         self._num_replicas = len(replicas)
@@ -35,12 +40,14 @@ class BaseGlobalScheduler(ABC):
             config.cluster_config.global_scheduler_config.seed
         )
 
-        self._execution_time_predictor = ExecutionTimePredictorRegistry.get(
-            config.execution_time_predictor_config.get_type(),
-            predictor_config=config.execution_time_predictor_config,
-            replica_config=config.cluster_config.replica_config,
-            cache_config=config.cluster_config.cache_config,
-        )
+        if execution_time_predictor is None:
+            execution_time_predictor = ExecutionTimePredictorRegistry.get(
+                config.execution_time_predictor_config.get_type(),
+                predictor_config=config.execution_time_predictor_config,
+                replica_config=config.cluster_config.replica_config,
+                cache_config=config.cluster_config.cache_config,
+            )
+        self._execution_time_predictor = execution_time_predictor
         self._replica_schedulers: Dict[ReplicaId, BaseReplicaScheduler] = {
             replica_id: ReplicaSchedulerRegistry.get_from_str(
                 self._config.cluster_config.replica_scheduler_config.get_type(),
