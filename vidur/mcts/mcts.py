@@ -49,10 +49,26 @@ class _MCTSLogger:
         "controller_decode_total",
     ]
 
-    def __init__(self, path: Optional[Union[str, Path]]) -> None:
+    def __init__(
+        self,
+        path: Optional[Union[str, Path]],
+        *,
+        log_rollouts: bool = True,
+        flush_every: int = 1,
+    ) -> None:
         self._path = Path(path) if path else None
         self._writer: Optional[csv.DictWriter] = None
         self._file = None
+        self._log_rollouts = log_rollouts
+        self._flush_every = max(0, int(flush_every))
+        self._row_count = 0
+
+    def enabled_for(self, phase: str) -> bool:
+        if not self._path:
+            return False
+        if phase == "rollout" and not self._log_rollouts:
+            return False
+        return True
 
     def log(
         self,
@@ -68,7 +84,7 @@ class _MCTSLogger:
         controller_action: Optional[ControllerAction],
         objective_cost: float,
     ) -> None:
-        if not self._path:
+        if not self.enabled_for(phase):
             return
         if self._writer is None:
             self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -147,7 +163,27 @@ class _MCTSLogger:
             else 0,
         }
         self._writer.writerow(row)
-        self._file.flush()
+        self._row_count += 1
+        if self._flush_every == 1:
+            self._file.flush()
+        elif self._flush_every > 1 and (self._row_count % self._flush_every == 0):
+            self._file.flush()
+
+    def write_rows(self, rows: List[Dict[str, Any]]) -> None:
+        if not self._path or not rows:
+            return
+        if self._writer is None:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._file = self._path.open("w", newline="")
+            self._writer = csv.DictWriter(self._file, fieldnames=self._FIELDS)
+            self._writer.writeheader()
+        for row in rows:
+            if not self.enabled_for(row.get("phase", "")):
+                continue
+            self._writer.writerow(row)
+            self._row_count += 1
+        if self._flush_every == 1 or (self._flush_every > 1 and (self._row_count % self._flush_every == 0)):
+            self._file.flush()
 
     def close(self) -> None:
         if self._file is not None:
@@ -191,13 +227,20 @@ class VidurMCTS:
         explore_cfg: MCTSExploreConfig,
         rng: Optional[random.Random] = None,
         log_path: Optional[Union[str, Path]] = None,
+        *,
+        log_rollouts: bool = True,
+        logger_flush_every: int = 1,
+        verbose: bool = False,
     ) -> None:
         self._env = env
         self._cfg = explore_cfg
         self._rng = rng or random.Random(0)
-        self._logger = _MCTSLogger(log_path)
+        self._logger = _MCTSLogger(
+            log_path, log_rollouts=log_rollouts, flush_every=logger_flush_every
+        )
         self._node_counter = 0
         self._current_iteration = 0
+        self._verbose = verbose
 
     def search(self, iterations: int) -> ControllerAction:
         root = self._create_root()
@@ -284,6 +327,7 @@ class VidurMCTS:
         total_cost = 0.0
         num_trials = max(1, self._cfg.simulation_random_tries)
 
+        rollout_batch_rows: List[Dict[str, Any]] = []
         for trial in range(num_trials):
             rollout_state = node.state.fork()
             current_player = node.player
@@ -300,11 +344,9 @@ class VidurMCTS:
                         else:
                             action = self._rng.choice(candidates)
                             rollout_state = self._env.apply_adversary_action_only(
-                                rollout_state, action
+                                rollout_state, action, inplace=True
                             )
                     else:
-                        print("CONTROLLER's PHASE SIMULATION : ")
-                        print(f"rollout_{self._current_iteration}_{node.node_id}_{trial}_{depth_idx}_{turn}")
                         candidates = self._env.sample_controller_actions(
                             rollout_state, self._cfg.max_branching
                         )
@@ -312,29 +354,30 @@ class VidurMCTS:
                             action = None
                         else:
                             action = self._rng.choice(candidates)
-                            print("Action choose for this phase is : ", action)
                             rollout_state = self._env.apply_controller_action_only(
-                                rollout_state, action
+                                rollout_state, action, inplace=True
                             )
 
                     if action is not None:
-                        node_id = (
-                            f"rollout_{self._current_iteration}_{node.node_id}_{trial}_{depth_idx}_{turn}"
-                        )
-                        self._log_state(
-                            iteration=self._current_iteration,
-                            phase="rollout",
-                            node_id=node_id,
-                            depth=node.depth + depth_idx + (turn + 1) / 2,
-                            state=rollout_state,
-                            parent_id=parent_id,
-                            acting_player=current_player,
-                            next_player="controller"
-                            if current_player == "adversary"
-                            else "adversary",
-                            action=action,
-                        )
-                        parent_id = node_id
+                        if self._logger.enabled_for("rollout"):
+                            node_id = (
+                                f"rollout_{self._current_iteration}_{node.node_id}_{trial}_{depth_idx}_{turn}"
+                            )
+                            row = self._make_log_row(
+                                iteration=self._current_iteration,
+                                phase="rollout",
+                                node_id=node_id,
+                                depth=node.depth + depth_idx + (turn + 1) / 2,
+                                state=rollout_state,
+                                parent_id=parent_id,
+                                acting_player=current_player,
+                                next_player=(
+                                    "controller" if current_player == "adversary" else "adversary"
+                                ),
+                                action=action,
+                            )
+                            rollout_batch_rows.append(row)
+                            parent_id = node_id
 
                     current_player = (
                         "controller" if current_player == "adversary" else "adversary"
@@ -343,6 +386,9 @@ class VidurMCTS:
             violations, avg_lateness = self._env.evaluate_objective(rollout_state)
             total_cost += _compute_objective_cost(violations, avg_lateness)
 
+        # Commit rollout rows in a single batch for this simulate() call.
+        if rollout_batch_rows:
+            self._logger.write_rows(rollout_batch_rows)
         return total_cost / num_trials
 
     def _backpropagate(self, node: MCTSNode, cost: float) -> None:
@@ -372,6 +418,9 @@ class VidurMCTS:
     def _best_child(self, node: MCTSNode) -> MCTSNode:
         best_score = -float("inf")
         best = None
+        # Precompute ln(N) once; guard against zero.
+        parent_visits = max(1, node.visits)
+        ln_parent = math.log(parent_visits)
         for edge in node.children:
             child = edge.node
             if child.visits == 0:
@@ -379,9 +428,8 @@ class VidurMCTS:
             else:
                 mean_cost = child.cumulative_cost / child.visits
                 exploit = -mean_cost if node.player == "controller" else mean_cost
-                explore = self._cfg.exploration_constant * (math.log(node.visits) / child.visits)
                 explore = self._cfg.exploration_constant * math.sqrt(
-                    math.log(node.visits) / child.visits
+                    ln_parent / max(1, child.visits)
                 )
                 score = exploit + explore
             if score > best_score:
@@ -416,12 +464,8 @@ class VidurMCTS:
         violations = snapshot["slo_violations"]
         avg_lateness = snapshot["avg_lateness"]
         cost = _compute_objective_cost(violations, avg_lateness)
-        adversary_action = (
-            action if acting_player == "adversary" else None
-        )
-        controller_action = (
-            action if acting_player == "controller" else None
-        )
+        adversary_action = (action if acting_player == "adversary" else None)
+        controller_action = (action if acting_player == "controller" else None)
         player_label = acting_player or (node.player if node else "")
         next_label = next_player or player_label
         depth_value = depth if depth is not None else 0.0
@@ -439,6 +483,71 @@ class VidurMCTS:
             objective_cost=cost,
         )
         return cost
+
+    def _make_log_row(
+        self,
+        iteration: int,
+        phase: str,
+        *,
+        parent_id: Optional[Union[int, str]] = None,
+        node_id: Optional[Union[int, str]] = None,
+        acting_player: Optional[str] = None,
+        next_player: Optional[str] = None,
+        depth: Optional[float] = None,
+        state: Optional[VidurMCTSState] = None,
+        action: Optional[Union[AdversaryAction, ControllerAction]] = None,
+    ) -> Dict[str, Any]:
+        assert state is not None
+        snapshot = self._env.describe_state(state)
+        violations = snapshot["slo_violations"]
+        avg_lateness = snapshot["avg_lateness"]
+        cost = _compute_objective_cost(violations, avg_lateness)
+        adversary_action = (action if acting_player == "adversary" else None)
+        controller_action = (action if acting_player == "controller" else None)
+        player_label = acting_player or ""
+        next_label = next_player or player_label
+        depth_value = depth if depth is not None else 0.0
+        row = {
+            "iteration": iteration,
+            "phase": phase,
+            "depth": depth_value,
+            "parent_node_id": "" if parent_id is None else str(parent_id),
+            "node_id": str(node_id or "root"),
+            "player_to_act": player_label,
+            "next_player": next_label,
+            "sim_time": snapshot["sim_time"],
+            "requests_in_system": snapshot["requests_in_system"],
+            "requests_generated": snapshot["requests_generated"],
+            "requests_completed": snapshot["requests_completed"],
+            "slo_violations": snapshot["slo_violations"],
+            "avg_lateness": snapshot["avg_lateness"],
+            "objective_cost": cost,
+            "state_waiting_ids": json.dumps(snapshot["waiting_request_ids"]),
+            "state_completed_request_ids": json.dumps(snapshot["completed_request_ids"]),
+            "adversary_requests": json.dumps([
+                {
+                    "prefill_tokens": spec.prefill_tokens,
+                    "decode_tokens": spec.decode_tokens,
+                    "prefill_slo": spec.prefill_slo,
+                    "decode_slo": spec.decode_slo,
+                }
+                for spec in action.requests
+            ]) if isinstance(action, AdversaryAction) else json.dumps([]),
+            "adversary_prefill_slos": json.dumps([
+                spec.prefill_slo for spec in action.requests
+            ]) if isinstance(action, AdversaryAction) else json.dumps([]),
+            "adversary_decode_slos": json.dumps([
+                spec.decode_slo for spec in action.requests
+            ]) if isinstance(action, AdversaryAction) else json.dumps([]),
+            "controller_token_budget": action.token_budget if isinstance(action, ControllerAction) else "",
+            "controller_selected_ids": json.dumps(action.selected_request_ids or []) if isinstance(action, ControllerAction) else json.dumps([]),
+            "controller_allocations": json.dumps(action.token_allocations) if isinstance(action, ControllerAction) else json.dumps({}),
+            "controller_prefill_allocations": json.dumps(action.prefill_allocations) if isinstance(action, ControllerAction) else json.dumps({}),
+            "controller_decode_allocations": json.dumps(action.decode_allocations) if isinstance(action, ControllerAction) else json.dumps({}),
+            "controller_prefill_total": sum(action.prefill_allocations.values()) if isinstance(action, ControllerAction) else 0,
+            "controller_decode_total": sum(action.decode_allocations.values()) if isinstance(action, ControllerAction) else 0,
+        }
+        return row
 
     def _next_node_id(self) -> int:
         node_id = self._node_counter

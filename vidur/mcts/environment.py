@@ -181,9 +181,8 @@ class VidurMCTSEnvironment:
     ) -> List[ControllerAction]:
         """Generate candidate controller actions by sampling token budgets and request priorities."""
         self._drain_arrivals(state.simulator)
-        token_budget_options = [
-            b for b in self._enumerate_token_budgets(state) if b > 0
-        ]
+        # Cache lookup and waiting IDs once per call.
+        token_budget_options = [b for b in self._enumerate_token_budgets(state) if b > 0]
         request_lookup = self._build_request_lookup(state.simulator)
         waiting_ids = sorted(request_lookup.keys())
         if not token_budget_options or not waiting_ids:
@@ -204,7 +203,17 @@ class VidurMCTSEnvironment:
             else:
                 selected = self._rng.sample(waiting_ids, selected_count) ## ?? : I Need to modfify this because at the moment this is selecting all requests 
             selected.sort()
-            actions.extend(self._generate_allocation_variants(request_lookup, budget, selected))
+            variants = self._generate_allocation_variants(request_lookup, budget, selected)
+            if not variants:
+                continue
+            # Respect overall branching cap to avoid producing an excessive number of actions.
+            remaining = max(0, self._cfg.max_branching - len(actions))
+            if remaining <= 0:
+                break
+            if len(variants) > remaining:
+                # Randomly sample to keep distribution similar without exceeding cap.
+                variants = self._rng.sample(variants, remaining)
+            actions.extend(variants)
 
         actions = [act for act in actions if act.token_budget > 0]
         if actions:
@@ -241,13 +250,10 @@ class VidurMCTSEnvironment:
             if req is None:
                 continue
 
-            remaining_prefill = max(
-                0, req.num_prefill_tokens - req.num_processed_prefill_tokens
-            )
-            remaining_decode = max(
-                0, req.num_decode_tokens - req.num_processed_decode_tokens
-            )
+            remaining_prefill = max(0, req.num_prefill_tokens - req.num_processed_prefill_tokens)
+            remaining_decode = max(0, req.num_decode_tokens - req.num_processed_decode_tokens)
 
+            # Avoid repeated getattr lookups per request.
             prefill_done = getattr(req, "_is_prefill_complete", req.is_prefill_complete)
             # print("Request with id : ", rid , " is done with the prefill status : ", prefill_done)
             if remaining_prefill > 0 and not prefill_done:
@@ -388,17 +394,29 @@ class VidurMCTSEnvironment:
     # Transition dynamics
     # ------------------------------------------------------------------ #
     def apply_adversary_action_only(
-        self, state: VidurMCTSState, action: AdversaryAction
+        self, state: VidurMCTSState, action: AdversaryAction, *, inplace: bool = False
     ) -> VidurMCTSState:
-        new_state = state.fork()
-        self._apply_adversary_action(new_state, action)
-        self._drain_arrivals(new_state.simulator)
-        return new_state
+        """Apply adversary action.
+
+        When ``inplace`` is False (default), returns a forked state (safe for tree expansion).
+        When ``inplace`` is True, mutates and returns ``state`` (intended for rollout trials).
+        """
+        target_state = state if inplace else state.fork()
+        self._apply_adversary_action(target_state, action)
+        self._drain_arrivals(target_state.simulator)
+        return target_state
 
     def apply_controller_action_only(
-        self, state: VidurMCTSState, action: ControllerAction
+        self, state: VidurMCTSState, action: ControllerAction, *, inplace: bool = False
     ) -> VidurMCTSState:
-        new_state = state.fork()
+        """Apply controller action.
+
+        When ``inplace`` is False (default), returns a forked state (safe for tree expansion).
+        When ``inplace`` is True, mutates and returns ``state`` (intended for rollout trials).
+        Temporary scheduler budget overrides and hidden-requests are still snapshot/restored
+        per call, regardless of ``inplace``.
+        """
+        new_state = state if inplace else state.fork()
         self._drain_arrivals(new_state.simulator)
 
         (

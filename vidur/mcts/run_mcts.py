@@ -39,9 +39,9 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mcts_prefill_slowdown", type=float, default=1.0)
     parser.add_argument("--mcts_simulation_depth", type=int, default=4)
     parser.add_argument("--mcts_simulation_random_tries", type=int, default=1)
-    parser.add_argument("--mcts_exploration_constant", type=float, default=4.0)
-    parser.add_argument("--mcts_max_branching", type=int, default=25)
-    parser.add_argument("--mcts_controller_budget_combs", type=int, default=10)
+    parser.add_argument("--mcts_exploration_constant", type=float, default=1.4)
+    parser.add_argument("--mcts_max_branching", type=int, default=30)
+    parser.add_argument("--mcts_controller_budget_combs", type=int, default=15)
     parser.add_argument(
         "--mcts_prefill_slos",
         type=float,

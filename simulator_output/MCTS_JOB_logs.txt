@@ -1,0 +1,7 @@
+
+================================================================================
+Launch time: 2025-11-07 19:00:13
+Command: /home/shazer/Desktop/Research/Vidur/vidur/.venv/bin/python3 -m vidur.mcts.run_mcts --mcts_iterations 100000 --mcts_simulation_random_tries 1 --mcts_simulation_depth 4 --mcts_interval_request_size 512 --mcts_min_request_tokens 512 --mcts_max_request_tokens 10240 --mcts_exploration_constant 1.4 --mcts_max_branching 30 --mcts_controller_budget_combs 20 --mcts_prefill_profile /home/shazer/Desktop/Research/Vidur/vidur/simulator_output/prefill_profile.csv --mcts_log_csv /home/shazer/Desktop/Research/Vidur/vidur/simulator_output/test_mcts_trace.csv --replica_config_model_name meta-llama/Meta-Llama-3-8B --replica_config_device h100 --replica_config_network_device h100_dgx --cluster_config_num_replicas 1 --replica_config_tensor_parallel_size 1 --replica_config_num_pipeline_stages 1 --global_scheduler_config_type round_robin --replica_scheduler_config_type vllm_v1
+Launched PID: 1665359
+INFO 11-07 19:00:14 sklearn_execution_time_predictor.py:709] Getting predictions for compute operations
+INFO 11-07 19:00:15 sklearn_execution_time_predictor.py:767] Getting predictions for attention operations
