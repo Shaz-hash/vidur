@@ -1,9 +1,14 @@
+
+## بِسْمِ اللهِ الرَّحْمٰنِ الرَّحِيْمِ 
+
 from __future__ import annotations
 
 import random
 import heapq
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Set
+from itertools import combinations_with_replacement ## Used in the _populate_Prefill_Reqs_Table only 
+import math
 
 from vidur.entities import Request
 from vidur.events.global_schedule_event import GlobalScheduleEvent
@@ -12,8 +17,12 @@ from vidur.events.request_arrival_event import RequestArrivalEvent
 from vidur.simulator import Simulator
 from vidur.utils.slo_manager import SLOManager
 from vidur.types import EventType
-from .config import MCTSConstraintConfig, MCTSExploreConfig
+from .launch_mcts_job import MCTSConstraintConfig, MCTSExploreConfig
 from .prefill_calibrator import PrefillProfile
+
+
+import time ## For Debugging
+
 
 
 ## These are the dimensions along which adversary will take an action. Some combination of these within constraints
@@ -29,6 +38,7 @@ class AdversaryRequestSpec:
 @dataclass
 class AdversaryAction:
     requests: List[AdversaryRequestSpec] = field(default_factory=list)
+    stop_decode_ids: List[int] = field(default_factory=list)
 
 
 ## These are the dimensions along which the controller will take an action.
@@ -39,6 +49,10 @@ class ControllerAction:
     token_allocations: Dict[int, int] = field(default_factory=dict)
     prefill_allocations: Dict[int, int] = field(default_factory=dict)
     decode_allocations: Dict[int, int] = field(default_factory=dict)
+    heuristic: Optional[str] = None          # NEW
+    strategy: Optional[str] = None           # NEW
+    mapping: Optional[Tuple[int, ...]] = None   # NEW: prefill mapping vector
+
 
 
 @dataclass
@@ -117,6 +131,13 @@ class VidurMCTSEnvironment:
             path=constraints.prefill_profile_path,
             max_tokens=constraints.max_request_tokens,
         )
+        self.all_possible_Prefill_reqs_table: Dict[int, List[int]] = None ## This dict will store all possible QPS Combinations produced by the adversary in a burst 
+        self.controller_all_possible_prefill_budgets: List[int] = None ## This list will store all possible token budget options Controller has to allocate a batch with 
+        self.all_possible_Controller_actions: List[any] = None ## This list will be storing all the different possible actions that controller can produce on its turn --> Size of this |LIST| = k x n x h where k = number of different allocations , n = number of different token budgets , h = hueristic options available. This becomes => 48 atm  
+        self.all_possible_Controller_States: Dict[Tuple[Tuple[int, ...], str, str], Dict[str, Any]] = {}
+        # key = (mapping_tuple, heuristic_name, allocation_strategy_name)
+        ## This carries the only possible states that can occur due to prefill requests after applying hueristics and the given constraints. Norm of |LIST| = k (Summation from i = 1 to n of i!)
+            
         if self._constraints.max_request_tokens is None:
             self._constraints.max_request_tokens = self._prefill_profile.max_tokens
 
@@ -132,263 +153,485 @@ class VidurMCTSEnvironment:
     def sample_adversary_actions(
         self, state: VidurMCTSState, max_samples: int
     ) -> List[AdversaryAction]:
-        """Generate candidate adversary actions obeying QPS/token bounds."""
+        """Generate adversary actions with fixed QPS and decode-stop options.
+
+        - Generates exactly = QPS new prefill requests, all with the same prefill size
+          chosen from [min..max] by step.
+        - For decode-eligible requests whose processed decode tokens are a multiple of step,
+          the adversary may choose to stop decode (set remaining decode to 0). The action
+          enumerates subsets of such requests (limited by max_samples or max_branching) assuming prefill & Decode SLOs are fixed to 1 option.
+        """
+        function_path: str = "enviroment.py function sample_adversary_actions()"
         actions: List[AdversaryAction] = []
-        max_new = self._available_qps_budget(state)
-        if max_new <= 0:
-            return [AdversaryAction([])]
+        qps_budget = self._available_qps_budget(state)
+        max_qps = int(self._constraints.maximum_qps or 0)
+        step = int(self._constraints.interval_request_size)
+        slo_opts = self._constraints.request_slo_options
+        cap = max_samples if (max_samples and max_samples > 0) else self._cfg.max_branching
+        cap = max(1, int(cap))
 
-        for _ in range(max_samples):
-            num_requests = self._rng.randint(0, max_new)
+        # Decode subsets: random unique subsets up to cap (including empty)
+        def build_decode_subsets_random(boundary_decode: List[int], limit: int) -> List[List[int]]:
+            if not boundary_decode:
+                return [[]]
+            n = len(boundary_decode)
+            total = 1 << n
+            if total <= limit:
+                out: List[List[int]] = [[]]
+                for mask in range(1, total):
+                    subset = [boundary_decode[i] for i in range(n) if (mask >> i) & 1]
+                    out.append(subset)
+                return out[:limit]
+            # Sample unique subsets randomly (include empty)
+            seen: Set[Tuple[int, ...]] = {tuple()}
+            out: List[List[int]] = [[]]
+            trials = 0
+            while len(out) < limit and trials < limit * 10:
+                trials += 1
+                subset = [rid for rid in boundary_decode if self._rng.random() < 0.5]
+                key = tuple(sorted(subset))
+                if key not in seen:
+                    seen.add(key)
+                    out.append(list(key))
+            return out
+
+
+         # Build specs converter once
+       
+        # Configures requests properly for the Simulator
+        def specs_from_prefill_combo(combo: List[int]) -> List[AdversaryRequestSpec]:
             specs: List[AdversaryRequestSpec] = []
-            for _ in range(num_requests):
-                total_budget = self._max_request_tokens_allowed()
-                decode = self._sample_token_size(
-                    min_size=self._constraints.interval_request_size,
-                    max_size=total_budget - self._constraints.interval_request_size,
-                )
-                max_prefill = max(self._constraints.interval_request_size, total_budget - decode)
-                prefill = self._sample_token_size(min_size=self._constraints.interval_request_size , max_size=max_prefill)
-                remaining = max(0, total_budget - prefill)
-                if remaining < self._constraints.interval_request_size:
-                    decode = remaining
-                else:
-                    decode = min(decode, remaining)
-                if decode < 0:
-                    decode = 0
+            MAX_REQUEST_LENGTH: int = 10240 ## ?? Note : Have this variable later passed from the config instead
+            #total_budget = self._max_request_tokens_allowed()
 
-                slo_opts = self._constraints.request_slo_options
-                prefill_slo = self._prefill_profile.lookup(prefill)
-                if slo_opts.prefill_slos:
-                    prefill_slo *= self._rng.choice(slo_opts.prefill_slos)
-                decode_slo = self._rng.choice(slo_opts.decode_slos) / 1000.0
+            for prefill_size in combo:
+                remaining_for_decode = max(0, MAX_REQUEST_LENGTH - prefill_size) ## ?? Note : Decode SLOS will be needed to take randomly here when we move from to multiple options next week IA
+                prefill_slo = self._prefill_profile.lookup(prefill_size)
+                if getattr(slo_opts, "prefill_slos", None):
+                    prefill_slo *= (
+                        slo_opts.prefill_slos[0]
+                        if len(slo_opts.prefill_slos) == 1
+                        else self._rng.choice(slo_opts.prefill_slos)
+                    )
+                if getattr(slo_opts, "decode_slos", None):
+                    dec_ms = (
+                        slo_opts.decode_slos[0]
+                        if len(slo_opts.decode_slos) == 1
+                        else self._rng.choice(slo_opts.decode_slos)
+                    )
+                    decode_slo = float(dec_ms) / 1000.0
+                else:
+                    decode_slo = 0.0
                 specs.append(
                     AdversaryRequestSpec(
-                        prefill_tokens=prefill,
-                        decode_tokens=decode,
+                        prefill_tokens=prefill_size,
+                        decode_tokens=remaining_for_decode,
                         prefill_slo=prefill_slo,
                         decode_slo=decode_slo,
                     )
                 )
-            actions.append(AdversaryAction(specs))
+            return specs
 
-        if not actions:
-            actions.append(AdversaryAction([]))
+
+        assert max_qps > 0 , f" Max QPS ! > 0 {max_qps} in {function_path}"
+        ## Since we are making Adversary always send the max QPS budget every second :
+        if(qps_budget >= max_qps): ## This means we can go for the multiple actions now at the adversary here 
+
+            ## Step 1 : Check whether we have all possible requests combinations produced already : 
+            if (self.all_possible_Prefill_reqs_table is None):
+                ## Step 1.1 : Fill the table first quickly to cache the results for the future:
+                self._populate_Prefill_Reqs_Table()
+            
+
+             # Prefill combos: random sample up to cap from cache
+            all_combos = (
+                list(self.all_possible_Prefill_reqs_table.values())
+                if self.all_possible_Prefill_reqs_table else []
+            )
+
+            assert len(all_combos) > 0, f"All combinations after creating tables still are {len(all_combos)}? in {function_path}"
+            
+            if len(all_combos) > cap:
+                prefill_combos = self._rng.sample(all_combos, cap)
+            else:
+                prefill_combos = all_combos
+
+            ## Step 2 : Find how many decodes eligible to stop are here 
+            request_lookup = self._build_request_lookup(state.simulator)
+            boundary_decode: List[int] = []
+
+            for rid, req in request_lookup.items():
+                if getattr(req, "_is_prefill_complete", req.is_prefill_complete):
+                    rem_dec = max(0, req.num_decode_tokens - req.num_processed_decode_tokens) 
+                    proc = max(0, req.num_processed_decode_tokens)
+                    if rem_dec > 0 and proc >= step and (proc % step == 0):
+                        boundary_decode.append(rid)
+
+            ## Step 2.1 : Get the necessary random sample of the eligible decodes :
+            decode_subsets = build_decode_subsets_random(boundary_decode, cap)
+
+
+            ## Step 3 : Building the combinations for the Adv actions : 
+            
+            pairs_total = len(prefill_combos) * len(decode_subsets)            
+
+            if pairs_total <= cap:
+                ## Add every possibile combination now :
+                specs_cache = [specs_from_prefill_combo(c) for c in prefill_combos]
+                for i in range(len(prefill_combos)):
+                    specs = specs_cache[i]
+                    for stop_ids in decode_subsets:
+                        actions.append(AdversaryAction(requests=list(specs), stop_decode_ids=list(stop_ids)))
+            else :
+                ## Sampling k unique linear iondecies without materialising product here :
+                sampled = self._rng.sample(range(pairs_total), cap) ## picks any caps numbers from 0 to pairs_total - 1
+                # Precompute specs only for the combos we actually picked
+                combo_idxs = {idx // len(decode_subsets) for idx in sampled}
+                specs_cache = {i: specs_from_prefill_combo(prefill_combos[i]) for i in combo_idxs}
+
+                for idx in sampled:
+                    i = idx // len(decode_subsets)
+                    j = idx % len(decode_subsets)
+                    actions.append(
+                        AdversaryAction(
+                            requests=list(specs_cache[i]),          # copy to avoid aliasing
+                            stop_decode_ids=list(decode_subsets[j])
+                        )
+                    )
+        
+        else :
+            ## Return Fallback here with no Prefill release but decode related actions are possible here :
+
+            request_lookup = self._build_request_lookup(state.simulator)
+            boundary_decode: List[int] = []
+
+
+            for rid, req in request_lookup.items():
+                if getattr(req, "_is_prefill_complete", req.is_prefill_complete):
+                    rem_dec = max(0, req.num_decode_tokens - req.num_processed_decode_tokens) 
+                    proc = max(0, req.num_processed_decode_tokens)
+                    if rem_dec > 0 and proc >= step and (proc % step == 0):
+                        boundary_decode.append(rid)
+
+            ## Step 1 : Get the necessary random sample of the eligible decodes :
+            decode_subsets = build_decode_subsets_random(boundary_decode, cap)
+            for stop_ids in decode_subsets:
+                actions.append(AdversaryAction(requests=[], stop_decode_ids=list(stop_ids)))           
+        
         return actions
 
     def sample_controller_actions(
-        self, state: VidurMCTSState, max_samples: int
+        self, state: VidurMCTSState, max_samples: int, use_state_cache: bool = True
     ) -> List[ControllerAction]:
-        """Generate candidate controller actions by sampling token budgets and request priorities."""
+        """Generate controller actions using 4 heuristics × 2 allocation strategies × budgets.
+
+        Heuristics (ordering prefill candidates):
+        - SJF (ascending remaining prefill)
+        - EDF (ascending absolute deadline)
+        - LST (ascending slack = remaining SLO time - estimated remaining process time)
+        - Slowdown (descending slowdown ratio)
+
+        Allocation strategies:
+        - single: allocate whole budget to the first request
+        - progressive: split among top requests by 50%/ceil and rules described
+
+        TODO :
+        --> log times in here to see how much sample controller action is taking here 
+        --> Connect the MAX Token request size from config to here aswell
+        --> Connect the visit_limit directly to the configuration 
+        """
+        
+        MAX_REQUEST_LENGTH: int = 10240
+        VISIT_LIMIT = 1
         self._drain_arrivals(state.simulator)
-        # Cache lookup and waiting IDs once per call.
-        token_budget_options = [b for b in self._enumerate_token_budgets(state) if b > 0]
+        sim_time = state.simulator._time
+        step = self._constraints.interval_request_size
+
+        # Build lookup once
         request_lookup = self._build_request_lookup(state.simulator)
-        waiting_ids = sorted(request_lookup.keys())
-        if not token_budget_options or not waiting_ids:
-            fallback = self._build_minimal_controller_action(
-                request_lookup, waiting_ids, self._constraints.interval_request_size
-            )
-            if fallback is not None:
-                return [fallback]
+        waiting_ids_all = sorted(request_lookup.keys())
+        if not waiting_ids_all:
             return [ControllerAction(token_budget=0, selected_request_ids=None)]
 
+        # Prefill candidates only
+        def remaining_prefill(req: Request) -> int:
+            return max(0, req.num_prefill_tokens - req.num_processed_prefill_tokens)
+
+        def prefill_done(req: Request) -> bool:
+            return getattr(req, "_is_prefill_complete", req.is_prefill_complete)
+
+        prefill_ids: List[int] = []
+        for rid in waiting_ids_all:
+            req = request_lookup.get(rid)
+            if req is None:
+                continue
+            if remaining_prefill(req) > 0 and not prefill_done(req):
+                prefill_ids.append(rid)
+
+        # Decode candidates: always included in every action (1 decode token each)
+        decode_candidates: List[int] = []
+        for rid in waiting_ids_all:
+            req = request_lookup.get(rid)
+            if req is None:
+                continue
+            rem_dec = max(0, req.num_decode_tokens - req.num_processed_decode_tokens) ##?? NOTE: This is not needed in here 
+            if prefill_done(req) and rem_dec > 0:
+                decode_candidates.append(rid)
+
+        # If no prefill candidates, action is to include all decode candidates only
+        if not prefill_ids:
+            if decode_candidates:
+                decode_base = {rid: 1 for rid in decode_candidates}
+                sel = sorted(decode_candidates)
+                tot = len(decode_candidates)
+                return [
+                    ControllerAction(
+                        token_budget=tot,
+                        selected_request_ids=sel,
+                        token_allocations=dict(decode_base),
+                        prefill_allocations={},
+                        decode_allocations=decode_base,
+                    )
+                ]
+            # Nothing to do
+            return [ControllerAction(token_budget=0, selected_request_ids=None)]
+
+        # Budgets from min..max inclusive by step
+        min_tok = max(step, self._constraints.min_request_tokens)
+        max_tok = self._max_request_tokens_allowed()
+
+        ## First check if the budgets are all calculated or not yet 
+        if (self.controller_all_possible_prefill_budgets == None):
+            self.controller_all_possible_prefill_budgets = [] ## NOTE: Only needed once and we can store this 
+            lo = (min_tok + step - 1) // step
+            hi = max_tok // step
+            for i in range(lo, hi + 1):
+                self.controller_all_possible_prefill_budgets.append(i * step)
+        
+
+        # Ordering helpers
+        def order_sjf(ids: List[int]) -> List[int]:
+            return sorted(ids, key=lambda rid: remaining_prefill(request_lookup[rid]))
+
+        def order_edf(ids: List[int]) -> List[int]:
+            # absolute deadline = arrival + prefill SLO time
+            return sorted(
+                ids,
+                key=lambda rid: (
+                    getattr(request_lookup[rid], "arrived_at", 0.0)
+                    + getattr(request_lookup[rid], "prefill_slo_time", 0.0)
+                ),
+            )
+
+        def order_lst(ids: List[int]) -> List[int]:
+            def slack(rid: int) -> float:
+                req = request_lookup[rid]
+                remaining_slo = (
+                    getattr(req, "prefill_slo_time", 0.0)
+                    - max(0.0, sim_time - getattr(req, "arrived_at", 0.0))
+                )
+                est = self._prefill_profile.lookup(remaining_prefill(req))
+                return remaining_slo - est
+            return sorted(ids, key=slack)
+
+        def order_slowdown(ids: List[int]) -> List[int]:
+            def ratio(rid: int) -> float:
+                req = request_lookup[rid]
+                waited = max(0.0, sim_time - getattr(req, "arrived_at", 0.0))
+                est_full = self._prefill_profile.lookup(getattr(req, "num_prefill_tokens", 0)) or 1e-9
+                return waited / est_full
+            # Descending: prioritize highest slowdown
+            return sorted(ids, key=ratio, reverse=True)
+
+        # heuristics = [order_sjf, order_edf, order_lst, order_slowdown]
+        # New
+        heuristics = [
+            ("SJF", order_sjf),
+            ("EDF", order_edf),
+            ("LST", order_lst),
+            ("Slowdown", order_slowdown),
+        ]
+        def ceil_to_step(x: int) -> int:
+            return step * ((x + step - 1) // step)
+
+        # Allocation Strategies 
+        def build_alloc_single(
+            ordered: List[int],
+            budget: int,
+        ) -> Tuple[ControllerAction, List[int]]:
+            # Length of the prefill pattern we care about
+            L = len(self.controller_all_possible_prefill_budgets)
+            mapping: List[int] = [0] * L
+
+            if budget <= 0 or not ordered or L == 0:
+                return ControllerAction(token_budget=0, selected_request_ids=None), mapping
+
+            remaining_budget = budget
+            pre: Dict[int, int] = {}
+
+            # Allocate greedily across the first L requests in `ordered`
+            k = min(L, len(ordered))
+            for idx in range(k):
+                rid = ordered[idx]
+                cap = remaining_prefill(request_lookup[rid])
+                if cap <= 0 or remaining_budget <= 0:
+                    continue
+                alloc_here = min(cap, remaining_budget)
+                pre[rid] = alloc_here
+                mapping[idx] = alloc_here
+                remaining_budget -= alloc_here
+                if remaining_budget <= 0:
+                    break
+
+            if not pre and not decode_candidates:
+                return ControllerAction(token_budget=0, selected_request_ids=None), mapping
+
+            # Decode part (unchanged): 1 decode token per decode candidate
+            decode_base = {did: 1 for did in decode_candidates}
+            sel_set = set(pre.keys()) | set(decode_candidates)
+            sel = sorted(sel_set)
+            tot = sum(pre.values()) + len(decode_base)
+
+            action = ControllerAction(
+                token_budget=tot,
+                selected_request_ids=sel,
+                token_allocations={**pre, **decode_base},
+                prefill_allocations=pre,
+                decode_allocations=decode_base,
+            )
+            return action, mapping
+
+        def build_alloc_progressive(
+            ordered: List[int],
+            budget: int
+        ) -> Tuple[ControllerAction, List[int]]: 
+            L = len(self.controller_all_possible_prefill_budgets)
+            mapping: List[int] = [0] * L
+
+            if budget <= 0 or not ordered or L == 0:
+                return ControllerAction(token_budget=0, selected_request_ids=None), mapping
+
+            remaining = budget
+            pre: Dict[int, int] = {}
+
+            k = min(L, len(ordered))
+            for idx in range(k):
+                if remaining <= 0:
+                    break
+                rid = ordered[idx]
+                cap = remaining_prefill(request_lookup[rid])
+                if cap <= 0:
+                    continue
+
+                # For the first request use 50% of original budget, then 50% of remaining
+                half_base = budget if idx == 0 else remaining
+                half = ceil_to_step(half_base // 2)
+
+                # Desired allocation per your rule:
+                # max(min(50% base, prefill remaining), step), then clip to remaining budget
+                desired = max(
+                    step,
+                    min(half, cap),
+                )
+                alloc_here = min(desired, cap, remaining)
+
+                if alloc_here <= 0:
+                    continue
+
+                pre[rid] = alloc_here
+                mapping[idx] = alloc_here
+                remaining -= alloc_here
+
+            if not pre and not decode_candidates:
+                return ControllerAction(token_budget=0, selected_request_ids=None), mapping
+
+            decode_base = {did: 1 for did in decode_candidates}
+            sel_set = set(pre.keys()) | set(decode_candidates)
+            sel = sorted(sel_set)
+            tot = sum(pre.values()) + len(decode_base)
+
+            action = ControllerAction(
+                token_budget=tot,
+                selected_request_ids=sel,
+                token_allocations={**pre, **decode_base},
+                prefill_allocations=pre,
+                decode_allocations=decode_base,
+            )
+            return action, mapping
+        ##-----
         actions: List[ControllerAction] = []
-        for budget in token_budget_options:
-            selected_count = min(len(waiting_ids), self._cfg.max_branching)
-            if selected_count == 0:
-                continue
-            if selected_count >= len(waiting_ids):
-                selected = list(waiting_ids)
-            else:
-                selected = self._rng.sample(waiting_ids, selected_count) ## ?? : I Need to modfify this because at the moment this is selecting all requests 
-            selected.sort()
-            variants = self._generate_allocation_variants(request_lookup, budget, selected)
-            if not variants:
-                continue
-            # Respect overall branching cap to avoid producing an excessive number of actions.
-            remaining = max(0, self._cfg.max_branching - len(actions))
-            if remaining <= 0:
-                break
-            if len(variants) > remaining:
-                # Randomly sample to keep distribution similar without exceeding cap.
-                variants = self._rng.sample(variants, remaining)
-            actions.extend(variants)
 
-        actions = [act for act in actions if act.token_budget > 0]
-        if actions:
-            return actions
+        for heur_name, order_fn in heuristics:
+            ordered = order_fn(prefill_ids)
+            for b in self.controller_all_possible_prefill_budgets:
+                # Single allocation (“All Allocation”)
+                a1, l1 = build_alloc_single(ordered, b)
+                # Progressive allocation (“Max Allocation”)
+                a2, l2 = build_alloc_progressive(ordered, b)
+                m1 = tuple(l1)
+                m2 = tuple(l2)
+                a1.heuristic = heur_name
+                a1.strategy = "All Allocation"
+                a1.mapping = m1
 
-        fallback = self._build_minimal_controller_action(
-            request_lookup, waiting_ids, self._constraints.interval_request_size
-        )
-        if fallback is not None:
-            return [fallback]
-        return [ControllerAction(token_budget=0, selected_request_ids=None)]
+                a2.heuristic = heur_name
+                a2.strategy = "Max Allocation"
+                a2.mapping = m2
+
+
+                if use_state_cache:
+                    # print("Creating actual Action")
+                    mapping1 = tuple(l1)
+                    key1 = (mapping1, heur_name, "All Allocation")
+                    if key1 not in self.all_possible_Controller_States:
+                        self.all_possible_Controller_States[key1] = {
+                            "visits": 0,
+                            "objective_cost": 0.0,
+                            "ucb_score": 0.0,
+                            "slo_violations": 0,
+                            "avg_lateness": 0.0,
+                        }
+                    # else :
+                    #     print(f"KEY WAS FOUND IN THE STATE {(key1)}")
+                    state1 = self.all_possible_Controller_States[key1]
+                    if a1.token_budget > 0 and state1["sample_visits"] < VISIT_LIMIT:
+                        state1["sample_visits"] += 1
+                        actions.append(a1)
+
+                    mapping2 = tuple(l2)
+                    key2 = (mapping2, heur_name, "Max Allocation")
+                    if key2 not in self.all_possible_Controller_States:
+                        self.all_possible_Controller_States[key2] = {
+                            "visits": 0,
+                            "objective_cost": 0.0,
+                            "ucb_score": 0.0,
+                            "slo_violations": 0,
+                            "avg_lateness": 0.0,
+                        }
+                    # else :
+                    #     print(f"KEY WAS FOUND IN THE STATE {(key2)}")
+                    state2 = self.all_possible_Controller_States[key2]
+                    if a2.token_budget > 0 and state2["sample_visits"] < VISIT_LIMIT:
+                        state2["sample_visits"] += 1
+                        actions.append(a2)
+                else:
+                    # Rollout mode: ignore Controller_States and visit caps
+                    # print("Running Simulation!")
+                    if a1.token_budget > 0:
+                        actions.append(a1)
+                    if a2.token_budget > 0:
+                        actions.append(a2)
+                        
+        # Ensure we always return something
+        if not actions:
+            return [ControllerAction(token_budget=0, selected_request_ids=None)]
+        return actions
 
     def _max_request_tokens_allowed(self) -> int:
         if self._constraints.max_request_tokens is not None:
             return self._constraints.max_request_tokens
         return self._prefill_profile.max_tokens
 
-    def _generate_allocation_variants(
-        self,
-        request_lookup: Dict[int, Request],
-        token_budget: int,
-        selected_ids: List[int],
-    ) -> List[ControllerAction]:
-        # print("FOR SIMULATION : TOKEN BUDGET = ", token_budget , " SELECTED REQUESTS = ", selected_ids)
-        if token_budget <= 0 or not selected_ids:
-            return []
-
-        step = self._constraints.interval_request_size
-        prefill_caps: Dict[int, int] = {}
-        decode_candidates: List[int] = []
-
-        for rid in selected_ids:
-            req = request_lookup.get(rid)
-            if req is None:
-                continue
-
-            remaining_prefill = max(0, req.num_prefill_tokens - req.num_processed_prefill_tokens)
-            remaining_decode = max(0, req.num_decode_tokens - req.num_processed_decode_tokens)
-
-            # Avoid repeated getattr lookups per request.
-            prefill_done = getattr(req, "_is_prefill_complete", req.is_prefill_complete)
-            # print("Request with id : ", rid , " is done with the prefill status : ", prefill_done)
-            if remaining_prefill > 0 and not prefill_done:
-                prefill_caps[rid] = remaining_prefill
-                continue
-
-            if prefill_done and remaining_decode > 0:
-                decode_candidates.append(rid)
-                continue
-
-            if remaining_prefill > 0:
-                prefill_caps[rid] = remaining_prefill
-
-        if not prefill_caps and not decode_candidates:
-            return []
-
-        variants: List[ControllerAction] = []
-        num_variants = max(1, self._cfg.controller_budget_combs)
-
-        decode_alloc_base: Dict[int, int] = {
-            rid: 1 for rid in decode_candidates
-        }
-        decode_total = sum(decode_alloc_base.values())
-
-        total_prefill_capacity = sum(prefill_caps.values())
-        effective_prefill_budget = min(token_budget, total_prefill_capacity)
-
-        for _ in range(num_variants):
-            allocations: Dict[int, int] = {}
-            prefill_alloc: Dict[int, int] = {}
-
-            remaining_prefill = effective_prefill_budget
-            if prefill_caps and remaining_prefill > 0:
-                caps = dict(prefill_caps)
-                # Allocate full chunks first.
-                while (
-                    remaining_prefill >= step
-                    and any(cap >= step for cap in caps.values())
-                ):
-                    chunk_candidates = [rid for rid, cap in caps.items() if cap >= step]
-                    if not chunk_candidates:
-                        break
-                    rid = self._rng.choice(chunk_candidates)
-                    alloc_amount = min(step, caps[rid], remaining_prefill)
-                    if alloc_amount <= 0:
-                        break
-                    prefill_alloc[rid] = prefill_alloc.get(rid, 0) + alloc_amount
-                    caps[rid] -= alloc_amount
-                    remaining_prefill -= alloc_amount
-
-                # Allocate any remaining budget (less than a chunk) to a request that can accept it.
-                if remaining_prefill > 0:
-                    remainder_candidates = [
-                        rid for rid, cap in caps.items() if cap > 0
-                    ]
-                    if remainder_candidates:
-                        rid = self._rng.choice(remainder_candidates)
-                        alloc_amount = min(remaining_prefill, caps[rid])
-                        if alloc_amount > 0:
-                            prefill_alloc[rid] = prefill_alloc.get(rid, 0) + alloc_amount
-                            caps[rid] -= alloc_amount
-                            remaining_prefill -= alloc_amount
-
-            prefill_alloc = {
-                rid: tokens for rid, tokens in prefill_alloc.items() if tokens > 0
-            }
-
-            total_tokens = sum(prefill_alloc.values()) + decode_total
-            if total_tokens <= 0:
-                continue
-
-            allocations.update(prefill_alloc)
-            allocations.update(decode_alloc_base)
-            prioritized_ids = sorted(set(prefill_alloc.keys()) | set(decode_alloc_base.keys()))
-
-            variants.append(
-                ControllerAction(
-                    token_budget=total_tokens,
-                    selected_request_ids=prioritized_ids,
-                    token_allocations=allocations,
-                    prefill_allocations=prefill_alloc,
-                    decode_allocations=dict(decode_alloc_base),
-                )
-            )
-
-        if not variants:
-            fallback = self._build_minimal_controller_action(
-                request_lookup, selected_ids, token_budget
-            )
-            if fallback is not None:
-                variants.append(fallback)
-
-        return variants
-
-    def _build_minimal_controller_action(
-        self,
-        request_lookup: Dict[int, Request],
-        candidate_ids: Sequence[int],
-        token_budget: int,
-    ) -> Optional[ControllerAction]:
-        step = self._constraints.interval_request_size
-        for rid in candidate_ids:
-            req = request_lookup.get(rid)
-            if req is None:
-                continue
-
-            remaining_prefill = max(
-                0, req.num_prefill_tokens - req.num_processed_prefill_tokens
-            )
-            remaining_decode = max(
-                0, req.num_decode_tokens - req.num_processed_decode_tokens
-            )
-
-            prefill_done = getattr(req, "_is_prefill_complete", req.is_prefill_complete)
-
-            if remaining_prefill > 0 and not prefill_done:
-                alloc = step if remaining_prefill >= step else remaining_prefill
-                if alloc > 0:
-                    return ControllerAction(
-                        token_budget=alloc,
-                        selected_request_ids=[rid],
-                        token_allocations={rid: alloc},
-                        prefill_allocations={rid: alloc},
-                        decode_allocations={},
-                    )
-
-            if prefill_done and remaining_decode > 0:
-                return ControllerAction(
-                    token_budget=1,
-                    selected_request_ids=[rid],
-                    token_allocations={rid: 1},
-                    prefill_allocations={},
-                    decode_allocations={rid: 1},
-                )
-        return None
 
     # ------------------------------------------------------------------ #
     # Transition dynamics
@@ -401,9 +644,18 @@ class VidurMCTSEnvironment:
         When ``inplace`` is False (default), returns a forked state (safe for tree expansion).
         When ``inplace`` is True, mutates and returns ``state`` (intended for rollout trials).
         """
+        t0 = time.perf_counter()
         target_state = state if inplace else state.fork()
+        t1 = time.perf_counter()
         self._apply_adversary_action(target_state, action)
+        t2 = time.perf_counter()
         self._drain_arrivals(target_state.simulator)
+        t3 = time.perf_counter()
+        print(
+            f"[PROFILE] FORK phase={t1 - t0:.4f}s: "
+            f"APPLYING ADVERSARY ACTION={t2 - t1:.4f}s "
+            f"DRAIN ARRIVALS={t3 - t2:.4f}s"
+        )
         return target_state
 
     def apply_controller_action_only(
@@ -497,7 +749,7 @@ class VidurMCTSEnvironment:
         self, state: VidurMCTSState, action: AdversaryAction
     ) -> None:
         sim = state.simulator
-        time_now = sim._time ## ?? : Check how does this time functions in the simulator and whether it matches with our goal or not 
+        time_now = sim._time 
         for spec in action.requests: 
             req = Request(
                 arrived_at=time_now,
@@ -516,6 +768,16 @@ class VidurMCTSEnvironment:
             sim._add_event(RequestArrivalEvent(time_now, req))
             state.stats.requests_generated += 1
             state.stats.recent_arrivals.append(time_now)
+
+        # Optionally stop decode on selected requests
+        if action.stop_decode_ids:
+            request_lookup = self._build_request_lookup(state.simulator)
+            for rid in action.stop_decode_ids:
+                req = request_lookup.get(rid)
+                if req is None:
+                    continue
+                # Force decode completion at current processed length
+                req.num_decode_tokens = max(req.num_processed_decode_tokens, 0)
 
         # Maintain arrival history within 1 second window for QPS constraint
         window_start = time_now - 1.0
@@ -615,7 +877,8 @@ class VidurMCTSEnvironment:
     ]:
         scheduler_snapshot = self._snapshot_scheduler_budget_state(simulator)
 
-        request_lookup = self._build_request_lookup(simulator)
+        request_lookup = self._build_request_lookup(simulator)   
+        ## If no request in the system then no action
         if not request_lookup:
             action.token_allocations.clear()
             action.prefill_allocations.clear()
@@ -624,43 +887,35 @@ class VidurMCTSEnvironment:
 
         max_budget = self._max_feasible_budget(simulator)
         requested_budget = max(0, int(action.token_budget or 0))
+        ## If no token budget then no action 
         if requested_budget <= 0:
             action.token_allocations.clear()
             action.prefill_allocations.clear()
             action.decode_allocations.clear()
             return None, scheduler_snapshot, set(), {}
 
+        ## Replacing the token budget with minimum possible budget in the system if necessary
         token_budget = min(requested_budget, max_budget)
         action.token_budget = token_budget
 
         selected_ids = list(action.selected_request_ids or [])
         if not selected_ids:
             selected_ids = sorted(request_lookup.keys())
+
+        ## Ensuring the selected ids match with the ids in the system
         selected_ids = [rid for rid in selected_ids if rid in request_lookup]
         if not selected_ids:
             action.token_allocations.clear()
             action.prefill_allocations.clear()
             action.decode_allocations.clear()
             return None, scheduler_snapshot, set(), {}
+
         action.selected_request_ids = selected_ids
-
         allocations = dict(action.token_allocations)
-        if not allocations:
-            variants = self._generate_allocation_variants(
-                request_lookup, token_budget, selected_ids
-            )
-            if not variants:
-                action.token_allocations.clear()
-                action.prefill_allocations.clear()
-                action.decode_allocations.clear()
-                return None, scheduler_snapshot, set(), {}
-            chosen = variants[0]
-            action.token_budget = chosen.token_budget
-            token_budget = chosen.token_budget
-            action.token_allocations = allocations = dict(chosen.token_allocations)
-            action.prefill_allocations = dict(chosen.prefill_allocations)
-            action.decode_allocations = dict(chosen.decode_allocations)
 
+        ## If no allocations provided for all requests then no action aswell
+        if not allocations:
+            return None, scheduler_snapshot, set(), {}
         if not action.prefill_allocations:
             action.prefill_allocations = {}
         if not action.decode_allocations:
@@ -1039,25 +1294,6 @@ class VidurMCTSEnvironment:
             request_ids.extend(req.id for req in running)
         return sorted(set(request_ids))
 
-    def _sample_token_size(self, min_size: Optional[int] = None, max_size: Optional[int] = None) -> int:
-        step = self._constraints.interval_request_size
-        lo = max(step, min_size or self._constraints.min_request_tokens)
-        hi = min(self._constraints.max_request_tokens, max_size or self._constraints.max_request_tokens)
-        lo = max(step, step * ((lo + step - 1) // step))
-        hi = max(lo, step * (hi // step))
-        if hi < lo:
-            hi = lo
-        return self._rng.randrange(lo, hi + 1, step)
-
-    def _enumerate_token_budgets(self, state: VidurMCTSState) -> List[int]:
-        max_budget = self._max_feasible_budget(state.simulator)
-        step = self._constraints.interval_request_size
-        budgets = list(range(step, max_budget + 1, step))
-        if len(budgets) > self._cfg.max_branching:
-            budgets = self._rng.sample(budgets, self._cfg.max_branching)
-        return sorted(budgets)
-
-
     ## ?? What about the decode lengths of both waiting requests ? every included/scheduled request in the budget has the token budget of 1 
     def _max_feasible_budget(self, simulator: Simulator) -> int:
         total_tokens = 0
@@ -1080,3 +1316,166 @@ class VidurMCTSEnvironment:
         cache_config = simulator._config.cluster_config.cache_config
         cache_tokens = cache_config.block_size * (cache_config.num_blocks or 1)
         return min(total_tokens, cache_tokens)
+
+
+    def _populate_Prefill_Reqs_Table(self) -> None:
+        
+        ## Populates the adversary requests options (that are order agnostic) depending on Min and Max request length of prefill sizes and request interval step size. 
+
+        function_path: str = "enviorment.py function _populate_prefill_reqs_table()"
+
+        ## Step 1 : Getting the neccesary variables for combos :
+        step = int(self._constraints.interval_request_size)
+        min_tok_limit = max(step, int(self._constraints.min_request_tokens))
+        max_tok_limit = int(self._max_request_tokens_allowed())
+        qps = int(self._constraints.maximum_qps or 0)
+
+        assert qps > 0 , f" Invalid QPS : {qps} passed to {function_path}. Must be greater than 0"
+        assert step > 0, f" Invalid STEP : {step} passed to {function_path}. Must be greater than 0"
+
+        # Step 2 : Normalising limits to multiple of the Step Size :
+        lo = ((min_tok_limit + step - 1) // step ) * step ## Ceiling applied 
+        hi = (max_tok_limit // step) * step ## Flooring applied 
+
+        assert hi >= lo , f" Maximum Request Size {max_tok_limit} has been passed as smaller size than smaller {min_tok_limit} in {function_path}"
+
+        # Step 3 : Possible Size options :
+        size_options = list(range(lo , hi + 1, step)) # produces [step , 2xstep , .... hi x step]
+        
+        # Step 4 : Generate Combos :
+        temp_table: Dict[int, List[int]] = {}
+        idx = 0 
+        for combo in combinations_with_replacement(size_options, qps):
+            temp_table[idx] = list(combo) ;  idx += 1 
+
+        self.all_possible_Prefill_reqs_table = temp_table    
+
+
+    ## THESE FUNCTIONS ARE TO PRE-COMPUTE NECESSARY STATES :
+    def _generate_prefill_sequences_with_budget(
+        self, token_budget: int
+    ) -> List[List[int]]:
+        vals = list(self.controller_all_possible_prefill_budgets or [])
+        L = len(vals)
+        result: List[List[int]] = []
+        current: List[int] = []
+
+        def backtrack(pos: int, remaining: int) -> None:
+            if pos == L:
+                if current:
+                    result.append(current.copy())
+                return
+            if current:
+                seq = current + [0] * (L - pos)
+                result.append(seq)
+            if remaining <= 0:
+                return
+            for v in vals:
+                if v <= remaining:
+                    current.append(v)
+                    backtrack(pos + 1, remaining - v)
+                    current.pop()
+
+        backtrack(0, token_budget)
+        return result
+
+    def precompute_controller_state_space(self, token_budget: int) -> None:
+        if self.all_possible_Controller_States:
+            return
+
+        # ensure budgets list is filled (same logic you already use)
+        if self.controller_all_possible_prefill_budgets is None:
+            self.controller_all_possible_prefill_budgets = []
+            step = self._constraints.interval_request_size
+            min_tok = max(step, self._constraints.min_request_tokens)
+            max_tok = self._max_request_tokens_allowed()
+            lo = (min_tok + step - 1) // step
+            hi = max_tok // step
+            for i in range(lo, hi + 1):
+                self.controller_all_possible_prefill_budgets.append(i * step)
+
+        mappings = self._generate_prefill_sequences_with_budget(token_budget)
+        heuristic_names = ["SJF", "EDF", "LST", "Slowdown"]
+        strategies = ["All Allocation", "Max Allocation"]
+
+        for m in mappings:
+            mt = tuple(m)
+            for h in heuristic_names:
+                for s in strategies:
+                    key = (mt, h, s)
+                    if key not in self.all_possible_Controller_States:
+                        self.all_possible_Controller_States[key] = {
+                            "sample_visits": 0,
+                            "mcts_visits": 0,
+                            "cumulative_cost": 0.0,
+                            "mean_cost": 0.0,
+                            "cumulative_delta_cost": 0.0,
+                            "mean_delta_cost": 0.0,
+                            "last_cost": 0.0,
+                            "last_delta_cost": 0.0,
+                            "last_slo_violations": 0,
+                            "last_avg_lateness": 0.0,
+                            "total_decode_tokens": 0,
+                            "last_decode_tokens": 0,
+                        }
+
+
+    def controller_states_fully_visited(self) -> bool:
+        if not self.all_possible_Controller_States:
+            return False
+        return all(
+            s.get("sample_visits", 0) >= 1
+            for s in self.all_possible_Controller_States.values()
+        )
+
+
+    def update_controller_state_metrics(
+        self,
+        action: ControllerAction,
+        total_cost: float,
+        delta_cost: float,
+        slo_violations: int,
+        avg_lateness: float,
+    ) -> None:
+        if action.mapping is None or not action.heuristic or not action.strategy:
+            return
+        key = (tuple(action.mapping), action.heuristic, action.strategy)
+        state = self.all_possible_Controller_States.get(key)
+        if state is None:
+            state = {
+                "sample_visits": 0,
+                "mcts_visits": 0,
+                "cumulative_cost": 0.0,
+                "mean_cost": 0.0,
+                "cumulative_delta_cost": 0.0,
+                "mean_delta_cost": 0.0,
+                "last_cost": 0.0,
+                "last_delta_cost": 0.0,
+                "last_slo_violations": 0,
+                "last_avg_lateness": 0.0,
+                "total_decode_tokens": 0,
+                "last_decode_tokens": 0,
+            }
+            self.all_possible_Controller_States[key] = state
+
+        # Absolute cost stats for this state
+        state["mcts_visits"] += 1
+        state["cumulative_cost"] += total_cost
+        state["mean_cost"] = state["cumulative_cost"] / max(1, state["mcts_visits"])
+        state["last_cost"] = total_cost
+
+        # Incremental cost stats (this decision only)
+        state["cumulative_delta_cost"] += delta_cost
+        state["mean_delta_cost"] = state["cumulative_delta_cost"] / max(1, state["mcts_visits"])
+        state["last_delta_cost"] = delta_cost
+
+        # SLO info
+        state["last_slo_violations"] = slo_violations
+        state["last_avg_lateness"] = avg_lateness
+
+        # Decode tokens allocated by this controller decision
+        decode_tokens = sum(action.decode_allocations.values())
+        state["total_decode_tokens"] += decode_tokens
+        state["last_decode_tokens"] = decode_tokens
+
+

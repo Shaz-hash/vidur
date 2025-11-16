@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Tuple  # add Tuple
 
 import numpy as np
 import wandb
-
+import time
 from vidur.config import SimulationConfig
 from vidur.entities import Cluster
 from vidur.entities.batch import Batch
@@ -408,13 +408,22 @@ class Simulator:
 
 
     def fork(self) -> "Simulator":
+        t0 = time.perf_counter()
         snapshot = self.snapshot_state()
+        t1 = time.perf_counter()
         forked = Simulator(
             self._config,
             register_atexit=False,
             execution_time_predictor=self._execution_time_predictor,
         )
+        t2 = time.perf_counter()
         forked.restore_state(snapshot)
+        t3 = time.perf_counter()
+        print(
+            f"[PROFILE] SIMULATOR RESULTS : "
+            f"Snap_shot={t1 - t0:.4f}s, FORK={t2 - t1:.4f}s, "
+            f"RESTORE={t3 - t2:.4f}s"
+        )
         return forked
 
     def _snapshot_event(

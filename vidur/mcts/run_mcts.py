@@ -8,9 +8,12 @@ from typing import Iterable, Optional, Sequence
 from vidur.config import SimulationConfig
 from vidur.simulator import Simulator
 
-from .config import MCTSConstraintConfig, MCTSExploreConfig, RequestSLOOptions
+from .launch_mcts_job import MCTSConstraintConfig, MCTSExploreConfig, RequestSLOOptions
 from .environment import VidurMCTSEnvironment
 from .mcts import VidurMCTS
+
+import csv
+import math
 
 
 def _parse_sequence(values: Optional[Sequence[float]], fallback: Sequence[float]) -> Sequence[float]:
@@ -34,7 +37,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mcts_maximum_qps", type=int, default=12)
     parser.add_argument("--mcts_interval_request_size", type=int, default=512)
     parser.add_argument("--mcts_min_request_tokens", type=int, default=512)
-    parser.add_argument("--mcts_max_request_tokens", type=int, default=None)
+    parser.add_argument("--mcts_max_request_tokens", type=int, default=3072)
     parser.add_argument("--mcts_prefill_profile", type=str, default=None)
     parser.add_argument("--mcts_prefill_slowdown", type=float, default=1.0)
     parser.add_argument("--mcts_simulation_depth", type=int, default=4)
@@ -56,6 +59,13 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override adversary SLO catalogue for decode stage.",
     )
+    parser.add_argument(
+        "--mcts_tree_csv",
+        type=str,
+        default=None,
+        help="Optional CSV capturing tree nodes with controller actions.",
+    )
+
     return parser
 
 
@@ -66,7 +76,6 @@ def configure_simulation(sim_args: Iterable[str]) -> SimulationConfig:
         cfg = SimulationConfig.create_from_cli_args()
     finally:
         sys.argv = original_argv
-
     cfg.metrics_config.write_metrics = False
     cfg.metrics_config.enable_chrome_trace = False
     cfg.metrics_config.write_json_trace = False
@@ -77,7 +86,7 @@ def configure_simulation(sim_args: Iterable[str]) -> SimulationConfig:
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     parser = build_argument_parser()
-    args, remaining = parser.parse_known_args(argv)
+    args, remaining = parser.parse_known_args(argv) ## Divides all the arguments into MCTS related config and Simulation related Config
 
     sim_cfg = configure_simulation(remaining)
     simulator = Simulator(sim_cfg, register_atexit=False)
@@ -109,19 +118,73 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     log_path = Path(args.mcts_log_csv)
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
+    if args.mcts_tree_csv:
+        tree_path = Path(args.mcts_tree_csv)
+    else:
+        tree_path = log_path.with_name(log_path.stem + "_tree.csv")
+
     env = VidurMCTSEnvironment(
         base_simulator=simulator,
         constraints=constraints,
         explore_cfg=explore_cfg,
     )
-    mcts = VidurMCTS(env, explore_cfg, log_path=log_path)
+    mcts = VidurMCTS(env, explore_cfg, log_path=log_path, tree_log_path=tree_path)
     best_action = mcts.search(args.mcts_iterations)
+
+    root_visits = mcts._root.visits  # or via a getter if you add one
+    state_csv_path = log_path.with_name(log_path.stem + "_controller_states.csv")
+    write_controller_state_summary(env, explore_cfg, root_visits, state_csv_path)
 
     print("Best controller action discovered:")
     print(f"  token_budget={best_action.token_budget}")
     print(f"  selected_request_ids={best_action.selected_request_ids}")
     print(f"  token_allocations={best_action.token_allocations}")
     print(f"Log written to: {log_path.resolve()}")
+
+
+def write_controller_state_summary(env, explore_cfg, root_visits: int, path: Path) -> None:
+    data = env.all_possible_Controller_States
+    if not data:
+        return
+
+    fields = [
+        "mapping",
+        "heuristic",
+        "strategy",
+        "sample_visits",
+        "mcts_visits",
+        "mean_cost",
+        "cumulative_cost",
+        "last_slo_violations",
+        "last_avg_lateness",
+        "ucb_score",
+    ]
+
+    c = explore_cfg.exploration_constant
+
+    with path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for (mapping, heuristic, strategy), stats in data.items():
+            n = max(1, stats.get("mcts_visits", 0))
+            mean_cost = stats.get("mean_cost", 0.0)
+            exploit = -mean_cost
+            explore_term = c * math.sqrt(math.log(max(1, root_visits)) / n)
+            ucb = exploit + explore_term
+
+            w.writerow({
+                "mapping": list(mapping),
+                "heuristic": heuristic,
+                "strategy": strategy,
+                "sample_visits": stats.get("sample_visits", 0),
+                "mcts_visits": stats.get("mcts_visits", 0),
+                "mean_cost": mean_cost,
+                "cumulative_cost": stats.get("cumulative_cost", 0.0),
+                "last_slo_violations": stats.get("last_slo_violations", 0),
+                "last_avg_lateness": stats.get("last_avg_lateness", 0.0),
+                "ucb_score": ucb,
+            })
+
 
 
 if __name__ == "__main__":

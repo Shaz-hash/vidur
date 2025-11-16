@@ -8,7 +8,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-from .config import MCTSExploreConfig
+import time ## Just to test the performance 
+
+from .launch_mcts_job import MCTSExploreConfig
 from .environment import (
     AdversaryAction,
     ControllerAction,
@@ -47,6 +49,8 @@ class _MCTSLogger:
         "controller_decode_allocations",
         "controller_prefill_total",
         "controller_decode_total",
+        "controller_heuristic",         # NEW
+        "controller_strategy",          # NEW
     ]
 
     def __init__(
@@ -91,6 +95,16 @@ class _MCTSLogger:
             self._file = self._path.open("w", newline="")
             self._writer = csv.DictWriter(self._file, fieldnames=self._FIELDS)
             self._writer.writeheader()
+        ctrl_heuristic = (
+            controller_action.heuristic
+            if controller_action is not None and getattr(controller_action, "heuristic", None) is not None
+            else ""
+        )
+        ctrl_strategy = (
+            controller_action.strategy
+            if controller_action is not None and getattr(controller_action, "strategy", None) is not None
+            else ""
+        )
 
         row = {
             "iteration": iteration,
@@ -191,6 +205,69 @@ class _MCTSLogger:
             self._file = None
 
 
+class _MCTSTreeLogger:
+    """CSV logger for tree-only rows, with heuristic/strategy columns."""
+
+    _FIELDS = [
+        "iteration",
+        "phase",
+        "depth",
+        "parent_node_id",
+        "node_id",
+        "player_to_act",
+        "next_player",
+        "sim_time",
+        "requests_in_system",
+        "requests_generated",
+        "requests_completed",
+        "slo_violations",
+        "avg_lateness",
+        "objective_cost",
+        "state_waiting_ids",
+        "state_completed_request_ids",
+        "adversary_requests",
+        "adversary_prefill_slos",
+        "adversary_decode_slos",
+        "controller_token_budget",
+        "controller_selected_ids",
+        "controller_allocations",
+        "controller_prefill_allocations",
+        "controller_decode_allocations",
+        "controller_prefill_total",
+        "controller_decode_total",
+        "controller_heuristic",    # extra
+        "controller_strategy",     # extra
+    ]
+
+    def __init__(self, path: Optional[Union[str, Path]], flush_every: int = 1) -> None:
+        self._path = Path(path) if path else None
+        self._writer: Optional[csv.DictWriter] = None
+        self._file = None
+        self._flush_every = max(0, int(flush_every))
+        self._row_count = 0
+
+    def write_row(self, row: Dict[str, Any]) -> None:
+        if not self._path:
+            return
+        if self._writer is None:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._file = self._path.open("w", newline="")
+            self._writer = csv.DictWriter(self._file, fieldnames=self._FIELDS)
+            self._writer.writeheader()
+        self._writer.writerow(row)
+        self._row_count += 1
+        if self._flush_every == 1 or (
+            self._flush_every > 1 and (self._row_count % self._flush_every == 0)
+        ):
+            self._file.flush()
+
+    def close(self) -> None:
+        if self._file is not None:
+            self._file.close()
+            self._file = None
+
+
+
 def _compute_objective_cost(violations: int, avg_lateness: float) -> float:
     return violations + avg_lateness
 
@@ -227,6 +304,7 @@ class VidurMCTS:
         explore_cfg: MCTSExploreConfig,
         rng: Optional[random.Random] = None,
         log_path: Optional[Union[str, Path]] = None,
+        tree_log_path: Optional[Union[str, Path]] = None,   # NEW
         *,
         log_rollouts: bool = True,
         logger_flush_every: int = 1,
@@ -242,9 +320,22 @@ class VidurMCTS:
         self._current_iteration = 0
         self._verbose = verbose
 
+        self._root: Optional[MCTSNode] = None
+        
+        # Derive default tree path if not provided explicitly
+        if tree_log_path is None and log_path:
+            base = Path(log_path)
+            tree_log_path = base.with_name(base.stem + "_tree" + base.suffix)
+
+        self._tree_logger = _MCTSTreeLogger(tree_log_path, flush_every=logger_flush_every)
+        ## Pre Computing the necessary states here 
+        max_budget = self._env._max_request_tokens_allowed()
+        self._env.precompute_controller_state_space(token_budget=max_budget)
+
     def search(self, iterations: int) -> ControllerAction:
         root = self._create_root()
         try:
+            self._root = root
             root_cost = self._log_state(
                 iteration=0,
                 phase="root",
@@ -256,18 +347,23 @@ class VidurMCTS:
             )
             root.cumulative_cost = root_cost
             for itr in range(iterations):
+                # EARLY EXIT: all controller states visited at least once
+                if self._env.controller_states_fully_visited():
+                    if self._verbose:
+                        print("Stopping MCTS: all controller states visited >= 1")
+                    break
+
                 self._current_iteration = itr + 1
                 node = self._select(root)
                 expanded = self._expand(node)
                 leaf = expanded or node
                 cost = self._simulate(leaf)
+
                 self._backpropagate(leaf, cost)
         finally:
             self._logger.close()
+            self._tree_logger.close()
 
-        # TODO: reinstate policy extraction (best-action selection) once we export
-        # the decision tree. For now return a placeholder action so callers can
-        # inspect the logged tree instead of a single suggestion.
         return ControllerAction(
             token_budget=self._env._constraints.interval_request_size
         )
@@ -293,15 +389,21 @@ class VidurMCTS:
         return node
 
     def _expand(self, node: MCTSNode) -> Optional[MCTSNode]:
+        t0 = time.perf_counter()
         if not node.untried_actions:
             return None
         action = node.untried_actions.pop()
         if node.player == "adversary":
             child_state = self._env.apply_adversary_action_only(node.state, action)
             next_player = "controller"
+            t1 = time.perf_counter()
+            # print(f"[PROFILE] apply_adversary_actions: {t1 - t0:.4f}s")
         else:
+            # print(f"SAMPLE APPLIED ON THE NODE : {node.node_id} : State_{node.state} : Node.Player = {node.player} , Player Applies the aciton = {action}")
             child_state = self._env.apply_controller_action_only(node.state, action)
             next_player = "adversary"
+            t1 = time.perf_counter()
+            # print(f"[PROFILE] apply_controller_actions: {t1 - t0:.4f}s")
         child = MCTSNode(
             state=child_state,
             player=next_player,
@@ -321,6 +423,8 @@ class VidurMCTS:
             next_player=child.player,
             action=action,
         )
+        t2 = time.perf_counter()
+        #print(f" Expansion time : {t2 - t0:.4f}s")
         return child
 
     def _simulate(self, node: MCTSNode) -> float:
@@ -348,7 +452,7 @@ class VidurMCTS:
                             )
                     else:
                         candidates = self._env.sample_controller_actions(
-                            rollout_state, self._cfg.max_branching
+                            rollout_state, self._cfg.max_branching, False
                         )
                         if not candidates:
                             action = None
@@ -404,16 +508,26 @@ class VidurMCTS:
     def _enumerate_actions(
         self, node: MCTSNode
     ) -> List[Union[AdversaryAction, ControllerAction]]:
+        t0 = time.perf_counter()
         if node.player == "adversary":
+            t1 = time.perf_counter()
             actions = self._env.sample_adversary_actions(
                 node.state, self._cfg.max_branching
             )
+            t2 = time.perf_counter()
+            #print(f"[PROFILE] sample_adversary_actions: {t2 - t1:.4f}s")
         else:
+            t1 = time.perf_counter()
             actions = self._env.sample_controller_actions(
                 node.state, self._cfg.max_branching
             )
+            t2 = time.perf_counter()
+            #print(f"[PROFILE] sample_controller_actions: {t2 - t1:.4f}s")
         self._rng.shuffle(actions)
+        t3 = time.perf_counter()
+        #print(f"[PROFILE] _enumerate_actions total ({node.player}): {t3 - t0:.4f}s")
         return actions
+
 
     def _best_child(self, node: MCTSNode) -> MCTSNode:
         best_score = -float("inf")
@@ -460,7 +574,9 @@ class VidurMCTS:
             acting_player = node.parent.player if node.parent else acting_player
             next_player = node.player
         assert state is not None
+        t0 = time.perf_counter()
         snapshot = self._env.describe_state(state)
+        t1 = time.perf_counter()
         violations = snapshot["slo_violations"]
         avg_lateness = snapshot["avg_lateness"]
         cost = _compute_objective_cost(violations, avg_lateness)
@@ -482,6 +598,48 @@ class VidurMCTS:
             controller_action=controller_action,
             objective_cost=cost,
         )
+        t2 = time.perf_counter()
+        # New: tree-only CSV (no rollouts)
+        if phase in ("root", "tree") and self._tree_logger is not None:
+            row = self._make_log_row(
+                iteration=iteration,
+                phase=phase,
+                parent_id=parent_id,
+                node_id=node_id or "root",
+                acting_player=player_label,
+                next_player=next_label,
+                depth=depth_value,
+                state=state,
+                action=action,
+            )
+            self._tree_logger.write_row(row)
+        t3 = time.perf_counter()
+        # print(
+        #     f"[PROFILE] log_state phase={phase}: "
+        #     f"describe_state Snap_shot={t1 - t0:.4f}s, main_log={t2 - t1:.4f}s, "
+        #     f"tree_log={t3 - t2:.4f}s"
+        # )
+        # New: per-controller-state metrics with delta cost
+        if isinstance(controller_action, ControllerAction) and phase in ("root", "tree"):
+            # Compute parent cost if there is a parent node
+            if node is not None and node.parent is not None:
+                parent_snapshot = self._env.describe_state(node.parent.state)
+                parent_cost = _compute_objective_cost(
+                    parent_snapshot["slo_violations"],
+                    parent_snapshot["avg_lateness"],
+                )
+            else:
+                parent_cost = 0.0  # treat root as baseline
+            delta_cost = cost - parent_cost
+
+            self._env.update_controller_state_metrics(
+                controller_action,
+                cost,
+                delta_cost,
+                violations,
+                avg_lateness,
+            )
+
         return cost
 
     def _make_log_row(
@@ -507,6 +665,13 @@ class VidurMCTS:
         player_label = acting_player or ""
         next_label = next_player or player_label
         depth_value = depth if depth is not None else 0.0
+        if isinstance(controller_action, ControllerAction):
+            ctrl_heuristic = controller_action.heuristic or ""
+            ctrl_strategy = controller_action.strategy or ""
+        else:
+            ctrl_heuristic = ""
+            ctrl_strategy = ""
+        
         row = {
             "iteration": iteration,
             "phase": phase,
@@ -546,6 +711,8 @@ class VidurMCTS:
             "controller_decode_allocations": json.dumps(action.decode_allocations) if isinstance(action, ControllerAction) else json.dumps({}),
             "controller_prefill_total": sum(action.prefill_allocations.values()) if isinstance(action, ControllerAction) else 0,
             "controller_decode_total": sum(action.decode_allocations.values()) if isinstance(action, ControllerAction) else 0,
+            "controller_heuristic": ctrl_heuristic, 
+            "controller_strategy": ctrl_strategy,     
         }
         return row
 
@@ -553,3 +720,4 @@ class VidurMCTS:
         node_id = self._node_counter
         self._node_counter += 1
         return node_id
+
