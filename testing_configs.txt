@@ -160,3 +160,31 @@ python3 -m vidur.mcts.verify_trace --csv simulator_output/test_mcts_trace.csv
 Launching the job :
 
 python3 -m vidur.mcts.launch_mcts_job
+
+
+
+
+Memory Test :
+python -m vidur.mcts.profile_sim_memory \
+  --replica_config_model_name meta-llama/Meta-Llama-3-8B \
+  --replica_config_device a100 \
+  --replica_config_network_device a100_dgx \
+  --cluster_config_num_replicas 1 \
+  --replica_config_tensor_parallel_size 1 \
+  --replica_config_num_pipeline_stages 1 \
+  --global_scheduler_config_type round_robin \
+  --replica_scheduler_config_type vllm_v1
+
+
+
+
+Suggestion
+i have an idea that might help us 
+We know for sure that the multiple nodes containing the simulator states are creating an issue for us 
+and we know that the rollout speed of lets say depth 10 signifianctly faster (1000 to 100x) than forking of a node.
+
+Using this as a guide 
+when trying a particular node's action in an iteration after the right selection in MCTS , we can just copy/snapshot the root node
+run that trace of MCTS all the way to that node which has been selected by applying the same actions recorded in the MCTS from the root node of both players till we reach that node that has been selected, perform the action etc suggested by MCTS and rollout like we do after the log has been stored as before, go back to the root simulator node and delete this forked node. This way we can have just at any given time 2 simulator nodes atmost while achieving the same speed and 100 to 1000x less memory. 
+
+So can you tell me that what changes needs to be done here without affecting the correctness ?

@@ -1,0 +1,1202 @@
+INFO 11-17 12:26:23 sklearn_execution_time_predictor.py:709] Getting predictions for compute operations
+INFO 11-17 12:26:23 sklearn_execution_time_predictor.py:709] Getting predictions for compute operations
+INFO 11-17 12:26:23 sklearn_execution_time_predictor.py:709] Getting predictions for compute operations
+INFO 11-17 12:26:23 sklearn_execution_time_predictor.py:709] Getting predictions for compute operations
+INFO 11-17 12:26:23 sklearn_execution_time_predictor.py:709] Getting predictions for compute operations
+INFO 11-17 12:26:23 sklearn_execution_time_predictor.py:709] Getting predictions for compute operations
+INFO 11-17 12:26:23 sklearn_execution_time_predictor.py:709] Getting predictions for compute operations
+INFO 11-17 12:26:23 sklearn_execution_time_predictor.py:709] Getting predictions for compute operations
+INFO 11-17 12:26:23 sklearn_execution_time_predictor.py:709] Getting predictions for compute operations
+INFO 11-17 12:26:23 sklearn_execution_time_predictor.py:709] Getting predictions for compute operations
+INFO 11-17 12:26:23 sklearn_execution_time_predictor.py:709] Getting predictions for compute operations
+INFO 11-17 12:26:23 sklearn_execution_time_predictor.py:709] Getting predictions for compute operations
+INFO 11-17 12:26:23 sklearn_execution_time_predictor.py:709] Getting predictions for compute operations
+INFO 11-17 12:26:23 sklearn_execution_time_predictor.py:709] Getting predictions for compute operations
+INFO 11-17 12:26:23 sklearn_execution_time_predictor.py:709] Getting predictions for compute operations
+INFO 11-17 12:26:24 sklearn_execution_time_predictor.py:767] Getting predictions for attention operations
+INFO 11-17 12:26:24 sklearn_execution_time_predictor.py:767] Getting predictions for attention operations
+INFO 11-17 12:26:24 sklearn_execution_time_predictor.py:767] Getting predictions for attention operations
+INFO 11-17 12:26:24 sklearn_execution_time_predictor.py:767] Getting predictions for attention operations
+INFO 11-17 12:26:24 sklearn_execution_time_predictor.py:767] Getting predictions for attention operations
+INFO 11-17 12:26:24 sklearn_execution_time_predictor.py:767] Getting predictions for attention operations
+INFO 11-17 12:26:24 sklearn_execution_time_predictor.py:767] Getting predictions for attention operations
+INFO 11-17 12:26:24 sklearn_execution_time_predictor.py:767] Getting predictions for attention operations
+INFO 11-17 12:26:24 sklearn_execution_time_predictor.py:767] Getting predictions for attention operations
+INFO 11-17 12:26:24 sklearn_execution_time_predictor.py:767] Getting predictions for attention operations
+INFO 11-17 12:26:24 sklearn_execution_time_predictor.py:767] Getting predictions for attention operations
+INFO 11-17 12:26:24 sklearn_execution_time_predictor.py:767] Getting predictions for attention operations
+INFO 11-17 12:26:24 sklearn_execution_time_predictor.py:767] Getting predictions for attention operations
+INFO 11-17 12:26:24 sklearn_execution_time_predictor.py:767] Getting predictions for attention operations
+INFO 11-17 12:26:24 sklearn_execution_time_predictor.py:767] Getting predictions for attention operations
+Traceback (most recent call last):
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/run_mcts.py", line 241, in <module>
+    main()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/run_mcts.py", line 182, in main
+    best_action = mcts.search(args.mcts_iterations)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/mcts.py", line 432, in search
+    cost = self._simulate(leaf)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/mcts.py", line 538, in _simulate
+    rollout_state = node.state.fork()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/environment.py", line 110, in fork
+    return VidurMCTSState(self.simulator.fork(), self.stats.clone())
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/simulator.py", line 412, in fork
+    snapshot = self.snapshot_state()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/simulator.py", line 251, in snapshot_state
+    scheduler_snapshot = clone_mutable(self._scheduler.snapshot_state())
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/scheduler/global_scheduler/base_global_scheduler.py", line 200, in snapshot_state
+    rsnap = replica_scheduler.snapshot_state()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/scheduler/replica_scheduler/vllm_v1_replica_scheduler.py", line 538, in snapshot_state
+    kv_cache_state=self._kv_cache_manager.snapshot_state(),
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/kv_cache/replica_kv_cache_manager.py", line 296, in snapshot_state
+    return ReplicaKVCacheManagerSnapshot(**to_primitive_tree(asdict(snap)))
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/utils/snapshot_utils.py", line 59, in to_primitive_tree
+    out[k] = to_primitive_tree(v, allow_sets=allow_sets)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/utils/snapshot_utils.py", line 59, in to_primitive_tree
+    out[k] = to_primitive_tree(v, allow_sets=allow_sets)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/utils/snapshot_utils.py", line 63, in to_primitive_tree
+    return [to_primitive_tree(v, allow_sets=allow_sets) for v in x]
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/utils/snapshot_utils.py", line 63, in <listcomp>
+    return [to_primitive_tree(v, allow_sets=allow_sets) for v in x]
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/utils/snapshot_utils.py", line 59, in to_primitive_tree
+    out[k] = to_primitive_tree(v, allow_sets=allow_sets)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/utils/snapshot_utils.py", line 44, in to_primitive_tree
+    def to_primitive_tree(x: Any, *, allow_sets: bool = True) -> Any:
+KeyboardInterrupt
+Traceback (most recent call last):
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/run_mcts.py", line 241, in <module>
+    main()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/run_mcts.py", line 182, in main
+    best_action = mcts.search(args.mcts_iterations)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/mcts.py", line 430, in search
+    expanded = self._expand(node)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/mcts.py", line 483, in _expand
+    child_state = self._env.apply_controller_action_only(node.state, action)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/environment.py", line 694, in apply_controller_action_only
+    new_state = state if inplace else state.fork()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/environment.py", line 110, in fork
+    return VidurMCTSState(self.simulator.fork(), self.stats.clone())
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/simulator.py", line 412, in fork
+    snapshot = self.snapshot_state()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/simulator.py", line 251, in snapshot_state
+    scheduler_snapshot = clone_mutable(self._scheduler.snapshot_state())
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/scheduler/global_scheduler/base_global_scheduler.py", line 200, in snapshot_state
+    rsnap = replica_scheduler.snapshot_state()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/scheduler/replica_scheduler/vllm_v1_replica_scheduler.py", line 538, in snapshot_state
+    kv_cache_state=self._kv_cache_manager.snapshot_state(),
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/kv_cache/replica_kv_cache_manager.py", line 289, in snapshot_state
+    block_pool=to_primitive_tree(asdict(bp)),
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/utils/snapshot_utils.py", line 59, in to_primitive_tree
+    out[k] = to_primitive_tree(v, allow_sets=allow_sets)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/utils/snapshot_utils.py", line 63, in to_primitive_tree
+    return [to_primitive_tree(v, allow_sets=allow_sets) for v in x]
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/utils/snapshot_utils.py", line 63, in <listcomp>
+    return [to_primitive_tree(v, allow_sets=allow_sets) for v in x]
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/utils/snapshot_utils.py", line 57, in to_primitive_tree
+    if not isinstance(k, (str, int)):
+KeyboardInterrupt
+Traceback (most recent call last):
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/run_mcts.py", line 241, in <module>
+    main()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/run_mcts.py", line 182, in main
+    best_action = mcts.search(args.mcts_iterations)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/mcts.py", line 430, in search
+    expanded = self._expand(node)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/mcts.py", line 483, in _expand
+    child_state = self._env.apply_controller_action_only(node.state, action)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/environment.py", line 694, in apply_controller_action_only
+    new_state = state if inplace else state.fork()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/environment.py", line 110, in fork
+    return VidurMCTSState(self.simulator.fork(), self.stats.clone())
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/simulator.py", line 412, in fork
+    snapshot = self.snapshot_state()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/simulator.py", line 251, in snapshot_state
+    scheduler_snapshot = clone_mutable(self._scheduler.snapshot_state())
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/scheduler/global_scheduler/base_global_scheduler.py", line 200, in snapshot_state
+    rsnap = replica_scheduler.snapshot_state()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/scheduler/replica_scheduler/vllm_v1_replica_scheduler.py", line 538, in snapshot_state
+    kv_cache_state=self._kv_cache_manager.snapshot_state(),
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/kv_cache/replica_kv_cache_manager.py", line 296, in snapshot_state
+    return ReplicaKVCacheManagerSnapshot(**to_primitive_tree(asdict(snap)))
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/utils/snapshot_utils.py", line 59, in to_primitive_tree
+    out[k] = to_primitive_tree(v, allow_sets=allow_sets)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/utils/snapshot_utils.py", line 59, in to_primitive_tree
+    out[k] = to_primitive_tree(v, allow_sets=allow_sets)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/utils/snapshot_utils.py", line 63, in to_primitive_tree
+    return [to_primitive_tree(v, allow_sets=allow_sets) for v in x]
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/utils/snapshot_utils.py", line 63, in <listcomp>
+    return [to_primitive_tree(v, allow_sets=allow_sets) for v in x]
+KeyboardInterrupt
+Traceback (most recent call last):
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/run_mcts.py", line 241, in <module>
+    main()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/run_mcts.py", line 182, in main
+    best_action = mcts.search(args.mcts_iterations)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/mcts.py", line 432, in search
+    cost = self._simulate(leaf)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/mcts.py", line 538, in _simulate
+    rollout_state = node.state.fork()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/environment.py", line 110, in fork
+    return VidurMCTSState(self.simulator.fork(), self.stats.clone())
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/simulator.py", line 412, in fork
+    snapshot = self.snapshot_state()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/simulator.py", line 251, in snapshot_state
+    scheduler_snapshot = clone_mutable(self._scheduler.snapshot_state())
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/scheduler/global_scheduler/base_global_scheduler.py", line 200, in snapshot_state
+    rsnap = replica_scheduler.snapshot_state()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/scheduler/replica_scheduler/vllm_v1_replica_scheduler.py", line 538, in snapshot_state
+    kv_cache_state=self._kv_cache_manager.snapshot_state(),
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/kv_cache/replica_kv_cache_manager.py", line 289, in snapshot_state
+    block_pool=to_primitive_tree(asdict(bp)),
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1238, in asdict
+    return _asdict_inner(obj, dict_factory)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1245, in _asdict_inner
+    value = _asdict_inner(getattr(obj, f.name), dict_factory)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1273, in _asdict_inner
+    return type(obj)(_asdict_inner(v, dict_factory) for v in obj)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1273, in <genexpr>
+    return type(obj)(_asdict_inner(v, dict_factory) for v in obj)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1246, in _asdict_inner
+    result.append((f.name, value))
+KeyboardInterrupt
+Traceback (most recent call last):
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/run_mcts.py", line 241, in <module>
+    main()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/run_mcts.py", line 182, in main
+    best_action = mcts.search(args.mcts_iterations)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/mcts.py", line 432, in search
+    cost = self._simulate(leaf)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/mcts.py", line 538, in _simulate
+    rollout_state = node.state.fork()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/environment.py", line 110, in fork
+    return VidurMCTSState(self.simulator.fork(), self.stats.clone())
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/simulator.py", line 412, in fork
+    snapshot = self.snapshot_state()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/simulator.py", line 251, in snapshot_state
+    scheduler_snapshot = clone_mutable(self._scheduler.snapshot_state())
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/scheduler/global_scheduler/base_global_scheduler.py", line 200, in snapshot_state
+    rsnap = replica_scheduler.snapshot_state()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/scheduler/replica_scheduler/vllm_v1_replica_scheduler.py", line 538, in snapshot_state
+    kv_cache_state=self._kv_cache_manager.snapshot_state(),
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/kv_cache/replica_kv_cache_manager.py", line 296, in snapshot_state
+    return ReplicaKVCacheManagerSnapshot(**to_primitive_tree(asdict(snap)))
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1238, in asdict
+    return _asdict_inner(obj, dict_factory)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1245, in _asdict_inner
+    value = _asdict_inner(getattr(obj, f.name), dict_factory)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1275, in _asdict_inner
+    return type(obj)((_asdict_inner(k, dict_factory),
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1276, in <genexpr>
+    _asdict_inner(v, dict_factory))
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1273, in _asdict_inner
+    return type(obj)(_asdict_inner(v, dict_factory) for v in obj)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1273, in <genexpr>
+    return type(obj)(_asdict_inner(v, dict_factory) for v in obj)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1275, in _asdict_inner
+    return type(obj)((_asdict_inner(k, dict_factory),
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1275, in <genexpr>
+    return type(obj)((_asdict_inner(k, dict_factory),
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1242, in _asdict_inner
+    if _is_dataclass_instance(obj):
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1207, in _is_dataclass_instance
+    return hasattr(type(obj), _FIELDS)
+KeyboardInterrupt
+Traceback (most recent call last):
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/run_mcts.py", line 241, in <module>
+    main()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/run_mcts.py", line 182, in main
+    best_action = mcts.search(args.mcts_iterations)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/mcts.py", line 432, in search
+    cost = self._simulate(leaf)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/mcts.py", line 538, in _simulate
+    rollout_state = node.state.fork()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/environment.py", line 110, in fork
+    return VidurMCTSState(self.simulator.fork(), self.stats.clone())
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/simulator.py", line 412, in fork
+    snapshot = self.snapshot_state()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/simulator.py", line 251, in snapshot_state
+    scheduler_snapshot = clone_mutable(self._scheduler.snapshot_state())
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/scheduler/global_scheduler/base_global_scheduler.py", line 200, in snapshot_state
+    rsnap = replica_scheduler.snapshot_state()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/scheduler/replica_scheduler/vllm_v1_replica_scheduler.py", line 538, in snapshot_state
+    kv_cache_state=self._kv_cache_manager.snapshot_state(),
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/kv_cache/replica_kv_cache_manager.py", line 296, in snapshot_state
+    return ReplicaKVCacheManagerSnapshot(**to_primitive_tree(asdict(snap)))
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1238, in asdict
+    return _asdict_inner(obj, dict_factory)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1245, in _asdict_inner
+    value = _asdict_inner(getattr(obj, f.name), dict_factory)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1275, in _asdict_inner
+    return type(obj)((_asdict_inner(k, dict_factory),
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1276, in <genexpr>
+    _asdict_inner(v, dict_factory))
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1273, in _asdict_inner
+    return type(obj)(_asdict_inner(v, dict_factory) for v in obj)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1273, in <genexpr>
+    return type(obj)(_asdict_inner(v, dict_factory) for v in obj)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1275, in _asdict_inner
+    return type(obj)((_asdict_inner(k, dict_factory),
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1276, in <genexpr>
+    _asdict_inner(v, dict_factory))
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1242, in _asdict_inner
+    if _is_dataclass_instance(obj):
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1207, in _is_dataclass_instance
+    return hasattr(type(obj), _FIELDS)
+KeyboardInterrupt
+Traceback (most recent call last):
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/run_mcts.py", line 241, in <module>
+    main()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/run_mcts.py", line 182, in main
+    best_action = mcts.search(args.mcts_iterations)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/mcts.py", line 430, in search
+    expanded = self._expand(node)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/mcts.py", line 483, in _expand
+    child_state = self._env.apply_controller_action_only(node.state, action)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/environment.py", line 694, in apply_controller_action_only
+    new_state = state if inplace else state.fork()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/environment.py", line 110, in fork
+    return VidurMCTSState(self.simulator.fork(), self.stats.clone())
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/simulator.py", line 412, in fork
+    snapshot = self.snapshot_state()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/simulator.py", line 251, in snapshot_state
+    scheduler_snapshot = clone_mutable(self._scheduler.snapshot_state())
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/scheduler/global_scheduler/base_global_scheduler.py", line 200, in snapshot_state
+    rsnap = replica_scheduler.snapshot_state()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/scheduler/replica_scheduler/vllm_v1_replica_scheduler.py", line 538, in snapshot_state
+    kv_cache_state=self._kv_cache_manager.snapshot_state(),
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/kv_cache/replica_kv_cache_manager.py", line 296, in snapshot_state
+    return ReplicaKVCacheManagerSnapshot(**to_primitive_tree(asdict(snap)))
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1238, in asdict
+    return _asdict_inner(obj, dict_factory)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1245, in _asdict_inner
+    value = _asdict_inner(getattr(obj, f.name), dict_factory)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1275, in _asdict_inner
+    return type(obj)((_asdict_inner(k, dict_factory),
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1276, in <genexpr>
+    _asdict_inner(v, dict_factory))
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1273, in _asdict_inner
+    return type(obj)(_asdict_inner(v, dict_factory) for v in obj)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1273, in <genexpr>
+    return type(obj)(_asdict_inner(v, dict_factory) for v in obj)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1275, in _asdict_inner
+    return type(obj)((_asdict_inner(k, dict_factory),
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1275, in <genexpr>
+    return type(obj)((_asdict_inner(k, dict_factory),
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1242, in _asdict_inner
+    if _is_dataclass_instance(obj):
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1207, in _is_dataclass_instance
+    return hasattr(type(obj), _FIELDS)
+KeyboardInterrupt
+Traceback (most recent call last):
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/run_mcts.py", line 241, in <module>
+    main()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/run_mcts.py", line 182, in main
+    best_action = mcts.search(args.mcts_iterations)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/mcts.py", line 430, in search
+    expanded = self._expand(node)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/mcts.py", line 483, in _expand
+    child_state = self._env.apply_controller_action_only(node.state, action)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/environment.py", line 694, in apply_controller_action_only
+    new_state = state if inplace else state.fork()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/environment.py", line 110, in fork
+    return VidurMCTSState(self.simulator.fork(), self.stats.clone())
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/simulator.py", line 412, in fork
+    snapshot = self.snapshot_state()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/simulator.py", line 251, in snapshot_state
+    scheduler_snapshot = clone_mutable(self._scheduler.snapshot_state())
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/scheduler/global_scheduler/base_global_scheduler.py", line 200, in snapshot_state
+    rsnap = replica_scheduler.snapshot_state()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/scheduler/replica_scheduler/vllm_v1_replica_scheduler.py", line 538, in snapshot_state
+    kv_cache_state=self._kv_cache_manager.snapshot_state(),
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/kv_cache/replica_kv_cache_manager.py", line 289, in snapshot_state
+    block_pool=to_primitive_tree(asdict(bp)),
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1238, in asdict
+    return _asdict_inner(obj, dict_factory)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1245, in _asdict_inner
+    value = _asdict_inner(getattr(obj, f.name), dict_factory)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1273, in _asdict_inner
+    return type(obj)(_asdict_inner(v, dict_factory) for v in obj)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1273, in <genexpr>
+    return type(obj)(_asdict_inner(v, dict_factory) for v in obj)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1279, in _asdict_inner
+    return copy.deepcopy(obj)
+KeyboardInterrupt
+Traceback (most recent call last):
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/run_mcts.py", line 241, in <module>
+    main()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/run_mcts.py", line 182, in main
+    best_action = mcts.search(args.mcts_iterations)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/mcts.py", line 430, in search
+    expanded = self._expand(node)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/mcts.py", line 483, in _expand
+    child_state = self._env.apply_controller_action_only(node.state, action)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/environment.py", line 694, in apply_controller_action_only
+    new_state = state if inplace else state.fork()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/environment.py", line 110, in fork
+    return VidurMCTSState(self.simulator.fork(), self.stats.clone())
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/simulator.py", line 412, in fork
+    snapshot = self.snapshot_state()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/simulator.py", line 251, in snapshot_state
+    scheduler_snapshot = clone_mutable(self._scheduler.snapshot_state())
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/scheduler/global_scheduler/base_global_scheduler.py", line 200, in snapshot_state
+    rsnap = replica_scheduler.snapshot_state()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/scheduler/replica_scheduler/vllm_v1_replica_scheduler.py", line 538, in snapshot_state
+    kv_cache_state=self._kv_cache_manager.snapshot_state(),
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/kv_cache/replica_kv_cache_manager.py", line 296, in snapshot_state
+    return ReplicaKVCacheManagerSnapshot(**to_primitive_tree(asdict(snap)))
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1238, in asdict
+    return _asdict_inner(obj, dict_factory)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1245, in _asdict_inner
+    value = _asdict_inner(getattr(obj, f.name), dict_factory)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1275, in _asdict_inner
+    return type(obj)((_asdict_inner(k, dict_factory),
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1276, in <genexpr>
+    _asdict_inner(v, dict_factory))
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1273, in _asdict_inner
+    return type(obj)(_asdict_inner(v, dict_factory) for v in obj)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1273, in <genexpr>
+    return type(obj)(_asdict_inner(v, dict_factory) for v in obj)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1275, in _asdict_inner
+    return type(obj)((_asdict_inner(k, dict_factory),
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1275, in <genexpr>
+    return type(obj)((_asdict_inner(k, dict_factory),
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1279, in _asdict_inner
+    return copy.deepcopy(obj)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/copy.py", line 144, in deepcopy
+    copier = _deepcopy_dispatch.get(cls)
+KeyboardInterrupt
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+Traceback (most recent call last):
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/run_mcts.py", line 241, in <module>
+    main()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/run_mcts.py", line 182, in main
+    best_action = mcts.search(args.mcts_iterations)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/mcts.py", line 430, in search
+    expanded = self._expand(node)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/mcts.py", line 483, in _expand
+    child_state = self._env.apply_controller_action_only(node.state, action)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/environment.py", line 694, in apply_controller_action_only
+    new_state = state if inplace else state.fork()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/environment.py", line 110, in fork
+    return VidurMCTSState(self.simulator.fork(), self.stats.clone())
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/simulator.py", line 412, in fork
+    snapshot = self.snapshot_state()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/simulator.py", line 251, in snapshot_state
+    scheduler_snapshot = clone_mutable(self._scheduler.snapshot_state())
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/scheduler/global_scheduler/base_global_scheduler.py", line 200, in snapshot_state
+    rsnap = replica_scheduler.snapshot_state()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/scheduler/replica_scheduler/vllm_v1_replica_scheduler.py", line 538, in snapshot_state
+    kv_cache_state=self._kv_cache_manager.snapshot_state(),
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/kv_cache/replica_kv_cache_manager.py", line 289, in snapshot_state
+    block_pool=to_primitive_tree(asdict(bp)),
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1238, in asdict
+    return _asdict_inner(obj, dict_factory)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1245, in _asdict_inner
+    value = _asdict_inner(getattr(obj, f.name), dict_factory)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1273, in _asdict_inner
+    return type(obj)(_asdict_inner(v, dict_factory) for v in obj)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1273, in <genexpr>
+    return type(obj)(_asdict_inner(v, dict_factory) for v in obj)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1245, in _asdict_inner
+    value = _asdict_inner(getattr(obj, f.name), dict_factory)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1242, in _asdict_inner
+    if _is_dataclass_instance(obj):
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1207, in _is_dataclass_instance
+    return hasattr(type(obj), _FIELDS)
+KeyboardInterrupt
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+Traceback (most recent call last):
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/run_mcts.py", line 241, in <module>
+    main()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/run_mcts.py", line 182, in main
+    best_action = mcts.search(args.mcts_iterations)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/mcts.py", line 432, in search
+    cost = self._simulate(leaf)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/mcts.py", line 538, in _simulate
+    rollout_state = node.state.fork()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/environment.py", line 110, in fork
+    return VidurMCTSState(self.simulator.fork(), self.stats.clone())
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/simulator.py", line 412, in fork
+    snapshot = self.snapshot_state()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/simulator.py", line 251, in snapshot_state
+    scheduler_snapshot = clone_mutable(self._scheduler.snapshot_state())
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/scheduler/global_scheduler/base_global_scheduler.py", line 200, in snapshot_state
+    rsnap = replica_scheduler.snapshot_state()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/scheduler/replica_scheduler/vllm_v1_replica_scheduler.py", line 538, in snapshot_state
+    kv_cache_state=self._kv_cache_manager.snapshot_state(),
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/kv_cache/replica_kv_cache_manager.py", line 296, in snapshot_state
+    return ReplicaKVCacheManagerSnapshot(**to_primitive_tree(asdict(snap)))
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1238, in asdict
+    return _asdict_inner(obj, dict_factory)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1245, in _asdict_inner
+    value = _asdict_inner(getattr(obj, f.name), dict_factory)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1275, in _asdict_inner
+    return type(obj)((_asdict_inner(k, dict_factory),
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1276, in <genexpr>
+    _asdict_inner(v, dict_factory))
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1273, in _asdict_inner
+    return type(obj)(_asdict_inner(v, dict_factory) for v in obj)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1273, in <genexpr>
+    return type(obj)(_asdict_inner(v, dict_factory) for v in obj)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1275, in _asdict_inner
+    return type(obj)((_asdict_inner(k, dict_factory),
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1276, in <genexpr>
+    _asdict_inner(v, dict_factory))
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1242, in _asdict_inner
+    if _is_dataclass_instance(obj):
+KeyboardInterrupt
+Traceback (most recent call last):
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/run_mcts.py", line 241, in <module>
+    main()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/run_mcts.py", line 182, in main
+    best_action = mcts.search(args.mcts_iterations)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/mcts.py", line 430, in search
+    expanded = self._expand(node)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/mcts.py", line 483, in _expand
+    child_state = self._env.apply_controller_action_only(node.state, action)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/environment.py", line 694, in apply_controller_action_only
+    new_state = state if inplace else state.fork()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/environment.py", line 110, in fork
+    return VidurMCTSState(self.simulator.fork(), self.stats.clone())
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/simulator.py", line 412, in fork
+    snapshot = self.snapshot_state()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/simulator.py", line 251, in snapshot_state
+    scheduler_snapshot = clone_mutable(self._scheduler.snapshot_state())
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/scheduler/global_scheduler/base_global_scheduler.py", line 200, in snapshot_state
+    rsnap = replica_scheduler.snapshot_state()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/scheduler/replica_scheduler/vllm_v1_replica_scheduler.py", line 538, in snapshot_state
+    kv_cache_state=self._kv_cache_manager.snapshot_state(),
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/kv_cache/replica_kv_cache_manager.py", line 296, in snapshot_state
+    return ReplicaKVCacheManagerSnapshot(**to_primitive_tree(asdict(snap)))
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1238, in asdict
+    return _asdict_inner(obj, dict_factory)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1245, in _asdict_inner
+    value = _asdict_inner(getattr(obj, f.name), dict_factory)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1275, in _asdict_inner
+    return type(obj)((_asdict_inner(k, dict_factory),
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1276, in <genexpr>
+    _asdict_inner(v, dict_factory))
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1273, in _asdict_inner
+    return type(obj)(_asdict_inner(v, dict_factory) for v in obj)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1273, in <genexpr>
+    return type(obj)(_asdict_inner(v, dict_factory) for v in obj)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1275, in _asdict_inner
+    return type(obj)((_asdict_inner(k, dict_factory),
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1275, in <genexpr>
+    return type(obj)((_asdict_inner(k, dict_factory),
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1279, in _asdict_inner
+    return copy.deepcopy(obj)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/copy.py", line 144, in deepcopy
+    copier = _deepcopy_dispatch.get(cls)
+KeyboardInterrupt
+Traceback (most recent call last):
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/run_mcts.py", line 241, in <module>
+    main()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/run_mcts.py", line 182, in main
+    best_action = mcts.search(args.mcts_iterations)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/mcts.py", line 432, in search
+    cost = self._simulate(leaf)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/mcts.py", line 538, in _simulate
+    rollout_state = node.state.fork()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/environment.py", line 110, in fork
+    return VidurMCTSState(self.simulator.fork(), self.stats.clone())
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/simulator.py", line 412, in fork
+    snapshot = self.snapshot_state()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/simulator.py", line 251, in snapshot_state
+    scheduler_snapshot = clone_mutable(self._scheduler.snapshot_state())
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/scheduler/global_scheduler/base_global_scheduler.py", line 200, in snapshot_state
+    rsnap = replica_scheduler.snapshot_state()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/scheduler/replica_scheduler/vllm_v1_replica_scheduler.py", line 538, in snapshot_state
+    kv_cache_state=self._kv_cache_manager.snapshot_state(),
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/kv_cache/replica_kv_cache_manager.py", line 289, in snapshot_state
+    block_pool=to_primitive_tree(asdict(bp)),
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1238, in asdict
+    return _asdict_inner(obj, dict_factory)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1245, in _asdict_inner
+    value = _asdict_inner(getattr(obj, f.name), dict_factory)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1273, in _asdict_inner
+    return type(obj)(_asdict_inner(v, dict_factory) for v in obj)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1273, in <genexpr>
+    return type(obj)(_asdict_inner(v, dict_factory) for v in obj)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1279, in _asdict_inner
+    return copy.deepcopy(obj)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/copy.py", line 175, in deepcopy
+    if y is not x:
+KeyboardInterrupt
+Traceback (most recent call last):
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/run_mcts.py", line 241, in <module>
+    main()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/run_mcts.py", line 182, in main
+    best_action = mcts.search(args.mcts_iterations)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/mcts.py", line 430, in search
+    expanded = self._expand(node)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/mcts.py", line 477, in _expand
+    child_state = self._env.apply_adversary_action_only(node.state, action)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/environment.py", line 671, in apply_adversary_action_only
+    target_state = state if inplace else state.fork()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/environment.py", line 110, in fork
+    return VidurMCTSState(self.simulator.fork(), self.stats.clone())
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/simulator.py", line 412, in fork
+    snapshot = self.snapshot_state()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/simulator.py", line 251, in snapshot_state
+    scheduler_snapshot = clone_mutable(self._scheduler.snapshot_state())
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/scheduler/global_scheduler/base_global_scheduler.py", line 200, in snapshot_state
+    rsnap = replica_scheduler.snapshot_state()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/scheduler/replica_scheduler/vllm_v1_replica_scheduler.py", line 538, in snapshot_state
+    kv_cache_state=self._kv_cache_manager.snapshot_state(),
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/kv_cache/replica_kv_cache_manager.py", line 296, in snapshot_state
+    return ReplicaKVCacheManagerSnapshot(**to_primitive_tree(asdict(snap)))
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1238, in asdict
+    return _asdict_inner(obj, dict_factory)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1245, in _asdict_inner
+    value = _asdict_inner(getattr(obj, f.name), dict_factory)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1275, in _asdict_inner
+    return type(obj)((_asdict_inner(k, dict_factory),
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1276, in <genexpr>
+    _asdict_inner(v, dict_factory))
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1273, in _asdict_inner
+    return type(obj)(_asdict_inner(v, dict_factory) for v in obj)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1273, in <genexpr>
+    return type(obj)(_asdict_inner(v, dict_factory) for v in obj)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1275, in _asdict_inner
+    return type(obj)((_asdict_inner(k, dict_factory),
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1276, in <genexpr>
+    _asdict_inner(v, dict_factory))
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1279, in _asdict_inner
+    return copy.deepcopy(obj)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/copy.py", line 144, in deepcopy
+    copier = _deepcopy_dispatch.get(cls)
+KeyboardInterrupt
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+Traceback (most recent call last):
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/run_mcts.py", line 241, in <module>
+    main()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/run_mcts.py", line 182, in main
+    best_action = mcts.search(args.mcts_iterations)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/mcts.py", line 432, in search
+    cost = self._simulate(leaf)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/mcts.py", line 538, in _simulate
+    rollout_state = node.state.fork()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/environment.py", line 110, in fork
+    return VidurMCTSState(self.simulator.fork(), self.stats.clone())
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/simulator.py", line 420, in fork
+    forked.restore_state(snapshot)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/simulator.py", line 374, in restore_state
+    self._scheduler.restore_state(snapshot.scheduler_state, request_lookup, batch_lookup)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/scheduler/global_scheduler/base_global_scheduler.py", line 276, in restore_state
+    restore_fn(rsnap, request_lookup, batch_lookup)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/scheduler/replica_scheduler/vllm_v1_replica_scheduler.py", line 585, in restore_state
+    self._kv_cache_manager.restore_state(snapshot.kv_cache_state)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/kv_cache/replica_kv_cache_manager.py", line 309, in restore_state
+    self._set_block_hash(blk, self._decode_bht(bs.get("block_hash")))
+KeyboardInterrupt
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!

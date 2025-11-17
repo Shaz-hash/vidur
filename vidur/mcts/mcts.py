@@ -324,6 +324,7 @@ class VidurMCTS:
         logger_flush_every: int = 1,
         verbose: bool = False,
         tree_dump_interval: int = 0,
+        history_depth: int = 0,          # NEW
     ) -> None:
         self._env = env
         self._cfg = explore_cfg
@@ -336,6 +337,7 @@ class VidurMCTS:
         self._verbose = verbose
 
         self._tree_dump_interval = max(0, int(tree_dump_interval))
+        self._history_depth = max(0, int(history_depth))    # NEW
 
         self._root: Optional[MCTSNode] = None
         
@@ -363,6 +365,59 @@ class VidurMCTS:
                 action=None,
             )
             root.cumulative_cost = root_cost
+
+
+            # --- Random history prefix (depth in plies) ---
+            current = root
+            for step in range(self._history_depth):
+                # Ensure we have actions to choose from
+                if not current.untried_actions:
+                    current.untried_actions = self._enumerate_actions(current)
+                    if not current.untried_actions:
+                        break
+
+                # Pick a random action from this node
+                action = self._rng.choice(current.untried_actions)
+                current.untried_actions.remove(action)
+
+                if current.player == "adversary":
+                    child_state = self._env.apply_adversary_action_only(current.state, action)
+                    next_player = "controller"
+                else:
+                    child_state = self._env.apply_controller_action_only(current.state, action)
+                    next_player = "adversary"
+
+                child = MCTSNode(
+                    state=child_state,
+                    player=next_player,
+                    node_id=self._next_node_id(),
+                    depth=current.depth + 1,
+                    parent=current,
+                    parent_action=action,
+                )
+                child.untried_actions = self._enumerate_actions(child)
+                current.children.append(MCTSChildEdge(action=action, node=child))
+
+                # Log these as part of iteration 0 (history)
+                self._log_state(
+                    iteration=0,
+                    phase="INITIAL_HISTORY_GEN",
+                    node=child,
+                    parent_id=current.node_id,
+                    acting_player=current.player,
+                    next_player=child.player,
+                    action=action,
+                )
+
+                current = child
+
+            # Use the last node of the history as the root for MCTS
+            root_for_search = current
+            self._root = root_for_search
+            root = self._root
+            ## --------- RANDOM HISTORY ENDS HERE -----------
+
+            ## -------- VANILLA MCTS STARTS HERE -----------
             for itr in range(iterations):
                 # EARLY EXIT: all controller states visited at least once
                 if self._env.controller_states_fully_visited():

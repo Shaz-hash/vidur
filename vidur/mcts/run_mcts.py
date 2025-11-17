@@ -79,6 +79,13 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default="",
         help="Optional run ID suffix (e.g. P1, P2) for per-process CSVs.",
     )
+    parser.add_argument(
+        "--mcts_history_depth",
+        type=int,
+        default=0,
+        help="Number of random tree steps (adversary/controller plies) before MCTS search.",
+    )
+
 
 
     return parser
@@ -104,6 +111,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     args, remaining = parser.parse_known_args(argv) ## Divides all the arguments into MCTS related config and Simulation related Config
 
     sim_cfg = configure_simulation(remaining)
+    et_cfg = sim_cfg.execution_time_predictor_config
+    et_cfg.prediction_max_tokens_per_request = 8192     
+    et_cfg.prediction_max_batch_size = 64               
     simulator = Simulator(sim_cfg, register_atexit=False)
 
     # t0 = time.perf_counter()
@@ -168,7 +178,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         constraints=constraints,
         explore_cfg=explore_cfg,
     )
-    mcts = VidurMCTS(env, explore_cfg, log_path=log_path, tree_log_path=tree_path , tree_dump_interval=args.mcts_tree_dump_interval)
+    mcts = VidurMCTS(env, explore_cfg, log_path=log_path, tree_log_path=tree_path , tree_dump_interval=args.mcts_tree_dump_interval, history_depth=args.mcts_history_depth,)
     best_action = mcts.search(args.mcts_iterations)
 
     # root_visits = mcts._root.visits  # or via a getter if you add one

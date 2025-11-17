@@ -174,8 +174,14 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         cli_argv = [original_argv[0]] + unknown if argv is None else ["prefill_calibrator"] + list(unknown)
         sys.argv = cli_argv
         cfg = SimulationConfig.create_from_cli_args()
+
     finally:
         sys.argv = original_argv
+
+    et_cfg = cfg.execution_time_predictor_config
+    et_cfg.prediction_max_tokens_per_request = 8192
+    et_cfg.prediction_max_batch_size = 64
+
     step = args.step or cfg.cluster_config.cache_config.block_size
     step = max(1, step)
     max_tokens_override = args.max_tokens

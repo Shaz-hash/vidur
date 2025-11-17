@@ -1,7 +1,5 @@
-INFO 11-16 20:31:37 sklearn_execution_time_predictor.py:709] Getting predictions for compute operations
-INFO 11-16 20:31:37 sklearn_execution_time_predictor.py:709] Getting predictions for compute operations
-INFO 11-16 20:31:39 sklearn_execution_time_predictor.py:767] Getting predictions for attention operations
-INFO 11-16 20:31:39 sklearn_execution_time_predictor.py:767] Getting predictions for attention operations
+INFO 11-16 21:14:27 sklearn_execution_time_predictor.py:709] Getting predictions for compute operations
+INFO 11-16 21:14:28 sklearn_execution_time_predictor.py:767] Getting predictions for attention operations
 PRINTING THE STATE INTO THE FOR THE TREE CSV!
 PRINTING THE STATE INTO THE FOR THE TREE CSV!
 PRINTING THE STATE INTO THE FOR THE TREE CSV!
@@ -11,7 +9,21 @@ Best controller action discovered:
   token_budget=512
   selected_request_ids=None
   token_allocations={}
-Log written to: /home/shazer/Desktop/Research/Vidur/vidur/simulator_output/test_mcts_trace_P2.csv
+Log written to: /home/shazer/Desktop/Research/Vidur/vidur/simulator_output/test_mcts_trace_P1.csv
+INFO 11-16 21:17:12 sklearn_execution_time_predictor.py:709] Getting predictions for compute operations
+INFO 11-16 21:17:13 sklearn_execution_time_predictor.py:767] Getting predictions for attention operations
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+Best controller action discovered:
+  token_budget=512
+  selected_request_ids=None
+  token_allocations={}
+Log written to: /home/shazer/Desktop/Research/Vidur/vidur/simulator_output/test_mcts_trace_P1.csv
+INFO 11-16 21:18:51 sklearn_execution_time_predictor.py:709] Getting predictions for compute operations
+INFO 11-16 21:18:52 sklearn_execution_time_predictor.py:767] Getting predictions for attention operations
 PRINTING THE STATE INTO THE FOR THE TREE CSV!
 PRINTING THE STATE INTO THE FOR THE TREE CSV!
 PRINTING THE STATE INTO THE FOR THE TREE CSV!
