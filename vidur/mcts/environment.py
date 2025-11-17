@@ -559,71 +559,94 @@ class VidurMCTSEnvironment:
             )
             return action, mapping
         ##-----
+        # actions: List[ControllerAction] = []
+
+        # for heur_name, order_fn in heuristics:
+        #     ordered = order_fn(prefill_ids)
+        #     for b in self.controller_all_possible_prefill_budgets:
+        #         # Single allocation (“All Allocation”)
+        #         a1, l1 = build_alloc_single(ordered, b)
+        #         # Progressive allocation (“Max Allocation”)
+        #         a2, l2 = build_alloc_progressive(ordered, b)
+        #         m1 = tuple(l1)
+        #         m2 = tuple(l2)
+        #         a1.heuristic = heur_name
+        #         a1.strategy = "All Allocation"
+        #         a1.mapping = m1
+
+        #         a2.heuristic = heur_name
+        #         a2.strategy = "Max Allocation"
+        #         a2.mapping = m2
+
+
+        #         if use_state_cache:
+        #             # print("Creating actual Action")
+        #             mapping1 = tuple(l1)
+        #             key1 = (mapping1, heur_name, "All Allocation")
+        #             if key1 not in self.all_possible_Controller_States:
+        #                 self.all_possible_Controller_States[key1] = {
+        #                     "visits": 0,
+        #                     "objective_cost": 0.0,
+        #                     "ucb_score": 0.0,
+        #                     "slo_violations": 0,
+        #                     "avg_lateness": 0.0,
+        #                 }
+        #             # else :
+        #             #     print(f"KEY WAS FOUND IN THE STATE {(key1)}")
+        #             state1 = self.all_possible_Controller_States[key1]
+        #             if a1.token_budget > 0 and state1["sample_visits"] < VISIT_LIMIT:
+        #                 state1["sample_visits"] += 1
+        #                 actions.append(a1)
+
+        #             mapping2 = tuple(l2)
+        #             key2 = (mapping2, heur_name, "Max Allocation")
+        #             if key2 not in self.all_possible_Controller_States:
+        #                 self.all_possible_Controller_States[key2] = {
+        #                     "visits": 0,
+        #                     "objective_cost": 0.0,
+        #                     "ucb_score": 0.0,
+        #                     "slo_violations": 0,
+        #                     "avg_lateness": 0.0,
+        #                 }
+        #             # else :
+        #             #     print(f"KEY WAS FOUND IN THE STATE {(key2)}")
+        #             state2 = self.all_possible_Controller_States[key2]
+        #             if a2.token_budget > 0 and state2["sample_visits"] < VISIT_LIMIT:
+        #                 state2["sample_visits"] += 1
+        #                 actions.append(a2)
+        #         else:
+        #             # Rollout mode: ignore Controller_States and visit caps
+        #             # print("Running Simulation!")
+        #             if a1.token_budget > 0:
+        #                 actions.append(a1)
+        #             if a2.token_budget > 0:
+        #                 actions.append(a2)
+                        
         actions: List[ControllerAction] = []
 
+        # Enumerate all heuristics × budgets × strategies,
+        # without using the controller state cache or visit limits.
         for heur_name, order_fn in heuristics:
             ordered = order_fn(prefill_ids)
             for b in self.controller_all_possible_prefill_budgets:
                 # Single allocation (“All Allocation”)
                 a1, l1 = build_alloc_single(ordered, b)
-                # Progressive allocation (“Max Allocation”)
-                a2, l2 = build_alloc_progressive(ordered, b)
-                m1 = tuple(l1)
-                m2 = tuple(l2)
                 a1.heuristic = heur_name
                 a1.strategy = "All Allocation"
-                a1.mapping = m1
+                a1.mapping = tuple(l1)
+                if a1.token_budget > 0:
+                    actions.append(a1)
 
+                # Progressive allocation (“Max Allocation”)
+                a2, l2 = build_alloc_progressive(ordered, b)
                 a2.heuristic = heur_name
                 a2.strategy = "Max Allocation"
-                a2.mapping = m2
-
-
-                if use_state_cache:
-                    # print("Creating actual Action")
-                    mapping1 = tuple(l1)
-                    key1 = (mapping1, heur_name, "All Allocation")
-                    if key1 not in self.all_possible_Controller_States:
-                        self.all_possible_Controller_States[key1] = {
-                            "visits": 0,
-                            "objective_cost": 0.0,
-                            "ucb_score": 0.0,
-                            "slo_violations": 0,
-                            "avg_lateness": 0.0,
-                        }
-                    # else :
-                    #     print(f"KEY WAS FOUND IN THE STATE {(key1)}")
-                    state1 = self.all_possible_Controller_States[key1]
-                    if a1.token_budget > 0 and state1["sample_visits"] < VISIT_LIMIT:
-                        state1["sample_visits"] += 1
-                        actions.append(a1)
-
-                    mapping2 = tuple(l2)
-                    key2 = (mapping2, heur_name, "Max Allocation")
-                    if key2 not in self.all_possible_Controller_States:
-                        self.all_possible_Controller_States[key2] = {
-                            "visits": 0,
-                            "objective_cost": 0.0,
-                            "ucb_score": 0.0,
-                            "slo_violations": 0,
-                            "avg_lateness": 0.0,
-                        }
-                    # else :
-                    #     print(f"KEY WAS FOUND IN THE STATE {(key2)}")
-                    state2 = self.all_possible_Controller_States[key2]
-                    if a2.token_budget > 0 and state2["sample_visits"] < VISIT_LIMIT:
-                        state2["sample_visits"] += 1
-                        actions.append(a2)
-                else:
-                    # Rollout mode: ignore Controller_States and visit caps
-                    # print("Running Simulation!")
-                    if a1.token_budget > 0:
-                        actions.append(a1)
-                    if a2.token_budget > 0:
-                        actions.append(a2)
-                        
+                a2.mapping = tuple(l2)
+                if a2.token_budget > 0:
+                    actions.append(a2)
         # Ensure we always return something
         if not actions:
+            print(f"NO ACTION PRODUCED !!! ERROR POSSIBLY ON THE STATE : {state}")
             return [ControllerAction(token_budget=0, selected_request_ids=None)]
         return actions
 
@@ -644,18 +667,18 @@ class VidurMCTSEnvironment:
         When ``inplace`` is False (default), returns a forked state (safe for tree expansion).
         When ``inplace`` is True, mutates and returns ``state`` (intended for rollout trials).
         """
-        t0 = time.perf_counter()
+        # t0 = time.perf_counter()
         target_state = state if inplace else state.fork()
-        t1 = time.perf_counter()
+        # t1 = time.perf_counter()
         self._apply_adversary_action(target_state, action)
-        t2 = time.perf_counter()
+        # t2 = time.perf_counter()
         self._drain_arrivals(target_state.simulator)
-        t3 = time.perf_counter()
-        print(
-            f"[PROFILE] FORK phase={t1 - t0:.4f}s: "
-            f"APPLYING ADVERSARY ACTION={t2 - t1:.4f}s "
-            f"DRAIN ARRIVALS={t3 - t2:.4f}s"
-        )
+        # t3 = time.perf_counter()
+        # print(
+        #     f"[PROFILE] FORK phase={t1 - t0:.4f}s: "
+        #     f"APPLYING ADVERSARY ACTION={t2 - t1:.4f}s "
+        #     f"DRAIN ARRIVALS={t3 - t2:.4f}s"
+        # )
         return target_state
 
     def apply_controller_action_only(

@@ -208,37 +208,51 @@ class _MCTSLogger:
 class _MCTSTreeLogger:
     """CSV logger for tree-only rows, with heuristic/strategy columns."""
 
+    # _FIELDS = [
+    #     "iteration",
+    #     "phase",
+    #     "depth",
+    #     "parent_node_id",
+    #     "node_id",
+    #     "player_to_act",
+    #     "next_player",
+    #     "sim_time",
+    #     "requests_in_system",
+    #     "requests_generated",
+    #     "requests_completed",
+    #     "slo_violations",
+    #     "avg_lateness",
+    #     "objective_cost",
+    #     "state_waiting_ids",
+    #     "state_completed_request_ids",
+    #     "adversary_requests",
+    #     "adversary_prefill_slos",
+    #     "adversary_decode_slos",
+    #     "controller_token_budget",
+    #     "controller_selected_ids",
+    #     "controller_allocations",
+    #     "controller_prefill_allocations",
+    #     "controller_decode_allocations",
+    #     "controller_prefill_total",
+    #     "controller_decode_total",
+    #     "controller_heuristic",    # extra
+    #     "controller_strategy",     # extra
+    # ]
+
+
     _FIELDS = [
         "iteration",
-        "phase",
-        "depth",
-        "parent_node_id",
         "node_id",
+        "parent_node_id",
+        "depth",
         "player_to_act",
-        "next_player",
+        "action_type",       # "adversary" or "controller"
         "sim_time",
         "requests_in_system",
-        "requests_generated",
-        "requests_completed",
-        "slo_violations",
-        "avg_lateness",
-        "objective_cost",
-        "state_waiting_ids",
-        "state_completed_request_ids",
-        "adversary_requests",
-        "adversary_prefill_slos",
-        "adversary_decode_slos",
-        "controller_token_budget",
-        "controller_selected_ids",
-        "controller_allocations",
-        "controller_prefill_allocations",
-        "controller_decode_allocations",
-        "controller_prefill_total",
-        "controller_decode_total",
-        "controller_heuristic",    # extra
-        "controller_strategy",     # extra
+        "node_cost",         # mean cost at this node
+        "ucb_score",
+        "action_repr",       # simple string/JSON for the action
     ]
-
     def __init__(self, path: Optional[Union[str, Path]], flush_every: int = 1) -> None:
         self._path = Path(path) if path else None
         self._writer: Optional[csv.DictWriter] = None
@@ -309,6 +323,7 @@ class VidurMCTS:
         log_rollouts: bool = True,
         logger_flush_every: int = 1,
         verbose: bool = False,
+        tree_dump_interval: int = 0,
     ) -> None:
         self._env = env
         self._cfg = explore_cfg
@@ -320,6 +335,8 @@ class VidurMCTS:
         self._current_iteration = 0
         self._verbose = verbose
 
+        self._tree_dump_interval = max(0, int(tree_dump_interval))
+
         self._root: Optional[MCTSNode] = None
         
         # Derive default tree path if not provided explicitly
@@ -328,9 +345,9 @@ class VidurMCTS:
             tree_log_path = base.with_name(base.stem + "_tree" + base.suffix)
 
         self._tree_logger = _MCTSTreeLogger(tree_log_path, flush_every=logger_flush_every)
-        ## Pre Computing the necessary states here 
-        max_budget = self._env._max_request_tokens_allowed()
-        self._env.precompute_controller_state_space(token_budget=max_budget)
+        # ## Pre Computing the necessary states here 
+        # max_budget = self._env._max_request_tokens_allowed()
+        # self._env.precompute_controller_state_space(token_budget=max_budget)
 
     def search(self, iterations: int) -> ControllerAction:
         root = self._create_root()
@@ -360,6 +377,14 @@ class VidurMCTS:
                 cost = self._simulate(leaf)
 
                 self._backpropagate(leaf, cost)
+
+                # Periodically dump the entire tree to the tree CSV
+                if (
+                    self._tree_dump_interval > 0
+                    and (itr + 1) % self._tree_dump_interval == 0
+                ):
+                    print("PRINTING THE STATE INTO THE FOR THE TREE CSV!")
+                    self._dump_tree_snapshot(iteration=itr + 1)
         finally:
             self._logger.close()
             self._tree_logger.close()
@@ -389,21 +414,43 @@ class VidurMCTS:
         return node
 
     def _expand(self, node: MCTSNode) -> Optional[MCTSNode]:
-        t0 = time.perf_counter()
+       
         if not node.untried_actions:
             return None
         action = node.untried_actions.pop()
         if node.player == "adversary":
             child_state = self._env.apply_adversary_action_only(node.state, action)
             next_player = "controller"
-            t1 = time.perf_counter()
+     
             # print(f"[PROFILE] apply_adversary_actions: {t1 - t0:.4f}s")
         else:
-            # print(f"SAMPLE APPLIED ON THE NODE : {node.node_id} : State_{node.state} : Node.Player = {node.player} , Player Applies the aciton = {action}")
+            # Controller applies the action → compute cost delta and update metrics
             child_state = self._env.apply_controller_action_only(node.state, action)
             next_player = "adversary"
-            t1 = time.perf_counter()
-            # print(f"[PROFILE] apply_controller_actions: {t1 - t0:.4f}s")
+
+            # parent cost
+            parent_snapshot = self._env.describe_state(node.state)
+            parent_cost = _compute_objective_cost(
+                parent_snapshot["slo_violations"],
+                parent_snapshot["avg_lateness"],
+            )
+
+            # child cost (this is exactly what the tree log will see)
+            child_snapshot = self._env.describe_state(child_state)
+            violations = child_snapshot["slo_violations"]
+            avg_lateness = child_snapshot["avg_lateness"]
+            cost = _compute_objective_cost(violations, avg_lateness)
+            delta_cost = cost - parent_cost
+
+            # update per-controller-state statistics
+            self._env.update_controller_state_metrics(
+                action,
+                cost,
+                delta_cost,
+                violations,
+                avg_lateness,
+            )
+
         child = MCTSNode(
             state=child_state,
             player=next_player,
@@ -423,7 +470,7 @@ class VidurMCTS:
             next_player=child.player,
             action=action,
         )
-        t2 = time.perf_counter()
+   
         #print(f" Expansion time : {t2 - t0:.4f}s")
         return child
 
@@ -574,9 +621,9 @@ class VidurMCTS:
             acting_player = node.parent.player if node.parent else acting_player
             next_player = node.player
         assert state is not None
-        t0 = time.perf_counter()
+      
         snapshot = self._env.describe_state(state)
-        t1 = time.perf_counter()
+   
         violations = snapshot["slo_violations"]
         avg_lateness = snapshot["avg_lateness"]
         cost = _compute_objective_cost(violations, avg_lateness)
@@ -598,47 +645,47 @@ class VidurMCTS:
             controller_action=controller_action,
             objective_cost=cost,
         )
-        t2 = time.perf_counter()
+       
         # New: tree-only CSV (no rollouts)
-        if phase in ("root", "tree") and self._tree_logger is not None:
-            row = self._make_log_row(
-                iteration=iteration,
-                phase=phase,
-                parent_id=parent_id,
-                node_id=node_id or "root",
-                acting_player=player_label,
-                next_player=next_label,
-                depth=depth_value,
-                state=state,
-                action=action,
-            )
-            self._tree_logger.write_row(row)
-        t3 = time.perf_counter()
+        # if phase in ("root", "tree") and self._tree_logger is not None:
+        #     row = self._make_log_row(
+        #         iteration=iteration,
+        #         phase=phase,
+        #         parent_id=parent_id,
+        #         node_id=node_id or "root",
+        #         acting_player=player_label,
+        #         next_player=next_label,
+        #         depth=depth_value,
+        #         state=state,
+        #         action=action,
+        #     )
+        #     self._tree_logger.write_row(row)
+    
         # print(
         #     f"[PROFILE] log_state phase={phase}: "
         #     f"describe_state Snap_shot={t1 - t0:.4f}s, main_log={t2 - t1:.4f}s, "
         #     f"tree_log={t3 - t2:.4f}s"
         # )
         # New: per-controller-state metrics with delta cost
-        if isinstance(controller_action, ControllerAction) and phase in ("root", "tree"):
-            # Compute parent cost if there is a parent node
-            if node is not None and node.parent is not None:
-                parent_snapshot = self._env.describe_state(node.parent.state)
-                parent_cost = _compute_objective_cost(
-                    parent_snapshot["slo_violations"],
-                    parent_snapshot["avg_lateness"],
-                )
-            else:
-                parent_cost = 0.0  # treat root as baseline
-            delta_cost = cost - parent_cost
+        # if isinstance(controller_action, ControllerAction) and phase in ("root", "tree"):
+        #     # Compute parent cost if there is a parent node
+        #     if node is not None and node.parent is not None:
+        #         parent_snapshot = self._env.describe_state(node.parent.state)
+        #         parent_cost = _compute_objective_cost(
+        #             parent_snapshot["slo_violations"],
+        #             parent_snapshot["avg_lateness"],
+        #         )
+        #     else:
+        #         parent_cost = 0.0  # treat root as baseline
+        #     delta_cost = cost - parent_cost
 
-            self._env.update_controller_state_metrics(
-                controller_action,
-                cost,
-                delta_cost,
-                violations,
-                avg_lateness,
-            )
+        #     self._env.update_controller_state_metrics(
+        #         controller_action,
+        #         cost,
+        #         delta_cost,
+        #         violations,
+        #         avg_lateness,
+        #     )
 
         return cost
 
@@ -715,6 +762,78 @@ class VidurMCTS:
             "controller_strategy": ctrl_strategy,     
         }
         return row
+
+    def _dump_tree_snapshot(self, iteration: int) -> None:
+        if self._tree_logger is None or self._root is None:
+            return
+
+        # BFS over the current tree
+        queue = [self._root]
+        while queue:
+            node = queue.pop(0)
+            for edge in node.children:
+                queue.append(edge.node)
+
+            parent = node.parent
+            parent_id = "" if parent is None else parent.node_id
+            depth = node.depth
+            player_to_act = node.player
+            action = node.parent_action  # action that led to this node
+
+            # Describe current simulator state at this node
+            snapshot = self._env.describe_state(node.state)
+            sim_time = snapshot["sim_time"]
+            num_requests = snapshot["requests_in_system"]
+
+            # Cost estimate at this node (mean MCTS cost)
+            mean_cost = (
+                node.cumulative_cost / node.visits if node.visits > 0 else 0.0
+            )
+
+            # UCB score relative to parent (same formula as _best_child)
+            if parent is not None and node.visits > 0:
+                parent_visits = max(1, parent.visits)
+                ln_parent = math.log(parent_visits)
+                exploit = -mean_cost if parent.player == "controller" else mean_cost
+                explore = self._cfg.exploration_constant * math.sqrt(
+                    ln_parent / max(1, node.visits)
+                )
+                ucb = exploit + explore
+            else:
+                ucb = 0.0
+
+            # Simple action representation
+            if action is None:
+                action_type = ""
+                action_repr = ""
+            else:
+                # from vidur.mcts.environment import AdversaryAction, ControllerAction  # adjust import if needed
+                if isinstance(action, AdversaryAction):
+                    action_type = "adversary"
+                elif isinstance(action, ControllerAction):
+                    action_type = "controller"
+                else:
+                    action_type = type(action).__name__
+                action_repr = repr(action)
+
+            self._tree_logger.write_row(
+                {
+                    "iteration": iteration,
+                    "node_id": node.node_id,
+                    "parent_node_id": parent_id,
+                    "depth": depth,
+                    "player_to_act": player_to_act,
+                    "action_type": action_type,
+                    "sim_time": sim_time,
+                    "requests_in_system": num_requests,
+                    "node_cost": mean_cost,
+                    "ucb_score": ucb,
+                    "action_repr": action_repr,
+                }
+            )
+
+
+
 
     def _next_node_id(self) -> int:
         node_id = self._node_counter

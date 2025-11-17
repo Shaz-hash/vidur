@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
+import time 
+
 from vidur.config import SimulationConfig
 from vidur.simulator import Simulator
 
@@ -65,6 +67,19 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional CSV capturing tree nodes with controller actions.",
     )
+    parser.add_argument(
+        "--mcts_tree_dump_interval",
+        type=int,
+        default=10,
+        help="Dump full MCTS tree to tree CSV every N iterations (0 = never).",
+    )
+    parser.add_argument(
+        "--mcts_run_id",
+        type=str,
+        default="",
+        help="Optional run ID suffix (e.g. P1, P2) for per-process CSVs.",
+    )
+
 
     return parser
 
@@ -91,6 +106,31 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     sim_cfg = configure_simulation(remaining)
     simulator = Simulator(sim_cfg, register_atexit=False)
 
+    # t0 = time.perf_counter()
+    # sim1 = Simulator(sim_cfg, register_atexit=False,
+    #              execution_time_predictor=simulator._execution_time_predictor)
+    # t1 = time.perf_counter()
+    
+    # print(
+    #         f"[PROFILE] SIMULATOR COPY RESULTS RESULTS : "
+    #         f"={t1 - t0:.4f}s"
+    #     )
+
+    # Suffix for this run (empty if not provided)
+    suffix = f"_{args.mcts_run_id}" if args.mcts_run_id else ""
+
+    base_log = Path(args.mcts_log_csv)
+    log_path = base_log.with_name(base_log.stem + suffix + base_log.suffix)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if args.mcts_tree_csv:
+        base_tree = Path(args.mcts_tree_csv)
+    else:
+        base_tree = base_log.with_name(base_log.stem + "_tree" + base_log.suffix)
+    tree_path = base_tree.with_name(base_tree.stem + suffix + base_tree.suffix)
+
+
+
     default_slos = RequestSLOOptions()
     slo_options = RequestSLOOptions(
         prefill_slos=_parse_sequence(args.mcts_prefill_slos, default_slos.prefill_slos),
@@ -115,25 +155,25 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         controller_budget_combs=args.mcts_controller_budget_combs,
     )
 
-    log_path = Path(args.mcts_log_csv)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
+    # log_path = Path(args.mcts_log_csv)
+    # log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if args.mcts_tree_csv:
-        tree_path = Path(args.mcts_tree_csv)
-    else:
-        tree_path = log_path.with_name(log_path.stem + "_tree.csv")
+    # if args.mcts_tree_csv:
+    #     tree_path = Path(args.mcts_tree_csv)
+    # else:
+    #     tree_path = log_path.with_name(log_path.stem + "_tree.csv")
 
     env = VidurMCTSEnvironment(
         base_simulator=simulator,
         constraints=constraints,
         explore_cfg=explore_cfg,
     )
-    mcts = VidurMCTS(env, explore_cfg, log_path=log_path, tree_log_path=tree_path)
+    mcts = VidurMCTS(env, explore_cfg, log_path=log_path, tree_log_path=tree_path , tree_dump_interval=args.mcts_tree_dump_interval)
     best_action = mcts.search(args.mcts_iterations)
 
-    root_visits = mcts._root.visits  # or via a getter if you add one
-    state_csv_path = log_path.with_name(log_path.stem + "_controller_states.csv")
-    write_controller_state_summary(env, explore_cfg, root_visits, state_csv_path)
+    # root_visits = mcts._root.visits  # or via a getter if you add one
+    # state_csv_path = log_path.with_name(log_path.stem + "_controller_states.csv")
+    # write_controller_state_summary(env, explore_cfg, root_visits, state_csv_path)
 
     print("Best controller action discovered:")
     print(f"  token_budget={best_action.token_budget}")

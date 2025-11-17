@@ -1,0 +1,148 @@
+INFO 11-16 20:21:22 sklearn_execution_time_predictor.py:709] Getting predictions for compute operations
+INFO 11-16 20:21:22 sklearn_execution_time_predictor.py:709] Getting predictions for compute operations
+INFO 11-16 20:21:23 sklearn_execution_time_predictor.py:767] Getting predictions for attention operations
+INFO 11-16 20:21:23 sklearn_execution_time_predictor.py:767] Getting predictions for attention operations
+INFO 11-16 20:21:32 sklearn_execution_time_predictor.py:709] Getting predictions for compute operations
+INFO 11-16 20:21:32 sklearn_execution_time_predictor.py:709] Getting predictions for compute operations
+INFO 11-16 20:21:34 sklearn_execution_time_predictor.py:767] Getting predictions for attention operations
+INFO 11-16 20:21:34 sklearn_execution_time_predictor.py:767] Getting predictions for attention operations
+INFO 11-16 20:21:43 simulator.py:131] Starting simulation with cluster: Cluster({'id': 1, 'num_replicas': 1, 'replicas': [{'id': ReplicaId(id=1), 'num_pipeline_stages': 1, 'num_tensor_parallel_workers': 1}]})
+INFO 11-16 20:21:43 simulator.py:168] Simulation ended at: 0.02114359945138969s
+INFO 11-16 20:21:43 simulator.py:131] Starting simulation with cluster: Cluster({'id': 1, 'num_replicas': 1, 'replicas': [{'id': ReplicaId(id=1), 'num_pipeline_stages': 1, 'num_tensor_parallel_workers': 1}]})
+INFO 11-16 20:21:43 simulator.py:168] Simulation ended at: 0.02114359945138969s
+INFO 11-16 20:21:43 sklearn_execution_time_predictor.py:709] Getting predictions for compute operations
+INFO 11-16 20:21:43 sklearn_execution_time_predictor.py:709] Getting predictions for compute operations
+INFO 11-16 20:21:45 sklearn_execution_time_predictor.py:767] Getting predictions for attention operations
+INFO 11-16 20:21:45 sklearn_execution_time_predictor.py:767] Getting predictions for attention operations
+INFO 11-16 20:21:55 simulator.py:131] Starting simulation with cluster: Cluster({'id': 2, 'num_replicas': 1, 'replicas': [{'id': ReplicaId(id=2), 'num_pipeline_stages': 1, 'num_tensor_parallel_workers': 1}]})
+INFO 11-16 20:21:55 simulator.py:168] Simulation ended at: 0.042627496630779374s
+INFO 11-16 20:21:55 simulator.py:131] Starting simulation with cluster: Cluster({'id': 2, 'num_replicas': 1, 'replicas': [{'id': ReplicaId(id=2), 'num_pipeline_stages': 1, 'num_tensor_parallel_workers': 1}]})
+INFO 11-16 20:21:55 simulator.py:168] Simulation ended at: 0.042627496630779374s
+INFO 11-16 20:21:55 sklearn_execution_time_predictor.py:709] Getting predictions for compute operations
+INFO 11-16 20:21:56 sklearn_execution_time_predictor.py:709] Getting predictions for compute operations
+INFO 11-16 20:21:57 sklearn_execution_time_predictor.py:767] Getting predictions for attention operations
+INFO 11-16 20:21:58 sklearn_execution_time_predictor.py:767] Getting predictions for attention operations
+INFO 11-16 20:22:08 simulator.py:131] Starting simulation with cluster: Cluster({'id': 3, 'num_replicas': 1, 'replicas': [{'id': ReplicaId(id=3), 'num_pipeline_stages': 1, 'num_tensor_parallel_workers': 1}]})
+INFO 11-16 20:22:08 simulator.py:168] Simulation ended at: 0.06460955137816907s
+INFO 11-16 20:22:08 simulator.py:131] Starting simulation with cluster: Cluster({'id': 3, 'num_replicas': 1, 'replicas': [{'id': ReplicaId(id=3), 'num_pipeline_stages': 1, 'num_tensor_parallel_workers': 1}]})
+INFO 11-16 20:22:08 simulator.py:168] Simulation ended at: 0.06460955137816907s
+INFO 11-16 20:22:08 sklearn_execution_time_predictor.py:709] Getting predictions for compute operations
+INFO 11-16 20:22:08 sklearn_execution_time_predictor.py:709] Getting predictions for compute operations
+INFO 11-16 20:22:10 sklearn_execution_time_predictor.py:767] Getting predictions for attention operations
+INFO 11-16 20:22:10 sklearn_execution_time_predictor.py:767] Getting predictions for attention operations
+INFO 11-16 20:22:21 simulator.py:131] Starting simulation with cluster: Cluster({'id': 4, 'num_replicas': 1, 'replicas': [{'id': ReplicaId(id=4), 'num_pipeline_stages': 1, 'num_tensor_parallel_workers': 1}]})
+INFO 11-16 20:22:21 simulator.py:168] Simulation ended at: 0.08703539953355875s
+INFO 11-16 20:22:21 sklearn_execution_time_predictor.py:709] Getting predictions for compute operations
+INFO 11-16 20:22:21 simulator.py:131] Starting simulation with cluster: Cluster({'id': 4, 'num_replicas': 1, 'replicas': [{'id': ReplicaId(id=4), 'num_pipeline_stages': 1, 'num_tensor_parallel_workers': 1}]})
+INFO 11-16 20:22:21 simulator.py:168] Simulation ended at: 0.08703539953355875s
+INFO 11-16 20:22:21 sklearn_execution_time_predictor.py:709] Getting predictions for compute operations
+INFO 11-16 20:22:23 sklearn_execution_time_predictor.py:767] Getting predictions for attention operations
+INFO 11-16 20:22:23 sklearn_execution_time_predictor.py:767] Getting predictions for attention operations
+INFO 11-16 20:22:34 simulator.py:131] Starting simulation with cluster: Cluster({'id': 5, 'num_replicas': 1, 'replicas': [{'id': ReplicaId(id=5), 'num_pipeline_stages': 1, 'num_tensor_parallel_workers': 1}]})
+INFO 11-16 20:22:34 simulator.py:168] Simulation ended at: 0.10994011104894842s
+INFO 11-16 20:22:34 simulator.py:131] Starting simulation with cluster: Cluster({'id': 5, 'num_replicas': 1, 'replicas': [{'id': ReplicaId(id=5), 'num_pipeline_stages': 1, 'num_tensor_parallel_workers': 1}]})
+INFO 11-16 20:22:34 simulator.py:168] Simulation ended at: 0.10994011104894842s
+INFO 11-16 20:22:34 sklearn_execution_time_predictor.py:709] Getting predictions for compute operations
+INFO 11-16 20:22:34 sklearn_execution_time_predictor.py:709] Getting predictions for compute operations
+INFO 11-16 20:22:36 sklearn_execution_time_predictor.py:767] Getting predictions for attention operations
+INFO 11-16 20:22:37 sklearn_execution_time_predictor.py:767] Getting predictions for attention operations
+INFO 11-16 20:22:47 simulator.py:131] Starting simulation with cluster: Cluster({'id': 6, 'num_replicas': 1, 'replicas': [{'id': ReplicaId(id=6), 'num_pipeline_stages': 1, 'num_tensor_parallel_workers': 1}]})
+INFO 11-16 20:22:47 simulator.py:168] Simulation ended at: 0.13335679184433813s
+INFO 11-16 20:22:47 simulator.py:131] Starting simulation with cluster: Cluster({'id': 6, 'num_replicas': 1, 'replicas': [{'id': ReplicaId(id=6), 'num_pipeline_stages': 1, 'num_tensor_parallel_workers': 1}]})
+INFO 11-16 20:22:47 simulator.py:168] Simulation ended at: 0.13335679184433813s
+Traceback (most recent call last):
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/run_mcts.py", line 231, in <module>
+    main()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/run_mcts.py", line 172, in main
+    best_action = mcts.search(args.mcts_iterations)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/mcts.py", line 375, in search
+    expanded = self._expand(node)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/mcts.py", line 428, in _expand
+    child_state = self._env.apply_controller_action_only(node.state, action)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/environment.py", line 694, in apply_controller_action_only
+    new_state = state if inplace else state.fork()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/environment.py", line 110, in fork
+    return VidurMCTSState(self.simulator.fork(), self.stats.clone())
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/simulator.py", line 412, in fork
+    snapshot = self.snapshot_state()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/simulator.py", line 251, in snapshot_state
+    scheduler_snapshot = clone_mutable(self._scheduler.snapshot_state())
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/scheduler/global_scheduler/base_global_scheduler.py", line 200, in snapshot_state
+    rsnap = replica_scheduler.snapshot_state()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/scheduler/replica_scheduler/vllm_v1_replica_scheduler.py", line 538, in snapshot_state
+    kv_cache_state=self._kv_cache_manager.snapshot_state(),
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/kv_cache/replica_kv_cache_manager.py", line 296, in snapshot_state
+    return ReplicaKVCacheManagerSnapshot(**to_primitive_tree(asdict(snap)))
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1238, in asdict
+    return _asdict_inner(obj, dict_factory)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1245, in _asdict_inner
+    value = _asdict_inner(getattr(obj, f.name), dict_factory)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1275, in _asdict_inner
+    return type(obj)((_asdict_inner(k, dict_factory),
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1276, in <genexpr>
+    _asdict_inner(v, dict_factory))
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1273, in _asdict_inner
+    return type(obj)(_asdict_inner(v, dict_factory) for v in obj)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1273, in <genexpr>
+    return type(obj)(_asdict_inner(v, dict_factory) for v in obj)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1275, in _asdict_inner
+    return type(obj)((_asdict_inner(k, dict_factory),
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1275, in <genexpr>
+    return type(obj)((_asdict_inner(k, dict_factory),
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1242, in _asdict_inner
+    if _is_dataclass_instance(obj):
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1207, in _is_dataclass_instance
+    return hasattr(type(obj), _FIELDS)
+KeyboardInterrupt
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+Traceback (most recent call last):
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/run_mcts.py", line 231, in <module>
+    main()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/run_mcts.py", line 172, in main
+    best_action = mcts.search(args.mcts_iterations)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/mcts.py", line 375, in search
+    expanded = self._expand(node)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/mcts.py", line 428, in _expand
+    child_state = self._env.apply_controller_action_only(node.state, action)
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/environment.py", line 694, in apply_controller_action_only
+    new_state = state if inplace else state.fork()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/environment.py", line 110, in fork
+    return VidurMCTSState(self.simulator.fork(), self.stats.clone())
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/simulator.py", line 412, in fork
+    snapshot = self.snapshot_state()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/simulator.py", line 251, in snapshot_state
+    scheduler_snapshot = clone_mutable(self._scheduler.snapshot_state())
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/scheduler/global_scheduler/base_global_scheduler.py", line 200, in snapshot_state
+    rsnap = replica_scheduler.snapshot_state()
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/scheduler/replica_scheduler/vllm_v1_replica_scheduler.py", line 538, in snapshot_state
+    kv_cache_state=self._kv_cache_manager.snapshot_state(),
+  File "/home/shazer/Desktop/Research/Vidur/vidur/vidur/kv_cache/replica_kv_cache_manager.py", line 289, in snapshot_state
+    block_pool=to_primitive_tree(asdict(bp)),
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1238, in asdict
+    return _asdict_inner(obj, dict_factory)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1245, in _asdict_inner
+    value = _asdict_inner(getattr(obj, f.name), dict_factory)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1273, in _asdict_inner
+    return type(obj)(_asdict_inner(v, dict_factory) for v in obj)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1273, in <genexpr>
+    return type(obj)(_asdict_inner(v, dict_factory) for v in obj)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1245, in _asdict_inner
+    value = _asdict_inner(getattr(obj, f.name), dict_factory)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/dataclasses.py", line 1279, in _asdict_inner
+    return copy.deepcopy(obj)
+  File "/home/shazer/.local/share/uv/python/cpython-3.10.19-linux-x86_64-gnu/lib/python3.10/copy.py", line 142, in deepcopy
+    cls = type(x)
+KeyboardInterrupt
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!
+PRINTING THE STATE INTO THE FOR THE TREE CSV!

@@ -63,12 +63,12 @@ def main() -> None:
         prefill_profile_path=str(prefill_profile),
     )
     explore = MCTSExploreConfig(
-        simulation_depth=1,
+        simulation_depth=10,
         simulation_random_tries=1,
         exploration_constant=1.4,
         max_branching=10,
     )
-    iterations = 1000
+    iterations = 50
 
     def cfg_to_args() -> Iterable[str]:
         args: list[str] = [
