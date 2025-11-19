@@ -308,10 +308,30 @@ class Simulator:
             self._request_generator.snapshot_state()
         )
 
+        # Derive per-simulator entity counters from this simulator's own
+        # objects, so forks/restores are independent of other simulators
+        # that may also be creating entities.
+        if request_states:
+            max_request_id = max(request_states.keys())
+        else:
+            max_request_id = -1
+
+        if batch_states:
+            max_batch_id = max(batch_states.keys())
+        else:
+            max_batch_id = -1
+
+        if batch_stage_states:
+            max_batch_stage_id = max(batch_stage_states.keys())
+        else:
+            max_batch_stage_id = -1
+
         entity_counters = {
-            "Request": Request._id,
-            "Batch": Batch._id,
-            "BatchStage": BatchStage._id,
+            "Request": max_request_id,
+            "Batch": max_batch_id,
+            "BatchStage": max_batch_stage_id,
+            # ExecutionTime entities are not tracked in request_states / batch_states,
+            # so we keep using the global counter for them.
             "ExecutionTime": ExecutionTime._id,
         }
 
@@ -330,6 +350,35 @@ class Simulator:
             python_random_state=random.getstate(),
             numpy_random_state=_encode_numpy_state(np.random.get_state()),
         )
+
+
+
+        # request_generator_state = clone_mutable(
+        #     self._request_generator.snapshot_state()
+        # )
+
+        # entity_counters = {
+        #     "Request": Request._id,
+        #     "Batch": Batch._id,
+        #     "BatchStage": BatchStage._id,
+        #     "ExecutionTime": ExecutionTime._id,
+        # }
+
+        # snapshot = SimulatorSnapshot(
+        #     __v__=_SNAP_VERSION_SIM,
+        #     time=self._time,
+        #     time_limit_reached=self._time_limit_reached,
+        #     event_queue=event_snapshots,
+        #     scheduler_state=scheduler_snapshot,
+        #     request_generator_state=request_generator_state,
+        #     entity_counters=entity_counters,
+        #     base_event_counter=BaseEvent._id,
+        #     request_states={k: clone_mutable(v) for k, v in request_states.items()},
+        #     batch_states={k: clone_mutable(v) for k, v in batch_states.items()},
+        #     batch_stage_states={k: clone_mutable(v) for k, v in batch_stage_states.items()},
+        #     python_random_state=random.getstate(),
+        #     numpy_random_state=_encode_numpy_state(np.random.get_state()),
+        # )
         return snapshot
 
     def restore_state(self, snapshot: SimulatorSnapshot) -> None:

@@ -188,3 +188,34 @@ when trying a particular node's action in an iteration after the right selection
 run that trace of MCTS all the way to that node which has been selected by applying the same actions recorded in the MCTS from the root node of both players till we reach that node that has been selected, perform the action etc suggested by MCTS and rollout like we do after the log has been stored as before, go back to the root simulator node and delete this forked node. This way we can have just at any given time 2 simulator nodes atmost while achieving the same speed and 100 to 1000x less memory. 
 
 So can you tell me that what changes needs to be done here without affecting the correctness ?
+
+
+
+
+ok so i have implemented your changes but i have some questions 
+First of all :
+In parrallel launch we have different histories that are not the same as simulator's initial state 
+so should replay_to_node start from the root state exactly so that we are consistent with the history given to the root ?
+
+Secondly,
+Why exactly are we forking again in the simulate ? does replay_to_node gives us a forked version of the initial state (which should be the root state ) ? Also from my point of view forking should be minimised that is unnecessary because its an expensive operation. Other than forking root for trying new node and in the dump_tree snapshot, we shouldnt be doing it more as it might affect our speed 
+
+So consider these suggestions and see if the implementation changes are needed 
+
+
+ 
+
+
+ python -m vidur.mcts.prefill_calibrator \
+  --output ./simulator_output/new_prefill_profile.csv \
+  --step 512 \
+  --max_tokens 10240 \
+  --replica_config_model_name meta-llama/Meta-Llama-3-8B \
+  --replica_config_device a100 \
+  --replica_config_network_device a100_dgx \
+  --cluster_config_num_replicas 1 \
+  --replica_config_tensor_parallel_size 1 \
+  --replica_config_num_pipeline_stages 1 \
+  --global_scheduler_config_type round_robin \
+  --replica_scheduler_config_type vllm_v1
+

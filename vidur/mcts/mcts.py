@@ -175,6 +175,8 @@ class _MCTSLogger:
             )
             if controller_action
             else 0,
+            "controller_heuristic": ctrl_heuristic,
+            "controller_strategy": ctrl_strategy,
         }
         self._writer.writerow(row)
         self._row_count += 1
@@ -247,8 +249,8 @@ class _MCTSTreeLogger:
         "depth",
         "player_to_act",
         "action_type",       # "adversary" or "controller"
-        "sim_time",
-        "requests_in_system",
+        "visits",            # node.visits
+        "parent_visits",     # parent.visits (0 if root)
         "node_cost",         # mean cost at this node
         "ucb_score",
         "action_repr",       # simple string/JSON for the action
@@ -288,7 +290,7 @@ def _compute_objective_cost(violations: int, avg_lateness: float) -> float:
 
 @dataclass
 class MCTSNode:
-    state: VidurMCTSState
+    # state: VidurMCTSState
     player: str  # "adversary" or "controller"
     node_id: int = 0
     depth: int = 0
@@ -298,6 +300,9 @@ class MCTSNode:
     cumulative_cost: float = 0.0  # smaller is better for controller
     children: List["MCTSChildEdge"] = field(default_factory=list)
     untried_actions: List[Union[AdversaryAction, ControllerAction]] = field(default_factory=list)
+
+
+
 
     def is_fully_expanded(self) -> bool:
         return len(self.untried_actions) == 0
@@ -347,6 +352,9 @@ class VidurMCTS:
             tree_log_path = base.with_name(base.stem + "_tree" + base.suffix)
 
         self._tree_logger = _MCTSTreeLogger(tree_log_path, flush_every=logger_flush_every)
+
+        self._history_root_state: Optional[VidurMCTSState] = None
+        self._history_root_node: Optional[MCTSNode] = None
         # ## Pre Computing the necessary states here 
         # max_budget = self._env._max_request_tokens_allowed()
         # self._env.precompute_controller_state_space(token_budget=max_budget)
@@ -355,50 +363,36 @@ class VidurMCTS:
         root = self._create_root()
         try:
             self._root = root
-            root_cost = self._log_state(
-                iteration=0,
-                phase="root",
-                node=root,
-                parent_id=None,
-                acting_player=None,
-                next_player=root.player,
-                action=None,
-            )
-            root.cumulative_cost = root_cost
 
-
-            # --- Random history prefix (depth in plies) ---
+            # --- Random history prefix (in plies: adversary/controller steps) ---
             current = root
+            current_state = self._replay_to_node(root)  # or reuse state from _create_root if you return it
             for step in range(self._history_depth):
-                # Ensure we have actions to choose from
                 if not current.untried_actions:
-                    current.untried_actions = self._enumerate_actions(current)
+                    current.untried_actions = self._enumerate_actions(current, current_state)
                     if not current.untried_actions:
                         break
 
-                # Pick a random action from this node
                 action = self._rng.choice(current.untried_actions)
                 current.untried_actions.remove(action)
 
                 if current.player == "adversary":
-                    child_state = self._env.apply_adversary_action_only(current.state, action)
+                    new_state = self._env.apply_adversary_action_only(current_state, action)
                     next_player = "controller"
                 else:
-                    child_state = self._env.apply_controller_action_only(current.state, action)
+                    new_state = self._env.apply_controller_action_only(current_state, action)
                     next_player = "adversary"
 
                 child = MCTSNode(
-                    state=child_state,
                     player=next_player,
                     node_id=self._next_node_id(),
                     depth=current.depth + 1,
                     parent=current,
                     parent_action=action,
                 )
-                child.untried_actions = self._enumerate_actions(child)
+                child.untried_actions = self._enumerate_actions(child, new_state)
                 current.children.append(MCTSChildEdge(action=action, node=child))
 
-                # Log these as part of iteration 0 (history)
                 self._log_state(
                     iteration=0,
                     phase="INITIAL_HISTORY_GEN",
@@ -407,38 +401,48 @@ class VidurMCTS:
                     acting_player=current.player,
                     next_player=child.player,
                     action=action,
+                    state=new_state,
                 )
 
                 current = child
+                current_state = new_state
 
-            # Use the last node of the history as the root for MCTS
+        
+            # after the history loop
             root_for_search = current
             self._root = root_for_search
-            root = self._root
-            ## --------- RANDOM HISTORY ENDS HERE -----------
+            self._history_root_node = root_for_search
+            self._history_root_state = current_state
 
-            ## -------- VANILLA MCTS STARTS HERE -----------
+
+            # --- Vanilla MCTS from history root ---
             for itr in range(iterations):
-                # EARLY EXIT: all controller states visited at least once
                 if self._env.controller_states_fully_visited():
                     if self._verbose:
                         print("Stopping MCTS: all controller states visited >= 1")
                     break
 
                 self._current_iteration = itr + 1
-                node = self._select(root)
-                expanded = self._expand(node)
-                leaf = expanded or node
-                cost = self._simulate(leaf)
+                node = self._select(root_for_search)
 
+                # Reconstruct state at selected node once
+                # Reconstruct state at selected node once
+                if self._history_root_node is not None and node is self._history_root_node and self._history_root_state is not None:
+                    parent_state = self._history_root_state
+                else:
+                    parent_state = self._replay_to_node(node)
+                # Expand once and reuse the resulting state
+                expanded, child_state = self._expand(node, parent_state)
+                leaf = expanded or node
+                leaf_state = child_state if expanded is not None else parent_state
+
+                cost = self._simulate(leaf, leaf_state)
                 self._backpropagate(leaf, cost)
 
-                # Periodically dump the entire tree to the tree CSV
                 if (
                     self._tree_dump_interval > 0
                     and (itr + 1) % self._tree_dump_interval == 0
                 ):
-                    print("PRINTING THE STATE INTO THE FOR THE TREE CSV!")
                     self._dump_tree_snapshot(iteration=itr + 1)
         finally:
             self._logger.close()
@@ -454,13 +458,65 @@ class VidurMCTS:
     def _create_root(self) -> MCTSNode:
         state = self._env.initial_state()
         node = MCTSNode(
-            state=state,
             player="adversary",
             node_id=self._next_node_id(),
             depth=0,
         )
-        node.untried_actions = self._enumerate_actions(node)
+        node.untried_actions = self._enumerate_actions(node, state)
+        cost = self._log_state(
+            iteration=0,
+            phase="root",
+            node=node,
+            parent_id=None,
+            acting_player=None,
+            next_player=node.player,
+            action=None,
+            state=state,
+        )
+        node.cumulative_cost = cost
         return node
+
+
+    def _replay_to_node(self, node: MCTSNode) -> VidurMCTSState:
+        """Reconstruct a fresh state at `node` by replaying actions.
+
+        If a random history prefix was generated, we treat the history root
+        state as the baseline and only replay actions *below* that node.
+        Otherwise, we start from a fresh initial state and replay from the
+        true root.
+        """
+        # Decide the baseline state and the cut node in the ancestry.
+        if self._history_root_node is not None and self._history_root_state is not None:
+            baseline_state = self._history_root_state
+            cut_node = self._history_root_node
+        else:
+            baseline_state = self._env.initial_state()
+            cut_node = None
+
+        # Collect path from `cut_node` (exclusive) down to `node`.
+        path: List[MCTSNode] = []
+        cur = node
+        while cur is not None and cur is not cut_node:
+            path.append(cur)
+            cur = cur.parent
+        path.reverse()
+
+        # Work on a fork so we never mutate the stored baseline state.
+        state = baseline_state.fork()
+
+        # Replay actions inplace along the path segment.
+        for n in path:
+            parent = n.parent
+            action = n.parent_action
+            if parent is None or action is None:
+                continue
+            if parent.player == "adversary":
+                state = self._env.apply_adversary_action_only(state, action, inplace=True)
+            else:
+                state = self._env.apply_controller_action_only(state, action, inplace=True)
+
+        return state
+    
 
     def _select(self, root: MCTSNode) -> MCTSNode:
         node = root
@@ -468,54 +524,33 @@ class VidurMCTS:
             node = self._best_child(node)
         return node
 
-    def _expand(self, node: MCTSNode) -> Optional[MCTSNode]:
-       
+    def _expand(
+        self,
+        node: MCTSNode,
+        parent_state: VidurMCTSState,
+    ) -> Tuple[Optional[MCTSNode], Optional[VidurMCTSState]]:
         if not node.untried_actions:
-            return None
+            return None, None
+
         action = node.untried_actions.pop()
+
         if node.player == "adversary":
-            child_state = self._env.apply_adversary_action_only(node.state, action)
+            child_state = self._env.apply_adversary_action_only(parent_state, action)
             next_player = "controller"
-     
-            # print(f"[PROFILE] apply_adversary_actions: {t1 - t0:.4f}s")
         else:
-            # Controller applies the action → compute cost delta and update metrics
-            child_state = self._env.apply_controller_action_only(node.state, action)
+            child_state = self._env.apply_controller_action_only(parent_state, action)
             next_player = "adversary"
 
-            # parent cost
-            parent_snapshot = self._env.describe_state(node.state)
-            parent_cost = _compute_objective_cost(
-                parent_snapshot["slo_violations"],
-                parent_snapshot["avg_lateness"],
-            )
-
-            # child cost (this is exactly what the tree log will see)
-            child_snapshot = self._env.describe_state(child_state)
-            violations = child_snapshot["slo_violations"]
-            avg_lateness = child_snapshot["avg_lateness"]
-            cost = _compute_objective_cost(violations, avg_lateness)
-            delta_cost = cost - parent_cost
-
-            # update per-controller-state statistics
-            self._env.update_controller_state_metrics(
-                action,
-                cost,
-                delta_cost,
-                violations,
-                avg_lateness,
-            )
-
         child = MCTSNode(
-            state=child_state,
             player=next_player,
             node_id=self._next_node_id(),
             depth=node.depth + 1,
             parent=node,
             parent_action=action,
         )
-        child.untried_actions = self._enumerate_actions(child)
+        child.untried_actions = self._enumerate_actions(child, child_state)
         node.children.append(MCTSChildEdge(action=action, node=child))
+
         self._log_state(
             iteration=self._current_iteration,
             phase="tree",
@@ -524,18 +559,29 @@ class VidurMCTS:
             acting_player=node.player,
             next_player=child.player,
             action=action,
+            state=child_state,
         )
-   
-        #print(f" Expansion time : {t2 - t0:.4f}s")
-        return child
 
-    def _simulate(self, node: MCTSNode) -> float:
+        return child, child_state
+ 
+    #     #print(f" Expansion time : {t2 - t0:.4f}s")
+    #     return child
+
+    def _simulate(self, node: MCTSNode, start_state: VidurMCTSState) -> float:
         total_cost = 0.0
         num_trials = max(1, self._cfg.simulation_random_tries)
 
         rollout_batch_rows: List[Dict[str, Any]] = []
         for trial in range(num_trials):
-            rollout_state = node.state.fork()
+            # rollout_state = node.state.fork()
+            # current_player = node.player
+            # base_state = self._replay_to_node(node)
+            # rollout_state = base_state.fork()
+            if num_trials > 1 :
+                rollout_state = start_state.fork() 
+            else :
+                rollout_state = start_state
+
             current_player = node.player
             parent_id: Union[int, str] = node.node_id
 
@@ -608,27 +654,34 @@ class VidurMCTS:
     # Utility helpers
     # ------------------------------------------------------------------ #
     def _enumerate_actions(
-        self, node: MCTSNode
+        self, node: MCTSNode, state: Optional[VidurMCTSState] = None
     ) -> List[Union[AdversaryAction, ControllerAction]]:
-        t0 = time.perf_counter()
+ 
+        # if node.player == "adversary":
+        #     actions = self._env.sample_adversary_actions(
+        #         node.state, self._cfg.max_branching
+        #     )
+        # else:
+        #     actions = self._env.sample_controller_actions(
+        #         node.state, self._cfg.max_branching
+        #     )
+        # self._rng.shuffle(actions)
+        # return actions
+
+        # If no state given, reconstruct it from the root
+        if state is None:
+            state = self._replay_to_node(node)
         if node.player == "adversary":
-            t1 = time.perf_counter()
             actions = self._env.sample_adversary_actions(
-                node.state, self._cfg.max_branching
+                state, self._cfg.max_branching
             )
-            t2 = time.perf_counter()
-            #print(f"[PROFILE] sample_adversary_actions: {t2 - t1:.4f}s")
         else:
-            t1 = time.perf_counter()
             actions = self._env.sample_controller_actions(
-                node.state, self._cfg.max_branching
+                state, self._cfg.max_branching
             )
-            t2 = time.perf_counter()
-            #print(f"[PROFILE] sample_controller_actions: {t2 - t1:.4f}s")
         self._rng.shuffle(actions)
-        t3 = time.perf_counter()
-        #print(f"[PROFILE] _enumerate_actions total ({node.player}): {t3 - t0:.4f}s")
         return actions
+
 
 
     def _best_child(self, node: MCTSNode) -> MCTSNode:
@@ -669,14 +722,26 @@ class VidurMCTS:
         depth: Optional[float] = None,
         state: Optional[VidurMCTSState] = None,
     ) -> float:
-        if node is not None:
-            state = node.state
-            node_id = node.node_id
-            depth = node.depth
-            acting_player = node.parent.player if node.parent else acting_player
-            next_player = node.player
-        assert state is not None
+        # if node is not None:
+        #     state = node.state
+        #     node_id = node.node_id
+        #     depth = node.depth
+        #     acting_player = node.parent.player if node.parent else acting_player
+        #     next_player = node.player
+        # assert state is not None
       
+        # If node is given and id/depth not provided, fill them
+        if node is not None:
+            node_id = node_id if node_id is not None else node.node_id
+            depth = depth if depth is not None else node.depth
+            acting_player = acting_player or (node.parent.player if node.parent else None)
+            next_player = next_player or node.player
+        if state is None:
+            if node is None:
+                raise ValueError("Either `state` or `node` must be provided to _log_state")
+            state = self._replay_to_node(node)
+
+
         snapshot = self._env.describe_state(state)
    
         violations = snapshot["slo_violations"]
@@ -701,46 +766,6 @@ class VidurMCTS:
             objective_cost=cost,
         )
        
-        # New: tree-only CSV (no rollouts)
-        # if phase in ("root", "tree") and self._tree_logger is not None:
-        #     row = self._make_log_row(
-        #         iteration=iteration,
-        #         phase=phase,
-        #         parent_id=parent_id,
-        #         node_id=node_id or "root",
-        #         acting_player=player_label,
-        #         next_player=next_label,
-        #         depth=depth_value,
-        #         state=state,
-        #         action=action,
-        #     )
-        #     self._tree_logger.write_row(row)
-    
-        # print(
-        #     f"[PROFILE] log_state phase={phase}: "
-        #     f"describe_state Snap_shot={t1 - t0:.4f}s, main_log={t2 - t1:.4f}s, "
-        #     f"tree_log={t3 - t2:.4f}s"
-        # )
-        # New: per-controller-state metrics with delta cost
-        # if isinstance(controller_action, ControllerAction) and phase in ("root", "tree"):
-        #     # Compute parent cost if there is a parent node
-        #     if node is not None and node.parent is not None:
-        #         parent_snapshot = self._env.describe_state(node.parent.state)
-        #         parent_cost = _compute_objective_cost(
-        #             parent_snapshot["slo_violations"],
-        #             parent_snapshot["avg_lateness"],
-        #         )
-        #     else:
-        #         parent_cost = 0.0  # treat root as baseline
-        #     delta_cost = cost - parent_cost
-
-        #     self._env.update_controller_state_metrics(
-        #         controller_action,
-        #         cost,
-        #         delta_cost,
-        #         violations,
-        #         avg_lateness,
-        #     )
 
         return cost
 
@@ -835,23 +860,17 @@ class VidurMCTS:
             player_to_act = node.player
             action = node.parent_action  # action that led to this node
 
-            # Describe current simulator state at this node
-            snapshot = self._env.describe_state(node.state)
-            sim_time = snapshot["sim_time"]
-            num_requests = snapshot["requests_in_system"]
-
-            # Cost estimate at this node (mean MCTS cost)
-            mean_cost = (
-                node.cumulative_cost / node.visits if node.visits > 0 else 0.0
-            )
+            # Pure tree statistics (no simulator replay)
+            visits = node.visits
+            parent_visits = parent.visits if parent is not None else 0
+            mean_cost = (node.cumulative_cost / visits) if visits > 0 else 0.0
 
             # UCB score relative to parent (same formula as _best_child)
-            if parent is not None and node.visits > 0:
-                parent_visits = max(1, parent.visits)
-                ln_parent = math.log(parent_visits)
+            if parent is not None and visits > 0 and parent_visits > 0:
+                ln_parent = math.log(max(1, parent_visits))
                 exploit = -mean_cost if parent.player == "controller" else mean_cost
                 explore = self._cfg.exploration_constant * math.sqrt(
-                    ln_parent / max(1, node.visits)
+                    ln_parent / max(1, visits)
                 )
                 ucb = exploit + explore
             else:
@@ -879,8 +898,8 @@ class VidurMCTS:
                     "depth": depth,
                     "player_to_act": player_to_act,
                     "action_type": action_type,
-                    "sim_time": sim_time,
-                    "requests_in_system": num_requests,
+                    "visits": visits,
+                    "parent_visits": parent_visits,
                     "node_cost": mean_cost,
                     "ucb_score": ucb,
                     "action_repr": action_repr,
@@ -894,4 +913,3 @@ class VidurMCTS:
         node_id = self._node_counter
         self._node_counter += 1
         return node_id
-

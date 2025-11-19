@@ -89,6 +89,9 @@ class VidurGameStats:
     slo_lateness_sum: float = 0.0
     recent_arrivals: List[float] = field(default_factory=list)  # absolute times
     completed_request_ids: Set[int] = field(default_factory=set)
+    # NEW: per-request max lateness and permanent violation flags
+    per_request_max_lateness: Dict[int, float] = field(default_factory=dict)
+    violated_request_ids: Set[int] = field(default_factory=set)
 
     def clone(self) -> "VidurGameStats":
         return VidurGameStats(
@@ -98,6 +101,8 @@ class VidurGameStats:
             slo_lateness_sum=self.slo_lateness_sum,
             recent_arrivals=list(self.recent_arrivals),
             completed_request_ids=set(self.completed_request_ids),
+            per_request_max_lateness=dict(self.per_request_max_lateness),
+            violated_request_ids=set(self.violated_request_ids),
         )
 
 ## Essentially checkpoints the state so it can return back to it to run a different simulation
@@ -131,21 +136,34 @@ class VidurMCTSEnvironment:
             path=constraints.prefill_profile_path,
             max_tokens=constraints.max_request_tokens,
         )
-        self.all_possible_Prefill_reqs_table: Dict[int, List[int]] = None ## This dict will store all possible QPS Combinations produced by the adversary in a burst 
-        self.controller_all_possible_prefill_budgets: List[int] = None ## This list will store all possible token budget options Controller has to allocate a batch with 
-        self.all_possible_Controller_actions: List[any] = None ## This list will be storing all the different possible actions that controller can produce on its turn --> Size of this |LIST| = k x n x h where k = number of different allocations , n = number of different token budgets , h = hueristic options available. This becomes => 48 atm  
+        self.all_possible_Prefill_reqs_table: Dict[int, List[int]] = None
+        self.controller_all_possible_prefill_budgets: List[int] = None
+        self.all_possible_Controller_actions: List[any] = None
         self.all_possible_Controller_States: Dict[Tuple[Tuple[int, ...], str, str], Dict[str, Any]] = {}
         # key = (mapping_tuple, heuristic_name, allocation_strategy_name)
-        ## This carries the only possible states that can occur due to prefill requests after applying hueristics and the given constraints. Norm of |LIST| = k (Summation from i = 1 to n of i!)
-            
+
+        # Take a frozen snapshot of the root simulator once, so that every
+        # initial MCTS state starts from the exact same simulator + ID counters.
+        self._base_snapshot = base_simulator.snapshot_state()
+
         if self._constraints.max_request_tokens is None:
             self._constraints.max_request_tokens = self._prefill_profile.max_tokens
+
 
     # ------------------------------------------------------------------ #
     # State helpers
     # ------------------------------------------------------------------ #
     def initial_state(self) -> VidurMCTSState:
-        return VidurMCTSState(self._base.fork(), VidurGameStats())
+        # Always recreate a fresh simulator from the frozen root snapshot.
+        # This ensures request IDs and entity counters are identical for every
+        # replay from the root, regardless of what other simulators did.
+        sim = Simulator(
+            self._base._config,
+            register_atexit=False,
+            execution_time_predictor=getattr(self._base, "_execution_time_predictor", None),
+        )
+        sim.restore_state(self._base_snapshot)
+        return VidurMCTSState(sim, VidurGameStats())
 
     # ------------------------------------------------------------------ #
     # Action generation helpers
@@ -732,22 +750,12 @@ class VidurMCTSEnvironment:
     # ------------------------------------------------------------------ #
     def evaluate_objective(self, state: VidurMCTSState) -> Tuple[int, float]:
         st = state.stats
-        simulator = state.simulator
-        request_lookup = self._build_request_lookup(simulator)
-
         violations = st.slo_violations
-        lateness_sum = st.slo_lateness_sum
-
-        for rid, req in request_lookup.items():
-            if rid in st.completed_request_ids:
-                continue
-            lateness = self._compute_lateness(req, simulator._time)
-            if lateness > 0:
-                violations += 1
-                lateness_sum += lateness
-
-        avg_lateness = lateness_sum / max(violations, 1) if violations else 0.0
+        avg_lateness = (
+            st.slo_lateness_sum / max(violations, 1) if violations else 0.0
+        )
         return violations, avg_lateness
+
 
     def describe_state(self, state: VidurMCTSState) -> Dict[str, Any]:
         violations, avg_lateness = self.evaluate_objective(state)
@@ -773,9 +781,13 @@ class VidurMCTSEnvironment:
     ) -> None:
         sim = state.simulator
         time_now = sim._time 
+
+        # Bucket logical arrival time down to the nearest lowest whole second e.g. if time now is 1.2s --> arrival time is 1.0s
+        arrival_time = math.floor(time_now)
+
         for spec in action.requests: 
             req = Request(
-                arrived_at=time_now,
+                arrived_at=arrival_time,
                 num_prefill_tokens=spec.prefill_tokens,
                 num_decode_tokens=spec.decode_tokens,
                 block_hash_ids=None,
@@ -790,7 +802,7 @@ class VidurMCTSEnvironment:
 
             sim._add_event(RequestArrivalEvent(time_now, req))
             state.stats.requests_generated += 1
-            state.stats.recent_arrivals.append(time_now)
+            state.stats.recent_arrivals.append(arrival_time)
 
         # Optionally stop decode on selected requests
         if action.stop_decode_ids:
@@ -1078,15 +1090,32 @@ class VidurMCTSEnvironment:
     def _update_stats(self, state: VidurMCTSState) -> None:
         sim = state.simulator
         stats = state.stats
+
+        # 1) For every request we know about, update per-request max lateness
+        #    and permanent violation flags.
+        for replica_scheduler in sim._scheduler._replica_schedulers.values():
+            for request in list(replica_scheduler._requests.values()):
+                rid = request.id
+                lateness = self._compute_lateness(request, sim._time)
+
+                # Monotone lateness: accumulate only the *increase* in max lateness
+                prev_max = stats.per_request_max_lateness.get(rid, 0.0)
+                if lateness > prev_max:
+                    stats.slo_lateness_sum += (lateness - prev_max)
+                    stats.per_request_max_lateness[rid] = lateness
+
+                # Monotone violations: once late, always counted as a violation
+                if lateness > 0 and rid not in stats.violated_request_ids:
+                    stats.violated_request_ids.add(rid)
+                    stats.slo_violations += 1
+
+        # 2) Track completions (this stays monotone as before)
         for replica_scheduler in sim._scheduler._replica_schedulers.values():
             for request in list(replica_scheduler._requests.values()):
                 if request.completed and request.id not in stats.completed_request_ids:
                     stats.requests_completed += 1
-                    lateness = self._compute_lateness(request, sim._time)
-                    if lateness > 0:
-                        stats.slo_violations += 1
-                        stats.slo_lateness_sum += lateness
                     stats.completed_request_ids.add(request.id)
+
 
     def _compute_lateness(self, request: Request, sim_time: float) -> float:
         total_lateness = 0.0
