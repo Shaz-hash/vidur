@@ -837,6 +837,33 @@ class VidurMCTSEnvironment:
         for req in ordered:
             waiting_queue.push(req)
 
+    # def _restrict_running_set(
+    #     self,
+    #     replica_scheduler,
+    #     targeted_ids: Iterable[int],
+    # ) -> List[Request]:
+    #     running = getattr(replica_scheduler, "_running", None)
+    #     if running is None:
+    #         return []
+
+    #     targeted = set(targeted_ids)
+    #     kept: List[Request] = []
+    #     hidden: List[Request] = []
+    #     for req in running:
+    #         if req.id in targeted:
+    #             kept.append(req)
+    #         else:
+    #             hidden.append(req)
+
+    #     setattr(replica_scheduler, "_running", kept)
+
+    #     scheduled_set = getattr(replica_scheduler, "scheduled_req_ids", None)
+    #     if isinstance(scheduled_set, set):
+    #         for req in hidden:
+    #             scheduled_set.discard(req.id)
+
+    #     return hidden
+
     def _restrict_running_set(
         self,
         replica_scheduler,
@@ -857,12 +884,13 @@ class VidurMCTSEnvironment:
 
         setattr(replica_scheduler, "_running", kept)
 
-        scheduled_set = getattr(replica_scheduler, "scheduled_req_ids", None)
-        if isinstance(scheduled_set, set):
-            for req in hidden:
-                scheduled_set.discard(req.id)
+        # IMPORTANT: do NOT modify scheduled_req_ids here.
+        # BatchEndEvent / on_batch_end relies on scheduled_req_ids to be
+        # consistent with batches already in flight; we only want to hide
+        # non-targeted requests from running, not rewrite scheduler history.
 
         return hidden
+
 
     def _restrict_waiting_queue(
         self,
@@ -1134,50 +1162,26 @@ class VidurMCTSEnvironment:
             total_lateness += max(0.0, actual - deadline)
 
         decode_slo = getattr(request, "_decode_slo_time", None)
+
         if decode_slo is not None and decode_slo >= 0:
-            has_decode_tokens = getattr(
-                request, "_num_decode_tokens", request.num_decode_tokens
-            ) > 0
+            has_decode_tokens = getattr(request, "_num_decode_tokens", request.num_decode_tokens) > 0
             if has_decode_tokens and prefill_completed_at is not None:
-                decode_tokens_done = request.num_processed_decode_tokens
-                total_decode_tokens = getattr(
-                    request, "_num_decode_tokens", request.num_decode_tokens
-                )
-                baseline_tokens = 1 if total_decode_tokens > 0 else 0
-                actual_tokens = max(decode_tokens_done - baseline_tokens, 0)
+                # Initialize next-deadline on first decode (if not already done)
+                if getattr(request, "_decode_next_deadline", None) is None:
+                    request._decode_next_deadline = prefill_completed_at + decode_slo
+                    request._decode_tokens_counted = 0
 
-                latest_iter_end = getattr(
-                    request, "_latest_iteration_completed_at", None
-                )
-                if latest_iter_end in (None, 0):
-                    latest_iter_end = None
+                # How many DECODE tokens actually done: processed minus prefill segment
+                decode_tokens_done = request.num_processed_decode_tokens 
 
+                # New tokens since last time we accounted for lateness
+                new_tokens = max(0, decode_tokens_done - getattr(request, "_decode_tokens_counted", 0))
                 decode_lateness = 0.0
-
-                if actual_tokens > 0:
-                    produced_deadline = (
-                        prefill_completed_at + actual_tokens * decode_slo
-                    )
-                    actual_decode = (
-                        latest_iter_end if latest_iter_end is not None else sim_time
-                    )
-                    decode_lateness = max(
-                        decode_lateness, max(0.0, actual_decode - produced_deadline)
-                    )
-                else:
-                    first_deadline = prefill_completed_at + decode_slo
-                    decode_lateness = max(
-                        decode_lateness, max(0.0, sim_time - first_deadline)
-                    )
-
-                remaining_tokens = max(total_decode_tokens - actual_tokens, 0)
-                if remaining_tokens > 0:
-                    next_deadline = prefill_completed_at + (
-                        actual_tokens + 1
-                    ) * decode_slo
-                    decode_lateness = max(
-                        decode_lateness, max(0.0, sim_time - next_deadline)
-                    )
+                for _ in range(new_tokens):
+                    deadline = request._decode_next_deadline
+                    decode_lateness += max(0.0, sim_time - deadline)
+                    request._decode_next_deadline += decode_slo
+                    request._decode_tokens_counted += 1
 
                 total_lateness += decode_lateness
 

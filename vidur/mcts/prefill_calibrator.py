@@ -82,12 +82,12 @@ class PrefillProfile:
         for size in tokens:
             entries[size] = _measure_prefill_time(sim_config, size)
 
-        # Extra large sizes we always want to profile, regardless of step
-        extra_sizes = [20000, 30000, 40000, 50000,
-                       60000, 70000, 80000, 90000 ,100000]
-        for size in extra_sizes:
-            if size not in entries:
-                entries[size] = _measure_prefill_time(sim_config, size)
+        # # Extra large sizes we always want to profile, regardless of step
+        # extra_sizes = [20000, 30000, 40000, 50000,
+        #                60000, 70000, 80000, 90000 ,100000]
+        # for size in extra_sizes:
+        #     if size not in entries:
+        #         entries[size] = _measure_prefill_time(sim_config, size)
 
         if output_path:
             output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -97,10 +97,10 @@ class PrefillProfile:
                 # Write base grid first
                 for size in tokens:
                     writer.writerow([size, entries[size]])
-                # Then append the extra big sizes at the end (sorted)
-                for size in sorted(extra_sizes):
-                    if size not in tokens and size in entries:
-                        writer.writerow([size, entries[size]])
+                # # Then append the extra big sizes at the end (sorted)
+                # for size in sorted(extra_sizes):
+                #     if size not in tokens and size in entries:
+                #         writer.writerow([size, entries[size]])
 
         return PrefillProfile(step=step, max_tokens=max_tokens, entries=entries)
 
@@ -193,8 +193,8 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         sys.argv = original_argv
 
     et_cfg = cfg.execution_time_predictor_config
-    et_cfg.prediction_max_tokens_per_request = 100000
-    et_cfg.prediction_max_batch_size = 64
+    et_cfg.prediction_max_tokens_per_request = 8192
+    et_cfg.prediction_max_batch_size = 128
 
     step = args.step or cfg.cluster_config.cache_config.block_size
     step = max(1, step)

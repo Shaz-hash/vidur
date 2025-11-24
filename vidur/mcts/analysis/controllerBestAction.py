@@ -112,12 +112,27 @@ ANALYSIS_FIELDS = [
 ]
 
 
+# def load_csv_rows(path: Path) -> List[Dict[str, str]]:
+#     if not path.exists():
+#         return []
+#     with path.open("r", newline="") as f:
+#         reader = csv.DictReader(f)
+#         return list(reader)
+
+
 def load_csv_rows(path: Path) -> List[Dict[str, str]]:
     if not path.exists():
         return []
-    with path.open("r", newline="") as f:
-        reader = csv.DictReader(f)
+
+    def _clean_lines(f):
+        for line in f:
+            # Remove any embedded NULs before csv.DictReader sees the line
+            yield line.replace("\x00", "")
+
+    with path.open("r", newline="", encoding="utf-8", errors="replace") as f:
+        reader = csv.DictReader(_clean_lines(f))
         return list(reader)
+
 
 
 def build_tree_stats_by_node(tree_path: Path) -> Dict[str, Dict[str, str]]:

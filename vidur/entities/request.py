@@ -149,6 +149,10 @@ class Request(BaseEntity):
 
         self._num_restarts = 0
 
+        self._decode_next_deadline = None   # float or None
+        self._decode_tokens_counted = 0     # how many decode tokens we've already accounted for in lateness
+
+
     @property
     def replica_id(self):
         return self._replica_id
@@ -376,6 +380,10 @@ class Request(BaseEntity):
         self._completed = False
         self._is_prefill_complete = False
 
+        # reset decode tracking
+        self._decode_next_deadline = None
+        self._decode_tokens_counted = 0
+
         self._num_restarts += 1
 
     def on_batch_schedule(
@@ -411,14 +419,19 @@ class Request(BaseEntity):
         if self._num_processed_tokens == self._num_prefill_tokens:
             self._is_prefill_complete = True
             # we get one decode token when the prefill processing completes
-            if self._num_decode_tokens > 0:
-                self._num_processed_tokens += 1
+            # if self._num_decode_tokens > 0:
+            #     self._num_processed_tokens += 1
 
             # we must record the prefill completion time only in the first time
             # in the subsequent restarts, we keep adding the previously decoded
             # tokens to the prefill tokens - that is irrelevant to the original prefill
             if self._prefill_completed_at == 0:
                 self._prefill_completed_at = time
+                
+            # Initialize decode lateness tracking when prefill first completes
+            if getattr(self, "_decode_next_deadline", None) is None and self._decode_slo_time >= 0:
+                self._decode_next_deadline = self._prefill_completed_at + self._decode_slo_time
+                self._decode_tokens_counted = 0
 
         # check if request is completed
         if self._num_processed_tokens == self.total_tokens:
@@ -597,6 +610,10 @@ class Request(BaseEntity):
         req._prefill_slo_time = float(s["prefill_slo_time"]) if s.get("prefill_slo_time") is not None else None
         req._decode_slo_time = float(s.get("decode_slo_time", -1.0))
         req._completion_slo_time = float(s.get("completion_slo_time", -1.0))
+
+        # NEW: ensure decode tracking fields exist on restored requests
+        req._decode_next_deadline = None
+        req._decode_tokens_counted = 0
 
         return req
 

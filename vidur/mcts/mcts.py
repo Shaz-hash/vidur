@@ -300,7 +300,7 @@ class MCTSNode:
     cumulative_cost: float = 0.0  # smaller is better for controller
     children: List["MCTSChildEdge"] = field(default_factory=list)
     untried_actions: List[Union[AdversaryAction, ControllerAction]] = field(default_factory=list)
-
+    sim_time: float = 0.0   # NEW: simulator time at this node after performing action
 
 
 
@@ -389,6 +389,7 @@ class VidurMCTS:
                     depth=current.depth + 1,
                     parent=current,
                     parent_action=action,
+                    sim_time=new_state.simulator._time,   # NEW
                 )
                 child.untried_actions = self._enumerate_actions(child, new_state)
                 current.children.append(MCTSChildEdge(action=action, node=child))
@@ -461,6 +462,7 @@ class VidurMCTS:
             player="adversary",
             node_id=self._next_node_id(),
             depth=0,
+            sim_time=state.simulator._time,  # typically 0.0
         )
         node.untried_actions = self._enumerate_actions(node, state)
         cost = self._log_state(
@@ -547,6 +549,7 @@ class VidurMCTS:
             depth=node.depth + 1,
             parent=node,
             parent_action=action,
+            sim_time=child_state.simulator._time,  # NEW
         )
         child.untried_actions = self._enumerate_actions(child, child_state)
         node.children.append(MCTSChildEdge(action=action, node=child))
@@ -567,26 +570,111 @@ class VidurMCTS:
     #     #print(f" Expansion time : {t2 - t0:.4f}s")
     #     return child
 
+    # def _simulate(self, node: MCTSNode, start_state: VidurMCTSState) -> float:
+    #     total_cost = 0.0
+    #     num_trials = max(1, self._cfg.simulation_random_tries)
+
+    #     rollout_batch_rows: List[Dict[str, Any]] = []
+    #     for trial in range(num_trials):
+    #         # rollout_state = node.state.fork()
+    #         # current_player = node.player
+    #         # base_state = self._replay_to_node(node)
+    #         # rollout_state = base_state.fork()
+    #         if num_trials > 1 :
+    #             rollout_state = start_state.fork() 
+    #         else :
+    #             rollout_state = start_state
+
+    #         current_player = node.player
+    #         parent_id: Union[int, str] = node.node_id
+
+    #         for depth_idx in range(self._cfg.simulation_depth):
+    #             for turn in range(2):
+    #                 if current_player == "adversary":
+    #                     candidates = self._env.sample_adversary_actions(
+    #                         rollout_state, self._cfg.max_branching
+    #                     )
+    #                     if not candidates:
+    #                         action = None
+    #                     else:
+    #                         action = self._rng.choice(candidates)
+    #                         rollout_state = self._env.apply_adversary_action_only(
+    #                             rollout_state, action, inplace=True
+    #                         )
+    #                 else:
+    #                     candidates = self._env.sample_controller_actions(
+    #                         rollout_state, self._cfg.max_branching, False
+    #                     )
+    #                     if not candidates:
+    #                         action = None
+    #                     else:
+    #                         action = self._rng.choice(candidates)
+    #                         rollout_state = self._env.apply_controller_action_only(
+    #                             rollout_state, action, inplace=True
+    #                         )
+
+    #                 if action is not None:
+    #                     if self._logger.enabled_for("rollout"):
+    #                         node_id = (
+    #                             f"rollout_{self._current_iteration}_{node.node_id}_{trial}_{depth_idx}_{turn}"
+    #                         )
+    #                         row = self._make_log_row(
+    #                             iteration=self._current_iteration,
+    #                             phase="rollout",
+    #                             node_id=node_id,
+    #                             depth=node.depth + depth_idx + (turn + 1) / 2,
+    #                             state=rollout_state,
+    #                             parent_id=parent_id,
+    #                             acting_player=current_player,
+    #                             next_player=(
+    #                                 "controller" if current_player == "adversary" else "adversary"
+    #                             ),
+    #                             action=action,
+    #                         )
+    #                         rollout_batch_rows.append(row)
+    #                         parent_id = node_id
+
+    #                 current_player = (
+    #                     "controller" if current_player == "adversary" else "adversary"
+    #                 )
+
+    #         violations, avg_lateness = self._env.evaluate_objective(rollout_state)
+    #         total_cost += _compute_objective_cost(violations, avg_lateness)
+
+    #     # Commit rollout rows in a single batch for this simulate() call.
+    #     if rollout_batch_rows:
+    #         self._logger.write_rows(rollout_batch_rows)
+    #     return total_cost / num_trials
+
     def _simulate(self, node: MCTSNode, start_state: VidurMCTSState) -> float:
         total_cost = 0.0
         num_trials = max(1, self._cfg.simulation_random_tries)
 
         rollout_batch_rows: List[Dict[str, Any]] = []
+
+        # NEW: compute horizon based on the parent node's simulator time, read from the node
+        base_node = node.parent if node.parent is not None else node 
+        parent_time = getattr(base_node, "sim_time", 0.0)
+        horizon_time = parent_time + float(self._cfg.simulation_depth)
+        total_dt = 0.0  # accumulate rollout duration across trials
         for trial in range(num_trials):
-            # rollout_state = node.state.fork()
-            # current_player = node.player
-            # base_state = self._replay_to_node(node)
-            # rollout_state = base_state.fork()
-            if num_trials > 1 :
-                rollout_state = start_state.fork() 
-            else :
+            if num_trials > 1:
+                rollout_state = start_state.fork()
+            else:
                 rollout_state = start_state
 
             current_player = node.player
             parent_id: Union[int, str] = node.node_id
 
-            for depth_idx in range(self._cfg.simulation_depth):
+            max_steps = max(1, int(self._cfg.simulation_depth) * 80)
+            steps = 0
+            depth_idx = 0
+
+            while rollout_state.simulator._time < horizon_time and steps < max_steps:
                 for turn in range(2):
+                    if rollout_state.simulator._time >= horizon_time or steps >= max_steps:
+                        break
+
                     if current_player == "adversary":
                         candidates = self._env.sample_adversary_actions(
                             rollout_state, self._cfg.max_branching
@@ -610,38 +698,89 @@ class VidurMCTS:
                                 rollout_state, action, inplace=True
                             )
 
-                    if action is not None:
-                        if self._logger.enabled_for("rollout"):
-                            node_id = (
-                                f"rollout_{self._current_iteration}_{node.node_id}_{trial}_{depth_idx}_{turn}"
-                            )
-                            row = self._make_log_row(
-                                iteration=self._current_iteration,
-                                phase="rollout",
-                                node_id=node_id,
-                                depth=node.depth + depth_idx + (turn + 1) / 2,
-                                state=rollout_state,
-                                parent_id=parent_id,
-                                acting_player=current_player,
-                                next_player=(
-                                    "controller" if current_player == "adversary" else "adversary"
-                                ),
-                                action=action,
-                            )
-                            rollout_batch_rows.append(row)
-                            parent_id = node_id
+                    if action is not None and self._logger.enabled_for("rollout"):
+                        node_id = (
+                            f"rollout_{self._current_iteration}_{node.node_id}_{trial}_{depth_idx}_{turn}"
+                        )
+                        row = self._make_log_row(
+                            iteration=self._current_iteration,
+                            phase="rollout",
+                            node_id=node_id,
+                            depth=node.depth + depth_idx + (turn + 1) / 2,
+                            state=rollout_state,
+                            parent_id=parent_id,
+                            acting_player=current_player,
+                            next_player=(
+                                "controller" if current_player == "adversary" else "adversary"
+                            ),
+                            action=action,
+                        )
+                        rollout_batch_rows.append(row)
+                        parent_id = node_id
 
                     current_player = (
                         "controller" if current_player == "adversary" else "adversary"
                     )
+                    steps += 1
+
+                depth_idx += 1
 
             violations, avg_lateness = self._env.evaluate_objective(rollout_state)
             total_cost += _compute_objective_cost(violations, avg_lateness)
 
-        # Commit rollout rows in a single batch for this simulate() call.
+            dt = rollout_state.simulator._time - parent_time
+            if dt <= 0.0:
+                dt = 1e-9  # guard against divide-by-zero
+            total_dt += dt
+
         if rollout_batch_rows:
             self._logger.write_rows(rollout_batch_rows)
-        return total_cost / num_trials
+        # Base average cost
+        base_cost = total_cost / num_trials
+        avg_dt = total_dt / max(num_trials, 1)
+
+        # Scale by (simulation_depth / actual_avg_duration)
+        sim_depth = float(self._cfg.simulation_depth)
+        if avg_dt > 0.0:
+            scaled_cost = base_cost * (sim_depth / avg_dt)
+        else:
+            scaled_cost = base_cost
+
+        # Debug/dummy log row: same iteration, node, parent, next player;
+        # all snapshot fields empty/zero except objective_cost.
+        if self._logger.enabled_for("rollout"):
+            dummy_snapshot = {
+                "sim_time": 0.0,
+                "requests_in_system": 0,
+                "requests_generated": 0,
+                "requests_completed": 0,
+                "slo_violations": 0,
+                "avg_lateness": 0.0,
+                "waiting_request_ids": [],
+                "completed_request_ids": [],
+            }
+            parent_id_field = node.parent.node_id if node.parent is not None else None
+            next_player = "controller" if node.player == "adversary" else "adversary"
+            self._logger.log(
+                iteration=self._current_iteration,
+                phase="rollout_scaled",   # distinguish from real rollout rows
+                depth=node.depth,
+                parent_node_id=parent_id_field,
+                node_id=node.node_id,
+                player_to_act=node.player,
+                next_player=next_player,
+                state_snapshot=dummy_snapshot,
+                adversary_action=None,
+                controller_action=None,
+                objective_cost=scaled_cost,
+            )
+
+        return scaled_cost
+
+        # if rollout_batch_rows:
+        #     self._logger.write_rows(rollout_batch_rows)
+        # return total_cost / num_trials
+
 
     def _backpropagate(self, node: MCTSNode, cost: float) -> None:
         current = node

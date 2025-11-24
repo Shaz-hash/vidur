@@ -113,7 +113,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     sim_cfg = configure_simulation(remaining)
     et_cfg = sim_cfg.execution_time_predictor_config
     et_cfg.prediction_max_tokens_per_request = 8192     
-    et_cfg.prediction_max_batch_size = 64               
+    et_cfg.prediction_max_batch_size = 128               
     simulator = Simulator(sim_cfg, register_atexit=False)
 
     # t0 = time.perf_counter()

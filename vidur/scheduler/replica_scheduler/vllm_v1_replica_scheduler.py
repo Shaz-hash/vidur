@@ -500,7 +500,8 @@ class VLLMV1ReplicaScheduler(BaseReplicaScheduler):
                 self._free_request(request)
             else:
                 new_running.append(request)
-            self.scheduled_req_ids.remove(req_id)
+            # self.scheduled_req_ids.remove(req_id)
+            self.scheduled_req_ids.discard(req_id)
         self._running = new_running
 
     def _free_request(self, request: Request) -> None:
