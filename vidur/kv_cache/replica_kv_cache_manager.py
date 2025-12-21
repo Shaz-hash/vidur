@@ -11,6 +11,9 @@
 # from vidur.logger import init_logger
 from vidur.utils import cdiv
 
+import time
+
+
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Any
 from collections import defaultdict
@@ -237,34 +240,157 @@ class ReplicaKVCacheManager(KVCacheManager):
 
 
     # --- snapshot/restore ------------------------------------------------
+    # def snapshot_old_state(self) -> ReplicaKVCacheManagerSnapshot:
+
+
+    #     t0 = time.perf_counter()
+
+    #     blocks_state = [
+    #         KVCacheBlockSnapshot(
+    #             block_id=blk.block_id,
+    #             ref_cnt=blk.ref_cnt,
+    #             block_hash=self._encode_bht(blk.block_hash),
+    #         )
+    #         for blk in self.block_pool.blocks
+    #     ]
+
+    #     t1 = time.perf_counter()
+
+    #     # free list as ordered ids
+    #     free_block_ids: List[int] = []
+    #     cursor = self.block_pool.free_block_queue.free_list_head
+    #     while cursor is not None:
+    #         free_block_ids.append(cursor.block_id)
+    #         cursor = cursor.next_free_block
+
+    #     t2 = time.perf_counter()
+
+    #     # encode cached map as a list of entries
+    #     cached_entries = [
+    #         {"block_hash": self._encode_bht(h), "block_ids": list(block_dict.keys())}
+    #         for h, block_dict in self.block_pool.cached_block_hash_to_block.items()
+    #     ]
+
+    #     t3 = time.perf_counter()
+    #     req_to_blocks = {
+    #         int(req_id): [blk.block_id for blk in blks]
+    #         for req_id, blks in self.req_to_blocks.items()
+    #     }
+
+    #     t4 = time.perf_counter()
+    #     # Encode namedtuples -> dicts
+    #     req_to_block_hashes = {
+    #         int(req_id): self._encode_bht_list(list(hashes))
+    #         for req_id, hashes in self.req_to_block_hashes.items()
+    #     }
+
+    
+
+    #     prefix_stats = {
+    #         "reset": self.prefix_cache_stats.reset,
+    #         "requests": self.prefix_cache_stats.requests,
+    #         "queries": self.prefix_cache_stats.queries,
+    #         "hits": self.prefix_cache_stats.hits,
+    #     }
+
+    #     # bp = BlockPoolSnapshot(
+    #     #     __v__=_SNAP_VERSION_KV,
+    #     #     blocks=blocks_state,
+    #     #     free_block_ids=free_block_ids,
+    #     #     cached_entries=cached_entries,
+    #     # )
+
+
+    #     bp = {
+    #         "__v__": _SNAP_VERSION_KV,
+    #         "blocks": blocks_state,
+    #         "free_block_ids": free_block_ids,
+    #         "cached_entries": cached_entries,
+    #     }
+
+
+    #     snap = ReplicaKVCacheManagerSnapshot(
+    #         __v__=_SNAP_VERSION_KV,
+    #         # block_pool=to_primitive_tree(asdict(bp)),
+    #         block_pool = bp,  
+    #         req_to_blocks=req_to_blocks,
+    #         req_to_block_hashes=req_to_block_hashes,  # encoded
+    #         num_cached_block=dict(self.num_cached_block),
+    #         prefix_cache_stats=prefix_stats,
+    #     )
+    #     # normalize outer layer too
+
+
+    #     t5 = time.perf_counter()
+
+    #     x = asdict(snap)
+    #     t5_5 = time.perf_counter()
+    #     payload = to_primitive_tree(x)  # normalize
+    #     t6 = time.perf_counter()
+    #     result = ReplicaKVCacheManagerSnapshot(**payload)  # dataclass construct
+    #     t7 = time.perf_counter()
+
+    #     print(
+    #         f"[PROFILE] KV RESULTS : \n"
+    #         f"TOTAL={t7 - t0:.4f}s\n"
+    #         f"BLOCK_Snapshot={t1 - t0:.4f}s\n"
+    #         f"FREE_Snapshot={t2 - t1:.4f}s\n"
+    #         f"CACHED_Snapshot={t3 - t2:.4f}s\n"
+    #         f"REQ_TO_BLOCK_Snapshot={t4 - t3:.4f}s\n"
+    #         f"REST_Snapshot={t5 - t4:.4f}s\n"
+    #         f"SNAP_TO_PRIMITIVE={t5_5 - t5:.4f}s\n"
+    #         f"SNAP_TO_ASDICT={t6 - t5_5:.4f}s\n"
+    #         f"SNAP_OBJ_BUILD={t7 - t6:.4f}s\n"
+    #     )
+
+
+
+
+
+    #     return ReplicaKVCacheManagerSnapshot(**to_primitive_tree(asdict(snap)))
+
+
     def snapshot_state(self) -> ReplicaKVCacheManagerSnapshot:
+        # t0 = time.perf_counter()
+
+        # Make per-block snapshots as dicts, not dataclasses
         blocks_state = [
-            KVCacheBlockSnapshot(
-                block_id=blk.block_id,
-                ref_cnt=blk.ref_cnt,
-                block_hash=self._encode_bht(blk.block_hash),
-            )
+            {
+                "block_id": blk.block_id,
+                "ref_cnt": blk.ref_cnt,
+                "block_hash": self._encode_bht(blk.block_hash),
+            }
             for blk in self.block_pool.blocks
         ]
 
-        # free list as ordered ids
+        
+
+        # t1 = time.perf_counter()
+
         free_block_ids: List[int] = []
         cursor = self.block_pool.free_block_queue.free_list_head
         while cursor is not None:
             free_block_ids.append(cursor.block_id)
             cursor = cursor.next_free_block
 
-        # encode cached map as a list of entries
+        
+
+        # t2 = time.perf_counter()
+
         cached_entries = [
             {"block_hash": self._encode_bht(h), "block_ids": list(block_dict.keys())}
             for h, block_dict in self.block_pool.cached_block_hash_to_block.items()
         ]
 
+        # t3 = time.perf_counter()
+
         req_to_blocks = {
             int(req_id): [blk.block_id for blk in blks]
             for req_id, blks in self.req_to_blocks.items()
         }
-        # Encode namedtuples -> dicts
+
+        # t4 = time.perf_counter()
+
         req_to_block_hashes = {
             int(req_id): self._encode_bht_list(list(hashes))
             for req_id, hashes in self.req_to_block_hashes.items()
@@ -277,25 +403,40 @@ class ReplicaKVCacheManager(KVCacheManager):
             "hits": self.prefix_cache_stats.hits,
         }
 
-        bp = BlockPoolSnapshot(
-            __v__=_SNAP_VERSION_KV,
-            blocks=blocks_state,
-            free_block_ids=free_block_ids,
-            cached_entries=cached_entries,
-        )
+        block_pool = {
+            "__v__": _SNAP_VERSION_KV,
+            "blocks": blocks_state,
+            "free_block_ids": free_block_ids,
+            "cached_entries": cached_entries,
+        }
 
         snap = ReplicaKVCacheManagerSnapshot(
             __v__=_SNAP_VERSION_KV,
-            block_pool=to_primitive_tree(asdict(bp)),
+            block_pool=block_pool,
             req_to_blocks=req_to_blocks,
-            req_to_block_hashes=req_to_block_hashes,  # encoded
+            req_to_block_hashes=req_to_block_hashes,
             num_cached_block=dict(self.num_cached_block),
             prefix_cache_stats=prefix_stats,
         )
-        # normalize outer layer too
-        return ReplicaKVCacheManagerSnapshot(**to_primitive_tree(asdict(snap)))
+
+        # t5 = time.perf_counter()
+        # print(
+        #     f"[PROFILE] KV RESULTS : \n"
+        #     f"TOTAL={t5 - t0:.4f}s\n"
+        #     f"BLOCK_Snapshot={t1 - t0:.4f}s\n"
+        #     f"FREE_Snapshot={t2 - t1:.4f}s\n"
+        #     f"CACHED_Snapshot={t3 - t2:.4f}s\n"
+        #     f"REQ_TO_BLOCK_Snapshot={t4 - t3:.4f}s\n"
+        #     f"REST_Snapshot={t5 - t4:.4f}s\n"
+        # )
+
+        return snap
+
 
     def restore_state(self, snapshot: ReplicaKVCacheManagerSnapshot) -> None:
+
+        # t1 = time.perf_counter()
+
         assert int(snapshot.__v__) == _SNAP_VERSION_KV, "KV snapshot version mismatch"
         bp = snapshot.block_pool
         assert int(bp["__v__"]) == _SNAP_VERSION_KV, "BlockPool snapshot version mismatch"
@@ -364,6 +505,10 @@ class ReplicaKVCacheManager(KVCacheManager):
         # final safety checks
         self._validate_invariants()
 
+        # t5 = time.perf_counter()
+        # print(
+        #     f"[PROFILE] RESTORE KV RESULTS : \n"
+        #     f"TOTAL={t5 - t1:.4f}s\n")
 
 
 

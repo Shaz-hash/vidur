@@ -1,7 +1,6 @@
 import os
 from hashlib import sha256
 from typing import Any, Callable, NamedTuple, Optional, Sequence
-
 from vidur.entities.request import Request
 
 

@@ -146,6 +146,9 @@ class VidurMCTSEnvironment:
         # initial MCTS state starts from the exact same simulator + ID counters.
         self._base_snapshot = base_simulator.snapshot_state()
 
+        # NEW: optional snapshot for the history root
+        self._history_root_snapshot = None
+
         if self._constraints.max_request_tokens is None:
             self._constraints.max_request_tokens = self._prefill_profile.max_tokens
 
@@ -164,6 +167,33 @@ class VidurMCTSEnvironment:
         )
         sim.restore_state(self._base_snapshot)
         return VidurMCTSState(sim, VidurGameStats())
+
+
+    def snapshot_history_root(self, state: VidurMCTSState) -> None:
+        """Capture a frozen simulator snapshot for the MCTS history root."""
+        self._history_root_snapshot = state.simulator.snapshot_state()
+
+    def clone_history_root_state(self, stats_template: VidurGameStats) -> VidurMCTSState:
+        """Return a fresh state cloned from the history-root snapshot.
+
+        Falls back to the base initial_state() if no history snapshot exists.
+        """
+        if self._history_root_snapshot is None:
+            # No history prefix used; just start from the base snapshot.
+            return self.initial_state()
+
+        sim = Simulator(
+            self._base._config,
+            register_atexit=False,
+            execution_time_predictor=getattr(
+                self._base, "_execution_time_predictor", None
+            ),
+        )
+        sim.restore_state(self._history_root_snapshot)
+        return VidurMCTSState(sim, stats_template.clone())
+
+
+    
 
     # ------------------------------------------------------------------ #
     # Action generation helpers
@@ -1118,7 +1148,7 @@ class VidurMCTSEnvironment:
     def _update_stats(self, state: VidurMCTSState) -> None:
         sim = state.simulator
         stats = state.stats
-
+        
         # 1) For every request we know about, update per-request max lateness
         #    and permanent violation flags.
         for replica_scheduler in sim._scheduler._replica_schedulers.values():
@@ -1145,6 +1175,48 @@ class VidurMCTSEnvironment:
                     stats.completed_request_ids.add(request.id)
 
 
+    # def _compute_lateness(self, request: Request, sim_time: float) -> float:
+    #     total_lateness = 0.0
+
+    #     arrived_at = getattr(request, "_arrived_at", request.arrived_at)
+    #     prefill_completed_at = getattr(request, "_prefill_completed_at", None)
+    #     if not getattr(request, "_is_prefill_complete", request.is_prefill_complete):
+    #         prefill_completed_at = None
+    #     elif prefill_completed_at in (None, 0):
+    #         prefill_completed_at = None
+
+    #     prefill_slo = getattr(request, "_prefill_slo_time", None)
+    #     if prefill_slo is not None:
+    #         deadline = arrived_at + prefill_slo
+    #         actual = prefill_completed_at if prefill_completed_at is not None else sim_time
+    #         total_lateness += max(0.0, actual - deadline)
+
+    #     decode_slo = getattr(request, "_decode_slo_time", None)
+
+    #     if decode_slo is not None and decode_slo >= 0:
+    #         has_decode_tokens = getattr(request, "_num_decode_tokens", request.num_decode_tokens) > 0
+    #         if has_decode_tokens and prefill_completed_at is not None:
+    #             # Initialize next-deadline on first decode (if not already done)
+    #             if getattr(request, "_decode_next_deadline", None) is None:
+    #                 request._decode_next_deadline = prefill_completed_at + decode_slo
+    #                 request._decode_tokens_counted = 0
+
+    #             # How many DECODE tokens actually done: processed minus prefill segment
+    #             decode_tokens_done = request.num_processed_decode_tokens 
+
+    #             # New tokens since last time we accounted for lateness
+    #             new_tokens = max(0, decode_tokens_done - getattr(request, "_decode_tokens_counted", 0))
+    #             decode_lateness = 0.0
+    #             for _ in range(new_tokens):
+    #                 deadline = request._decode_next_deadline
+    #                 decode_lateness += max(0.0, sim_time - deadline)
+    #                 request._decode_next_deadline += decode_slo
+    #                 request._decode_tokens_counted += 1
+
+    #             total_lateness += decode_lateness
+
+    #     return total_lateness
+
     def _compute_lateness(self, request: Request, sim_time: float) -> float:
         total_lateness = 0.0
 
@@ -1162,30 +1234,38 @@ class VidurMCTSEnvironment:
             total_lateness += max(0.0, actual - deadline)
 
         decode_slo = getattr(request, "_decode_slo_time", None)
+        has_decode_tokens = getattr(request, "_num_decode_tokens", request.num_decode_tokens) > 0
 
-        if decode_slo is not None and decode_slo >= 0:
-            has_decode_tokens = getattr(request, "_num_decode_tokens", request.num_decode_tokens) > 0
-            if has_decode_tokens and prefill_completed_at is not None:
-                # Initialize next-deadline on first decode (if not already done)
-                if getattr(request, "_decode_next_deadline", None) is None:
-                    request._decode_next_deadline = prefill_completed_at + decode_slo
-                    request._decode_tokens_counted = 0
+        # NEW semantics: decode SLO starts at prefill completion.
+        # If decode hasn't started yet but time has passed prefill_completed_at + decode_slo,
+        # we accumulate lateness against that single decode deadline.
+        if decode_slo is not None and decode_slo >= 0 and prefill_completed_at is not None:
+            decode_deadline_start = prefill_completed_at + decode_slo
 
-                # How many DECODE tokens actually done: processed minus prefill segment
-                decode_tokens_done = request.num_processed_decode_tokens 
+            # If no decode tokens processed yet, treat the entire decode as late once we pass the start deadline.
+            if request.num_processed_decode_tokens == 0:
+                total_lateness += max(0.0, sim_time - decode_deadline_start)
+            else:
+                # Existing per-token decode lateness logic (optional: keep as-is)
+                if has_decode_tokens:
+                    if getattr(request, "_decode_next_deadline", None) is None:
+                        request._decode_next_deadline = decode_deadline_start
+                        request._decode_tokens_counted = 0
 
-                # New tokens since last time we accounted for lateness
-                new_tokens = max(0, decode_tokens_done - getattr(request, "_decode_tokens_counted", 0))
-                decode_lateness = 0.0
-                for _ in range(new_tokens):
-                    deadline = request._decode_next_deadline
-                    decode_lateness += max(0.0, sim_time - deadline)
-                    request._decode_next_deadline += decode_slo
-                    request._decode_tokens_counted += 1
+                    decode_tokens_done = request.num_processed_decode_tokens
+                    new_tokens = max(0, decode_tokens_done - getattr(request, "_decode_tokens_counted", 0))
+                    decode_lateness = 0.0
+                    for _ in range(new_tokens):
+                        deadline = request._decode_next_deadline
+                        decode_lateness += max(0.0, sim_time - deadline)
+                        request._decode_next_deadline += decode_slo
+                        request._decode_tokens_counted += 1
 
-                total_lateness += decode_lateness
+                    total_lateness += decode_lateness
 
         return total_lateness
+
+
 
     # ------------------------------------------------------------------ #
     # Utility functions

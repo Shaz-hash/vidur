@@ -415,6 +415,9 @@ class VidurMCTS:
             self._history_root_node = root_for_search
             self._history_root_state = current_state
 
+            # NEW: snapshot the simulator at the history root once
+            self._env.snapshot_history_root(self._history_root_state)
+
 
             # --- Vanilla MCTS from history root ---
             for itr in range(iterations):
@@ -489,7 +492,13 @@ class VidurMCTS:
         """
         # Decide the baseline state and the cut node in the ancestry.
         if self._history_root_node is not None and self._history_root_state is not None:
-            baseline_state = self._history_root_state
+            # baseline_state = self._history_root_state
+            # cut_node = self._history_root_node
+
+            # Clone from the frozen history-root snapshot, with stats cloned
+            baseline_state = self._env.clone_history_root_state(
+                self._history_root_state.stats
+            )
             cut_node = self._history_root_node
         else:
             baseline_state = self._env.initial_state()
@@ -504,8 +513,8 @@ class VidurMCTS:
         path.reverse()
 
         # Work on a fork so we never mutate the stored baseline state.
-        state = baseline_state.fork()
-
+        # state = baseline_state.fork()
+        state = baseline_state
         # Replay actions inplace along the path segment.
         for n in path:
             parent = n.parent

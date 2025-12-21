@@ -2,6 +2,8 @@ from dataclasses import dataclass
 from collections import deque
 from typing import Deque, Dict, List, Set
 
+import time
+
 from vidur.entities.batch import Batch, Request
 from vidur.kv_cache.replica_kv_cache_manager import (
     ReplicaKVCacheManager,
@@ -513,10 +515,15 @@ class VLLMV1ReplicaScheduler(BaseReplicaScheduler):
     # --- Snapshot helpers -------------------------------------------------
     def snapshot_state(self) -> VLLMV1ReplicaSchedulerSnapshot:
         # Per-request snapshots (only those known to this replica)
+
+      
+
         request_states = {
             int(request_id): req.snapshot_state()
             for request_id, req in self._requests.items()
         }
+
+      
 
         waiting_queue_state = (
             self._waiting_queue.snapshot_state()
@@ -524,10 +531,14 @@ class VLLMV1ReplicaScheduler(BaseReplicaScheduler):
             else {}
         )
 
+       
+
         stage_states = {
             int(stage_id): stage_scheduler.snapshot_state()
             for stage_id, stage_scheduler in self._replica_stage_schedulers.items()
         }
+
+    
 
         return VLLMV1ReplicaSchedulerSnapshot(
             __v__=_SNAP_VERSION_VLLM_V1,

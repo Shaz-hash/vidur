@@ -1,7 +1,6 @@
 import random
 from abc import ABC, abstractmethod
 from typing import Dict, List, Tuple
-
 from vidur.config import SimulationConfig
 from vidur.entities import Request
 from vidur.entities.batch import Batch
@@ -213,7 +212,7 @@ class BaseGlobalScheduler(ABC):
             # key by string to be stable across restore
             # replica_snapshots[str(replica_id)] = rsnap
             replica_snapshots[self._replica_key(replica_id)] = rsnap
-
+       
         return {
             "__v__": _SNAP_VERSION_GLOBAL_SCHED,
             "rng_state": self._random_number_generator.getstate(),

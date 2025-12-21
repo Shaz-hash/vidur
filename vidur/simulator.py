@@ -248,8 +248,11 @@ class Simulator:
                 for req in batch_stage.requests:
                     track_request(req)
 
+       
+
         scheduler_snapshot = clone_mutable(self._scheduler.snapshot_state())
 
+        
         # handle dataclass or dict uniformly
         if hasattr(scheduler_snapshot, "request_states"):
             req_states = getattr(scheduler_snapshot, "request_states")
@@ -261,6 +264,7 @@ class Simulator:
         for req_id, state in getattr(req_states, "items", lambda: [])():
             request_states.setdefault(req_id, clone_mutable(state))
 
+       
 
         # for req_id, state in scheduler_snapshot.get("request_states", {}).items():
         #     request_states.setdefault(req_id, clone_mutable(state))
@@ -289,6 +293,8 @@ class Simulator:
                     for batch in getattr(stage_scheduler, "_batch_queue", []):
                         track_batch(batch)
 
+       
+
         # Capture pending requests in global queue.
         for request in self._scheduler._request_queue:
             track_request(request)
@@ -299,6 +305,7 @@ class Simulator:
                 self._snapshot_event(event, track_request, track_batch, track_batch_stage)
             )
 
+     
         # Capture generator queue requests.
         if hasattr(self._request_generator, "requests"):
             for request in getattr(self._request_generator, "requests"):
@@ -308,6 +315,7 @@ class Simulator:
             self._request_generator.snapshot_state()
         )
 
+      
         # Derive per-simulator entity counters from this simulator's own
         # objects, so forks/restores are independent of other simulators
         # that may also be creating entities.
@@ -457,22 +465,18 @@ class Simulator:
 
 
     def fork(self) -> "Simulator":
-        t0 = time.perf_counter()
+        # t0 = time.perf_counter()
         snapshot = self.snapshot_state()
-        t1 = time.perf_counter()
+        # t1 = time.perf_counter()
         forked = Simulator(
             self._config,
             register_atexit=False,
             execution_time_predictor=self._execution_time_predictor,
         )
-        t2 = time.perf_counter()
+        # t2 = time.perf_counter()
         forked.restore_state(snapshot)
-        t3 = time.perf_counter()
-        # print(
-        #     f"[PROFILE] SIMULATOR RESULTS : "
-        #     f"Snap_shot={t1 - t0:.4f}s, FORK={t2 - t1:.4f}s, "
-        #     f"RESTORE={t3 - t2:.4f}s"
-        # )
+        # t3 = time.perf_counter()
+        
         return forked
 
     def _snapshot_event(

@@ -219,3 +219,23 @@ So consider these suggestions and see if the implementation changes are needed
   --global_scheduler_config_type round_robin \
   --replica_scheduler_config_type vllm_v1
 
+
+
+TO RUN THE PYTHON Longitudanal analysis file. use the following command :
+python3 -m vidur.mcts.analysis.process_iteration_longitudinal --stride 200
+Single process: python3 -m vidur.mcts.analysis.process_iteration_longitudinal --run_ids 4 --stride 200
+
+TO RUN THE PYTHON GRAPH SCRIPT :
+From vidur/:
+
+Plot all runs: python3 -m vidur.mcts.analysis.plot_process_iteration_longitudinal
+Single run: python3 -m vidur.mcts.analysis.plot_process_iteration_longitudinal --run_ids 10
+Change marker spacing: python3 -m vidur.mcts.analysis.plot_process_iteration_longitudinal --marker_stride 2000
+
+
+
+# From your local machine SCP
+scp -r <your_username>@<remote_host>:/home/shazer/Desktop/Research/Vidur/vidur/simulator_output/Parrallel_Launch/analysis/P*/process_iteration_visits.svg /path/to/local/destination/
+scp -r "shazer@shaz.csres.utexas.edu:/home/shazer/Desktop/Research/Vidur/vidur/simulator_output/Parrallel_Launch/analysis/P*/process_iteration_visits.svg" \
+/Users/shazer/Desktop/FallResearch
+

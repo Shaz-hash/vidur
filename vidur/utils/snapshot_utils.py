@@ -4,6 +4,7 @@ import copy
 from typing import Any
 
 
+
 # def clone_mutable(value: Any) -> Any:
 #     """Return a lightweight recursive copy of common mutable containers.
 
@@ -37,7 +38,7 @@ from typing import Any
 
 
 # snapshot_utils.py
-from typing import Any
+
 
 _PRIM = (int, float, bool, str, type(None))
 
@@ -48,6 +49,10 @@ def to_primitive_tree(x: Any, *, allow_sets: bool = True) -> Any:
     - dict keys must be str or int
     Raises TypeError on unsupported objects.
     """
+
+    # t0 = time.perf_counter()
+
+
     if isinstance(x, _PRIM):
         return x
 
@@ -67,6 +72,10 @@ def to_primitive_tree(x: Any, *, allow_sets: bool = True) -> Any:
         lst = [to_primitive_tree(v, allow_sets=allow_sets) for v in x]
         return sorted(lst, key=lambda z: (str(type(z)), str(z)))
 
+    # t1 = time.perf_counter()
+    # print(
+    #         f"[PROFILE] PRIMITIVE RESULTS : \n"
+    #         f"Snap_shot_TOTAL={t1 - t0:.4f}s\n")
     # Explicit whitelist any other types you need (e.g., numpy RNG state dicts)
     raise TypeError(f"Unsupported type in snapshot: {type(x).__name__}")
 

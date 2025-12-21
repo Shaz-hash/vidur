@@ -70,7 +70,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mcts_tree_dump_interval",
         type=int,
-        default=100,
+        default=200,
         help="Dump full MCTS tree to tree CSV every N iterations (0 = never).",
     )
     parser.add_argument(
