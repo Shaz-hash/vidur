@@ -2,41 +2,63 @@
 
 ## (بِسْمِ ٱللَّهِ ٱلرَّحْمَٰنِ ٱلرَّحِيْمِ)
 
-import math 
-from abc import ABC, abstractmethod
 
+"""
+AlphaZero-style policy/value network for Vidur MCTS.
 
+Design goals (for correct bridging with MCTS):
+- Node = simulator state + player-to-act (in MCTS code).
+- Edge = action; each edge stores a *prior* from the NN policy π(a|s).
+- This file only defines the NN and inference helpers.
+- Feature extraction from VidurMCTSState is intentionally NOT implemented here yet.
+
+Important: NN value is from the *controller perspective*.
+"""
+
+from __future__ import annotations
+
+import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Callable, Optional, Protocol, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# NOTE: models.py is inside vidur/vidur/mcts/DNN/, so environment is one level up.
+from ..environment import VidurMCTSState
+from .types import ModelInputs, Player
 
 
 
-##==============================
-# HARDCODED PARAMETERS
-##==============================
 
-N_REQ : int = 20  ## --> Number of requests in a batch
-D_REQ : int = 5   ## --> Number of features per request
-D_GLOBAL : int = 4  ## --> Number of global features
-NUM_ACTIONS : int = 24  ## --> Number of possible actions
-# Value Scaling : the bin size for value head support is calculated as (Max SLO Cost for a move : 5seconds + HARDMISS_PENALTY)/ (1-gamma) 
-HARD_MISS_PENALTY : int = 15  # seconds
-MAX_SLO_COST : int = 5  # seconds
-GAMMA : float = 0.98  # discount factor
-VALUE_SCALE : int = 20
-SUPPORT_SIZE = math.ceil(((MAX_SLO_COST + HARD_MISS_PENALTY) / (1 - GAMMA)) / VALUE_SCALE)  # Assuming support size is equal to value scale for simplicity
+# =============================================================================
+# Configuration constants (can later be moved into a config object)
+# =============================================================================
+
+# Input tensor shapes (your planned feature schema)
+N_REQ: int = 20          # max number of (prefill) requests represented
+D_REQ: int = 3           # features per request
+D_GLOBAL: int = 7        # global features
+
+# Action space sizes (you said you'll make deterministic indexing in environment.py)
+NUM_ACTIONS_CONTROLLER: int = 24
+NUM_ACTIONS_ADVERSARY: int = 6  # placeholder; update once adversary action indexing is finalized
+
+# MuZero-style value support (optional, but you already started it) * Note : Penalty and Max SLO cost in real units in seconds
+HARD_MISS_PENALTY: float = 5
+MAX_SLO_COST: float = 10
+GAMMA: float = 0.98
+VALUE_SCALE: float = 0.5  # scale between real and scaled units
+
+SUPPORT_SIZE: int = math.ceil(((MAX_SLO_COST + HARD_MISS_PENALTY) / (1.0 - GAMMA)) / VALUE_SCALE)
 
 
 ##------------------------------
 # HELPER FUNCTIONS
 ##------------------------------
 
-def mlp(in_dim: int, hidden: list[int], out_dim: int, act=nn.ReLU) -> nn.Sequential:
+def mlp(in_dim: int, hidden: list[int], out_dim: int, act: type[nn.Module] = nn.ReLU) -> nn.Sequential:
     """Creates a multi-layer perceptron (MLP) with the specified architecture.
 
     Args:
@@ -71,12 +93,12 @@ def masked_mean (x: torch.Tensor, mask: Optional[torch.Tensor], dim: int) -> tor
     Returns:
         torch.Tensor: The computed mean tensor.
     """
-    if mask is not None:
-        return x.mean(dim= dim)
-    
-    m = mask.float().unsqueeze(-1)  # [B, N, 1]
-    denom = m.sum(dim= dim, keepdim= True).clamp(min= 1.0)  
-    return (x * m).sum(dim= dim) / denom
+    if mask is None:
+        return x.mean(dim=dim)
+    m = mask.to(dtype=x.dtype).unsqueeze(-1)  # [B, N, 1]
+    denom = m.sum(dim=dim, keepdim=False).clamp(min=1.0)  # [B, 1] or [B]
+    return (x * m).sum(dim=dim) / denom.unsqueeze(-1) if denom.dim() == 1 else (x * m).sum(dim=dim) / denom
+
 
 
 def masked_max (x: torch.Tensor, mask: Optional[torch.Tensor], dim: int) -> torch.Tensor:
@@ -93,11 +115,23 @@ def masked_max (x: torch.Tensor, mask: Optional[torch.Tensor], dim: int) -> torc
     Returns:
         torch.Tensor: The computed maximum tensor.
     """
-    if mask is not None:
-        return x.max(dim= dim).values
+    if mask is None:
+        return x.max(dim=dim).values
+    x_masked = x.masked_fill(~mask.unsqueeze(-1), float("-inf"))
+    out = x_masked.max(dim=dim).values
+    return torch.nan_to_num(out, neginf=0.0, posinf=0.0)
 
-    x_masked = x.masked_fill(~mask.unsqueeze(-1), float('-inf'))
-    return torch.nan_to_num(out,neginf=0.0)
+
+def masked_min(x, mask, dim):
+    "Similar to masked_max but for min"
+    if mask is None:
+        return x.min(dim=dim).values
+    # mask: True=valid
+    x2 = x.masked_fill(~mask.unsqueeze(-1), float("inf"))
+    out = x2.min(dim=dim).values
+    out = out.masked_fill(torch.isinf(out), 0.0)
+    return out
+
 
 
 
@@ -137,22 +171,18 @@ def scalar_to_support(x: torch.Tensor, support_size: int) -> torch.Tensor:
     # Output shape : [..., 2*support_size + 1]
     last_dim = 2 * support_size + 1
     out_shape = list(x.shape[:-1]) + [last_dim]
-    logits = torch.zeros(out_shape, device= x.device)  # 
+    dist = torch.zeros(out_shape, device=x.device, dtype=x.dtype)
 
     # Put mass on floor bin 
     idx0 = (floor + support_size).long()  # shift to [0, 2*support_size]
-    logits.scatter_add_(-1, idx0.unsqueeze(-1), (1 - prob).unsqueeze(-1))
+    idx1 = (idx0 + 1).clamp(0, last_dim - 1)
 
-    # Put remaining mass on next bin (floor+1)
-    idx1 = idx0 + 1
+    p0 = (1.0 - prob)
+    p1 = prob
 
-    # if idx1 is out of bounds, clamp to last bin a.k.a drop the excess mass
-    valid = (idx1 >= 0) & (idx1 < last_dim)
-    prob1 = torch.where(valid, prob, torch.zeros_like(prob))
-    idx1 = torch.where(valid, idx1, idx0)  # if invalid, put mass back to idx0
-    logits.scatter_add_(-1, idx1.unsqueeze(-1), prob1.unsqueeze(-1))
-
-    return logits
+    dist.scatter_add_(-1, idx0, p0)
+    dist.scatter_add_(-1, idx1, p1)
+    return dist
 
 
 def support_to_scalar(logits: torch.Tensor, support_size: int) -> torch.Tensor:
@@ -176,103 +206,172 @@ def support_to_scalar(logits: torch.Tensor, support_size: int) -> torch.Tensor:
     # Inverse scaling (MuZero)
     # x = sign(x) * ( ((sqrt(1+4*0.001*(|x|+1+0.001)) - 1) / (2*0.001))^2 - 1 )
     eps = 0.001
-    x = torch.sign(x) * ((((torch.sqrt(1 + 4 * eps * (torch.abs(x) + 1 + eps))) - 1) / (2 * eps)) ** 2 - 1)
-
+    x = torch.sign(x) * (
+        (
+            (torch.sqrt(1.0 + 4.0 * eps * (torch.abs(x) + 1.0 + eps)) - 1.0)
+            / (2.0 * eps)
+        )
+        ** 2
+        - 1.0
+    )
     return x
 
 
 class AlphaZeroModel(nn.Module):
 
     """
-    Inputs: 
-        req_features : torch.Tensor : [B, N_REQ : 20, D_REQ] (pad with zeros if < 20 requests)
-        global_features : torch.Tensor : [B, D_GLOBAL]
-        req_mask : torch.Tensor : [B, N_REQ] (boolean) True for valid requests, False for padded requests
-        action_mask : torch.Tensor : [B, NUM_ACTIONS : 24] (boolean) True for valid actions, False for invalid actions
-    Outputs:
-        policy_logits : torch.Tensor : [B, NUM_ACTIONS : 24] (logits for each action)
-        value : [B] scalar in *real units* after applying VALUE_SCALE : 20
+    Policy/value network with:
+      - shared trunk
+      - separate policy heads per player
+      - value head using categorical support
+
+    Forward returns:
+      policy_logits: [B, num_actions(player)]
+      value_logits:  [B, 2*SUPPORT_SIZE+1]   (in SCALED units; convert to scalar via value_scalar_from_logits)
     """
 
+    def __init__(
+        self,
+        *,
+        num_actions_controller: int = NUM_ACTIONS_CONTROLLER,
+        num_actions_adversary: int = NUM_ACTIONS_ADVERSARY,
+    ) -> None:
+        super().__init__()
 
-    def __init__(self):
+        self.num_actions_controller = int(num_actions_controller)
+        self.num_actions_adversary = int(num_actions_adversary)
 
-        super().__init__() # initialize the nn.Module
+        self.norm_req = nn.Identity()
+        self.norm_global = nn.Identity()
 
-        # Normalisation over each request's features and global features vector
-        self.norm_req = nn.LayerNorm(D_REQ)
-        self.norm_global = nn.LayerNorm(D_GLOBAL)
+        self.req_encoder = mlp(in_dim=D_REQ, hidden=[128, 128], out_dim=64)
+        self.global_encoder = mlp(in_dim=D_GLOBAL, hidden=[128], out_dim=64)
 
-        # Request Encoder MLP (DEEPSet style)
-        self.req_encoder = mlp(in_dim= D_REQ, hidden= [128,128], out_dim= 64)
+        trunk_in = 64 * 4  # mean pooled + max pooled + min pooled + global
+        self.trunk = mlp(in_dim=trunk_in, hidden=[128, 128], out_dim=128)
 
-        # Global Encoder MLP
-        self.global_encoder = mlp(in_dim= D_GLOBAL, hidden= [128], out_dim= 64)
+        # Two policy heads (one per player)
+        self.policy_head_controller = nn.Linear(128, self.num_actions_controller)
+        self.policy_head_adversary = nn.Linear(128, self.num_actions_adversary)
 
-        # Trunk after pooling (mean + max + global)
-        turnk_in = 64 * 3  # mean pooled reqs + max pooled reqs + global encoded
-        self.trunk = mlp(trunk_in, hidden = [128, 128], out_dim= 128)
+        # Value head (categorical support in SCALED units)
+        self.value_head = nn.Linear(128, 2 * SUPPORT_SIZE + 1)
 
-        ## HEADS => Policy Head and Value Head
-        self.policy_head = nn.Linear(128, NUM_ACTIONS)
-        self.value_head = nn.Linear(128, 2 * support_size + 1)  # outputs logits over support
-
-        
-        
 
     def forward(
         self,
         req_features: torch.Tensor,
         global_features: torch.Tensor,
+        *,
+        player: Player,
         req_mask: Optional[torch.Tensor] = None,
         action_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Forward pass of the AlphaZeroModel.
-
-        Args:
-            req_features (torch.Tensor): Request features tensor of shape [B, N_REQ : 20 e.g., D_REQ].
-            global_features (torch.Tensor): Global features tensor of shape [B, D_GLOBAL].
-            req_mask (Optional[torch.Tensor]): Optional request mask of shape [B, N_REQ].
-            action_mask (Optional[torch.Tensor]): Optional action mask of shape [B, NUM_ACTIONS].
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: Policy logits and value tensor.
+        req_features:   [B, N_REQ, D_REQ]
+        global_features:[B, D_GLOBAL]
+        req_mask:       [B, N_REQ] bool (True = valid)
+        action_mask:    [B, num_actions(player)] bool (True = valid)
         """
+        if req_features.dim() != 3 or req_features.size(1) != N_REQ or req_features.size(2) != D_REQ:
+            raise ValueError(f"req_features must be [B,{N_REQ},{D_REQ}], got {tuple(req_features.shape)}")
+        if global_features.dim() != 2 or global_features.size(1) != D_GLOBAL:
+            raise ValueError(f"global_features must be [B,{D_GLOBAL}], got {tuple(global_features.shape)}")
 
-        assert req_features.dim() == 3 and req_features.size(1) == N_REQ and req_features.size(2) == D_REQ, f"req_features must be of shape [B, N_REQ, D_REQ], got {req_features.shape}"
-        B, N , D = req_features.shape
-        assert N == N_REQ and D == D_REQ, f"Expected req_features shape [B, {N_REQ}, {D_REQ}], got {req_features.shape}" 
-        assert global_features.dim() == 2 and global_features.size(1) == D_GLOBAL, f"global_features must be of shape [B, D_GLOBAL], got {global_features.shape}"
-        
+        bsz = req_features.size(0)
 
-        # Normalise : 
-        req_features = self.norm_req(req_features)  # [B, N_REQ, D_REQ]
-        global_features = self.norm_global(global_features)  # [B, D_GLOBAL]
+        req_features = self.norm_req(req_features)
+        global_features = self.norm_global(global_features)
 
-        # Encode requests individually (shared weights)
-        req_encoded = self.req_encoder(req_features.reshape(B * N , D)).reshape(B, N , -1)  # [B, N_REQ, 64]
+        req_encoded = self.req_encoder(req_features.reshape(bsz * N_REQ, D_REQ)).reshape(bsz, N_REQ, 64)
 
-        # Pool over the set (order-invariant)
-        req_mean = masked_mean(req_encoded, req_mask, dim= 1)  # [B, 64]
-        req_max = masked_max(req_encoded, req_mask, dim=1)  # [B, 64]
+        req_mean = masked_mean(req_encoded, req_mask, dim=1)  # [B,64]
+        req_max = masked_max(req_encoded, req_mask, dim=1)    # [B,64]
+        req_min = masked_min(req_encoded, req_mask, dim=1)  # [B,64]
 
-        # Encode global features
-        global_encoded = self.global_encoder(global_features)  # [B, 64]
+        global_encoded = self.global_encoder(global_features) # [B,64]
 
-        # Concatenate pooled reqs and global encoding i.e. combine + trunk 
-        h = self.trunk(torch.cat([req_mean, req_max, global_encoded], dim= -1))  # [B, 192] -> [B, 128]
-    
-        # Policy Head
-        policy_logits = self.policy_head(h)  # [B, NUM_ACTIONS]
+        h = self.trunk(torch.cat([req_mean, req_max, req_min, global_encoded], dim=-1))  # [B,128]
+
+        if player == "controller":
+            policy_logits = self.policy_head_controller(h)  # [B, A_c]
+        elif player == "adversary":
+            policy_logits = self.policy_head_adversary(h)   # [B, A_a]
+        else:
+            raise ValueError(f"Unknown player={player!r}; expected 'controller' or 'adversary'")
+
         if action_mask is not None:
-            policy_logits = policy_logits.masked_fill(~action_mask, float('-inf'))
-        
-        # Value Head
-        # value = self.value_head(h).squeeze(-1) * VALUE_SCALE  # [B]
-        value_logits = self.value_head(h)  # [B, 2*support_size + 1]
+            if action_mask.shape != policy_logits.shape:
+                raise ValueError(f"action_mask shape {tuple(action_mask.shape)} != logits shape {tuple(policy_logits.shape)}")
+            policy_logits = policy_logits.masked_fill(~action_mask, float("-inf"))
 
+        value_logits = self.value_head(h)  # [B, 2*SUPPORT_SIZE+1]
         return policy_logits, value_logits
+
+
+
+    # -------------------------------------------------------------------------
+    # Inference helpers (bridge to MCTS)
+    # -------------------------------------------------------------------------
+
+    @torch.no_grad()
+    def infer_from_inputs(
+        self,
+        inputs: ModelInputs,
+        player: Player,
+        *,
+        device: Optional[torch.device] = None,
+    ) -> Tuple[float, list[float]]:
+        """
+        Returns:
+          value_controller: float
+          priors: list[float] aligned with deterministic action indexing for that player
+                  (i.e., priors[i] = π(a_i | s) for action index i)
+        """
+        dev = device or next(self.parameters()).device
+
+        req_features = inputs.req_features.to(dev)
+        global_features = inputs.global_features.to(dev)
+        req_mask = inputs.req_mask.to(dev) if inputs.req_mask is not None else None
+        action_mask = inputs.action_mask.to(dev) if inputs.action_mask is not None else None
+
+        policy_logits, value_logits = self.forward(
+            req_features=req_features,
+            global_features=global_features,
+            player=player,
+            req_mask=req_mask,
+            action_mask=action_mask,
+        )
+
+        # Convert value support logits -> scalar in real units (controller perspective)
+        value = self.value_scalar_from_logits(value_logits).squeeze(0).item()
+
+        # Convert logits -> normalized priors (softmax over valid actions)
+        priors = F.softmax(policy_logits, dim=-1).squeeze(0).to("cpu").tolist()
+        return value, priors
+
+    # TODO: I dont think this is needed even in MCTS so remove it afterwards 
+    @torch.no_grad()
+    def infer_from_state(
+        self,
+        state: VidurMCTSState,
+        player: Player,
+        *,
+        build_inputs: Callable[[VidurMCTSState, Player, torch.device], ModelInputs],
+        device: Optional[torch.device] = None,
+    ) -> Tuple[float, list[float]]:
+        """
+        This is the method MCTS should call.
+
+        You provide `build_inputs(state, player, device)` elsewhere (e.g. mcts/DNN/infer.py),
+        so environment.py stays clean.
+        """
+        dev = device or next(self.parameters()).device
+        inputs = build_inputs(state, player, dev)
+        return self.infer_from_inputs(inputs, player, device=dev)
+
+
+        
 
 
     ##==============================    

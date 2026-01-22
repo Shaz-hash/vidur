@@ -1,177 +1,304 @@
 # (بِسْمِ ٱللَّهِ ٱلرَّحْمَٰنِ ٱلرَّحِيْمِ)
 
-
 """
- THis file will be responsible for self play logic using DNN model , but for now we will use MCTS from vidur/vidur/mcts/mcts.py, but in future we will implement self play logic here IA.
+DNN self-play runner.
+
+No configuration lives here. alphaZero.py builds:
+- Simulator + Env
+- DNN model
+- MCTS (mctsDNN)
+- ReplayWriter
+
+Then calls SelfPlayRunner.run_single_root(...)
 """
 
-import math 
-import time 
-import numpy 
-import torch 
-import models
+from __future__ import annotations
 
-# import ray  ## for distributed training in future
-## we will use mcts from vidur/vidur/mcts/mcts.py for now 
-import vidur.vidur.mcts.mcts as mcts
+from dataclasses import dataclass
+from typing import Optional, Sequence, Tuple
 
+import torch
 
-## NOTE : IN our MCTS 1 Node is essentially state on Vidur Simulator + player to play next move on that state !
-## So Node = (state, player) pair
-## Action is the action taken by the player on that state to reach next state.
-
-##----------------------------------------------
-# HARDCODED PARAMETERS FOR SELF PLAY
-##----------------------------------------------
-TRAINING_STEPS = 1000
-TEMPERATURE_VALUE = 1.0
-TEMPERATURE_THRESHOLD = 30
-INITIAL_HISTORY_STEPS = 5 # number of initial steps at random by both Request Generator and Scheduler before using the DNN model to guide the self-play in order to create a new state.
-DEVICE_MODE = 'gpu' if torch.cuda.is_available() else 'cpu'
-MAX_GAME_LENGTH = 50  # maximum number of steps in a single game to avoid infinite loops.
-
-#ray.remote
-class SelfPlay:
-
-    """
-    A class to handle self-play logic using a DNN model and MCTS.
-    This will run in a dedicated thread to play games and save them in the replay buffer.
-    """
-
-    def __init__(self, initial_checkpoint, game, shared_storage, config, seed=42):
-
-        """Initializes the SelfPlay with the game environment, shared storage, and configuration."""
-        self.game = game
-
-        # Fix random generator seed 
-        numpy.random.seed(seed)
-        torch.manual_seed(seed)
-
-        # Initialising the Network 
-        self.model = models.AlphaZeroModel()
-        self.model.set_weights(initial_checkpoint['weights'])
-        self.model.to(torch.device(DEVICE_MODE))
-        self.model.eval() # means model will not be trained here aka model is in inference mode
-  
+from ..environment import VidurMCTSEnvironment, VidurMCTSState
+from ..mctsDNN import VidurMCTS
+from .infer import build_model_inputs
+from .types import ModelInputs
+from .replay_write import ReplayWriter, make_root_sample
 
 
-    def continous_self_play(self, shared_storage, replay_buffer):
-
-        """Continuously plays games and stores them in the replay buffer."""
-        # --> need ray here later for distributed training
-        while shared_storage.get_info('training_steps') < TRAINING_STEPS:
-
-            self.model.set_weights(shared_storage.get_info('weights'))
-
-            ## Training mode only :
-            game_history = self.play_game(TEMPERATURE_VALUE, TEMPERATURE_THRESHOLD,"self", 0)
-            replay_buffer.save_game_history(game_history, shared_storage)
-        
-        # TODO: Add logic for the RAY/ray distributed training here later to work with multiple self-play workers + training workers.
+def _mask_to_list(mask) -> list[bool]:
+    if isinstance(mask, torch.Tensor):
+        return [bool(x) for x in mask.to(dtype=torch.bool).cpu().tolist()]
+    return [bool(x) for x in mask]
 
 
-    def play_game(self, temperature, temperature_threshold, player, step):
+def _compute_mcts_prior_from_root(root, mask: Sequence[bool]) -> Tuple[list[float], int]:
+    a = len(mask)
 
-        """Plays a single game using MCTS guided by the DNN model at each move."""
-        game_history = GameHistory()
+    # Canonical visit totals from the actual MCTS tree
+    canon_visits: dict[int, int] = {}
+    for idx, child in root.children.items():
+        ii = int(idx)
+        if 0 <= ii < a:
+            canon_visits[ii] = int(child.visits)
 
-        # We will get the initial state from the game environment + player who will play next move on that state from the mcts.py
-        initial_state , player = mcts.generateInititalState(INITIAL_HISTORY_STEPS) # TODO: implement this function in mcts.py (core functionality is in the search function of mcts.py)
-        state = self.game.get_initial_state()
-        game_history.state_history.append(state)
-        game_history.to_play_history.append(player)
-        done = False
+    # Best action should be picked by canonical totals (NOT split totals)
+    valid_canon = [i for i in canon_visits.keys() if mask[i]]
+    if valid_canon:
+        best_idx = max(valid_canon, key=lambda i: canon_visits[i])
+    else:
+        best_idx = next((i for i, ok in enumerate(mask) if ok), 0)
 
-        with torch.no_grad():
-            while not done and len(game_history.state_history) <= MAX_GAME_LENGTH:
-                # TODO : Adjust the logic of search function to utilise new params and return the state as needed. Atm state will have sim_snapshot, state_value, actions for that state etc 
-                new_root_state , new_player , action_space = mcts.search(self.model, initial_state) # new root state also contains essentially the snapshot of the vidur simulator provided by the mcts after search is done.
-                action , reward = self.select_action(new_root_state, temperature, temperature_threshold, len(game_history.state_history))
-                # TODO : This line will need change as new_root_state object will be properly defined in mcts.py
-                game_history.store_search_statistics(new_root_state, action_space)
+    # Build policy target counts over FULL action space
+    counts = [0.0] * a
 
-                # Appending the relevant details to game history
-                game_history.reward_history.append(reward)
-                game_history.to_play_history.append(new_player)
+    canon_to_aliases = getattr(root, "canonical_to_action_aliases", None)
+
+    if canon_to_aliases:
+        # Distribute each canonical child’s visits across its alias indices (uniform split)
+        for canon, aliases in canon_to_aliases.items():
+            canon = int(canon)
+            v = float(canon_visits.get(canon, 0))
+            valid_aliases = [int(i) for i in aliases if 0 <= int(i) < a and mask[int(i)]]
+            if not valid_aliases:
+                continue
+            share = v / float(len(valid_aliases))
+            for i in valid_aliases:
+                counts[i] += share
+    else:
+        # No dedupe: each index is its own action
+        for i, v in canon_visits.items():
+            if mask[i]:
+                counts[i] = float(v)
+
+    total = sum(counts[i] for i, ok in enumerate(mask) if ok)
+    if total > 0:
+        prior = [(counts[i] / total) if mask[i] else 0.0 for i in range(a)]
+    else:
+        valid = [i for i, ok in enumerate(mask) if ok]
+        prior = [0.0] * a
+        if valid:
+            p = 1.0 / len(valid)
+            for i in valid:
+                prior[i] = p
+
+    return prior, int(best_idx)
 
 
 
-            return reward
+@dataclass(frozen=True)
+class SingleRootRun:
+    game_id: int = 0
+    root_id: int = 0
+    root_depth: int = 0
+    root_player: str = "adversary"  # "adversary" or "controller"
+    iterations: int = 5000
+    feature_version: int = 1
+
+
+class SelfPlayRunner:
+    def __init__(
+        self,
+        *,
+        env: VidurMCTSEnvironment,
+        mcts: VidurMCTS,
+        model,
+        writer: ReplayWriter,
+        device_for_features: torch.device = torch.device("cpu"),
+    ) -> None:
+        self.env = env
+        self.mcts = mcts
+        self.model = model
+        self.writer = writer
+        self.device = device_for_features
+
+
+
+    def _advance_to_branching_root(
+        self,
+        state: VidurMCTSState,
+        player: str,
+        depth: int,
+        *,
+        max_hops: int = 10000,
+    ) -> tuple[VidurMCTSState, str, int]:
+        """
+        Advance the real self-play state through forced moves until the current player
+        has >1 *unique* actions (controller uniqueness uses the same key as MCTS dedupe).
+
+        Returns: (state, player_to_act, updated_depth)
+        """
+        for _ in range(int(max_hops)):
+           
+            if player == "controller":
+                actions_by_index, mask = self.env.sample_controller_actions(state, self.mcts._cfg.max_branching)
+                mask_list = _mask_to_list(mask)
+                valid = [i for i, ok in enumerate(mask_list) if ok and actions_by_index[i] is not None]
+
+                if len(valid) != 1:
+                    return state, player, depth  # 0 (terminal) or >1 (branching)
+
+                forced_idx = valid[0]
+                action = actions_by_index[forced_idx]
+                assert action is not None
+                state = self.env.apply_controller_action_only(state, action, inplace=True)
+                player = "adversary"
+                depth += 1
+                continue
+
+            # player == "adversary"
+            actions_by_index, mask = self.env.sample_adversary_actions(
+                state, self.mcts._cfg.max_branching
+            )
+            mask_list = _mask_to_list(mask)
+            valid = [i for i, ok in enumerate(mask_list) if ok and actions_by_index[i] is not None]
+            if not valid:
+                return state, player, depth
+
+            if len(valid) > 1:
+                return state, player, depth  # branching root
+
+            # forced: apply the only valid adversary action and continue
+            forced_idx = valid[0]
+            action = actions_by_index[forced_idx]
+            assert action is not None
+            state = self.env.apply_adversary_action_only(state, action, inplace=True)
+            player = "controller"
+            depth += 1
+
+        return state, player, depth
 
 
 
 
-class GameHistory:
-    
-    """A class to store the history of a single game played.
-    
-    FORMAT :
-    ---------------------------------------------------
-    INDEX        | 1    | 2     | 3     |
-    STATE        |state1|state2 |state3 | ...
-    MCTS_VALUE   |VALUE1| VALUE2 | VALUE3 | ... aka root_values below
-    VIDUR_REWARD |REWARD1|REWARD2|REWARD3| ...
-    MCTS_POLICY  |POLICY1|POLICY2|POLICY3| ... aka child_visits below
-    PLAYER       | P1   |  P2   |  P1   | ... aka to_play_history below
-    ---------------------------------------------------
-    """
-    
+    def run_single_root(self, cfg: SingleRootRun, root_state: Optional[VidurMCTSState] = None) -> None:
+        state = root_state or self.env.initial_state()
 
-    def __init__(self):
 
-        """Initializes an empty game history."""
-        self.state_history = []
-        self.reward_history = []
-        self.to_play_history = []
-        self.child_visits = []
-        self.root_values = []
+        # run MCTS on a fork so it cannot mutate the selfplay root state
+        search_state = state.fork()
+        # Run MCTS search (will also write MCTS CSV logs if enabled inside mcts)
+        self.mcts.search_dnn(
+            dnn_model=self.model,
+            rootState=search_state,
+            root_player=cfg.root_player,
+            iterations=cfg.iterations,
+            game_id=cfg.game_id,
+            root_id=cfg.root_id,
+            root_depth=cfg.root_depth,
+        )
 
-    def store_search_statistics(self, root_state, action_space):
+        # Mask from env for this root/player (fixed action indexing)
+        if cfg.root_player == "controller":
+            _, mask = self.env.sample_controller_actions(state, self.mcts._cfg.max_branching)
+        else:
+            _, mask = self.env.sample_adversary_actions(state, self.mcts._cfg.max_branching)
+        mask_list = _mask_to_list(mask)
 
-        # Turn visit count from root into a policy
-        if root_state is not None :
-            sum_visits = sum(child.visit_count for child in root_state.children.values())
-            self.child_visits.append(
-                [
-                    root_state.children[action].visit_count / sum_visits if action in root_state.children else 0
-                    for action in range(action_space)
-                ]
+        # MCTS targets from the built root
+        root = self.mcts._root
+        mcts_prior, best_idx = _compute_mcts_prior_from_root(root, mask_list)
+        mcts_value = float(root.mean_value())
+
+        # Build model inputs (CPU) and force action_mask to env mask
+        base_inputs = build_model_inputs(state, cfg.root_player, self.device)
+        inputs = ModelInputs(
+            req_features=base_inputs.req_features,
+            global_features=base_inputs.global_features,
+            req_mask=base_inputs.req_mask,
+            action_mask=torch.tensor(mask_list, dtype=torch.bool, device=self.device).unsqueeze(0),
+        )
+
+        # Write one root sample into dataset shards
+        sample = make_root_sample(
+            feature_version=cfg.feature_version,
+            game_id=cfg.game_id,
+            root_id=cfg.root_id,
+            root_node_id=int(root.node_id),
+            root_depth=int(cfg.root_depth),
+            player=cfg.root_player,
+            model_inputs=inputs,
+            action_mask=mask_list,
+            mcts_policy=mcts_prior,
+            mcts_value_controller=mcts_value,
+            meta={
+                "best_action_index": int(best_idx),
+                "num_simulations": int(cfg.iterations),
+            },
+        )
+        self.writer.add(sample)
+
+    ## TODO: ENSURE THAT MINIMAX IS RESET AGAIN & THE NEXT NODE IS ALWAYS THE NODE WHERE NN CAN BE CALLED AGAIN & WHY ARE THE ROOT ITEREATIONS LOGS CREATED AGAIN...
+    def run_n_roots(
+        self,
+        *,
+        game_id: int,
+        num_roots: int,
+        # iterations_per_root: int = 5000,
+        adv_iterations_per_root: int = 1000,
+        cont_iterations_per_root: int = 500,
+        start_root_id: int = 0,
+        start_root_depth: int = 0,
+        start_player: str = "adversary",
+        feature_version: int = 1,
+        initial_state: Optional[VidurMCTSState] = None,
+    ) -> VidurMCTSState:
+        # state = initial_state or self.env.initial_state()
+        # player = start_player
+
+        state = initial_state or self.env.initial_state()
+        player = start_player
+        depth = int(start_root_depth)
+
+        for k in range(int(num_roots)):
+            root_id = start_root_id + k
+            # root_depth = start_root_depth + k
+
+            # NEW: force-advance until branching before running MCTS
+            state, player, depth = self._advance_to_branching_root(state, player, depth)
+
+            # Determine iterations per root based on player to act
+            iters = int(adv_iterations_per_root if player == "adversary" else cont_iterations_per_root)
+            
+            # 1) Run one root search + write one dataset sample
+            self.run_single_root(
+                SingleRootRun(
+                    game_id=game_id,
+                    root_id=root_id,
+                    root_depth=depth,
+                    root_player=player,
+                    iterations=iters,
+                    feature_version=feature_version,
+                ),
+                root_state=state,
             )
 
-            self.root_values.append(root_state.value())
-        else:
-            self.root_values.append(None)
+            # 2) Choose best action index from visit counts (greedy argmax)
+            if player == "controller":
+                actions_by_index, mask = self.env.sample_controller_actions(state, self.mcts._cfg.max_branching)
+            else:
+                actions_by_index, mask = self.env.sample_adversary_actions(state, self.mcts._cfg.max_branching)
 
+            mask_list = _mask_to_list(mask)
 
+            root = self.mcts._root
+            _, best_idx = _compute_mcts_prior_from_root(root, mask_list)
 
+            if not (0 <= best_idx < len(actions_by_index)):
+                raise RuntimeError(f"best_idx={best_idx} out of range for actions_by_index length={len(actions_by_index)}")
+            if not mask_list[best_idx]:
+                raise RuntimeError(f"best_idx={best_idx} is not valid per mask")
+            action = actions_by_index[best_idx]
+            if action is None:
+                raise RuntimeError(f"actions_by_index[{best_idx}] is None even though mask is True")
 
+            # 3) Advance simulator state in-place
+            if player == "adversary":
+                state = self.env.apply_adversary_action_only(state, action, inplace=True)
+                player = "controller"
+            else:
+                state = self.env.apply_controller_action_only(state, action, inplace=True)
+                player = "adversary"
+            depth += 1
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+        return state

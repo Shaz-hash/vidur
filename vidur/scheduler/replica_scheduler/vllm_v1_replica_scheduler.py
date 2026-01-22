@@ -20,6 +20,8 @@ from vidur.scheduler.replica_stage_scheduler.replica_stage_scheduler import (
 )
 from vidur.types.request_queue_type import RequestQueueType
 
+from vidur.kv_cache.infinite_kv_cache_manager import InfiniteKVCacheManager
+
 
 _SNAP_VERSION_VLLM_V1 = 1
 
@@ -62,13 +64,32 @@ class VLLMV1ReplicaScheduler(BaseReplicaScheduler):
         # Create the KV Cache manager
         # NOTE TO MYSELF : 
         # This part is KV memory manager. Some params allow for the prefix caching which in our case will be default 
-        self._kv_cache_manager = ReplicaKVCacheManager(
-            block_size=self._cache_config.block_size,
-            num_gpu_blocks=self._cache_config.num_blocks,
-            enable_caching=self._cache_config.enable_prefix_caching,
-            caching_hash_algo=self._cache_config.prefix_caching_hash_algo,
-            num_preallocate_tokens=self._cache_config.num_preallocate_tokens,
-        )
+        # self._kv_cache_manager = ReplicaKVCacheManager(
+        #     block_size=self._cache_config.block_size,
+        #     num_gpu_blocks=self._cache_config.num_blocks,
+        #     enable_caching=self._cache_config.enable_prefix_caching,
+        #     caching_hash_algo=self._cache_config.prefix_caching_hash_algo,
+        #     num_preallocate_tokens=self._cache_config.num_preallocate_tokens,
+        # )
+        # use_infinite=True
+        use_infinite = getattr(self._cache_config, "assume_infinite_kv", False)
+        if use_infinite:
+            self._kv_cache_manager = InfiniteKVCacheManager(
+                block_size=self._cache_config.block_size,
+                num_gpu_blocks=self._cache_config.num_blocks,
+                enable_caching=False,
+                caching_hash_algo=self._cache_config.prefix_caching_hash_algo,
+                num_preallocate_tokens=self._cache_config.num_preallocate_tokens,
+            )
+        else:
+            self._kv_cache_manager = ReplicaKVCacheManager(
+                block_size=self._cache_config.block_size,
+                num_gpu_blocks=self._cache_config.num_blocks,
+                enable_caching=self._cache_config.enable_prefix_caching,
+                caching_hash_algo=self._cache_config.prefix_caching_hash_algo,
+                num_preallocate_tokens=self._cache_config.num_preallocate_tokens,
+            )
+
 
         # req_id -> Request
         self._requests: Dict[str, Request] = {}

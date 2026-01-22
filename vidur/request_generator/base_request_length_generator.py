@@ -8,17 +8,17 @@ from vidur.config import BaseRequestLengthGeneratorConfig
 class RequestLengthGeneratorOutput:
     num_prefill_tokens: int
     num_decode_tokens: int
-    block_hash_ids: Optional[List[int]]
-    block_size: Optional[int]
-    session_id: Optional[int]
+    block_hash_ids: Optional[List[int]] 
+    block_size: Optional[int] 
+    session_id: Optional[int] 
 
     def __init__(
         self,
         num_prefill_tokens: int,
         num_decode_tokens: int,
-        block_hash_ids: Optional[List[int]],
-        block_size: Optional[int],
-        session_id: Optional[int],
+        block_hash_ids: Optional[List[int]] = None,
+        block_size: Optional[int] = None,
+        session_id: Optional[int] = None,
     ):
         self.num_prefill_tokens = int(num_prefill_tokens)
         self.num_decode_tokens = int(num_decode_tokens)
