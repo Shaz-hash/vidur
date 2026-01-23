@@ -167,8 +167,8 @@ def selfImprovementPolicy(
         cfg=TrainerConfig(
             lr=1e-3,
             weight_decay=1e-4,
-            policy_weight=3.0,
-            value_weight=0.5,
+            policy_weight=1.0,
+            value_weight=1.0,
             grad_clip_norm=5.0,
         ),
         device=torch.device(cfg.model.device),
@@ -512,11 +512,11 @@ def main() -> None:
 
 
     ## MODEL TRAINING PARMS FOR SELF-IMPROVEMENT LOOP:
-    num_generations = 10
-    roots_per_generation = 100
+    num_generations = 50
+    roots_per_generation = 75
     adv_iterations_per_root = 2000
     cont_iterations_per_root = 2000
-    train_steps_per_generation = 1000   
+    train_steps_per_generation = 200   
     max_batch_size = 256
     train_log_csv = Path("simulator_output/mcts_dnn_logs/train_metrics.csv")
     ckpt_dir = Path("simulator_output/mcts_dnn_checkpoints")

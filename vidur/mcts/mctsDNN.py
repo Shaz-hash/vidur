@@ -6,6 +6,8 @@ import math
 import random
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
+from collections import OrderedDict
+
 import time 
 
 # Misc Imports for debugging the tree and logging
@@ -79,6 +81,10 @@ class MCTSNode:
     action_alias_to_canonical: Dict[int, int] = field(default_factory=dict)      # alias_idx -> canonical_idx
     canonical_to_action_aliases: Dict[int, List[int]] = field(default_factory=dict)  # canonical_idx -> [idxs...]
 
+    # Optional cached state to accelerate _replay_to_node()
+    cached_sim_snapshot: Any | None = None
+    cached_stats: Any | None = None
+
 
     def expanded(self) -> bool:
         return len(self.children) > 0
@@ -128,6 +134,10 @@ class VidurMCTS:
         self._root: Optional[MCTSNode] = None
         self._history_root_state: Optional[VidurMCTSState] = None
         self._history_root_node: Optional[MCTSNode] = None
+
+        # --- State cache (speeds up _replay_to_node) ---
+        self._max_cached_states = 1240000  # tune as needed
+        self._state_cache_lru: "OrderedDict[int, MCTSNode]" = OrderedDict()
 
         # self._iter_logger = DNNMCTSIterationLogger(log_path, flush_every=logger_flush_every)
         # Disable per-simulation iteration logging (mcts_iter.csv)
@@ -216,29 +226,81 @@ class VidurMCTS:
 
 
 
+    # def _replay_to_node(self, node: MCTSNode) -> VidurMCTSState:
+    #     """Reconstruct a fresh state at `node` by replaying actions.
+
+    #     If a random history prefix was generated, we treat the history root
+    #     state as the baseline and only replay actions *below* that node.
+    #     Otherwise, we start from a fresh initial state and replay from the
+    #     true root.
+    #     """
+    #     # Decide the baseline state and the cut node in the ancestry.
+    #     if self._history_root_node is not None and self._history_root_state is not None:
+    #         # baseline_state = self._history_root_state
+    #         # cut_node = self._history_root_node
+
+    #         # Clone from the frozen history-root snapshot, with stats cloned
+    #         baseline_state = self._env.clone_history_root_state(
+    #             self._history_root_state.stats
+    #         )
+    #         cut_node = self._history_root_node
+    #     else:
+    #         baseline_state = self._env.initial_state()
+    #         cut_node = None
+
+    #     # Collect path from `cut_node` (exclusive) down to `node`.
+    #     path: List[MCTSNode] = []
+    #     cur = node
+    #     while cur is not None and cur is not cut_node:
+    #         path.append(cur)
+    #         cur = cur.parent
+    #     path.reverse()
+
+    #     # Work on a fork so we never mutate the stored baseline state.
+    #     # state = baseline_state.fork()
+    #     state = baseline_state
+    #     # Replay actions inplace along the path segment.
+    #     for n in path:
+    #         parent = n.parent
+    #         action = n.parent_action
+    #         if parent is None or action is None:
+    #             continue
+    #         if parent.player == "adversary":
+    #             state = self._env.apply_adversary_action_only(state, action, inplace=True)
+    #         else:
+    #             state = self._env.apply_controller_action_only(state, action, inplace=True)
+
+    #     return state
+
+
     def _replay_to_node(self, node: MCTSNode) -> VidurMCTSState:
-        """Reconstruct a fresh state at `node` by replaying actions.
 
-        If a random history prefix was generated, we treat the history root
-        state as the baseline and only replay actions *below* that node.
-        Otherwise, we start from a fresh initial state and replay from the
-        true root.
-        """
-        # Decide the baseline state and the cut node in the ancestry.
-        if self._history_root_node is not None and self._history_root_state is not None:
-            # baseline_state = self._history_root_state
-            # cut_node = self._history_root_node
+        # Fast path: exact cached state exists
+        if node.cached_sim_snapshot is not None and node.cached_stats is not None:
+            state = self._env.clone_state_from_snapshot(node.cached_sim_snapshot, node.cached_stats)
+            self._state_cache_lru.pop(int(node.node_id), None)
+            self._state_cache_lru[int(node.node_id)] = node
+            return state
 
-            # Clone from the frozen history-root snapshot, with stats cloned
-            baseline_state = self._env.clone_history_root_state(
-                self._history_root_state.stats
-            )
-            cut_node = self._history_root_node
+        # Find nearest cached ancestor
+        cut_node = node.parent
+        while cut_node is not None:
+            if cut_node.cached_sim_snapshot is not None and cut_node.cached_stats is not None:
+                break
+            cut_node = cut_node.parent
+
+        if cut_node is not None:
+            baseline_state = self._env.clone_state_from_snapshot(cut_node.cached_sim_snapshot, cut_node.cached_stats)
         else:
-            baseline_state = self._env.initial_state()
-            cut_node = None
+            # Fall back to history-root snapshot
+            if self._history_root_state is not None:
+                baseline_state = self._env.clone_history_root_state(self._history_root_state.stats)
+                cut_node = self._history_root_node
+            else:
+                baseline_state = self._env.initial_state()
+                cut_node = None
 
-        # Collect path from `cut_node` (exclusive) down to `node`.
+        # Replay actions from cut_node (exclusive) down to node
         path: List[MCTSNode] = []
         cur = node
         while cur is not None and cur is not cut_node:
@@ -246,10 +308,7 @@ class VidurMCTS:
             cur = cur.parent
         path.reverse()
 
-        # Work on a fork so we never mutate the stored baseline state.
-        # state = baseline_state.fork()
         state = baseline_state
-        # Replay actions inplace along the path segment.
         for n in path:
             parent = n.parent
             action = n.parent_action
@@ -260,6 +319,8 @@ class VidurMCTS:
             else:
                 state = self._env.apply_controller_action_only(state, action, inplace=True)
 
+        # Cache the reconstructed state for next time
+        self._cache_node_state(node, state)
         return state
 
 
@@ -569,6 +630,11 @@ class VidurMCTS:
             n_valid = len(valid)
             node.num_valid_actions = int(n_valid)
 
+            # inside _advance_through_single_child_chain
+            # if n_valid != 1:  # branching/terminal checkpoint only
+            #     self._cache_node_state(node, state)
+
+
             if n_valid != 1:
                 return node, state
             
@@ -758,7 +824,10 @@ class VidurMCTS:
         else:
             # Reconstruct parent state once, apply this node's incoming action
             parent = node.parent
+            # t0 = time.perf_counter()
             parent_state = self._replay_to_node(parent)
+            # t1 = time.perf_counter()
+            # print(f"[PERF] replay_to_node time: {(t1 - t0)} seconds")
             parent_cost = parent.state_cost
 
             # Apply incoming action to parent_state to reach leaf_state
@@ -776,56 +845,57 @@ class VidurMCTS:
 
         # Expansion + NN evaluation at leaf
         # only skip trivial forced chains
-        forced_logs: List[Tuple[MCTSNode, Dict[str, Any], int, int]] = []   
-
+        
+        iter_logging = getattr(self._iter_logger, "_path", None) is not None
+        forced_logs = [] if iter_logging else None
 
         node, leaf_state = self._advance_through_single_child_chain(
             node, leaf_state, search_path, forced_step_logs=forced_logs
         )
 
         ## LOGGGING FOR FORCED STEPS ##
-        for forced_node, forced_snap, forced_n_valid, forced_unique in forced_logs:
-            parent_multi = (forced_node.parent is None) or (len(forced_node.parent.children) > 1)
+        # for forced_node, forced_snap, forced_n_valid, forced_unique in forced_logs:
+        #     parent_multi = (forced_node.parent is None) or (len(forced_node.parent.children) > 1)
 
-            if forced_n_valid == 0:
-                forced_phase = "terminal"
-            elif forced_n_valid == 1:
-                forced_phase = "single-child" if parent_multi else "trivial-single-child"
-            else:
-                forced_phase = "multiple-child" if parent_multi else "trivial-multiple-child"
+        #     if forced_n_valid == 0:
+        #         forced_phase = "terminal"
+        #     elif forced_n_valid == 1:
+        #         forced_phase = "single-child" if parent_multi else "trivial-single-child"
+        #     else:
+        #         forced_phase = "multiple-child" if parent_multi else "trivial-multiple-child"
 
-            self._iter_logger.log_expand(
-                game_id=game_id,
-                root_id=root_id,
-                sim_iteration=sim_iteration,
-                root_depth=root.depth,
-                root_node_id=root.node_id,
-                root_player=root.player,
+        #     self._iter_logger.log_expand(
+        #         game_id=game_id,
+        #         root_id=root_id,
+        #         sim_iteration=sim_iteration,
+        #         root_depth=root.depth,
+        #         root_node_id=root.node_id,
+        #         root_player=root.player,
 
-                node_depth=forced_node.depth,
-                parent_node_id=(forced_node.parent.node_id if forced_node.parent else None),
-                node_id=forced_node.node_id,
-                player_acted_to_create_this_node=(forced_node.parent.player if forced_node.parent else "root_no_parent"),
-                player_to_act=forced_node.player,
+        #         node_depth=forced_node.depth,
+        #         parent_node_id=(forced_node.parent.node_id if forced_node.parent else None),
+        #         node_id=forced_node.node_id,
+        #         player_acted_to_create_this_node=(forced_node.parent.player if forced_node.parent else "root_no_parent"),
+        #         player_to_act=forced_node.player,
 
-                action_index=forced_node.parent_action_index,
-                action_repr=(repr(forced_node.parent_action) if forced_node.parent_action else ""),
-                prior=float(getattr(forced_node, "prior", 0.0)),
-                reward=float(getattr(forced_node, "reward", 0.0)),
-                # action_cost_softcap=float(
-                #     max(0.0, min(1.0, -float(getattr(forced_node, "reward", 0.0))))
-                # ),
+        #         action_index=forced_node.parent_action_index,
+        #         action_repr=(repr(forced_node.parent_action) if forced_node.parent_action else ""),
+        #         prior=float(getattr(forced_node, "prior", 0.0)),
+        #         reward=float(getattr(forced_node, "reward", 0.0)),
+        #         # action_cost_softcap=float(
+        #         #     max(0.0, min(1.0, -float(getattr(forced_node, "reward", 0.0))))
+        #         # ),
 
 
-                nn_called=False,
-                num_valid_actions=int(forced_n_valid),
-                unique_actions=int(forced_unique),
-                nn_value_controller=None,
+        #         nn_called=False,
+        #         num_valid_actions=int(forced_n_valid),
+        #         unique_actions=int(forced_unique),
+        #         nn_value_controller=None,
 
-                objective_cost=float(getattr(forced_node, "state_cost", 0.0)),
-                state_snapshot=forced_snap,
-                phase=f"forced_step:{forced_phase}",
-            )
+        #         objective_cost=float(getattr(forced_node, "state_cost", 0.0)),
+        #         state_snapshot=forced_snap,
+        #         phase=f"forced_step:{forced_phase}",
+        #     )
 
         # now expand/eval at the first “meaningful” node
         nn_value, nn_called, num_valid = self._expand_node(node, leaf_state, dnn_model)
@@ -841,44 +911,45 @@ class VidurMCTS:
             phase = "multiple-child" if parent_multi else "trivial-multiple-child"
 
         # Logging for this iteration
-        snap = self._env.describe_state(leaf_state)
-        unique_actions = len(node.children)  # after expansion, children dict keys are the unique/canonical actions
+        if iter_logging:
+            snap = self._env.describe_state(leaf_state)
+            unique_actions = len(node.children)  # after expansion, children dict keys are the unique/canonical actions
 
-        adv_deadlines = "{}"
-        if node.parent_action is not None and isinstance(node.parent_action, AdversaryAction):
-            adv_deadlines = self._adversary_prefill_deadlines_by_id_json(leaf_state, node.parent_action)
+            adv_deadlines = "{}"
+            if node.parent_action is not None and isinstance(node.parent_action, AdversaryAction):
+                adv_deadlines = self._adversary_prefill_deadlines_by_id_json(leaf_state, node.parent_action)
 
-        self._iter_logger.log_expand(
-                game_id=game_id,
-                root_id=root_id,
-                sim_iteration=sim_iteration,
-                root_depth=root.depth,
-                root_node_id=root.node_id,
-                root_player=root.player,
+            self._iter_logger.log_expand(
+                    game_id=game_id,
+                    root_id=root_id,
+                    sim_iteration=sim_iteration,
+                    root_depth=root.depth,
+                    root_node_id=root.node_id,
+                    root_player=root.player,
 
-                node_depth=node.depth,
-                parent_node_id=(node.parent.node_id if node.parent else None),
-                node_id=node.node_id,
-                player_acted_to_create_this_node=(node.parent.player if node.parent else "root_no_parent"),
-                player_to_act=node.player,
-                
+                    node_depth=node.depth,
+                    parent_node_id=(node.parent.node_id if node.parent else None),
+                    node_id=node.node_id,
+                    player_acted_to_create_this_node=(node.parent.player if node.parent else "root_no_parent"),
+                    player_to_act=node.player,
+                    
 
-                action_index=node.parent_action_index,
-                action_repr=(repr(node.parent_action) if node.parent_action else ""),
-                prior=float(node.prior),
-                reward=float(node.reward),
-                # action_cost_softcap=float(max(0.0, min(1.0, -float(node.reward)))),
+                    action_index=node.parent_action_index,
+                    action_repr=(repr(node.parent_action) if node.parent_action else ""),
+                    prior=float(node.prior),
+                    reward=float(node.reward),
+                    # action_cost_softcap=float(max(0.0, min(1.0, -float(node.reward)))),
 
-                nn_called=nn_called,
-                num_valid_actions=num_valid,
-                unique_actions=unique_actions,
-                nn_value_controller=nn_value,   # None for forced/terminal
+                    nn_called=nn_called,
+                    num_valid_actions=num_valid,
+                    unique_actions=unique_actions,
+                    nn_value_controller=nn_value,   # None for forced/terminal
 
-                objective_cost=float(node.state_cost),
-                adversary_prefill_deadlines_by_id_json=adv_deadlines,
-                state_snapshot=snap,
-                phase=phase,
-            )
+                    objective_cost=float(node.state_cost),
+                    adversary_prefill_deadlines_by_id_json=adv_deadlines,
+                    state_snapshot=snap,
+                    phase=phase,
+                )
 
         # Backup
         self.backpropagate(search_path, nn_value, min_max_stats)
@@ -900,9 +971,15 @@ class VidurMCTS:
 
 
     def search_dnn(self, dnn_model: Any, rootState: VidurMCTSState, root_player: str, iterations: int , * , game_id: int , root_id: int , root_depth: int) -> Tuple[str, List[Union[AdversaryAction, ControllerAction]]]:
+        
+        
+        
         self._history_root_state = rootState
         # TODO: Code review the state cost logic for root and child from the Codex here
         self._root = MCTSNode(player=root_player, node_id=self._next_node_id(), depth=0, sim_time=rootState.simulator._time, state_cost = self._state_cost(rootState))
+        
+        self._state_cache_lru.clear()
+
         self._history_root_node = self._root
         self._env.snapshot_history_root(self._history_root_state)
         self._did_root_infer_debug = False
@@ -1025,6 +1102,55 @@ class VidurMCTS:
         return next_player, action_space
 
     # CORE PHASE ENDS HERE #
+
+
+    # def _cache_node_state(self, node: MCTSNode, state: VidurMCTSState) -> None:
+    #     # Only snapshot once per node (node states are immutable in the tree)
+    #     if node.cached_sim_snapshot is None or node.cached_stats is None:
+    #         node.cached_sim_snapshot = state.simulator.snapshot_state()
+    #         node.cached_stats = state.stats.clone()
+
+    #     nid = int(node.node_id)
+    #     self._state_cache_lru.pop(nid, None)
+    #     self._state_cache_lru[nid] = node
+
+    #     # LRU eviction to cap memory
+    #     while len(self._state_cache_lru) > int(self._max_cached_states):
+    #         _, old = self._state_cache_lru.popitem(last=False)
+    #         old.cached_sim_snapshot = None
+    #         old.cached_stats = None
+
+
+    def _cache_node_state(self, node: MCTSNode, state: VidurMCTSState) -> None:
+        # Disable cache entirely if configured.
+        if int(self._max_cached_states) <= 0:
+            return
+
+        # Never cache trivial forced-chain nodes:
+        # node has exactly 1 valid action AND its parent also had exactly 1 valid action.
+        parent = node.parent
+        # if (
+        #     parent is not None
+        #     and int(getattr(node, "num_valid_actions", 0) or 0) == 1
+        #     and int(getattr(parent, "num_valid_actions", 0) or 0) == 1
+        # ):
+        #     return
+
+        # Only snapshot once per node (node states are immutable in the tree)
+        if node.cached_sim_snapshot is None or node.cached_stats is None:
+            node.cached_sim_snapshot = state.simulator.snapshot_state()
+            node.cached_stats = state.stats.clone()
+
+        nid = int(node.node_id)
+        self._state_cache_lru.pop(nid, None)
+        self._state_cache_lru[nid] = node
+
+        # LRU eviction to cap memory
+        while len(self._state_cache_lru) > int(self._max_cached_states):
+            _, old = self._state_cache_lru.popitem(last=False)
+            old.cached_sim_snapshot = None
+            old.cached_stats = None
+
 
     # ------------------------------------------------------------------ #
     # Logging helpers

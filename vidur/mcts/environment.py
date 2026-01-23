@@ -106,6 +106,7 @@ class VidurGameStats:
             completed_request_ids=set(self.completed_request_ids),
             per_request_max_lateness=dict(self.per_request_max_lateness),
             violated_request_ids=set(self.violated_request_ids),
+            last_prefill_batch_time=self.last_prefill_batch_time,
         )
 
 ## Essentially checkpoints the state so it can return back to it to run a different simulation
@@ -194,6 +195,16 @@ class VidurMCTSEnvironment:
         )
         sim.restore_state(self._history_root_snapshot)
         return VidurMCTSState(sim, stats_template.clone())
+
+    def clone_state_from_snapshot(self, snapshot: Any, stats_template: VidurGameStats) -> VidurMCTSState:
+        sim = Simulator(
+            self._base._config,
+            register_atexit=False,
+            execution_time_predictor=getattr(self._base, "_execution_time_predictor", None),
+        )
+        sim.restore_state(snapshot)
+        return VidurMCTSState(sim, stats_template.clone())
+
 
 
     
