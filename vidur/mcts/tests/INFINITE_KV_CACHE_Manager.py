@@ -64,7 +64,7 @@ DECODE_TOKENS = 256
 
 # Scheduler / KV
 CHUNK_SIZE = 512
-BATCH_SIZE_CAP = 128
+BATCH_SIZE_CAP = 256
 CACHE_BLOCK_SIZE = 16
 CACHE_NUM_BLOCKS = 4096  # pick high enough to avoid preemption in "finite" run
 

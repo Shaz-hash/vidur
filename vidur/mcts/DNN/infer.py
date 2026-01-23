@@ -23,6 +23,57 @@ Notes:
 - You will likely refine/normalize these features later.
 """
 
+# =============================================================================
+# ModelInputs feature schema (infer.py)
+# =============================================================================
+# Shapes:
+#   req_features    : [1, N_REQ, D_REQ]   (prefill requests only)
+#   global_features : [1, D_GLOBAL]
+#   req_mask        : [1, N_REQ] bool     (True = this slot is a real request)
+#   action_mask     : [1, A(player)] bool (True = action is valid)
+#
+# Request ordering:
+#   We take ONLY active prefill requests (not completed and not prefill-complete),
+#   and sort them by urgency: (time_left_to_deadline, request_id). First N_REQ kept.
+#
+# Per-request features (D_REQ=3), for slot i:
+#   f0 = remaining_prefill_norm
+#        = (num_prefill_tokens - num_processed_prefill_tokens) / max_prefill_tokens
+#          (max_prefill_tokens default = 3072)
+#
+#   f1 = cached_prefill_norm
+#        = num_processed_prefill_tokens / max_prefill_tokens
+#
+#   f2 = slack_ratio (clipped to [-slack_clip, +slack_clip], slack_clip default = 5.0)
+#        deadline = queued_at + prefill_slo_time
+#        time_left = deadline - sim_time
+#        base_total_exec = prefill_slo_time / prefill_slowdown   (prefill_slowdown default = 3.0)
+#        frac_remaining = remaining_prefill / max(1, total_prefill_tokens)
+#        est_remaining_exec = base_total_exec * frac_remaining
+#        slack = time_left - est_remaining_exec
+#        slack_ratio = slack / prefill_slo_time
+#
+# Global features (D_GLOBAL=7):
+#   g0 = prefill_frac_total  = num_prefill_active / max(1, total_active_requests)
+#   g1 = decode_frac_total   = num_decode_active  / max(1, total_active_requests)
+#   g2 = prefill_missed_frac = missed_prefill_deadlines / max(1, num_prefill_active)
+#   g3 = backlog_over_rate   = min(num_prefill_active / max(1, prefill_rate + 1), 25.0)
+#        prefill_rate uses state.stats.maximum_qps if set, else fallback 5.0
+#   g4 = prefill_over_200    = num_prefill_active / 200
+#   g5 = decode_over_200     = num_decode_active  / 200
+#   g6 = remaining_prefill_norm
+#        = total_remaining_prefill_tokens / (3072 * 10)
+#
+# Note:
+#   action_mask is currently all-True unless an action_mask_fn is provided.
+# =============================================================================
+
+
+
+
+
+
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -38,7 +89,7 @@ from .types import ModelInputs
 # -----------------------------
 N_REQ: int = 20
 D_REQ: int = 3  # per-request features
-D_GLOBAL: int = 7
+D_GLOBAL: int = 9
 
 # Placeholder action space sizes (keep aligned with your policy heads)
 NUM_ACTIONS_CONTROLLER: int = 24
@@ -352,6 +403,24 @@ def build_model_inputs(
 
     remaining_prefill_norm = float(total_remaining_prefill_tokens) / float(REMAINING_PREFILL_DENOM)
 
+
+    # NEW: violated-request features (history-based, tracked by environment stats)
+    violated_ids = set(getattr(getattr(state, "stats", None), "violated_request_ids", set()) or set())
+
+    num_total_violated_active = 0
+    num_decode_violated_active = 0
+
+    for r in requests:
+        rid = _safe_int(getattr(r, "id", None), -1)
+        if rid in violated_ids:
+            num_total_violated_active += 1
+            if _is_decode_request(r):
+                num_decode_violated_active += 1
+
+    decode_violated_over_200 = float(num_decode_violated_active) / float(MAX_ACTIVE_REQUESTS)
+    total_violated_over_200 = float(num_total_violated_active) / float(MAX_ACTIVE_REQUESTS)
+
+
     global_feat = torch.tensor(
         [[
             prefill_frac_total,
@@ -360,6 +429,8 @@ def build_model_inputs(
             backlog_over_rate,
             prefill_over_200,
             decode_over_200,
+            decode_violated_over_200,   # NEW
+            total_violated_over_200,    # NEW
             remaining_prefill_norm,
         ]],
         dtype=torch.float32,
@@ -382,6 +453,8 @@ def build_model_inputs(
             backlog_over_rate=float(backlog_over_rate),
             prefill_over_200=float(prefill_over_200),
             decode_over_200=float(decode_over_200),
+            decode_violated_over_200=float(decode_violated_over_200),
+            total_violated_over_200=float(total_violated_over_200),
             total_remaining_prefill_tokens=int(total_remaining_prefill_tokens),
             remaining_prefill_norm=float(remaining_prefill_norm),
             req_debug_rows=req_debug_rows,
@@ -409,7 +482,9 @@ def _infer_debug_dump(
     prefill_rate: float,
     backlog_over_rate: float,
     prefill_over_200: float,                 
-    decode_over_200: float,                  
+    decode_over_200: float,  
+    decode_violated_over_200: float,
+    total_violated_over_200: float,                
     total_remaining_prefill_tokens: int,     
     remaining_prefill_norm: float,           
     req_debug_rows: List[Dict[str, float]],
@@ -427,6 +502,13 @@ def _infer_debug_dump(
         f"remaining_prefill_tokens={total_remaining_prefill_tokens} "
         f"remaining_prefill_norm={remaining_prefill_norm:.6f}"
     )
+
+    lines.append(
+        f"decode_violated/200={decode_violated_over_200:.6f} "
+        f"total_violated/200={total_violated_over_200:.6f}"
+    )
+
+
 
     lines.append("-" * 100)
 

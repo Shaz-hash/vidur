@@ -39,20 +39,20 @@ from .types import ModelInputs, Player
 # Input tensor shapes (your planned feature schema)
 N_REQ: int = 20          # max number of (prefill) requests represented
 D_REQ: int = 3           # features per request
-D_GLOBAL: int = 7        # global features
+D_GLOBAL: int = 9        # global features
 
 # Action space sizes (you said you'll make deterministic indexing in environment.py)
 NUM_ACTIONS_CONTROLLER: int = 24
 NUM_ACTIONS_ADVERSARY: int = 6  # placeholder; update once adversary action indexing is finalized
 
 # MuZero-style value support (optional, but you already started it) * Note : Penalty and Max SLO cost in real units in seconds
-HARD_MISS_PENALTY: float = 5
-MAX_SLO_COST: float = 10
+# HARD_MISS_PENALTY: float = 5
+# MAX_SLO_COST: float = 10
 GAMMA: float = 0.98
 VALUE_SCALE: float = 0.5  # scale between real and scaled units
 
-SUPPORT_SIZE: int = math.ceil(((MAX_SLO_COST + HARD_MISS_PENALTY) / (1.0 - GAMMA)) / VALUE_SCALE)
-
+# SUPPORT_SIZE: int = math.ceil(((MAX_SLO_COST + HARD_MISS_PENALTY) / (1.0 - GAMMA)) / VALUE_SCALE)
+SUPPORT_SIZE: int = math.ceil(((1) / (1.0 - GAMMA)) / VALUE_SCALE)
 
 ##------------------------------
 # HELPER FUNCTIONS
@@ -396,7 +396,7 @@ class AlphaZeroModel(nn.Module):
         v_real: [B] or [B, T]
         Converts real value targets to support logits        
         """
-        valzue_scaled = self.scale_value(value_real)
+        value_scaled = self.scale_value(value_real)
         return scalar_to_support(value_scaled, SUPPORT_SIZE)
 
     def value_scalar_from_logits(self, value_logits: torch.Tensor) -> torch.Tensor:

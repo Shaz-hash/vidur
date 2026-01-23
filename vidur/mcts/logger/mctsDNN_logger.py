@@ -80,6 +80,7 @@ class DNNMCTSIterationLogger:
         "action_repr",
         "prior",
         "reward",
+        # "action_cost_softcap",
 
         # To see/debug whether DNN was called to filter non trivial actions
         "nn_called",
@@ -163,6 +164,7 @@ class DNNMCTSIterationLogger:
         action_repr: str,
         prior: float,
         reward: float,
+        # action_cost_softcap: float,
 
         # mcts_value_controller: float,
 
@@ -217,6 +219,7 @@ class DNNMCTSIterationLogger:
             "action_repr": action_repr,
             "prior": _safe_float(prior),
             "reward": _safe_float(reward),
+            # "action_cost_softcap": _safe_float(action_cost_softcap),
 
             "nn_called": bool(nn_called),
             "num_valid_actions": int(num_valid_actions),

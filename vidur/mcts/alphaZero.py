@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import csv
 import math
+import random
 import re
 import time
 import sys
@@ -153,6 +154,7 @@ def selfImprovementPolicy(
     # iterations_per_root: int,
     adv_iterations_per_root: int,
     cont_iterations_per_root: int,
+    max_batch_size: int = 72,
     train_steps_per_generation: int,
     ckpt_dir: Path,
     train_log_csv: Path,
@@ -225,6 +227,7 @@ def selfImprovementPolicy(
             num_roots=roots_per_generation,
             adv_iterations_per_root=adv_iterations_per_root,
             cont_iterations_per_root=cont_iterations_per_root,
+            max_batch_size=max_batch_size,
             start_root_id=0,
             start_root_depth=0,
             start_player="adversary",
@@ -242,11 +245,42 @@ def selfImprovementPolicy(
         num_controller = sum(1 for s in samples if s.get("player") == "controller")
         num_adversary = sum(1 for s in samples if s.get("player") == "adversary")
 
-        batch = collate_mixed_samples(samples, device=trainer.device)
+        eval_batch = collate_mixed_samples(samples, device=trainer.device)
 
         # 3) train multiple optimizer steps on this batch (few samples => multiple epochs)
+        # for _ in range(int(train_steps_per_generation)):
+        #     train_metrics = trainer.train_step(batch)
+        #     _append_train_log_row(
+        #         train_log_csv,
+        #         {
+        #             "time": time.time(),
+        #             "event": "train",
+        #             "gen": gen,
+        #             "trainer_step": int(trainer.step),
+        #             "dataset_dir": str(gen_dataset_dir),
+        #             "num_samples": int(len(samples)),
+        #             "num_controller": int(num_controller),
+        #             "num_adversary": int(num_adversary),
+        #             **train_metrics,
+        #             "saved_best": "",
+        #             "ckpt_path": "",
+        #             "best_path": str(best_path),
+        #             "resume_ckpt": str(resume_ckpt) if resume_ckpt else "",
+        #         },
+        #     )
+
+        # Eval on full latest-generation dataset (stable metric)
+        eval_batch = collate_mixed_samples(samples, device=trainer.device)
+
+        # Train with random minibatches from latest generation (replay-style)
+        rng = random.Random(1000 + int(gen))   # deterministic per gen; change seed if you want
+        train_minibatch_size = 32
+
         for _ in range(int(train_steps_per_generation)):
-            train_metrics = trainer.train_step(batch)
+            minibatch_samples = rng.choices(samples, k=train_minibatch_size)  # with replacement
+            train_batch = collate_mixed_samples(minibatch_samples, device=trainer.device)
+
+            train_metrics = trainer.train_step(train_batch)
             _append_train_log_row(
                 train_log_csv,
                 {
@@ -266,8 +300,9 @@ def selfImprovementPolicy(
                 },
             )
 
+
         # 4) eval + checkpoint
-        eval_metrics = trainer.eval_step(batch)
+        eval_metrics = trainer.eval_step(eval_batch)
         saved_best = trainer.maybe_save_best(eval_metrics["loss"], best_path)
 
         ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -431,6 +466,7 @@ def main() -> None:
                 "--replica_config_num_pipeline_stages", "1",
                 "--global_scheduler_config_type", "round_robin",
                 "--replica_scheduler_config_type", "vllm_v1",
+                "--vllm_v1_scheduler_config_batch_size_cap", "512",
             ]
         ),
         constraints=MCTSConstraintsGroup(
@@ -476,11 +512,12 @@ def main() -> None:
 
 
     ## MODEL TRAINING PARMS FOR SELF-IMPROVEMENT LOOP:
-    num_generations = 5
-    roots_per_generation = 50
-    adv_iterations_per_root = 10
-    cont_iterations_per_root = 10
-    train_steps_per_generation = 50   
+    num_generations = 10
+    roots_per_generation = 100
+    adv_iterations_per_root = 2000
+    cont_iterations_per_root = 2000
+    train_steps_per_generation = 1000   
+    max_batch_size = 256
     train_log_csv = Path("simulator_output/mcts_dnn_logs/train_metrics.csv")
     ckpt_dir = Path("simulator_output/mcts_dnn_checkpoints")
 
@@ -576,32 +613,33 @@ def main() -> None:
 
     try:
 
-        runner.run_single_root(
-            SingleRootRun(
-                game_id=cfg.run.game_id,
-                root_id=cfg.run.root_id,
-                root_depth=cfg.run.root_depth,
-                root_player=cfg.run.root_player,
-                iterations=cfg.run.iterations,
-                feature_version=cfg.run.feature_version,
-            )
-        )
-
-
-        # selfImprovementPolicy(
-        #     cfg=cfg,
-        #     env=env,
-        #     mcts=mcts,
-        #     model=model,
-        #     num_generations=num_generations,
-        #     roots_per_generation=roots_per_generation,
-        #     adv_iterations_per_root=adv_iterations_per_root,
-        #     cont_iterations_per_root=cont_iterations_per_root,
-        #     train_steps_per_generation=train_steps_per_generation,
-        #     ckpt_dir=ckpt_dir,
-        #     train_log_csv=train_log_csv,
-        #     device_for_features=torch.device("cpu"),
+        # runner.run_single_root(
+        #     SingleRootRun(
+        #         game_id=cfg.run.game_id,
+        #         root_id=cfg.run.root_id,
+        #         root_depth=cfg.run.root_depth,
+        #         root_player=cfg.run.root_player,
+        #         iterations=cfg.run.iterations,
+        #         feature_version=cfg.run.feature_version,
+        #     )
         # )
+
+
+        selfImprovementPolicy(
+            cfg=cfg,
+            env=env,
+            mcts=mcts,
+            model=model,
+            num_generations=num_generations,
+            roots_per_generation=roots_per_generation,
+            adv_iterations_per_root=adv_iterations_per_root,
+            cont_iterations_per_root=cont_iterations_per_root,
+            max_batch_size=max_batch_size,
+            train_steps_per_generation=train_steps_per_generation,
+            ckpt_dir=ckpt_dir,
+            train_log_csv=train_log_csv,
+            device_for_features=torch.device("cpu"),
+        )
     finally:
         mcts.close()
 

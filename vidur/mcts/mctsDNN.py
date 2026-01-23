@@ -129,7 +129,10 @@ class VidurMCTS:
         self._history_root_state: Optional[VidurMCTSState] = None
         self._history_root_node: Optional[MCTSNode] = None
 
-        self._iter_logger = DNNMCTSIterationLogger(log_path, flush_every=logger_flush_every)
+        # self._iter_logger = DNNMCTSIterationLogger(log_path, flush_every=logger_flush_every)
+        # Disable per-simulation iteration logging (mcts_iter.csv)
+        self._iter_logger = DNNMCTSIterationLogger(None, flush_every=logger_flush_every)
+
         self._root_logger = DNNMCTSRootSummaryLogger(tree_log_path, flush_every=logger_flush_every)
 
         # --- Time-based discount calibration ---
@@ -166,10 +169,28 @@ class VidurMCTS:
         violations, avg_lateness = self._env.evaluate_objective(state)
         return float(violations) + float(avg_lateness)
 
+    # def _transition_reward(self, parent_cost: float, child_cost: float) -> float:
+    #     # controller-reward (higher better): reward = -(child_cost - parent_cost)
+    #     # Essentially the cost will always increase therefore, reward will be negative 
+    #     return parent_cost - child_cost
+
     def _transition_reward(self, parent_cost: float, child_cost: float) -> float:
-        # controller-reward (higher better): reward = -(child_cost - parent_cost)
-        # Essentially the cost will always increase therefore, reward will be negative 
-        return parent_cost - child_cost
+        """
+        Immediate controller-perspective reward for parent -> child.
+
+        We treat *increases* in objective cost as immediate action cost:
+            delta_cost = max(0, child_cost - parent_cost)
+
+        Soft-cap it to [0, 1):
+            soft_cost = 1 - exp(-delta_cost)
+
+        And propagate as negative reward:
+            reward = -soft_cost   in (-1, 0]
+        """
+        delta_cost = max(0.0, float(child_cost) - float(parent_cost))
+        soft_cost = 1.0 - math.exp(-delta_cost)
+        return -soft_cost
+
 
     def _time_discount(self, t_child_time: float, t_parent_branch: float) -> float:
         """
@@ -791,6 +812,10 @@ class VidurMCTS:
                 action_repr=(repr(forced_node.parent_action) if forced_node.parent_action else ""),
                 prior=float(getattr(forced_node, "prior", 0.0)),
                 reward=float(getattr(forced_node, "reward", 0.0)),
+                # action_cost_softcap=float(
+                #     max(0.0, min(1.0, -float(getattr(forced_node, "reward", 0.0))))
+                # ),
+
 
                 nn_called=False,
                 num_valid_actions=int(forced_n_valid),
@@ -842,6 +867,7 @@ class VidurMCTS:
                 action_repr=(repr(node.parent_action) if node.parent_action else ""),
                 prior=float(node.prior),
                 reward=float(node.reward),
+                # action_cost_softcap=float(max(0.0, min(1.0, -float(node.reward)))),
 
                 nn_called=nn_called,
                 num_valid_actions=num_valid,

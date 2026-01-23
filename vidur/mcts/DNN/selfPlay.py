@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Optional, Sequence, Tuple
 
 import torch
+import time  # add at file top if missing
 
 from ..environment import VidurMCTSEnvironment, VidurMCTSState
 from ..mctsDNN import VidurMCTS
@@ -174,9 +175,11 @@ class SelfPlayRunner:
     def run_single_root(self, cfg: SingleRootRun, root_state: Optional[VidurMCTSState] = None) -> None:
         state = root_state or self.env.initial_state()
 
-
+        t0 = time.perf_counter()
+        snap0 = self.env.describe_state(state)
         # run MCTS on a fork so it cannot mutate the selfplay root state
         search_state = state.fork()
+        t1 = time.perf_counter()
         # Run MCTS search (will also write MCTS CSV logs if enabled inside mcts)
         self.mcts.search_dnn(
             dnn_model=self.model,
@@ -186,6 +189,12 @@ class SelfPlayRunner:
             game_id=cfg.game_id,
             root_id=cfg.root_id,
             root_depth=cfg.root_depth,
+        )
+        t2 = time.perf_counter()
+        # confirm real root state was NOT mutated by search_dnn
+        snap_after = self.env.describe_state(state)
+        print(
+            f"[run_single_root_search_DNN:after_search] dt={t2 - t1:.3f}s "
         )
 
         # Mask from env for this root/player (fixed action indexing)
@@ -227,6 +236,12 @@ class SelfPlayRunner:
             },
         )
         self.writer.add(sample)
+        t3 = time.perf_counter()
+        print(
+            f"[run_single_root_search_DNN:end] total_dt={t3 - t0:.3f}s "
+            f"fork_dt={t1 - t0:.3f}s "
+            f"search_dt={t2 - t1:.3f}s encode/write_dt={t3 - t2:.3f}s"
+        )
 
     ## TODO: ENSURE THAT MINIMAX IS RESET AGAIN & THE NEXT NODE IS ALWAYS THE NODE WHERE NN CAN BE CALLED AGAIN & WHY ARE THE ROOT ITEREATIONS LOGS CREATED AGAIN...
     def run_n_roots(
@@ -237,6 +252,7 @@ class SelfPlayRunner:
         # iterations_per_root: int = 5000,
         adv_iterations_per_root: int = 1000,
         cont_iterations_per_root: int = 500,
+        max_batch_size: int = 72,
         start_root_id: int = 0,
         start_root_depth: int = 0,
         start_player: str = "adversary",
@@ -254,8 +270,18 @@ class SelfPlayRunner:
             root_id = start_root_id + k
             # root_depth = start_root_depth + k
 
-            # NEW: force-advance until branching before running MCTS
+            # force-advance until branching before running MCTS
             state, player, depth = self._advance_to_branching_root(state, player, depth)
+
+            ## TODO : This terminal condition needs to be later avoided. 
+            # NEW: terminal cutoff for dataset collection
+            requests_in_system = int(self.env.describe_state(state).get("requests_in_system", 0))
+            if requests_in_system > int(max_batch_size):
+                print(
+                    f"[SelfPlayRunner] stop: requests_in_system={requests_in_system} "
+                    f"> max_batch_size={max_batch_size}"
+                )
+                return state
 
             # Determine iterations per root based on player to act
             iters = int(adv_iterations_per_root if player == "adversary" else cont_iterations_per_root)
