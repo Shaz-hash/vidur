@@ -60,20 +60,34 @@ class _ControllerBudgetTracker:
     allocations: Dict[int, Tuple[int, int]]
     baseline_prefill: Dict[int, int]
     baseline_decode: Dict[int, int]
+    tracked_requests: Dict[int, Request]  # NEW
 
-    def is_satisfied(self, lookup: Dict[int, Request]) -> bool:
+    # def is_satisfied(self, lookup: Dict[int, Request]) -> bool:
+    #     for rid, (prefill_budget, decode_budget) in self.allocations.items():
+    #         req = lookup.get(rid)
+    #         if req is None:
+    #             continue
+    #         gained_prefill = (
+    #             req.num_processed_prefill_tokens - self.baseline_prefill.get(rid, 0)
+    #         )
+    #         if gained_prefill < prefill_budget:
+    #             return False
+    #         gained_decode = (
+    #             req.num_processed_decode_tokens - self.baseline_decode.get(rid, 0)
+    #         )
+    #         if gained_decode < decode_budget:
+    #             return False
+    #     return True
+
+    def is_satisfied(self) -> bool:
         for rid, (prefill_budget, decode_budget) in self.allocations.items():
-            req = lookup.get(rid)
+            req = self.tracked_requests.get(rid)
             if req is None:
                 continue
-            gained_prefill = (
-                req.num_processed_prefill_tokens - self.baseline_prefill.get(rid, 0)
-            )
+            gained_prefill = req.num_processed_prefill_tokens - self.baseline_prefill.get(rid, 0)
             if gained_prefill < prefill_budget:
                 return False
-            gained_decode = (
-                req.num_processed_decode_tokens - self.baseline_decode.get(rid, 0)
-            )
+            gained_decode = req.num_processed_decode_tokens - self.baseline_decode.get(rid, 0)
             if gained_decode < decode_budget:
                 return False
         return True
@@ -169,6 +183,9 @@ class VidurMCTSEnvironment:
             register_atexit=False,
             execution_time_predictor=getattr(self._base, "_execution_time_predictor", None),
         )
+        from vidur.metrics.noop_metrics_store import NoOpClusterMetricsStore
+        sim._cluster_metric_store = NoOpClusterMetricsStore()
+
         sim.restore_state(self._base_snapshot)
         return VidurMCTSState(sim, VidurGameStats())
 
@@ -202,6 +219,9 @@ class VidurMCTSEnvironment:
             register_atexit=False,
             execution_time_predictor=getattr(self._base, "_execution_time_predictor", None),
         )
+        from vidur.metrics.noop_metrics_store import NoOpClusterMetricsStore
+        sim._cluster_metric_store = NoOpClusterMetricsStore()
+
         sim.restore_state(snapshot)
         return VidurMCTSState(sim, stats_template.clone())
 
@@ -735,30 +755,57 @@ class VidurMCTSEnvironment:
         Temporary scheduler budget overrides and hidden-requests are still snapshot/restored
         per call, regardless of ``inplace``.
         """
+        # t0 = time.perf_counter()
         new_state = state if inplace else state.fork()
+        from vidur.metrics.noop_metrics_store import NoOpClusterMetricsStore
+        new_state.simulator._cluster_metric_store = NoOpClusterMetricsStore()
+        # t1 = time.perf_counter()
+        # print(f"[PROFILE] FORK phase={t1 - t0:.6f}s")
+        
+        # t0 = time.perf_counter()
         self._drain_arrivals(new_state.simulator)
-
+        # t1 = time.perf_counter()
+        # print(f"[PROFILE] DRAIN ARRIVALS phase={t1 - t0:.6f}s")
+        
+        # t0 = time.perf_counter()
         (
             tracker,
             scheduler_budget_snapshot,
             activated_replicas,
             hidden_requests,
         ) = self._configure_controller_action(new_state.simulator, action)
+        # t1 = time.perf_counter()
+        # print(f"[PROFILE] CONTROLLER ACTION SETUP phase={t1 - t0:.6f}s")
         try:
             if tracker is not None:
-                sim_time = new_state.simulator._time
-                new_state.simulator._add_event(GlobalScheduleEvent(sim_time))
-                for replica_id in activated_replicas:
-                    new_state.simulator._add_event(
-                        ReplicaScheduleEvent(sim_time, replica_id)
-                    )
-                self._advance_simulation(new_state, tracker)
+                # t0 = time.perf_counter()
+                # sim_time = new_state.simulator._time
+                # new_state.simulator._add_event(GlobalScheduleEvent(sim_time))
+                # t1 = time.perf_counter()
+                # print(f"[PROFILE] CONTROLLER ACTION SCHEDULE PHASE={t1 - t0:.6f}s")
+                # t0 = time.perf_counter()
+                # for replica_id in activated_replicas:
+                #     new_state.simulator._add_event(
+                #         ReplicaScheduleEvent(sim_time, replica_id)
+                #     )
+                # t1 = time.perf_counter()
+                # print(f"[PROFILE] CONTROLLER ACTION REPLICA SCHEDULE PHASE={t1 - t0:.6f}s")
+                # t0 = time.perf_counter()
+                # self._advance_simulation(new_state, tracker)
+
+                self._advance_simulation_fast(new_state, tracker, activated_replicas)
+                # t1 = time.perf_counter()
+                # print(f"[PROFILE] CONTROLLER ACTION ADVANCE SIM PHASE={t1 - t0:.6f}s")
+            # t0 = time.perf_counter()
             self._update_stats(new_state)
+            # t1 = time.perf_counter()
+            # print(f"[PROFILE] CONTROLLER ACTION RESTORE PHASE={t1 - t0:.6f}s")
         finally:
             self._restore_scheduler_budget_state(
                 new_state.simulator, scheduler_budget_snapshot
             )
             self._restore_hidden_requests(new_state.simulator, hidden_requests)
+        
         return new_state
 
     def apply_actions(
@@ -805,6 +852,9 @@ class VidurMCTSEnvironment:
     def _apply_adversary_action(
         self, state: VidurMCTSState, action: AdversaryAction
     ) -> None:
+        
+        if (not action.requests) and (not action.stop_decode_ids):
+            return
         sim = state.simulator
         time_now = sim._time 
 
@@ -1115,10 +1165,13 @@ class VidurMCTSEnvironment:
                     scheduler_cfg.chunk_size = max(total_tokens, 1)
                 activated_replicas.add(getattr(replica_scheduler, "replica_id", None) or getattr(replica_scheduler, "_replica_id", None))
 
+        tracked_requests = {rid: request_lookup[rid] for rid in tracker_allocations.keys() if rid in request_lookup}
+
         tracker = _ControllerBudgetTracker(
             allocations=tracker_allocations,
             baseline_prefill=baseline_prefill,
             baseline_decode=baseline_decode,
+            tracked_requests=tracked_requests,
         )
         action.selected_request_ids = sorted(tracker_allocations.keys())
         activated_replicas = {replica_id for replica_id in activated_replicas if replica_id is not None}
@@ -1127,32 +1180,197 @@ class VidurMCTSEnvironment:
 
 
 
-    def _advance_simulation(
-        self,
-        state: VidurMCTSState,
-        tracker: _ControllerBudgetTracker,
-    ) -> None:
+    # def _advance_simulation(
+    #     self,
+    #     state: VidurMCTSState,
+    #     tracker: _ControllerBudgetTracker,
+    # ) -> None:
+    #     sim = state.simulator
+
+    #     steps = 0
+    #     max_steps = max(1, self._cfg.simulation_depth * 10)
+    #     while sim._event_queue and steps < max_steps:
+    #         next_event = sim._event_queue[0]
+    #         if (
+    #             next_event.event_type == EventType.REQUEST_ARRIVAL
+    #             and next_event._time > sim._time
+    #         ):
+    #             break
+    #         event = heapq.heappop(sim._event_queue)
+    #         sim._set_time(event._time)
+    #         new_events = event.handle_event(sim._scheduler, sim._cluster_metric_store)
+    #         for new_event in new_events:
+    #             sim._add_event(new_event)
+    #         steps += 1
+    #         t0 = time.perf_counter()
+    #         lookup = self._build_request_lookup(sim)
+    #         t1 = time.perf_counter()
+    #         print(f"[PROFILEXXX] BUILD REQUEST LOOKUP phase={t1 - t0:.6f}s")
+    #         if tracker.is_satisfied(lookup):
+    #             self._prune_pending_replica_schedule_events(sim)
+    #             break
+
+
+    def _advance_simulation(self, state: VidurMCTSState, tracker: _ControllerBudgetTracker) -> None:
+        from vidur.scheduler.global_scheduler.base_global_scheduler import BaseGlobalScheduler
+        from vidur.types import EventType
+
         sim = state.simulator
+
+        drop_end_events = (
+            (not sim._config.metrics_config.write_metrics)
+            and type(sim._scheduler).on_prefill_end is BaseGlobalScheduler.on_prefill_end
+            and type(sim._scheduler).on_request_end is BaseGlobalScheduler.on_request_end
+        )
+
+        if tracker.is_satisfied():
+            self._prune_pending_replica_schedule_events(sim)
+            return
 
         steps = 0
         max_steps = max(1, self._cfg.simulation_depth * 10)
+
+        heappop = heapq.heappop
+        add_event = sim._add_event
+        scheduler = sim._scheduler
+        metrics = sim._cluster_metric_store
+
         while sim._event_queue and steps < max_steps:
             next_event = sim._event_queue[0]
-            if (
-                next_event.event_type == EventType.REQUEST_ARRIVAL
-                and next_event._time > sim._time
-            ):
+            if next_event.event_type == EventType.REQUEST_ARRIVAL and next_event._time > sim._time:
                 break
-            event = heapq.heappop(sim._event_queue)
+
+            event = heappop(sim._event_queue)
             sim._set_time(event._time)
-            new_events = event.handle_event(sim._scheduler, sim._cluster_metric_store)
-            for new_event in new_events:
-                sim._add_event(new_event)
+
+            new_events = event.handle_event(scheduler, metrics)
+
+            if drop_end_events and event.event_type == EventType.BATCH_END:
+                new_events = [e for e in new_events if e.event_type not in (EventType.PREFILL_END, EventType.REQUEST_END)]
+
+            for e in new_events:
+                add_event(e)
             steps += 1
-            lookup = self._build_request_lookup(sim)
-            if tracker.is_satisfied(lookup):
+
+            if event.event_type == EventType.BATCH_END and tracker.is_satisfied():
                 self._prune_pending_replica_schedule_events(sim)
                 break
+
+    def _advance_simulation_fast(
+        self,
+        state: VidurMCTSState,
+        tracker: _ControllerBudgetTracker,
+        activated_replicas: Set[Any],
+    ) -> None:
+        """
+        Fast-path controller advance for the common MCTS case:
+        - single replica
+        - single pipeline stage
+        - no future REQUEST_ARRIVAL events pending
+
+        Executes the same semantics as the event chain:
+        ReplicaScheduleEvent -> BatchStageArrivalEvent -> ReplicaStageScheduleEvent
+        -> BatchStageEndEvent -> BatchEndEvent (+reschedule)
+        without using the event heap / BaseEvent.handle_event().
+        """
+        sim = state.simulator
+
+        # If there are any future request arrivals, event ordering matters -> fall back.
+        if any(
+            (e.event_type == EventType.REQUEST_ARRIVAL and float(e._time) > float(sim._time))
+            for e in getattr(sim, "_event_queue", [])
+        ):
+            self._advance_simulation(state, tracker)
+            return
+
+        if tracker.is_satisfied():
+            self._prune_pending_replica_schedule_events(sim)
+            return
+
+        # Only safe for single-stage replicas (your config).
+        for rid in activated_replicas:
+            rs = sim._scheduler.get_replica_scheduler(rid)
+            if int(getattr(rs, "_num_stages", 1)) != 1:
+                self._advance_simulation(state, tracker)
+                return
+
+        # Remove any stale ReplicaScheduleEvent at current time; we drive scheduling manually.
+        self._prune_pending_replica_schedule_events(sim)
+
+        max_batches = max(1, self._cfg.simulation_depth * 10)
+        batches_executed = 0
+
+        global_sched = sim._scheduler
+        get_replica_sched = global_sched.get_replica_scheduler
+        get_stage_sched = global_sched.get_replica_stage_scheduler
+        set_time = sim._set_time
+
+        while batches_executed < max_batches and not tracker.is_satisfied():
+            made_progress = False
+
+            for replica_id in activated_replicas:
+                replica_scheduler = get_replica_sched(replica_id)
+
+                # Mimic ReplicaScheduleEvent: keep trying if scheduler requeued but produced no batch.
+                if not replica_scheduler.can_schedule():
+                    continue
+
+                while replica_scheduler.can_schedule():
+                    out = replica_scheduler.on_schedule(sim._time)
+                    batch = getattr(out, "batch", None)
+
+                    if batch is None:
+                        # In event-version: if requeued_requests exist, it would schedule another
+                        # ReplicaScheduleEvent at the same time; so retry once more here.
+                        requeued = getattr(out, "requeued_requests", None) or []
+                        if requeued:
+                            continue
+                        break
+
+                    # batch.on_schedule(time)
+                    batch.on_schedule(sim._time)
+
+                    # One stage: directly run the stage then batch_end at end_time
+                    stage_scheduler = get_stage_sched(replica_id, 0)
+                    stage_scheduler.add_batch(batch)
+
+                    b, batch_stage, _exec_time = stage_scheduler.on_schedule()
+                    if b is None or batch_stage is None:
+                        # Unexpected; preserve correctness
+                        self._advance_simulation(state, tracker)
+                        return
+
+                    start_time = float(sim._time)
+                    batch_stage.on_schedule(start_time)
+
+                    end_time = start_time + float(batch_stage.execution_time)
+                    set_time(end_time)
+
+                    # BatchStageEndEvent semantics
+                    stage_scheduler.on_stage_end()
+                    batch_stage.on_stage_end(end_time)
+
+                    # BatchEndEvent semantics
+                    batch.on_batch_end(end_time)
+                    global_sched.on_batch_end(batch)
+                    replica_scheduler.on_batch_end(batch)
+
+                    batches_executed += 1
+                    made_progress = True
+
+                    # With 1 stage, we can't schedule another concurrent batch anyway.
+                    break
+
+                if tracker.is_satisfied() or batches_executed >= max_batches:
+                    break
+
+            if not made_progress:
+                break
+
+        if tracker.is_satisfied():
+            self._prune_pending_replica_schedule_events(sim)
+
+
 
     def _update_stats(self, state: VidurMCTSState) -> None:
         sim = state.simulator

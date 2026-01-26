@@ -37,6 +37,7 @@ from typing import List, Tuple, Dict, Any
 
 from vidur.entities import Request
 from vidur.scheduler.global_scheduler.base_global_scheduler import BaseGlobalScheduler
+from vidur.types import EventType
 from vidur.types.replica_id import ReplicaId
 
 _RR_SNAP_VERSION = 1

@@ -173,7 +173,7 @@ python -m vidur.mcts.profile_sim_memory \
   --replica_config_tensor_parallel_size 1 \
   --replica_config_num_pipeline_stages 1 \
   --global_scheduler_config_type round_robin \
-  --replica_scheduler_config_type vllm_v1
+  --replica_scheduler_config_type vllm_v1 \
 
 
 

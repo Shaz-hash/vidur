@@ -97,6 +97,16 @@ class MCTSNode:
     #     return len(self.untried_actions) == 0
 
 
+# Essentially an action from a given node leading to its child
+@dataclass
+class MCTSChildEdge:
+    action: Union[AdversaryAction, ControllerAction]
+    child: "MCTSNode"
+    prior: float = 0.0 # probability from policy network for this action
+    action_index: Optional[int] = None  # index of this action in the action space
+    action_cost : float = 0.0 # True Cost incurred by simulator when applying this action (we wont be using this at the moment, this has been shifted as reward in MCTSNode)
+    # node: MCTSNode
+
 
 class VidurMCTS:
     """UCB1-based Monte Carlo Tree Search coordinating adversary and controller."""
@@ -125,6 +135,7 @@ class VidurMCTS:
         self._history_root_state: Optional[VidurMCTSState] = None
         self._history_root_node: Optional[MCTSNode] = None
 
+    
         # self._iter_logger = DNNMCTSIterationLogger(log_path, flush_every=logger_flush_every)
         # Disable per-simulation iteration logging (mcts_iter.csv)
         self._iter_logger = DNNMCTSIterationLogger(None, flush_every=logger_flush_every)
@@ -240,50 +251,6 @@ class VidurMCTS:
         return self._scratch_state
 
 
-    def _store_node_snapshot(self, node: MCTSNode, state: VidurMCTSState) -> None:
-        node.cached_sim_snapshot = state.simulator.snapshot_state()
-        node.cached_stats = state.stats.clone()
-
-    def _restore_state_for_node(self, node: MCTSNode) -> VidurMCTSState:
-        """
-        Restores scratch simulator to `node` state.
-        If `node` has no snapshot yet, it materializes it by restoring parent and applying the parent_action once.
-        """
-        # Fast path: node already has snapshot
-        if node.cached_sim_snapshot is not None and node.cached_stats is not None:
-            return self._scratch_restore(node.cached_sim_snapshot, node.cached_stats)
-
-        parent = node.parent
-        if parent is None:
-            raise RuntimeError("Root node has no cached snapshot/stats")
-
-        # Restore parent first (recursive; typically 1 hop in practice)
-        state = self._restore_state_for_node(parent)
-
-        action = node.parent_action
-        if action is None:
-            raise RuntimeError(f"Missing parent_action for node_id={node.node_id}")
-
-        parent_cost = float(parent.state_cost)
-
-        # Apply parent->child transition on scratch state
-        if parent.player == "adversary":
-            state = self._env.apply_adversary_action_only(state, action, inplace=True)
-        else:
-            state = self._env.apply_controller_action_only(state, action, inplace=True)
-
-        # Fill edge reward/cost/time now that we have the true child state
-        child_cost = float(self._state_cost(state))
-        node.reward = float(self._transition_reward(parent_cost, child_cost))
-        node.state_cost = float(child_cost)
-        node.sim_time = float(getattr(state.simulator, "_time", 0.0))
-
-        # Snapshot this node so future rollouts can jump here
-        self._store_node_snapshot(node, state)
-        return state
-
-
-
     def _nn_value_and_priors(
         self,
         dnn_model: Any,
@@ -377,6 +344,7 @@ class VidurMCTS:
                     sim_time=state.simulator._time,
                     state_cost=0.0,
                     num_valid_actions=0,
+                    branch_anchor_time=node.branch_anchor_time,
                 )
 
             # NEW: never call NN on single-child states
@@ -554,8 +522,12 @@ class VidurMCTS:
 
 
             if n_valid != 1:
+                # store snapshot ONLY at the end of the forced chain (branching or terminal)
                 if node.cached_sim_snapshot is None or node.cached_stats is None:
-                    self._store_node_snapshot(node, state)
+                    node.cached_sim_snapshot = state.simulator.snapshot_state()
+                    node.cached_stats = state.stats.clone()
+                    node.sim_time = float(state.simulator._time)
+                    node.state_cost = float(self._state_cost(state))  # optional safety
                 return node, state
             
             # DEBUG: controller should not be "forced" if any request still has prefill remaining
@@ -627,15 +599,12 @@ class VidurMCTS:
             assert action is not None
 
             parent_cost = float(node.state_cost)
-            # time0 = time.time()
+
             # Apply forced action
             if node.player == "adversary":
                 state = self._env.apply_adversary_action_only(state, action, inplace=True)
             else:
                 state = self._env.apply_controller_action_only(state, action, inplace=True)
-            # time1 = time.time()
-            # print(f"  [MCTS] apply_action took {time1 - time0:.6f} sec for hop {hops} player={node.player}")
-            
 
             child_cost = self._state_cost(state)
             step_reward = self._transition_reward(parent_cost, child_cost)
@@ -680,68 +649,127 @@ class VidurMCTS:
             value = reward_used + disc * value
 
 
+    
 
-    def run_one_simulation(
-        self,
-        root: MCTSNode,
-        dnn_model: Any,
-        min_max_stats: MinMaxStats,
-        game_id: Optional[str] = None, root_id: Optional[str] = None, sim_iteration: Optional[int] = None
-    ) -> None:
-        # 1) Selection (TREE ONLY)
+    def run_one_simulation(...):
+        # Always start from root state (restore root snapshot into scratch sim)
+        assert root.cached_sim_snapshot is not None and root.cached_stats is not None
+        state = self._scratch_restore(root.cached_sim_snapshot, root.cached_stats)
+
         node = root
-        search_path: List[MCTSNode] = [node]
+        search_path = [node]
+
+        # Selection: descend; keep `state` synchronized with `node`
         while node.expanded():
-            _, node = self.select_child(node, min_max_stats)
+            _, child = self.select_child(node, min_max_stats)
+            assert child.parent is node
+
+            # If we already materialized this node before, restore directly
+            if child.cached_sim_snapshot is not None and child.cached_stats is not None:
+                state = self._scratch_restore(child.cached_sim_snapshot, child.cached_stats)
+            else:
+                # First time visiting this child: apply the edge action once
+                action = child.parent_action
+                assert action is not None
+
+                parent_cost = float(node.state_cost)
+
+                if node.player == "adversary":
+                    state = self._env.apply_adversary_action_only(state, action, inplace=True)
+                else:
+                    state = self._env.apply_controller_action_only(state, action, inplace=True)
+
+                child_cost = self._state_cost(state)
+
+                child.reward = float(self._transition_reward(parent_cost, child_cost))
+                child.state_cost = float(child_cost)
+                child.sim_time = float(state.simulator._time)
+
+                # Materialize/store this child's state for future restores
+                child.cached_sim_snapshot = state.simulator.snapshot_state()
+                child.cached_stats = state.stats.clone()
+
+            node = child
             search_path.append(node)
 
-        # 2) Restore scratch sim straight to the selected node state (or materialize it once)
-        # t0 = time.time()
-        state = self._restore_state_for_node(node)
-        # t1 = time.time()
-        # print(f"  [MCTS] _restore_state_for_node took {t1 - t0:.6f} sec for sim_iteration={sim_iteration}")
+        # Ensure leaf itself is materialized (usually already true)
+        if node.cached_sim_snapshot is None or node.cached_stats is None:
+            node.cached_sim_snapshot = state.simulator.snapshot_state()
+            node.cached_stats = state.stats.clone()
+            node.sim_time = float(state.simulator._time)
 
+        # Forced chain skipping (still OK, but now you should snapshot forced nodes too; see next section)
         iter_logging = getattr(self._iter_logger, "_path", None) is not None
         forced_logs = [] if iter_logging else None
+        node, state = self._advance_through_single_child_chain(node, state, search_path, forced_step_logs=forced_logs)
 
-        # 3) Skip forced single-child chains so we end on branching/terminal
-        # t0 = time.time()
-        leaf_node, leaf_state = self._advance_through_single_child_chain(node, state, search_path, forced_step_logs=forced_logs)
-        # t1 = time.time()
-        # print(f"  [MCTS] advance_through_single_child_chain took {t1 - t0:.6f} , sec for sim_iteration={sim_iteration}")
-        # (Safety) If we bailed out due to max_hops etc, don’t silently proceed
-        if getattr(leaf_node, "num_valid_actions", 0) == 1:
-            raise RuntimeError("advance_through_single_child_chain ended on single-child node; check max_hops/no-progress")
+        ## LOGGGING FOR FORCED STEPS ##
+        # for forced_node, forced_snap, forced_n_valid, forced_unique in forced_logs:
+        #     parent_multi = (forced_node.parent is None) or (len(forced_node.parent.children) > 1)
 
-        # t0 = time.time()
-        # 4) Expand + NN evaluation at final node
-        leaf_value, _nn_called, _num_valid = self._expand_node(leaf_node, leaf_state, dnn_model)
-        # t1 = time.time()
-        # print(f"  [MCTS] expand_node took {t1 - t0:.6f} sec for sim_iteration={sim_iteration}")
+        #     if forced_n_valid == 0:
+        #         forced_phase = "terminal"
+        #     elif forced_n_valid == 1:
+        #         forced_phase = "single-child" if parent_multi else "trivial-single-child"
+        #     else:
+        #         forced_phase = "multiple-child" if parent_multi else "trivial-multiple-child"
+
+        #     self._iter_logger.log_expand(
+        #         game_id=game_id,
+        #         root_id=root_id,
+        #         sim_iteration=sim_iteration,
+        #         root_depth=root.depth,
+        #         root_node_id=root.node_id,
+        #         root_player=root.player,
+
+        #         node_depth=forced_node.depth,
+        #         parent_node_id=(forced_node.parent.node_id if forced_node.parent else None),
+        #         node_id=forced_node.node_id,
+        #         player_acted_to_create_this_node=(forced_node.parent.player if forced_node.parent else "root_no_parent"),
+        #         player_to_act=forced_node.player,
+
+        #         action_index=forced_node.parent_action_index,
+        #         action_repr=(repr(forced_node.parent_action) if forced_node.parent_action else ""),
+        #         prior=float(getattr(forced_node, "prior", 0.0)),
+        #         reward=float(getattr(forced_node, "reward", 0.0)),
+        #         # action_cost_softcap=float(
+        #         #     max(0.0, min(1.0, -float(getattr(forced_node, "reward", 0.0))))
+        #         # ),
+
+
+        #         nn_called=False,
+        #         num_valid_actions=int(forced_n_valid),
+        #         unique_actions=int(forced_unique),
+        #         nn_value_controller=None,
+
+        #         objective_cost=float(getattr(forced_node, "state_cost", 0.0)),
+        #         state_snapshot=forced_snap,
+        #         phase=f"forced_step:{forced_phase}",
+        #     )
+
+
+
+        nn_value, nn_called, num_valid = self._expand_node(node, state, dnn_model)
+
+        parent_multi = (node.parent is None) or (len(node.parent.children) > 1)
+
+        if num_valid == 0:
+            phase = "terminal"
+        elif num_valid == 1:
+            phase = "single-child" if parent_multi else "trivial-single-child"
+        else:
+            phase = "multiple-child" if parent_multi else "trivial-multiple-child"
+
+        # Logging for this iteration
         if iter_logging:
-            parent_multi = (leaf_node.parent is None) or (len(leaf_node.parent.children) > 1)
+            snap = self._env.describe_state(leaf_state)
+            unique_actions = len(node.children)  # after expansion, children dict keys are the unique/canonical actions
 
-            if _num_valid == 0:
-                phase = "terminal"
-            elif _num_valid == 1:
-                phase = "single-child" if parent_multi else "trivial-single-child"
-            else:
-                phase = "multiple-child" if parent_multi else "trivial-multiple-child"
+            adv_deadlines = "{}"
+            if node.parent_action is not None and isinstance(node.parent_action, AdversaryAction):
+                adv_deadlines = self._adversary_prefill_deadlines_by_id_json(leaf_state, node.parent_action)
 
-            # Logging for this iteration
-
-            # 1. Forced Steps ##
-            for forced_node, forced_snap, forced_n_valid, forced_unique in forced_logs:
-                parent_multi = (forced_node.parent is None) or (len(forced_node.parent.children) > 1)
-
-                if forced_n_valid == 0:
-                    forced_phase = "terminal"
-                elif forced_n_valid == 1:
-                    forced_phase = "single-child" if parent_multi else "trivial-single-child"
-                else:
-                    forced_phase = "multiple-child" if parent_multi else "trivial-multiple-child"
-
-                self._iter_logger.log_expand(
+            self._iter_logger.log_expand(
                     game_id=game_id,
                     root_id=root_id,
                     sim_iteration=sim_iteration,
@@ -749,75 +777,30 @@ class VidurMCTS:
                     root_node_id=root.node_id,
                     root_player=root.player,
 
-                    node_depth=forced_node.depth,
-                    parent_node_id=(forced_node.parent.node_id if forced_node.parent else None),
-                    node_id=forced_node.node_id,
-                    player_acted_to_create_this_node=(forced_node.parent.player if forced_node.parent else "root_no_parent"),
-                    player_to_act=forced_node.player,
+                    node_depth=node.depth,
+                    parent_node_id=(node.parent.node_id if node.parent else None),
+                    node_id=node.node_id,
+                    player_acted_to_create_this_node=(node.parent.player if node.parent else "root_no_parent"),
+                    player_to_act=node.player,
+                    
 
-                    action_index=forced_node.parent_action_index,
-                    action_repr=(repr(forced_node.parent_action) if forced_node.parent_action else ""),
-                    prior=float(getattr(forced_node, "prior", 0.0)),
-                    reward=float(getattr(forced_node, "reward", 0.0)),
-                    # action_cost_softcap=float(
-                    #     max(0.0, min(1.0, -float(getattr(forced_node, "reward", 0.0))))
-                    # ),
+                    action_index=node.parent_action_index,
+                    action_repr=(repr(node.parent_action) if node.parent_action else ""),
+                    prior=float(node.prior),
+                    reward=float(node.reward),
+                    # action_cost_softcap=float(max(0.0, min(1.0, -float(node.reward)))),
 
+                    nn_called=nn_called,
+                    num_valid_actions=num_valid,
+                    unique_actions=unique_actions,
+                    nn_value_controller=nn_value,   # None for forced/terminal
 
-                    nn_called=False,
-                    num_valid_actions=int(forced_n_valid),
-                    unique_actions=int(forced_unique),
-                    nn_value_controller=None,
+                    objective_cost=float(node.state_cost),
+                    adversary_prefill_deadlines_by_id_json=adv_deadlines,
+                    state_snapshot=snap,
+                    phase=phase,
 
-                    objective_cost=float(getattr(forced_node, "state_cost", 0.0)),
-                    state_snapshot=forced_snap,
-                    phase=f"forced_step:{forced_phase}",
-                )
-
-            snap = self._env.describe_state(leaf_state)
-            unique_actions = len(leaf_node.children)
-
-            adv_deadlines = "{}"
-            if isinstance(leaf_node.parent_action, AdversaryAction):
-                adv_deadlines = self._adversary_prefill_deadlines_by_id_json(leaf_state, leaf_node.parent_action)
-
-            nn_value_controller = float(leaf_node.nn_value_controller) if _nn_called else None
-
-            self._iter_logger.log_expand(
-                game_id=int(game_id),
-                root_id=int(root_id),
-                sim_iteration=int(sim_iteration),
-                root_depth=root.depth,
-                root_node_id=root.node_id,
-                root_player=root.player,
-
-                node_depth=leaf_node.depth,
-                parent_node_id=(leaf_node.parent.node_id if leaf_node.parent else None),
-                node_id=leaf_node.node_id,
-                player_acted_to_create_this_node=(leaf_node.parent.player if leaf_node.parent else "root_no_parent"),
-                player_to_act=leaf_node.player,
-
-                action_index=leaf_node.parent_action_index,
-                action_repr=(repr(leaf_node.parent_action) if leaf_node.parent_action else ""),
-                prior=float(getattr(leaf_node, "prior", 0.0)),
-                reward=float(getattr(leaf_node, "reward", 0.0)),
-
-                nn_called=bool(_nn_called),
-                num_valid_actions=int(_num_valid),
-                unique_actions=int(unique_actions),
-                nn_value_controller=nn_value_controller,
-
-                objective_cost=float(getattr(leaf_node, "state_cost", 0.0)),
-                adversary_prefill_deadlines_by_id_json=adv_deadlines,
-                state_snapshot=snap,
-                phase=phase,
-            )
-
-
-        # 5) Backprop
-        self.backpropagate(search_path, float(leaf_value), min_max_stats)
-
-        # # LOGGING MCTS:
+        # LOGGING MCTS:
         # DUMP_EVERY = 1  # or 50/100 to reduce overhead
         # if sim_iteration is not None and (sim_iteration % DUMP_EVERY == 0):
         #     dump_tree_snapshot_csv(
@@ -830,6 +813,10 @@ class VidurMCTS:
         #         minmax_max=min_max_stats.maximum,
         #         max_nodes=None,   # or set a cap while debugging
         #     )
+
+        self.backpropagate(search_path, nn_value, min_max_stats)
+
+
 
 
 
@@ -847,6 +834,10 @@ class VidurMCTS:
 
         # One scratch simulator per search_dnn
         self._scratch_state = None  # forces _scratch_restore to create it once
+
+
+        self._history_root_node = self._root
+        self._env.snapshot_history_root(self._history_root_state)
         self._did_root_infer_debug = False
 
         min_max_stats = MinMaxStats()
@@ -856,20 +847,22 @@ class VidurMCTS:
         root_work = self._scratch_restore(self._root.cached_sim_snapshot, self._root.cached_stats)
         _ignored_value, _ignored_called, _ignored_num_valid = self._expand_node(self._root, root_work, dnn_model)
 
+        
 
         for sim_iteration in range(int(iterations)):
-            # print(f"[INFO] Starting MCTS simulation iteration {sim_iteration} / {iterations}_______")
-            # t1 = time.perf_counter()
+            print(f"[INFO] Starting MCTS simulation iteration {sim_iteration} / {iterations}_______")
+            t1 = time.perf_counter()
             self.run_one_simulation(
                 self._root,
+                rootState,
                 dnn_model,
                 min_max_stats,
                 game_id=game_id,
                 root_id=root_id,
                 sim_iteration=sim_iteration,
             )
-            # t2 = time.perf_counter()
-            # print(f"[PERF] MCTS simulation {sim_iteration} time: {(t2 - t1)} seconds ======= \n\n")
+            t2 = time.perf_counter()
+            print(f"[PERF] MCTS simulation {sim_iteration} time: {(t2 - t1)} seconds ======= \n\n")
 
         next_player = "controller" if self._root.player == "adversary" else "adversary"
         action_space = [child.parent_action for child in self._root.children.values()]
@@ -961,6 +954,8 @@ class VidurMCTS:
         return next_player, action_space
 
     # CORE PHASE ENDS HERE #
+
+
 
     # ------------------------------------------------------------------ #
     # Logging helpers

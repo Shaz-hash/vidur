@@ -248,7 +248,6 @@ class Simulator:
                 for req in batch_stage.requests:
                     track_request(req)
 
-       
 
         scheduler_snapshot = clone_mutable(self._scheduler.snapshot_state())
 
@@ -261,43 +260,54 @@ class Simulator:
         else:
             req_states = {}
 
-        for req_id, state in getattr(req_states, "items", lambda: [])():
-            request_states.setdefault(req_id, clone_mutable(state))
+        # for req_id, state in getattr(req_states, "items", lambda: [])():
+        #     request_states.setdefault(req_id, clone_mutable(state))
 
+        for req_id, state in getattr(req_states, "items", lambda: [])():
+            request_states.setdefault(int(req_id), state)
        
 
         # for req_id, state in scheduler_snapshot.get("request_states", {}).items():
         #     request_states.setdefault(req_id, clone_mutable(state))
 
         # Capture live requests/batches/stages from schedulers.
+        # for replica_scheduler in self._scheduler._replica_schedulers.values():
+        #     if hasattr(replica_scheduler, "_requests"):
+        #         for request in replica_scheduler._requests.values():
+        #             track_request(request)
+        #     if hasattr(replica_scheduler, "_running"):
+        #         for request in getattr(replica_scheduler, "_running", []):
+        #             track_request(request)
+        #     if hasattr(replica_scheduler, "_waiting_queue"):
+        #         waiting_queue = getattr(replica_scheduler, "_waiting_queue")
+        #         if hasattr(waiting_queue, "to_list"):
+        #             for request in waiting_queue.to_list():
+        #                 track_request(request)
+        #         elif hasattr(waiting_queue, "__iter__"):
+        #             for item in waiting_queue:
+        #                 if isinstance(item, Request):
+        #                     track_request(item)
+        #                 elif hasattr(item, "request"):
+        #                     track_request(item.request)
+        #     if hasattr(replica_scheduler, "_replica_stage_schedulers"):
+        #         for stage_scheduler in replica_scheduler._replica_stage_schedulers.values():
+        #             for batch in getattr(stage_scheduler, "_batch_queue", []):
+        #                 track_batch(batch)
+
+       # Capture queued batches in stage schedulers (needed for restore correctness)
         for replica_scheduler in self._scheduler._replica_schedulers.values():
-            if hasattr(replica_scheduler, "_requests"):
-                for request in replica_scheduler._requests.values():
-                    track_request(request)
-            if hasattr(replica_scheduler, "_running"):
-                for request in getattr(replica_scheduler, "_running", []):
-                    track_request(request)
-            if hasattr(replica_scheduler, "_waiting_queue"):
-                waiting_queue = getattr(replica_scheduler, "_waiting_queue")
-                if hasattr(waiting_queue, "to_list"):
-                    for request in waiting_queue.to_list():
-                        track_request(request)
-                elif hasattr(waiting_queue, "__iter__"):
-                    for item in waiting_queue:
-                        if isinstance(item, Request):
-                            track_request(item)
-                        elif hasattr(item, "request"):
-                            track_request(item.request)
             if hasattr(replica_scheduler, "_replica_stage_schedulers"):
                 for stage_scheduler in replica_scheduler._replica_stage_schedulers.values():
                     for batch in getattr(stage_scheduler, "_batch_queue", []):
                         track_batch(batch)
+                    active = getattr(stage_scheduler, "_active_batch", None)
+                    if active is not None:
+                        track_batch(active)
 
-       
 
-        # Capture pending requests in global queue.
-        for request in self._scheduler._request_queue:
-            track_request(request)
+        # # Capture pending requests in global queue.
+        # for request in self._scheduler._request_queue:
+        #     track_request(request)
 
         event_snapshots: List[dict] = []
         for event in self._event_queue:
@@ -352,41 +362,13 @@ class Simulator:
             request_generator_state=request_generator_state,
             entity_counters=entity_counters,
             base_event_counter=BaseEvent._id,
-            request_states={k: clone_mutable(v) for k, v in request_states.items()},
-            batch_states={k: clone_mutable(v) for k, v in batch_states.items()},
-            batch_stage_states={k: clone_mutable(v) for k, v in batch_stage_states.items()},
+            request_states=request_states,
+            batch_states=batch_states,
+            batch_stage_states=batch_stage_states,
             python_random_state=random.getstate(),
             numpy_random_state=_encode_numpy_state(np.random.get_state()),
         )
 
-
-
-        # request_generator_state = clone_mutable(
-        #     self._request_generator.snapshot_state()
-        # )
-
-        # entity_counters = {
-        #     "Request": Request._id,
-        #     "Batch": Batch._id,
-        #     "BatchStage": BatchStage._id,
-        #     "ExecutionTime": ExecutionTime._id,
-        # }
-
-        # snapshot = SimulatorSnapshot(
-        #     __v__=_SNAP_VERSION_SIM,
-        #     time=self._time,
-        #     time_limit_reached=self._time_limit_reached,
-        #     event_queue=event_snapshots,
-        #     scheduler_state=scheduler_snapshot,
-        #     request_generator_state=request_generator_state,
-        #     entity_counters=entity_counters,
-        #     base_event_counter=BaseEvent._id,
-        #     request_states={k: clone_mutable(v) for k, v in request_states.items()},
-        #     batch_states={k: clone_mutable(v) for k, v in batch_states.items()},
-        #     batch_stage_states={k: clone_mutable(v) for k, v in batch_stage_states.items()},
-        #     python_random_state=random.getstate(),
-        #     numpy_random_state=_encode_numpy_state(np.random.get_state()),
-        # )
         return snapshot
 
     def restore_state(self, snapshot: SimulatorSnapshot) -> None:
@@ -408,11 +390,14 @@ class Simulator:
         # Rebuild objects
         request_lookup: Dict[int, Request] = {}
         for request_id, state in snapshot.request_states.items():
-            req = Request.__new__(Request)
-            req.restore_state(state)
+            # req = Request.__new__(Request)
+            # req.restore_state(state)
+            req = Request.from_snapshot(state)
+            request_lookup[int(request_id)] = req
+
             # Optional: assert id matches key
             assert req._id == int(request_id), "Request id mismatch during restore"
-            request_lookup[int(request_id)] = req
+            # request_lookup[int(request_id)] = req
 
         batch_lookup: Dict[int, Batch] = {}
         for batch_id, state in snapshot.batch_states.items():
@@ -456,12 +441,12 @@ class Simulator:
 
         # Optional: sanity checks
         # - all batch.request ids exist in request_lookup
-        for b in batch_lookup.values():
-            for r in b.requests:
-                assert r.id in request_lookup, "Batch references unknown Request"
+        # for b in batch_lookup.values():
+        #     for r in b.requests:
+        #         assert r.id in request_lookup, "Batch references unknown Request"
 
-        # - event queue is consistent
-        assert all(hasattr(e, "_priority_number") for e in self._event_queue)
+        # # - event queue is consistent
+        # assert all(hasattr(e, "_priority_number") for e in self._event_queue)
 
 
     def fork(self) -> "Simulator":

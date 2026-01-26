@@ -238,9 +238,9 @@ class SelfPlayRunner:
         self.writer.add(sample)
         t3 = time.perf_counter()
         print(
-            f"[run_single_root_search_DNN:end] total_dt={t3 - t0:.3f}s "
-            f"fork_dt={t1 - t0:.3f}s "
-            f"search_dt={t2 - t1:.3f}s encode/write_dt={t3 - t2:.3f}s"
+            f"[run_single_root_search_DNN:end] total_dt={t3 - t0:.6f}s "
+            f"fork_dt={t1 - t0:.6f}s "
+            f"search_dt={t2 - t1:.6f}s encode/write_dt={t3 - t2:.6f}s"
         )
 
     ## TODO: ENSURE THAT MINIMAX IS RESET AGAIN & THE NEXT NODE IS ALWAYS THE NODE WHERE NN CAN BE CALLED AGAIN & WHY ARE THE ROOT ITEREATIONS LOGS CREATED AGAIN...

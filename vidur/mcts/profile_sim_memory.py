@@ -27,6 +27,8 @@ def main(argv=None) -> None:
     et_cfg = sim_cfg.execution_time_predictor_config
     et_cfg.prediction_max_tokens_per_request = 8192
     et_cfg.prediction_max_batch_size = 64
+    assume_infinite_kv = True
+    setattr(sim_cfg.cluster_config.cache_config, "assume_infinite_kv", bool(assume_infinite_kv))
     print(f"[MEM] after configure_simulation: {rss_mb():.1f} MB")
 
     sim = Simulator(sim_cfg, register_atexit=False)
@@ -48,9 +50,9 @@ def main(argv=None) -> None:
 
     print(
             f"[PROFILE] KV RESULTS : \n"
-            f"Snapshot={t2 - t1:.4f}s\n"
-            f"Snapshot={t3 - t2:.4f}s\n"
-            f"Restore={t4 - t3:.4f}s\n"
+            f"Snapshot={t2 - t1:.6f}s\n"
+            f"Snapshot={t3 - t2:.6f}s\n"
+            f"Restore={t4 - t3:.6f}s\n"
         )
 
 
