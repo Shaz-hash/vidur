@@ -501,55 +501,97 @@ class Request(BaseEntity):
 
     # --- Snapshot helpers (REPLACE THE OLD ONES) --------------------------
 
+    # def snapshot_state(self) -> Dict[str, Any]:
+    #     """Return a JSON-friendly, minimal snapshot of this Request's logical state."""
+    #     # replica_id=int(self._replica_id) if self._replica_id is not None else None,
+    #     rid = None
+    #     if self._replica_id is not None:
+    #         # prefer .id if present; otherwise fall back
+    #         rid = int(getattr(self._replica_id, "id", self._replica_id))
+
+    #     snap = RequestSnapshot(
+    #         __v__=_SNAP_VERSION_REQ,
+    #         id=int(self._id),
+    #         arrived_at=float(self._arrived_at),
+    #         queued_at=float(self._queued_at),
+    #         replica_id = rid,
+    #         num_prefill_tokens=int(self._num_prefill_tokens),
+    #         num_prefill_tokens_cached=int(self._num_prefill_tokens_cached),
+    #         num_decode_tokens=int(self._num_decode_tokens),
+    #         num_processed_tokens=int(self._num_processed_tokens),
+
+    #         block_hash_ids=list(self._block_hash_ids) if self._block_hash_ids is not None else None,
+    #         block_size=int(self._block_size) if self._block_size is not None else None,
+
+    #         scheduled=bool(self._scheduled),
+    #         preempted=bool(self._preempted),
+    #         completed=bool(self._completed),
+    #         is_prefill_complete=bool(self._is_prefill_complete),
+
+    #         num_restarts=int(self._num_restarts),
+
+    #         scheduled_at=float(self._scheduled_at),
+    #         preempted_time=float(self._preempted_time),
+    #         completed_at=float(self._completed_at),
+    #         prefill_completed_at=float(self._prefill_completed_at),
+    #         scheduling_delay=float(self._scheduling_delay),
+    #         execution_time=float(self._execution_time),
+    #         model_execution_time=float(self._model_execution_time),
+    #         latest_stage_scheduled_at=float(self._latest_stage_scheduled_at),
+    #         latest_stage_completed_at=float(self._latest_stage_completed_at),
+    #         latest_iteration_scheduled_at=float(self._latest_iteration_scheduled_at),
+    #         latest_iteration_completed_at=float(self._latest_iteration_completed_at),
+    #         latest_iteration_scheduling_delay=float(self._latest_iteration_scheduling_delay),
+
+    #         prefill_slo_time=float(self._prefill_slo_time) if self._prefill_slo_time is not None else None,
+    #         decode_slo_time=float(self._decode_slo_time),
+    #         completion_slo_time=float(self._completion_slo_time),
+    #         session_id=int(self._session_id) if self._session_id is not None else None,
+    #     )
+    #     # normalize/validate primitives for safety
+    #     return to_primitive_tree(asdict(snap))
+
     def snapshot_state(self) -> Dict[str, Any]:
-        """Return a JSON-friendly, minimal snapshot of this Request's logical state."""
-        # replica_id=int(self._replica_id) if self._replica_id is not None else None,
         rid = None
         if self._replica_id is not None:
-            # prefer .id if present; otherwise fall back
             rid = int(getattr(self._replica_id, "id", self._replica_id))
 
-        snap = RequestSnapshot(
-            __v__=_SNAP_VERSION_REQ,
-            id=int(self._id),
-            arrived_at=float(self._arrived_at),
-            queued_at=float(self._queued_at),
-            replica_id = rid,
-            num_prefill_tokens=int(self._num_prefill_tokens),
-            num_prefill_tokens_cached=int(self._num_prefill_tokens_cached),
-            num_decode_tokens=int(self._num_decode_tokens),
-            num_processed_tokens=int(self._num_processed_tokens),
+        return {
+            "__v__": _SNAP_VERSION_REQ,
+            "id": int(self._id),
+            "arrived_at": float(self._arrived_at),
+            "queued_at": float(self._queued_at),
+            "replica_id": rid,
+            "num_prefill_tokens": int(self._num_prefill_tokens),
+            "num_prefill_tokens_cached": int(self._num_prefill_tokens_cached),
+            "num_decode_tokens": int(self._num_decode_tokens),
+            "num_processed_tokens": int(self._num_processed_tokens),
+            "block_hash_ids": list(self._block_hash_ids) if self._block_hash_ids is not None else None,
+            "block_size": int(self._block_size) if self._block_size is not None else None,
+            "scheduled": bool(self._scheduled),
+            "preempted": bool(self._preempted),
+            "completed": bool(self._completed),
+            "is_prefill_complete": bool(self._is_prefill_complete),
+            "num_restarts": int(self._num_restarts),
+            "scheduled_at": float(self._scheduled_at),
+            "preempted_time": float(self._preempted_time),
+            "completed_at": float(self._completed_at),
+            "prefill_completed_at": float(self._prefill_completed_at),
+            "scheduling_delay": float(self._scheduling_delay),
+            "execution_time": float(self._execution_time),
+            "model_execution_time": float(self._model_execution_time),
+            "latest_stage_scheduled_at": float(self._latest_stage_scheduled_at),
+            "latest_stage_completed_at": float(self._latest_stage_completed_at),
+            "latest_iteration_scheduled_at": float(self._latest_iteration_scheduled_at),
+            "latest_iteration_completed_at": float(self._latest_iteration_completed_at),
+            "latest_iteration_scheduling_delay": float(self._latest_iteration_scheduling_delay),
+            "prefill_slo_time": float(self._prefill_slo_time) if self._prefill_slo_time is not None else None,
+            "decode_slo_time": float(self._decode_slo_time),
+            "completion_slo_time": float(self._completion_slo_time),
+            "session_id": int(self._session_id) if self._session_id is not None else None,
+        }
 
-            block_hash_ids=list(self._block_hash_ids) if self._block_hash_ids is not None else None,
-            block_size=int(self._block_size) if self._block_size is not None else None,
 
-            scheduled=bool(self._scheduled),
-            preempted=bool(self._preempted),
-            completed=bool(self._completed),
-            is_prefill_complete=bool(self._is_prefill_complete),
-
-            num_restarts=int(self._num_restarts),
-
-            scheduled_at=float(self._scheduled_at),
-            preempted_time=float(self._preempted_time),
-            completed_at=float(self._completed_at),
-            prefill_completed_at=float(self._prefill_completed_at),
-            scheduling_delay=float(self._scheduling_delay),
-            execution_time=float(self._execution_time),
-            model_execution_time=float(self._model_execution_time),
-            latest_stage_scheduled_at=float(self._latest_stage_scheduled_at),
-            latest_stage_completed_at=float(self._latest_stage_completed_at),
-            latest_iteration_scheduled_at=float(self._latest_iteration_scheduled_at),
-            latest_iteration_completed_at=float(self._latest_iteration_completed_at),
-            latest_iteration_scheduling_delay=float(self._latest_iteration_scheduling_delay),
-
-            prefill_slo_time=float(self._prefill_slo_time) if self._prefill_slo_time is not None else None,
-            decode_slo_time=float(self._decode_slo_time),
-            completion_slo_time=float(self._completion_slo_time),
-            session_id=int(self._session_id) if self._session_id is not None else None,
-        )
-        # normalize/validate primitives for safety
-        return to_primitive_tree(asdict(snap))
 
     @staticmethod
     def from_snapshot(s: Dict[str, Any]) -> "Request":

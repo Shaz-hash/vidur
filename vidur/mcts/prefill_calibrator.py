@@ -1,3 +1,23 @@
+# # (بِسْمِ ٱللَّهِ ٱلرَّحْمَٰنِ ٱلرَّحِيْمِ)
+
+"""
+python -m vidur.mcts.prefill_calibrator \
+  --output ./simulator_output/new_prefill_profile.csv \
+  --step 512 \
+  --max_tokens 10240 \
+  --replica_config_model_name meta-llama/Meta-Llama-3-8B \
+  --replica_config_device h100 \
+  --replica_config_network_device h100_dgx \
+  --cluster_config_num_replicas 1 \
+  --replica_config_tensor_parallel_size 1 \
+  --replica_config_num_pipeline_stages 1 \
+  --global_scheduler_config_type round_robin \
+  --replica_scheduler_config_type vllm_v1 \
+  --vllm_v1_scheduler_config_batch_size_cap 512 
+"""
+
+
+
 from __future__ import annotations
 
 import argparse
@@ -113,9 +133,11 @@ class PrefillProfile:
 
 def _measure_prefill_time(sim_config: SimulationConfig, prefill_tokens: int) -> float:
     cfg = copy.deepcopy(sim_config)
-    scheduler_cfg = getattr(cfg, "replica_scheduler_config", None)
+    scheduler_cfg = getattr(cfg.cluster_config, "replica_scheduler_config", None)
     if scheduler_cfg is not None and hasattr(scheduler_cfg, "chunk_size"):
-        scheduler_cfg.chunk_size = max(prefill_tokens, getattr(scheduler_cfg, "chunk_size", 0) or prefill_tokens)
+        scheduler_cfg.chunk_size = int(prefill_tokens)  # force single-batch prefill for this probe
+
+    
     if hasattr(cfg.request_generator_config, "num_requests"):
         cfg.request_generator_config.num_requests = 0  # type: ignore[attr-defined]
     cfg.metrics_config.write_metrics = False
@@ -123,6 +145,7 @@ def _measure_prefill_time(sim_config: SimulationConfig, prefill_tokens: int) -> 
     cfg.metrics_config.write_json_trace = False
 
     simulator = Simulator(cfg, register_atexit=False)
+    print(simulator._execution_time_predictor.to_dict())
     simulator._event_queue.clear()
 
     request = Request(

@@ -1,4 +1,21 @@
 #!/usr/bin/env python3
+
+# # (بِسْمِ ٱللَّهِ ٱلرَّحْمَٰنِ ٱلرَّحِيْمِ)
+"""
+
+python -m vidur.mcts.profile_sim_memory \
+  --replica_config_model_name meta-llama/Meta-Llama-3-8B \
+  --replica_config_device h100 \
+  --replica_config_network_device h100_dgx \
+  --cluster_config_num_replicas 1 \
+  --replica_config_tensor_parallel_size 1 \
+  --replica_config_num_pipeline_stages 1 \
+  --global_scheduler_config_type round_robin \
+  --replica_scheduler_config_type vllm_v1 \
+
+
+"""
+
 import os
 import sys
 from pathlib import Path
@@ -25,8 +42,8 @@ def main(argv=None) -> None:
     # reuse same CLI args you would pass to run_mcts.py after the MCTS flags
     sim_cfg = configure_simulation(argv or [])
     et_cfg = sim_cfg.execution_time_predictor_config
-    et_cfg.prediction_max_tokens_per_request = 8192
-    et_cfg.prediction_max_batch_size = 64
+    et_cfg.prediction_max_tokens_per_request = 262144
+    et_cfg.prediction_max_batch_size = 512
     assume_infinite_kv = True
     setattr(sim_cfg.cluster_config.cache_config, "assume_infinite_kv", bool(assume_infinite_kv))
     print(f"[MEM] after configure_simulation: {rss_mb():.1f} MB")

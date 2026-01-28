@@ -28,7 +28,9 @@ class ReplicaStageScheduleEvent(BaseEvent):
         )
 
         self._batch, self._batch_stage, execution_time = stage_scheduler.on_schedule()
-
+        # print("SCHEDULE EVENT", self._replica_id, self._stage_id,
+        #       "BATCH TOKENS", self._batch.num_tokens if self._batch else None,
+        #       "STAGE TIME", self._batch_stage.execution_time if self._batch_stage else None)
         if not (self._batch and self._batch_stage):
             return []
 

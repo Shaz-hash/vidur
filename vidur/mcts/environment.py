@@ -20,7 +20,7 @@ from vidur.types import EventType
 from .launch_mcts_job import MCTSConstraintConfig, MCTSExploreConfig
 from .prefill_calibrator import PrefillProfile
 
-
+# TODO : Remove this import after debugging
 import time ## For Debugging
 
 
@@ -62,23 +62,6 @@ class _ControllerBudgetTracker:
     baseline_decode: Dict[int, int]
     tracked_requests: Dict[int, Request]  # NEW
 
-    # def is_satisfied(self, lookup: Dict[int, Request]) -> bool:
-    #     for rid, (prefill_budget, decode_budget) in self.allocations.items():
-    #         req = lookup.get(rid)
-    #         if req is None:
-    #             continue
-    #         gained_prefill = (
-    #             req.num_processed_prefill_tokens - self.baseline_prefill.get(rid, 0)
-    #         )
-    #         if gained_prefill < prefill_budget:
-    #             return False
-    #         gained_decode = (
-    #             req.num_processed_decode_tokens - self.baseline_decode.get(rid, 0)
-    #         )
-    #         if gained_decode < decode_budget:
-    #             return False
-    #     return True
-
     def is_satisfied(self) -> bool:
         for rid, (prefill_budget, decode_budget) in self.allocations.items():
             req = self.tracked_requests.get(rid)
@@ -95,16 +78,26 @@ class _ControllerBudgetTracker:
 ## MCTS node carrying useful states for propogating upwards + helping in exploitation vs exploration goal
 @dataclass
 class VidurGameStats:
+    
     """Lightweight bookkeeping attached to a simulator snapshot."""
-
     requests_generated: int = 0
     requests_completed: int = 0
     slo_violations: int = 0
     slo_lateness_sum: float = 0.0
     recent_arrivals: List[float] = field(default_factory=list)  # absolute times
     completed_request_ids: Set[int] = field(default_factory=set)
-    # NEW: per-request max lateness and permanent violation flags
-    per_request_max_lateness: Dict[int, float] = field(default_factory=dict)
+
+    # Per-request lateness tracking
+    per_request_prefill_lateness: Dict[int, float] = field(default_factory=dict)  # monotone (max)
+    per_request_decode_lateness: Dict[int, float] = field(default_factory=dict)   # cumulative sum
+
+    # Decode tracking state
+    decode_tokens_counted: Dict[int, int] = field(default_factory=dict)
+    decode_next_deadline_by_id: Dict[int, float] = field(default_factory=dict)
+
+    # Prefill bookkeeping: once prefill is complete, we can stop recomputing prefill lateness
+    prefill_lateness_finalized: Set[int] = field(default_factory=set)
+
     violated_request_ids: Set[int] = field(default_factory=set)
 
     # Used for the Adversary to track arrivals within the  prefill reqs containing batches
@@ -118,7 +111,11 @@ class VidurGameStats:
             slo_lateness_sum=self.slo_lateness_sum,
             recent_arrivals=list(self.recent_arrivals),
             completed_request_ids=set(self.completed_request_ids),
-            per_request_max_lateness=dict(self.per_request_max_lateness),
+            per_request_prefill_lateness=dict(self.per_request_prefill_lateness),
+            per_request_decode_lateness=dict(self.per_request_decode_lateness),
+            decode_tokens_counted=dict(self.decode_tokens_counted),
+            decode_next_deadline_by_id=dict(self.decode_next_deadline_by_id),
+            prefill_lateness_finalized=set(self.prefill_lateness_finalized),
             violated_request_ids=set(self.violated_request_ids),
             last_prefill_batch_time=self.last_prefill_batch_time,
         )
@@ -128,9 +125,9 @@ class VidurGameStats:
 class VidurMCTSState:
     simulator: Simulator
     stats: VidurGameStats
-
-    def fork(self) -> "VidurMCTSState":
-        return VidurMCTSState(self.simulator.fork(), self.stats.clone())
+    # TODO : Remove this flag after testing 
+    def fork(self , flag: Optional[bool] = None) -> "VidurMCTSState":
+        return VidurMCTSState(self.simulator.fork(flag=flag), self.stats.clone())
 
 ## 
 class VidurMCTSEnvironment:
@@ -158,15 +155,10 @@ class VidurMCTSEnvironment:
         self.controller_all_possible_prefill_budgets: List[int] = None
         self.all_possible_Controller_actions: List[any] = None
         self.all_possible_Controller_States: Dict[Tuple[Tuple[int, ...], str, str], Dict[str, Any]] = {}
-        # key = (mapping_tuple, heuristic_name, allocation_strategy_name)
-
-        # Take a frozen snapshot of the root simulator once, so that every
-        # initial MCTS state starts from the exact same simulator + ID counters.
         self._base_snapshot = base_simulator.snapshot_state()
-
-        # NEW: optional snapshot for the history root
         self._history_root_snapshot = None
 
+        # TODO : later this variable will encode max length + prefill + decode lengths
         if self._constraints.max_request_tokens is None:
             self._constraints.max_request_tokens = self._prefill_profile.max_tokens
 
@@ -177,7 +169,7 @@ class VidurMCTSEnvironment:
     def initial_state(self) -> VidurMCTSState:
         # Always recreate a fresh simulator from the frozen root snapshot.
         # This ensures request IDs and entity counters are identical for every
-        # replay from the root, regardless of what other simulators did.
+        # replay from the root, regardless of what other snapshots did.
         sim = Simulator(
             self._base._config,
             register_atexit=False,
@@ -227,189 +219,9 @@ class VidurMCTSEnvironment:
 
 
 
-    
-
     # ------------------------------------------------------------------ #
-    # Action generation helpers
+    # Action sampling for Players
     # ------------------------------------------------------------------ #
-
-    # def sample_adversary_actions(
-    #     self, state: VidurMCTSState, max_samples: int
-    # ) -> Tuple[List[Optional[AdversaryAction]], List[bool]]:
-    #     """
-    #     Deterministic adversary action indexing (6 actions total).
-
-    #     Actions (indices 0..5):
-    #     idx i => generate `rate` new requests, each with prefill_tokens = (i+1)*step
-
-    #     Mask:
-    #     - If we are still inside the same 1-second window (i.e. _available_qps_budget < rate),
-    #         then all 6 actions are invalid (mask all False).
-    #     - Otherwise, all 6 actions are valid (mask all True).
-
-    #     Returns:
-    #     actions_by_index: length 6, each entry is AdversaryAction or None
-    #     mask: length 6 bool
-    #     """
-    #     self._drain_arrivals(state.simulator)
-
-    #     # Config
-    #     step = int(self._constraints.interval_request_size or 512)
-    #     budgets: List[int] = [step * i for i in range(1, 7)]  # 6 sizes: step..6*step
-
-    #     slo_opts = self._constraints.request_slo_options
-
-    #     # Rate (requests per second) – use config if set, else fallback to 5
-    #     rate = int(self._constraints.maximum_qps or 5)
-    #     if rate <= 0:
-    #         rate = 5
-        
-    #     # Gate by 1-second rule using existing budget logic
-    #     # (Assumes _available_qps_budget returns remaining capacity in current 1s window)
-    #     max_qps = int(self._constraints.maximum_qps or 0)
-    #     qps_budget = int(self._available_qps_budget(state))
-    #     allow = qps_budget >= rate
-
-    #     actions_by_index: List[Optional[AdversaryAction]] = [None] * 6
-    #     mask: List[bool] = [False] * 6
-
-    #     # If we can't send a batch yet, force one no-op action (index 0) to avoid branching
-    #     if qps_budget < max_qps:
-    #         actions_by_index[0] = AdversaryAction(requests=[], stop_decode_ids=[])
-    #         mask[0] = True
-    #         return actions_by_index, mask
-
-    #     # else: build all 6 real actions and set all mask True
-
-    #     MAX_REQUEST_LENGTH: int = 10240  # keep your existing constant for now
-
-    #     def build_specs(prefill_size: int) -> List[AdversaryRequestSpec]:
-    #         specs: List[AdversaryRequestSpec] = []
-    #         for _ in range(rate):
-    #             remaining_for_decode = max(0, MAX_REQUEST_LENGTH - prefill_size)
-
-    #             prefill_slo = self._prefill_profile.lookup(prefill_size)
-    #             if getattr(slo_opts, "prefill_slos", None):
-    #                 # pick the first (deterministic) for now
-    #                 prefill_slo *= float(slo_opts.prefill_slos[0])
-
-    #             if getattr(slo_opts, "decode_slos", None):
-    #                 # decode_slos stored in ms in your existing code
-    #                 decode_slo = float(slo_opts.decode_slos[0]) / 1000.0
-    #             else:
-    #                 decode_slo = 0.0
-
-    #             specs.append(
-    #                 AdversaryRequestSpec(
-    #                     prefill_tokens=prefill_size,
-    #                     decode_tokens=remaining_for_decode,
-    #                     prefill_slo=float(prefill_slo),
-    #                     decode_slo=float(decode_slo),
-    #                 )
-    #             )
-    #         return specs
-
-    #     for i, prefill_size in enumerate(budgets):
-    #         mask[i] = True
-    #         actions_by_index[i] = AdversaryAction(
-    #             requests=build_specs(prefill_size),
-    #             stop_decode_ids=[],
-    #         )
-
-    #     return actions_by_index, mask
-
-
-
-    ## TESTING ONLY :
-    # def sample_adversary_actions(
-    #     self, state: VidurMCTSState, max_samples: int
-    # ) -> Tuple[List[Optional[AdversaryAction]], List[bool]]:
-    #     """
-    #     Deterministic adversary action indexing (6 actions total).
-
-    #     Actions (indices 0..5):
-    #     idx i => generate `rate` new requests, each with prefill_tokens = (i+1)*step
-
-    #     Mask:
-    #     - If we are still inside the same 1-second window (i.e. _available_qps_budget < rate),
-    #         then all 6 actions are invalid (mask all False).
-    #     - Otherwise, all 6 actions are valid (mask all True).
-
-    #     Returns:
-    #     actions_by_index: length 6, each entry is AdversaryAction or None
-    #     mask: length 6 bool
-    #     """
-    #     self._drain_arrivals(state.simulator)
-
-    #     # Config
-    #     # step = int(self._constraints.interval_request_size or 512)
-    #     # budgets: List[int] = [step * i for i in range(1, 7)]  # 6 sizes: step..6*step
-        
-    #     prefill_size = int(self._constraints.max_request_tokens or 3072)  # or hardcode 3072
-    #     counts = [i for i in range(1, 7)]  # 1..6
-
-
-    #     slo_opts = self._constraints.request_slo_options
-
-    #     # Rate (requests per second) – use config if set, else fallback to 5
-    #     rate = int(self._constraints.maximum_qps or 5)
-    #     if rate <= 0:
-    #         rate = 5
-        
-    #     # Gate by 1-second rule using existing budget logic
-    #     # (Assumes _available_qps_budget returns remaining capacity in current 1s window)
-    #     max_qps = int(self._constraints.maximum_qps or 0)
-    #     qps_budget = int(self._available_qps_budget(state))
-    #     allow = qps_budget >= rate
-
-    #     actions_by_index: List[Optional[AdversaryAction]] = [None] * 6
-    #     mask: List[bool] = [False] * 6
-
-    #     # If we can't send a batch yet, force one no-op action (index 0) to avoid branching
-    #     if qps_budget < max_qps:
-    #         actions_by_index[0] = AdversaryAction(requests=[], stop_decode_ids=[])
-    #         mask[0] = True
-    #         return actions_by_index, mask
-
-    #     # else: build all 6 real actions and set all mask True
-
-    #     MAX_REQUEST_LENGTH: int = 10240  # keep your existing constant for now
-
-    #     def build_specs(prefill_size: int) -> List[AdversaryRequestSpec]:
-    #         specs: List[AdversaryRequestSpec] = []
-    #         for _ in range(rate):
-    #             remaining_for_decode = max(0, MAX_REQUEST_LENGTH - prefill_size)
-
-    #             prefill_slo = self._prefill_profile.lookup(prefill_size)
-    #             # if getattr(slo_opts, "prefill_slos", None):
-    #             #     # pick the first (deterministic) for now
-    #             #     prefill_slo *= float(slo_opts.prefill_slos[0])
-
-    #             if getattr(slo_opts, "decode_slos", None):
-    #                 # decode_slos stored in ms in your existing code
-    #                 decode_slo = float(slo_opts.decode_slos[0]) / 1000.0
-    #             else:
-    #                 decode_slo = 0.0
-
-    #             specs.append(
-    #                 AdversaryRequestSpec(
-    #                     prefill_tokens=prefill_size,
-    #                     decode_tokens=remaining_for_decode,
-    #                     prefill_slo=float(prefill_slo),
-    #                     decode_slo=float(decode_slo),
-    #                 )
-    #             )
-    #         return specs
-
-    #     for i, prefill_size in enumerate(budgets):
-    #         mask[i] = True
-    #         actions_by_index[i] = AdversaryAction(
-    #             requests=build_specs(prefill_size),
-    #             stop_decode_ids=[],
-    #         )
-
-    #     return actions_by_index, mask
-
 
     def sample_adversary_actions(
         self, state: VidurMCTSState, max_samples: int
@@ -449,19 +261,9 @@ class VidurMCTSEnvironment:
 
         slo_opts = self._constraints.request_slo_options
 
-        # IMPORTANT: avoid double-multiplying slowdown vs prefill_slos.
-        # Right now env._prefill_profile is already scaled by constraints.prefill_slowdown.
-        # So this should usually be just:
         base_prefill = float(self._prefill_profile.lookup(prefill_size))
         prefill_slo_time = base_prefill
-        # # If you still want to use prefill_slos as the only multiplier, then you must
-        # # stop scaling the profile at load time (slowdown=1.0). Otherwise you'll multiply twice.
-        # if getattr(slo_opts, "prefill_slos", None):
-        #     # If you want ONLY slo_opts.prefill_slos[0] (no slowdown), remove slowdown scaling in PrefillProfile.load_or_generate.
-        #     prefill_slo_time = base_prefill * float(slo_opts.prefill_slos[0])
-        # else:
-        #     prefill_slo_time = base_prefill
-
+    
         if getattr(slo_opts, "decode_slos", None):
             decode_slo_time = float(slo_opts.decode_slos[0]) / 1000.0
         else:
@@ -712,8 +514,6 @@ class VidurMCTSEnvironment:
 
 
 
-
-
     def _max_request_tokens_allowed(self) -> int:
         if self._constraints.max_request_tokens is not None:
             return self._constraints.max_request_tokens
@@ -731,20 +531,13 @@ class VidurMCTSEnvironment:
         When ``inplace`` is False (default), returns a forked state (safe for tree expansion).
         When ``inplace`` is True, mutates and returns ``state`` (intended for rollout trials).
         """
-        # t0 = time.perf_counter()
         target_state = state if inplace else state.fork()
-        # t1 = time.perf_counter()
         self._apply_adversary_action(target_state, action)
-        # t2 = time.perf_counter()
         self._drain_arrivals(target_state.simulator)
-        # t3 = time.perf_counter()
-        # print(
-        #     f"[PROFILE] FORK phase={t1 - t0:.4f}s: "
-        #     f"APPLYING ADVERSARY ACTION={t2 - t1:.4f}s "
-        #     f"DRAIN ARRIVALS={t3 - t2:.4f}s"
-        # )
         return target_state
 
+
+    #TODO: Remove the comments used for profiling after testing
     def apply_controller_action_only(
         self, state: VidurMCTSState, action: ControllerAction, *, inplace: bool = False
     ) -> VidurMCTSState:
@@ -824,14 +617,15 @@ class VidurMCTSEnvironment:
     def evaluate_objective(self, state: VidurMCTSState) -> Tuple[int, float]:
         st = state.stats
         violations = st.slo_violations
-        avg_lateness = (
-            st.slo_lateness_sum / max(violations, 1) if violations else 0.0
-        )
-        return violations, avg_lateness
+        # avg_lateness = (
+        #     st.slo_lateness_sum / max(violations, 1) if violations else 0.0
+        # )
+        total_lateness = float(st.slo_lateness_sum)
+        return violations, total_lateness
 
 
     def describe_state(self, state: VidurMCTSState) -> Dict[str, Any]:
-        violations, avg_lateness = self.evaluate_objective(state)
+        violations, total_lateness = self.evaluate_objective(state)
         simulator = state.simulator
         request_lookup = self._build_request_lookup(simulator)
         waiting_ids = self._collect_waiting_request_ids(simulator)
@@ -841,7 +635,7 @@ class VidurMCTSEnvironment:
             "requests_generated": state.stats.requests_generated,
             "requests_completed": state.stats.requests_completed,
             "slo_violations": violations,
-            "avg_lateness": avg_lateness,
+            "total_lateness": total_lateness, # NOTE: now total lateness (sum), not average TODO : make sure this defination becomes consistent everywhere
             "waiting_request_ids": waiting_ids,
             "completed_request_ids": list(state.stats.completed_request_ids),
         }
@@ -925,33 +719,6 @@ class VidurMCTSEnvironment:
         ]
         for req in ordered:
             waiting_queue.push(req)
-
-    # def _restrict_running_set(
-    #     self,
-    #     replica_scheduler,
-    #     targeted_ids: Iterable[int],
-    # ) -> List[Request]:
-    #     running = getattr(replica_scheduler, "_running", None)
-    #     if running is None:
-    #         return []
-
-    #     targeted = set(targeted_ids)
-    #     kept: List[Request] = []
-    #     hidden: List[Request] = []
-    #     for req in running:
-    #         if req.id in targeted:
-    #             kept.append(req)
-    #         else:
-    #             hidden.append(req)
-
-    #     setattr(replica_scheduler, "_running", kept)
-
-    #     scheduled_set = getattr(replica_scheduler, "scheduled_req_ids", None)
-    #     if isinstance(scheduled_set, set):
-    #         for req in hidden:
-    #             scheduled_set.discard(req.id)
-
-    #     return hidden
 
     def _restrict_running_set(
         self,
@@ -1180,37 +947,6 @@ class VidurMCTSEnvironment:
 
 
 
-    # def _advance_simulation(
-    #     self,
-    #     state: VidurMCTSState,
-    #     tracker: _ControllerBudgetTracker,
-    # ) -> None:
-    #     sim = state.simulator
-
-    #     steps = 0
-    #     max_steps = max(1, self._cfg.simulation_depth * 10)
-    #     while sim._event_queue and steps < max_steps:
-    #         next_event = sim._event_queue[0]
-    #         if (
-    #             next_event.event_type == EventType.REQUEST_ARRIVAL
-    #             and next_event._time > sim._time
-    #         ):
-    #             break
-    #         event = heapq.heappop(sim._event_queue)
-    #         sim._set_time(event._time)
-    #         new_events = event.handle_event(sim._scheduler, sim._cluster_metric_store)
-    #         for new_event in new_events:
-    #             sim._add_event(new_event)
-    #         steps += 1
-    #         t0 = time.perf_counter()
-    #         lookup = self._build_request_lookup(sim)
-    #         t1 = time.perf_counter()
-    #         print(f"[PROFILEXXX] BUILD REQUEST LOOKUP phase={t1 - t0:.6f}s")
-    #         if tracker.is_satisfied(lookup):
-    #             self._prune_pending_replica_schedule_events(sim)
-    #             break
-
-
     def _advance_simulation(self, state: VidurMCTSState, tracker: _ControllerBudgetTracker) -> None:
         from vidur.scheduler.global_scheduler.base_global_scheduler import BaseGlobalScheduler
         from vidur.types import EventType
@@ -1297,7 +1033,7 @@ class VidurMCTSEnvironment:
         # Remove any stale ReplicaScheduleEvent at current time; we drive scheduling manually.
         self._prune_pending_replica_schedule_events(sim)
 
-        max_batches = max(1, self._cfg.simulation_depth * 10)
+        max_batches = max(1, self._cfg.simulation_depth * 100)
         batches_executed = 0
 
         global_sched = sim._scheduler
@@ -1333,8 +1069,15 @@ class VidurMCTSEnvironment:
                     # One stage: directly run the stage then batch_end at end_time
                     stage_scheduler = get_stage_sched(replica_id, 0)
                     stage_scheduler.add_batch(batch)
+                    # print("hello" , batch.num_tokens)
 
                     b, batch_stage, _exec_time = stage_scheduler.on_schedule()
+                    # if len(batch.num_tokens) == 1 and batch.num_tokens[0] in (512, 1024, 1536, 2048, 2560, 3072):
+                    #     print("DEBUG tokens", batch.num_tokens,
+                    #         "stage_total", batch_stage.execution_time,
+                    #         "stage_model", batch_stage.model_execution_time)
+                    
+
                     if b is None or batch_stage is None:
                         # Unexpected; preserve correctness
                         self._advance_simulation(state, tracker)
@@ -1371,128 +1114,108 @@ class VidurMCTSEnvironment:
             self._prune_pending_replica_schedule_events(sim)
 
 
-
     def _update_stats(self, state: VidurMCTSState) -> None:
         sim = state.simulator
         stats = state.stats
-        
-        # 1) For every request we know about, update per-request max lateness
-        #    and permanent violation flags.
+        sim_time = float(sim._time)
+
         for replica_scheduler in sim._scheduler._replica_schedulers.values():
             for request in list(replica_scheduler._requests.values()):
-                rid = request.id
-                lateness = self._compute_lateness(request, sim._time)
+                rid = int(request.id)
 
-                # Monotone lateness: accumulate only the *increase* in max lateness
-                prev_max = stats.per_request_max_lateness.get(rid, 0.0)
-                if lateness > prev_max:
-                    stats.slo_lateness_sum += (lateness - prev_max)
-                    stats.per_request_max_lateness[rid] = lateness
+                # -------------------------
+                # Prefill lateness (monotone max; finalized after prefill completes)
+                # -------------------------
+                if rid not in stats.prefill_lateness_finalized:
+                    prefill_slo = getattr(request, "_prefill_slo_time", None)
+                    if prefill_slo is not None:
+                        arrived_at = float(getattr(request, "_arrived_at", request.arrived_at))
+                        deadline = arrived_at + float(prefill_slo)
 
-                # Monotone violations: once late, always counted as a violation
-                if lateness > 0 and rid not in stats.violated_request_ids:
+                        is_prefill_complete = bool(
+                            getattr(request, "_is_prefill_complete", request.is_prefill_complete)
+                        )
+                        prefill_completed_at = getattr(request, "_prefill_completed_at", None)
+
+                        if is_prefill_complete and prefill_completed_at not in (None, 0):
+                            actual = float(prefill_completed_at)
+                        else:
+                            actual = sim_time
+
+                        prefill_late = max(0.0, actual - deadline)
+
+                        prev_prefill = float(stats.per_request_prefill_lateness.get(rid, 0.0))
+                        if prefill_late > prev_prefill:
+                            stats.slo_lateness_sum += (prefill_late - prev_prefill)
+                            stats.per_request_prefill_lateness[rid] = prefill_late
+
+                        if is_prefill_complete:
+                            # after completion, prefill lateness is final; no need to recompute again
+                            stats.prefill_lateness_finalized.add(rid)
+
+                # -------------------------
+                # Decode lateness (cumulative per new decode token)
+                # Deadline rule you requested:
+                #   - first deadline = prefill_completed_at + decode_slo
+                #   - after each token: next_deadline = sim_time + decode_slo
+                # -------------------------
+                decode_slo = getattr(request, "_decode_slo_time", None)
+                has_decode_tokens = int(getattr(request, "_num_decode_tokens", request.num_decode_tokens)) > 0
+
+                is_prefill_complete = bool(
+                    getattr(request, "_is_prefill_complete", request.is_prefill_complete)
+                )
+                prefill_completed_at = getattr(request, "_prefill_completed_at", None)
+
+                if (
+                    decode_slo is not None
+                    and float(decode_slo) >= 0.0
+                    and has_decode_tokens
+                    and is_prefill_complete
+                    and prefill_completed_at not in (None, 0)
+                ):
+                    # init first decode deadline if missing
+                    if rid not in stats.decode_next_deadline_by_id:
+                        stats.decode_next_deadline_by_id[rid] = float(prefill_completed_at) + float(decode_slo)
+
+                    done = int(request.num_processed_decode_tokens)
+                    counted = int(stats.decode_tokens_counted.get(rid, 0))
+                    new_tokens = done - counted
+
+                    if new_tokens:
+                        # You asked for this assert:
+                        assert new_tokens == 1, f"Expected 1 new decode token for req {rid}, got {new_tokens}"
+
+                        deadline = float(stats.decode_next_deadline_by_id[rid])
+                        token_late = max(0.0, sim_time - deadline)
+
+                        # accumulate lateness for this request + global sum
+                        stats.per_request_decode_lateness[rid] = float(
+                            stats.per_request_decode_lateness.get(rid, 0.0)
+                        ) + float(token_late)
+                        stats.slo_lateness_sum += float(token_late)
+
+                        # advance counters + set next deadline relative to *now* (your rule)
+                        stats.decode_tokens_counted[rid] = done
+                        stats.decode_next_deadline_by_id[rid] = sim_time + float(decode_slo)
+
+                # -------------------------
+                # Violations (once per request)
+                # -------------------------
+                total_lateness = float(stats.per_request_prefill_lateness.get(rid, 0.0)) + float(
+                    stats.per_request_decode_lateness.get(rid, 0.0)
+                )
+                if total_lateness > 0.0 and rid not in stats.violated_request_ids:
                     stats.violated_request_ids.add(rid)
                     stats.slo_violations += 1
 
-        # 2) Track completions (this stays monotone as before)
+        # Track completions (same as your current logic)
         for replica_scheduler in sim._scheduler._replica_schedulers.values():
             for request in list(replica_scheduler._requests.values()):
                 if request.completed and request.id not in stats.completed_request_ids:
                     stats.requests_completed += 1
                     stats.completed_request_ids.add(request.id)
-
-
-    # def _compute_lateness(self, request: Request, sim_time: float) -> float:
-    #     total_lateness = 0.0
-
-    #     arrived_at = getattr(request, "_arrived_at", request.arrived_at)
-    #     prefill_completed_at = getattr(request, "_prefill_completed_at", None)
-    #     if not getattr(request, "_is_prefill_complete", request.is_prefill_complete):
-    #         prefill_completed_at = None
-    #     elif prefill_completed_at in (None, 0):
-    #         prefill_completed_at = None
-
-    #     prefill_slo = getattr(request, "_prefill_slo_time", None)
-    #     if prefill_slo is not None:
-    #         deadline = arrived_at + prefill_slo
-    #         actual = prefill_completed_at if prefill_completed_at is not None else sim_time
-    #         total_lateness += max(0.0, actual - deadline)
-
-    #     decode_slo = getattr(request, "_decode_slo_time", None)
-
-    #     if decode_slo is not None and decode_slo >= 0:
-    #         has_decode_tokens = getattr(request, "_num_decode_tokens", request.num_decode_tokens) > 0
-    #         if has_decode_tokens and prefill_completed_at is not None:
-    #             # Initialize next-deadline on first decode (if not already done)
-    #             if getattr(request, "_decode_next_deadline", None) is None:
-    #                 request._decode_next_deadline = prefill_completed_at + decode_slo
-    #                 request._decode_tokens_counted = 0
-
-    #             # How many DECODE tokens actually done: processed minus prefill segment
-    #             decode_tokens_done = request.num_processed_decode_tokens 
-
-    #             # New tokens since last time we accounted for lateness
-    #             new_tokens = max(0, decode_tokens_done - getattr(request, "_decode_tokens_counted", 0))
-    #             decode_lateness = 0.0
-    #             for _ in range(new_tokens):
-    #                 deadline = request._decode_next_deadline
-    #                 decode_lateness += max(0.0, sim_time - deadline)
-    #                 request._decode_next_deadline += decode_slo
-    #                 request._decode_tokens_counted += 1
-
-    #             total_lateness += decode_lateness
-
-    #     return total_lateness
-
-    def _compute_lateness(self, request: Request, sim_time: float) -> float:
-        total_lateness = 0.0
-
-        arrived_at = getattr(request, "_arrived_at", request.arrived_at)
-        prefill_completed_at = getattr(request, "_prefill_completed_at", None)
-        if not getattr(request, "_is_prefill_complete", request.is_prefill_complete):
-            prefill_completed_at = None
-        elif prefill_completed_at in (None, 0):
-            prefill_completed_at = None
-
-        prefill_slo = getattr(request, "_prefill_slo_time", None)
-        if prefill_slo is not None:
-            deadline = arrived_at + prefill_slo
-            actual = prefill_completed_at if prefill_completed_at is not None else sim_time
-            total_lateness += max(0.0, actual - deadline)
-
-        decode_slo = getattr(request, "_decode_slo_time", None)
-        has_decode_tokens = getattr(request, "_num_decode_tokens", request.num_decode_tokens) > 0
-
-        # NEW semantics: decode SLO starts at prefill completion.
-        # If decode hasn't started yet but time has passed prefill_completed_at + decode_slo,
-        # we accumulate lateness against that single decode deadline.
-        if decode_slo is not None and decode_slo >= 0 and prefill_completed_at is not None:
-            decode_deadline_start = prefill_completed_at + decode_slo
-
-            # If no decode tokens processed yet, treat the entire decode as late once we pass the start deadline.
-            if request.num_processed_decode_tokens == 0:
-                total_lateness += max(0.0, sim_time - decode_deadline_start)
-            else:
-                # Existing per-token decode lateness logic (optional: keep as-is)
-                if has_decode_tokens:
-                    if getattr(request, "_decode_next_deadline", None) is None:
-                        request._decode_next_deadline = decode_deadline_start
-                        request._decode_tokens_counted = 0
-
-                    decode_tokens_done = request.num_processed_decode_tokens
-                    new_tokens = max(0, decode_tokens_done - getattr(request, "_decode_tokens_counted", 0))
-                    decode_lateness = 0.0
-                    for _ in range(new_tokens):
-                        deadline = request._decode_next_deadline
-                        decode_lateness += max(0.0, sim_time - deadline)
-                        request._decode_next_deadline += decode_slo
-                        request._decode_tokens_counted += 1
-
-                    total_lateness += decode_lateness
-
-        return total_lateness
-
-
+            
 
     # ------------------------------------------------------------------ #
     # Utility functions
@@ -1511,6 +1234,8 @@ class VidurMCTSEnvironment:
                     lookup[req.id] = req
         return lookup
 
+    ## Needed to stop next batch execution because Batch_end event triggers next batch schedule event
+    ## Hence neeeded so that controller' actions end cleanly
     def _prune_pending_replica_schedule_events(self, simulator: Simulator) -> None:
         if not simulator._event_queue:
             return

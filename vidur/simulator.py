@@ -4,7 +4,7 @@ import json
 import random
 import zipfile
 from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple  # add Tuple
+from typing import Any, Dict, List, Tuple, Optional  # add Tuple
 
 import numpy as np
 import wandb
@@ -249,8 +249,8 @@ class Simulator:
                     track_request(req)
 
 
-        scheduler_snapshot = clone_mutable(self._scheduler.snapshot_state())
-
+        # scheduler_snapshot = clone_mutable(self._scheduler.snapshot_state())
+        scheduler_snapshot = self._scheduler.snapshot_state()
         
         # handle dataclass or dict uniformly
         if hasattr(scheduler_snapshot, "request_states"):
@@ -295,6 +295,7 @@ class Simulator:
         #                 track_batch(batch)
 
        # Capture queued batches in stage schedulers (needed for restore correctness)
+
         for replica_scheduler in self._scheduler._replica_schedulers.values():
             if hasattr(replica_scheduler, "_replica_stage_schedulers"):
                 for stage_scheduler in replica_scheduler._replica_stage_schedulers.values():
@@ -304,27 +305,28 @@ class Simulator:
                     if active is not None:
                         track_batch(active)
 
-
         # # Capture pending requests in global queue.
         # for request in self._scheduler._request_queue:
         #     track_request(request)
 
+    
         event_snapshots: List[dict] = []
         for event in self._event_queue:
             event_snapshots.append(
                 self._snapshot_event(event, track_request, track_batch, track_batch_stage)
             )
-
+        
      
         # Capture generator queue requests.
         if hasattr(self._request_generator, "requests"):
             for request in getattr(self._request_generator, "requests"):
                 track_request(request)
 
-        request_generator_state = clone_mutable(
-            self._request_generator.snapshot_state()
-        )
-
+        # request_generator_state = clone_mutable(
+        #     self._request_generator.snapshot_state()
+        # )
+        
+        request_generator_state = self._request_generator.snapshot_state()
       
         # Derive per-simulator entity counters from this simulator's own
         # objects, so forks/restores are independent of other simulators
@@ -352,7 +354,6 @@ class Simulator:
             # so we keep using the global counter for them.
             "ExecutionTime": ExecutionTime._id,
         }
-
         snapshot = SimulatorSnapshot(
             __v__=_SNAP_VERSION_SIM,
             time=self._time,
@@ -368,6 +369,7 @@ class Simulator:
             python_random_state=random.getstate(),
             numpy_random_state=_encode_numpy_state(np.random.get_state()),
         )
+    
 
         return snapshot
 
@@ -449,7 +451,27 @@ class Simulator:
         # assert all(hasattr(e, "_priority_number") for e in self._event_queue)
 
 
-    def fork(self) -> "Simulator":
+    def fork(self , flag : Optional[bool] = None ) -> "Simulator":
+
+        # TODO : REMove this conditional once testing is done
+        if flag is not None:
+
+            t0 = time.perf_counter()
+            snapshot = self.snapshot_state()
+            t1 = time.perf_counter()
+            forked = Simulator(
+                self._config,
+                register_atexit=False,
+                execution_time_predictor=self._execution_time_predictor,
+            )
+            t2 = time.perf_counter()
+            forked.restore_state(snapshot)
+            t3 = time.perf_counter()
+            print(f"Snapshot took {t1 - t0:.6f} seconds")
+            print(f"Fork init took {t2 - t1:.6f} seconds")
+            print(f"Restore took {t3 - t2:.6f} seconds")
+            return forked
+
         # t0 = time.perf_counter()
         snapshot = self.snapshot_state()
         # t1 = time.perf_counter()

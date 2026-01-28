@@ -178,7 +178,9 @@ class SelfPlayRunner:
         t0 = time.perf_counter()
         snap0 = self.env.describe_state(state)
         # run MCTS on a fork so it cannot mutate the selfplay root state
-        search_state = state.fork()
+        #TODO : Remove this bool variable later 
+        use_fork_logging = True
+        search_state = state.fork(flag =use_fork_logging)
         t1 = time.perf_counter()
         # Run MCTS search (will also write MCTS CSV logs if enabled inside mcts)
         self.mcts.search_dnn(

@@ -586,12 +586,14 @@ class VLLMV1ReplicaScheduler(BaseReplicaScheduler):
         ), "VLLM v1 scheduler snapshot version mismatch"
 
         # 1) Rebuild request registry and restore each Request’s internal state
-        rebuilt: Dict[int, Request] = {}
-        for req_id, req_state in snapshot.request_states.items():
-            req_obj = request_lookup[req_id]  # authoritative object from the sim
-            req_obj.restore_state(req_state)
-            rebuilt[int(req_id)] = req_obj
-        self._requests = rebuilt
+        # rebuilt: Dict[int, Request] = {}
+        # for req_id, req_state in snapshot.request_states.items():
+        #     req_obj = request_lookup[req_id]  # authoritative object from the sim
+        #     req_obj.restore_state(req_state)
+        #     rebuilt[int(req_id)] = req_obj
+        # self._requests = rebuilt
+
+        self._requests = {int(req_id): request_lookup[int(req_id)] for req_id in snapshot.request_states.keys()}
 
         # 2) Waiting queue
         if hasattr(self._waiting_queue, "restore_state"):

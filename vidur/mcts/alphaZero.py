@@ -505,14 +505,14 @@ def main() -> None:
             root_id=0,
             root_depth=0,
             root_player="adversary",
-            iterations=2000,
+            iterations=1000,
             feature_version=1,
         ),
     )
 
 
     ## MODEL TRAINING PARMS FOR SELF-IMPROVEMENT LOOP:
-    num_generations = 50
+    num_generations = 1
     roots_per_generation = 75
     adv_iterations_per_root = 2000
     cont_iterations_per_root = 2000
@@ -526,6 +526,8 @@ def main() -> None:
     sim_cfg = configure_simulation(cfg.sim.cli_args)
     setattr(sim_cfg.cluster_config.cache_config, "assume_infinite_kv", True)
     simulator = Simulator(sim_cfg, register_atexit=False)
+    # print("Simulator initialized.")
+    # print(simulator._execution_time_predictor.to_dict())
 
     slo_options = RequestSLOOptions(
         prefill_slos=tuple(cfg.constraints.prefill_slos),
@@ -613,33 +615,33 @@ def main() -> None:
 
     try:
 
-        runner.run_single_root(
-            SingleRootRun(
-                game_id=cfg.run.game_id,
-                root_id=cfg.run.root_id,
-                root_depth=cfg.run.root_depth,
-                root_player=cfg.run.root_player,
-                iterations=cfg.run.iterations,
-                feature_version=cfg.run.feature_version,
-            )
-        )
-
-
-        # selfImprovementPolicy(
-        #     cfg=cfg,
-        #     env=env,
-        #     mcts=mcts,
-        #     model=model,
-        #     num_generations=num_generations,
-        #     roots_per_generation=roots_per_generation,
-        #     adv_iterations_per_root=adv_iterations_per_root,
-        #     cont_iterations_per_root=cont_iterations_per_root,
-        #     max_batch_size=max_batch_size,
-        #     train_steps_per_generation=train_steps_per_generation,
-        #     ckpt_dir=ckpt_dir,
-        #     train_log_csv=train_log_csv,
-        #     device_for_features=torch.device("cpu"),
+        # runner.run_single_root(
+        #     SingleRootRun(
+        #         game_id=cfg.run.game_id,
+        #         root_id=cfg.run.root_id,
+        #         root_depth=cfg.run.root_depth,
+        #         root_player=cfg.run.root_player,
+        #         iterations=cfg.run.iterations,
+        #         feature_version=cfg.run.feature_version,
+        #     )
         # )
+
+
+        selfImprovementPolicy(
+            cfg=cfg,
+            env=env,
+            mcts=mcts,
+            model=model,
+            num_generations=num_generations,
+            roots_per_generation=roots_per_generation,
+            adv_iterations_per_root=adv_iterations_per_root,
+            cont_iterations_per_root=cont_iterations_per_root,
+            max_batch_size=max_batch_size,
+            train_steps_per_generation=train_steps_per_generation,
+            ckpt_dir=ckpt_dir,
+            train_log_csv=train_log_csv,
+            device_for_features=torch.device("cpu"),
+        )
     finally:
         mcts.close()
 
