@@ -125,9 +125,9 @@ class VidurMCTS:
         self._history_root_state: Optional[VidurMCTSState] = None
         self._history_root_node: Optional[MCTSNode] = None
 
-        # self._iter_logger = DNNMCTSIterationLogger(log_path, flush_every=logger_flush_every)
+        self._iter_logger = DNNMCTSIterationLogger(log_path, flush_every=logger_flush_every)
         # Disable per-simulation iteration logging (mcts_iter.csv)
-        self._iter_logger = DNNMCTSIterationLogger(None, flush_every=logger_flush_every)
+        # self._iter_logger = DNNMCTSIterationLogger(None, flush_every=logger_flush_every)
 
         self._root_logger = DNNMCTSRootSummaryLogger(tree_log_path, flush_every=logger_flush_every)
 
@@ -835,11 +835,16 @@ class VidurMCTS:
 
 
 
-    def search_dnn(self, dnn_model: Any, rootState: VidurMCTSState, root_player: str, iterations: int , * , game_id: int , root_id: int , root_depth: int) -> Tuple[str, List[Union[AdversaryAction, ControllerAction]]]:
+    def search_dnn(self, dnn_model: Any, rootState: VidurMCTSState, root_player: str, iterations: int , * , game_id: int , root_id: int, root_node_id_override: int , root_depth: int) -> Tuple[str, List[Union[AdversaryAction, ControllerAction]]]:
         
         self._history_root_state = rootState
-        # TODO: Code review the state cost logic for root and child from the Codex here
-        self._root = MCTSNode(player=root_player, node_id=self._next_node_id(), depth=0, sim_time=rootState.simulator._time, state_cost = self._state_cost(rootState))
+        if root_node_id_override is None:
+            root_node_id = self._next_node_id()
+        else:
+            root_node_id = int(root_node_id_override)
+            self._node_counter = max(self._node_counter, root_node_id + 1)  # so children get fresh ids
+
+        self._root = MCTSNode(player=root_player, node_id=root_node_id, depth=int(root_depth), parent=None)
         
         # Store the exact root state on the root node
         self._root.cached_sim_snapshot = rootState.simulator.snapshot_state()
@@ -961,6 +966,7 @@ class VidurMCTS:
         return next_player, action_space
 
     # CORE PHASE ENDS HERE #
+
 
     # ------------------------------------------------------------------ #
     # Logging helpers

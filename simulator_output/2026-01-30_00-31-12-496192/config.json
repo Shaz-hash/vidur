@@ -148,7 +148,7 @@
         "subsamples": null,
         "min_batch_index": null,
         "max_batch_index": null,
-        "output_dir": "simulator_output/2026-01-28_15-22-03-861557"
+        "output_dir": "simulator_output/2026-01-30_00-31-12-496192"
     },
     "slo_config": {
         "prefill_e2e_time_normalized": null,

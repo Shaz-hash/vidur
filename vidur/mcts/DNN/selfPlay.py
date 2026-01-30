@@ -22,6 +22,7 @@ import time  # add at file top if missing
 
 from ..environment import VidurMCTSEnvironment, VidurMCTSState
 from ..mctsDNN import VidurMCTS
+from .history_root import HistoryRootGenerator
 from .infer import build_model_inputs
 from .types import ModelInputs
 from .replay_write import ReplayWriter, make_root_sample
@@ -95,6 +96,7 @@ class SingleRootRun:
     root_player: str = "adversary"  # "adversary" or "controller"
     iterations: int = 5000
     feature_version: int = 1
+    root_node_id_override: int | None = None
 
 
 class SelfPlayRunner:
@@ -112,7 +114,7 @@ class SelfPlayRunner:
         self.model = model
         self.writer = writer
         self.device = device_for_features
-
+        self.history = HistoryRootGenerator(env=self.env , max_branching = self.mcts._cfg.max_branching, iter_logger = getattr(self.mcts, '_iter_logger', None))
 
 
     def _advance_to_branching_root(
@@ -172,7 +174,7 @@ class SelfPlayRunner:
 
 
 
-    def run_single_root(self, cfg: SingleRootRun, root_state: Optional[VidurMCTSState] = None) -> None:
+    def run_single_root(self, cfg: SingleRootRun, root_state: Optional[VidurMCTSState] = None  ) -> None:
         state = root_state or self.env.initial_state()
 
         t0 = time.perf_counter()
@@ -190,6 +192,7 @@ class SelfPlayRunner:
             iterations=cfg.iterations,
             game_id=cfg.game_id,
             root_id=cfg.root_id,
+            root_node_id_override=cfg.root_node_id_override,
             root_depth=cfg.root_depth,
         )
         t2 = time.perf_counter()
@@ -245,7 +248,7 @@ class SelfPlayRunner:
             f"search_dt={t2 - t1:.6f}s encode/write_dt={t3 - t2:.6f}s"
         )
 
-    ## TODO: ENSURE THAT MINIMAX IS RESET AGAIN & THE NEXT NODE IS ALWAYS THE NODE WHERE NN CAN BE CALLED AGAIN & WHY ARE THE ROOT ITEREATIONS LOGS CREATED AGAIN...
+    # TODO : seems like start_root_depth is unncessary 
     def run_n_roots(
         self,
         *,
@@ -258,6 +261,7 @@ class SelfPlayRunner:
         start_root_id: int = 0,
         start_root_depth: int = 0,
         start_player: str = "adversary",
+        history_nontrivial_hops: int = 0,
         feature_version: int = 1,
         initial_state: Optional[VidurMCTSState] = None,
     ) -> VidurMCTSState:
@@ -267,8 +271,27 @@ class SelfPlayRunner:
         state = initial_state or self.env.initial_state()
         player = start_player
         depth = int(start_root_depth)
+        next_log_node_id = int(getattr(self.mcts, "_node_counter", 0))
+        last_log_node_id: int | None = None
+
+
+        if int(history_nontrivial_hops) > 0:
+            state, player, depth, next_log_node_id, last_log_node_id = self.history.generate_history_root(
+                state,
+                player,
+                depth,
+                nontrivial_hops=int(history_nontrivial_hops),
+                game_id=int(game_id),
+                root_id_for_logs=int(start_root_id),  # history rows attach to the first root
+                log_history=True,
+                log_node_id_start=next_log_node_id,
+                log_parent_id_start=last_log_node_id,
+            )
+            # IMPORTANT: prevent MCTS from reusing history node ids
+            self.mcts._node_counter = int(next_log_node_id)
 
         for k in range(int(num_roots)):
+            root_node_id_override = int(last_log_node_id) if (k == 0 and last_log_node_id is not None) else None
             root_id = start_root_id + k
             # root_depth = start_root_depth + k
 
@@ -297,6 +320,7 @@ class SelfPlayRunner:
                     root_player=player,
                     iterations=iters,
                     feature_version=feature_version,
+                    root_node_id_override=root_node_id_override,
                 ),
                 root_state=state,
             )

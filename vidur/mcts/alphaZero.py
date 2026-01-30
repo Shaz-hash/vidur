@@ -2,6 +2,8 @@
 
 """
 alphaZero.py
+run command :
+python3 -m vidur.mcts.alphaZero
 
 Single entrypoint that owns configuration for:
 - Vidur simulator config (CLI args passed to SimulationConfig)
@@ -154,6 +156,7 @@ def selfImprovementPolicy(
     # iterations_per_root: int,
     adv_iterations_per_root: int,
     cont_iterations_per_root: int,
+    history_nontrivial_hops: int = 0,
     max_batch_size: int = 72,
     train_steps_per_generation: int,
     ckpt_dir: Path,
@@ -231,6 +234,7 @@ def selfImprovementPolicy(
             start_root_id=0,
             start_root_depth=0,
             start_player="adversary",
+            history_nontrivial_hops=history_nontrivial_hops,
             feature_version=cfg.run.feature_version,
         )
         gen_writer.close()
@@ -327,10 +331,6 @@ def selfImprovementPolicy(
                 "resume_ckpt": str(resume_ckpt) if resume_ckpt else "",
             },
         )
-
-
-
-
 
 
 
@@ -513,7 +513,8 @@ def main() -> None:
 
     ## MODEL TRAINING PARMS FOR SELF-IMPROVEMENT LOOP:
     num_generations = 1
-    roots_per_generation = 75
+    history_nontrivial_hops = 5
+    roots_per_generation = 1
     adv_iterations_per_root = 2000
     cont_iterations_per_root = 2000
     train_steps_per_generation = 200   
@@ -636,6 +637,7 @@ def main() -> None:
             roots_per_generation=roots_per_generation,
             adv_iterations_per_root=adv_iterations_per_root,
             cont_iterations_per_root=cont_iterations_per_root,
+            history_nontrivial_hops=history_nontrivial_hops,
             max_batch_size=max_batch_size,
             train_steps_per_generation=train_steps_per_generation,
             ckpt_dir=ckpt_dir,

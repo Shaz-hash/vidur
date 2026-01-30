@@ -933,6 +933,7 @@ def main() -> None:
     total_adv_actions = 0
     try:
         for tr in traces:
+            #print(f"\n--- Running trace: game={tr[0].game_id} root={tr[0].root_id} leaf={tr[-1].node_id} ---")
             total_adv_actions += run_trace(tr, prefill_profile=prefill_profile)
     except TestFailure as e:
         print("\n❌ MCTS_DNN adversary log test failed:\n")
