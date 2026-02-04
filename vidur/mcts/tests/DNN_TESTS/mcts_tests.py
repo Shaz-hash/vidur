@@ -7,6 +7,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+import glob
 import os
 import re
 import sys
@@ -28,6 +29,15 @@ INTERVAL_EPS = 1e-9
 DECODE_SLO = 0.05  # 50ms
 BUDGET_STEP = 512  # controller interval
 MAX_REQUESTS_NORM = 200  # not used here, but kept for future
+
+## For threshold prior tests & verification 
+CONTROLLER_MIN_PRIOR_THRESHOLD = 0.01
+ADVERSARY_MIN_PRIOR_THRESHOLD = 0.1
+
+PRIOR_SUM_TOL = 1e-6
+PRIOR_FLOOR_TOL = 1e-6
+PRIOR_POS_EPS = 1e-12  # treat <= this as "zero / invalid"
+# -----------------------------
 
 @dataclass
 class RequestState:
@@ -75,6 +85,49 @@ def _resolve_existing_path(candidates: List[str]) -> str:
             return p
     raise FileNotFoundError(f"None of these paths exist: {candidates}")
 
+def _resolve_mcts_iter_paths() -> List[str]:
+    # If user passes args, treat them as glob patterns/paths.
+    args = sys.argv[1:]
+    paths: List[str] = []
+
+    if args:
+        for a in args:
+            # allow either a literal file or a glob like ".../mcts_iter_p*.csv"
+            matches = glob.glob(a)
+            if matches:
+                paths.extend(matches)
+            elif os.path.exists(a):
+                paths.append(a)
+        paths = sorted(set(paths))
+        if not paths:
+            raise FileNotFoundError(f"No files matched args: {args}")
+        return paths
+
+    # Default: pick up per-gen/per-worker logs too.
+    candidates = [
+        "simulator_output/mcts_dnn_logs/mcts_iter*.csv",
+        "simulator_output/mcts_dnn_logs/gen_*/mcts_iter*.csv",
+        "vidur/simulator_output/mcts_dnn_logs/mcts_iter*.csv",
+        "vidur/simulator_output/mcts_dnn_logs/gen_*/mcts_iter*.csv",
+    ]
+    for pat in candidates:
+        paths.extend(glob.glob(pat))
+
+    paths = sorted(set(paths))
+    if paths:
+        return paths
+
+    # Fallback: old single-file behavior
+    return [
+        _resolve_existing_path(
+            [
+                "vidur/simulator_output/mcts_dnn_logs/mcts_iter.csv",
+                "simulator_output/mcts_dnn_logs/mcts_iter.csv",
+            ]
+        )
+    ]
+
+
 
 def _safe_int(x: object, default: int = 0) -> int:
     try:
@@ -120,6 +173,27 @@ def _parse_int_list(cell: str) -> List[int]:
     if isinstance(val, list):
         return [_safe_int(x, default=0) for x in val]
     return []
+
+
+
+def _parse_float_list_json(s: str) -> List[float]:
+    s = (s or "").strip()
+    if not s or s == "[]":
+        return []
+    try:
+        arr = json.loads(s)
+    except Exception:
+        return []
+    if not isinstance(arr, list):
+        return []
+    out: List[float] = []
+    for x in arr:
+        try:
+            out.append(float(x))
+        except Exception:
+            out.append(float("nan"))
+    return out
+
 
 
 def _parse_deadline_map(cell: str) -> Dict[int, float]:
@@ -208,6 +282,12 @@ class Row:
 
     action_index: int
     action_repr: str
+
+    phase: str
+    nn_called: bool
+    model_prior_json: str
+    normalized_prior_json: str
+
 
     state_waiting_ids: List[int]
     state_completed_ids: List[int]
@@ -559,10 +639,12 @@ def test_controller_allocations_respect_remaining(
                 )
 
 def test_controller_time_delta(
+    ctx: TraceContext,
     row: Row,
     prev_row: Optional[Row],
     prefill_profile: Dict[int, float],
     prefill_total: int,
+    decode_total: int,
     trace_id: str,
 ) -> None:
     # Test 6
@@ -631,9 +713,14 @@ def test_controller_time_delta(
     
     else:
         # decode-only: just bound it by prefill_time(1024) as you requested
-        cap = prefill_profile.get(1024)
-        if cap is not None and dt - DEADLINE_TOL > cap:
-            _fail("test_controller_time_delta", f"decode-only dt={dt:.9f} > prefill_time(1024)={cap:.9f}", row, trace_id)
+        # NEW : snap to next adversary second as the bound
+        if decode_total > 0 and ctx.last_adv_batch_time is not None:
+            target = ctx.last_adv_batch_time + 1.0
+            if abs(row.sim_time - target) > 1e-3:
+                _fail("test_controller_time_delta", f"decode-only snap mismatch: sim_time={row.sim_time:.6f} target={target:.6f}", row, trace_id)
+        # cap = prefill_profile.get(1024)
+        # if cap is not None and dt - DEADLINE_TOL > cap:
+        #     _fail("test_controller_time_delta", f"decode-only dt={dt:.9f} > prefill_time(1024)={cap:.9f}", row, trace_id)
 
 
 def _apply_controller_and_update_objective(
@@ -641,6 +728,7 @@ def _apply_controller_and_update_objective(
     row: Row,
     prefill_alloc: Dict[int, int],
     decode_alloc: Dict[int, int],
+    prev_row: Optional[Row] = None, 
 ) -> None:
     sim_time = float(row.sim_time)
 
@@ -671,6 +759,20 @@ def _apply_controller_and_update_objective(
 
         if is_prefill_complete:
             rs.prefill_finalized = True
+
+    # To handle the case where we fast forward to the next adversary second which happens when there is no prefill work:
+    snap_decode_deadlines = False
+    if prev_row is not None and (not prefill_alloc) and decode_alloc and ctx.last_adv_batch_time is not None:
+        target = float(ctx.last_adv_batch_time) + 1.0
+        if (float(prev_row.sim_time) + INTERVAL_EPS < target) and (abs(sim_time - target) <= DEADLINE_TOL):
+            snap_decode_deadlines = True
+
+    # before computing token_late:
+    if snap_decode_deadlines:
+        for rs in ctx.requests.values():
+            if rs.remaining_prefill == 0 and rs.prefill_completed_at is not None and (not rs.completed):
+                rs.decode_next_deadline = sim_time + float(rs.decode_slo)
+
 
     # --- Decode lateness: per new decode token (deadline = prefill_completed_at + slo, then next = sim_time + slo) ---
     for rs in ctx.requests.values():
@@ -722,6 +824,69 @@ def test_objective_matches_log(ctx: TraceContext, row: Row, trace_id: str) -> No
         _fail("test_objective_matches_log", f"objective_cost mismatch: expected {exp_obj:.9f}, got {got_obj:.9f}", row, trace_id)
 
 
+def test_min_prior_threshold_and_sums(row: Row, trace_id: str) -> None:
+    # Ignore history rows
+    if (row.phase or "").startswith("history-"):
+        return
+
+    # Only test where priors are actually logged (NN called on multi-child nodes)
+    if not row.nn_called:
+        return
+
+    model_prior = _parse_float_list_json(row.model_prior_json)
+    norm_prior = _parse_float_list_json(row.normalized_prior_json)
+
+    # forced/trivial nodes often log "[]"
+    if not model_prior or not norm_prior:
+        return
+
+    if len(model_prior) != len(norm_prior):
+        _fail(
+            "test_min_prior_threshold_and_sums",
+            f"prior length mismatch: model={len(model_prior)} norm={len(norm_prior)}",
+            row,
+            trace_id,
+        )
+
+    sm = float(sum(model_prior))
+    sn = float(sum(norm_prior))
+    if abs(sm - 1.0) > PRIOR_SUM_TOL:
+        _fail("test_min_prior_threshold_and_sums", f"model_prior sum={sm:.9f} != 1", row, trace_id)
+    if abs(sn - 1.0) > PRIOR_SUM_TOL:
+        _fail("test_min_prior_threshold_and_sums", f"normalized_prior sum={sn:.9f} != 1", row, trace_id)
+
+    for name, arr in (("model_prior_json", model_prior), ("normalized_prior_json", norm_prior)):
+        if any((not math.isfinite(x)) for x in arr):
+            _fail("test_min_prior_threshold_and_sums", f"{name} contains non-finite values", row, trace_id)
+        if min(arr) < -PRIOR_POS_EPS:
+            _fail("test_min_prior_threshold_and_sums", f"{name} has negative prob min={min(arr):.9e}", row, trace_id)
+
+    if row.player_to_act == "controller":
+        mp = CONTROLLER_MIN_PRIOR_THRESHOLD
+    elif row.player_to_act == "adversary":
+        mp = ADVERSARY_MIN_PRIOR_THRESHOLD
+    else:
+        return
+
+    # In your logging, normalized_prior_json is nonzero only on valid indices.
+    positive = [p for p in norm_prior if p > PRIOR_POS_EPS]
+    if not positive:
+        _fail("test_min_prior_threshold_and_sums", "normalized_prior has no positive entries", row, trace_id)
+
+    n_valid = len(positive)
+    # If infeasible (mp*n_valid >= 1), code falls back to uniform -> skip strict floor check
+    if mp * float(n_valid) < 1.0 - 1e-9:
+        min_pos = min(positive)
+        if min_pos < mp - PRIOR_FLOOR_TOL:
+            _fail(
+                "test_min_prior_threshold_and_sums",
+                f"min normalized_prior among valid is {min_pos:.6f} < floor {mp:.6f} (n_valid={n_valid})",
+                row,
+                trace_id,
+            )
+
+
+
 # -----------------------------
 # Trace running
 # -----------------------------
@@ -739,6 +904,9 @@ def run_trace(trace_rows: List[Row], *, prefill_profile: Dict[int, float]) -> in
     prev_row = None
     for row in trace_rows:
         test_player_turn_consistency(ctx, row, trace_id)
+
+        test_min_prior_threshold_and_sums(row, trace_id)
+
 
         ids_seen = set(row.state_waiting_ids) | set(row.state_completed_ids)
 
@@ -825,13 +993,13 @@ def run_trace(trace_rows: List[Row], *, prefill_profile: Dict[int, float]) -> in
                 )
 
             test_controller_allocations_respect_remaining(ctx, row, prefill_alloc, decode_alloc, token_alloc, trace_id)
-            test_controller_time_delta(row, prev_row, prefill_profile, prefill_total, trace_id)
+            test_controller_time_delta(ctx, row, prev_row, prefill_profile, prefill_total, decode_total, trace_id)
 
             # Test 7: apply allocations + update lateness/violations/objective + compare with log
-            _apply_controller_and_update_objective(ctx, row, prefill_alloc, decode_alloc)
+            _apply_controller_and_update_objective(ctx, row, prefill_alloc, decode_alloc,prev_row)
             test_objective_matches_log(ctx, row, trace_id)
 
-            prev_row = row
+        prev_row = row
     
 
     return adv_actions_checked
@@ -865,6 +1033,10 @@ def load_rows(mcts_iter_path: str) -> List[Row]:
                     player_to_act=(raw.get("player_to_act_in_this_node") or "").strip(),
                     action_index=_safe_int(raw.get("action_index"), -1),
                     action_repr=(raw.get("action_repr") or ""),
+                    phase=(raw.get("phase") or "").strip(),
+                    nn_called=(str(raw.get("nn_called") or "").strip().lower() == "true"),
+                    model_prior_json=(raw.get("model_prior_json") or ""),
+                    normalized_prior_json=(raw.get("normalized_prior_json") or ""),
                     state_waiting_ids=_parse_int_list(raw.get("state_waiting_ids") or ""),
                     state_completed_ids=_parse_int_list(raw.get("state_completed_request_ids") or ""),
                     adv_deadlines_by_id=_parse_deadline_map(
@@ -910,12 +1082,7 @@ def build_leaf_traces(rows: List[Row]) -> List[List[Row]]:
 
 
 def main() -> None:
-    mcts_iter_path = _resolve_existing_path(
-        [
-            "vidur/simulator_output/mcts_dnn_logs/mcts_iter.csv",
-            "simulator_output/mcts_dnn_logs/mcts_iter.csv",
-        ]
-    )
+    
     prefill_profile_path = _resolve_existing_path(
         [
             "vidur/simulator_output/prefill_profile.csv",
@@ -923,28 +1090,36 @@ def main() -> None:
         ]
     )
 
+    iter_paths = _resolve_mcts_iter_paths()
+
     prefill_profile = load_prefill_profile(prefill_profile_path)
-    rows = load_rows(mcts_iter_path)
-    traces = build_leaf_traces(rows)
 
-    print(f"Loaded {len(rows)} rows from {mcts_iter_path}")
-    print(f"Built {len(traces)} leaf traces")
+    grand_traces = 0
+    grand_adv = 0
 
-    total_adv_actions = 0
     try:
-        for tr in traces:
-            #print(f"\n--- Running trace: game={tr[0].game_id} root={tr[0].root_id} leaf={tr[-1].node_id} ---")
-            total_adv_actions += run_trace(tr, prefill_profile=prefill_profile)
+        for mcts_iter_path in iter_paths:
+            rows = load_rows(mcts_iter_path)
+            traces = build_leaf_traces(rows)
+
+            print(f"\n=== Testing {mcts_iter_path} ===")
+            print(f"Loaded {len(rows)} rows")
+            print(f"Built {len(traces)} leaf traces")
+
+            total_adv_actions = 0
+            for tr in traces:
+                total_adv_actions += run_trace(tr, prefill_profile=prefill_profile)
+
+            print(f"✅ Passed {mcts_iter_path}: traces={len(traces)} adv_actions={total_adv_actions}")
+            grand_traces += len(traces)
+            grand_adv += total_adv_actions
+
     except TestFailure as e:
-        print("\n❌ MCTS_DNN adversary log test failed:\n")
+        print("\n❌ MCTS_DNN log test failed:\n")
         print(str(e))
         sys.exit(1)
 
-    print(
-        f"\n✅ All adversary log tests passed. traces={len(traces)} adversary_actions_checked={total_adv_actions}"
-    )
-
-
+    print(f"\n✅ All files passed. files={len(iter_paths)} traces={grand_traces} adv_actions_checked={grand_adv}")
 if __name__ == "__main__":
     main()
 

@@ -441,25 +441,25 @@ def build_model_inputs(
     action_mask = build_action_mask(state, player, device, action_mask_fn=action_mask_fn)
 
 
-    if debug:
-        _infer_debug_dump(
-            player=player,
-            sim_time=sim_time,
-            num_prefill=int(num_prefill),
-            num_decode=int(num_decode),
-            missed_prefill=int(missed_prefill),
-            total_active=int(total_active),
-            prefill_rate=float(prefill_rate),
-            backlog_over_rate=float(backlog_over_rate),
-            prefill_over_200=float(prefill_over_200),
-            decode_over_200=float(decode_over_200),
-            decode_violated_over_200=float(decode_violated_over_200),
-            total_violated_over_200=float(total_violated_over_200),
-            total_remaining_prefill_tokens=int(total_remaining_prefill_tokens),
-            remaining_prefill_norm=float(remaining_prefill_norm),
-            req_debug_rows=req_debug_rows,
-            out_path=debug_out_path,
-        )
+    # if debug:
+    #     _infer_debug_dump(
+    #         player=player,
+    #         sim_time=sim_time,
+    #         num_prefill=int(num_prefill),
+    #         num_decode=int(num_decode),
+    #         missed_prefill=int(missed_prefill),
+    #         total_active=int(total_active),
+    #         prefill_rate=float(prefill_rate),
+    #         backlog_over_rate=float(backlog_over_rate),
+    #         prefill_over_200=float(prefill_over_200),
+    #         decode_over_200=float(decode_over_200),
+    #         decode_violated_over_200=float(decode_violated_over_200),
+    #         total_violated_over_200=float(total_violated_over_200),
+    #         total_remaining_prefill_tokens=int(total_remaining_prefill_tokens),
+    #         remaining_prefill_norm=float(remaining_prefill_norm),
+    #         req_debug_rows=req_debug_rows,
+    #         out_path=debug_out_path,
+    #     )
 
 
     return ModelInputs(

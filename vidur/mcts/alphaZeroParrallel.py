@@ -1,9 +1,9 @@
 # (بِسْمِ ٱللَّهِ ٱلرَّحْمَٰنِ ٱلرَّحِيْمِ)
 
 """
-alphaZero.py
+alphaZeroParrallel.py
 run command :
-python3 -m vidur.mcts.alphaZero
+python3 -m vidur.mcts.alphaZeroParrallel
 
 Single entrypoint that owns configuration for:
 - Vidur simulator config (CLI args passed to SimulationConfig)
@@ -19,6 +19,8 @@ Training hookup comes next.
 
 from __future__ import annotations
 
+import multiprocessing as mp
+import os 
 
 import csv
 import math
@@ -145,18 +147,158 @@ def _maybe_resume_best(
     return None
 
 
+def _selfplay_worker_main(
+    worker_id: int,
+    task_q: "mp.Queue",
+    result_q: "mp.Queue",
+    cfg: "AlphaZeroConfig",
+    adv_iterations_per_root: int,
+    cont_iterations_per_root: int,
+    max_batch_size: int,
+    history_nontrivial_hops: int,
+) -> None:
+    # Important: avoid CPU oversubscription when you run many processes
+    try:
+        import torch
+        torch.set_num_threads(1)
+        torch.set_num_interop_threads(1)
+    except Exception:
+        pass
+
+    # Optional: pin to core (Linux)
+    # try:
+    #     os.sched_setaffinity(0, {worker_id})
+    # except Exception:
+    #     pass
+
+    # Build simulator/env ONCE per process (big speed win vs rebuilding every gen)
+    sim_cfg = configure_simulation(cfg.sim.cli_args)
+    setattr(sim_cfg.cluster_config.cache_config, "assume_infinite_kv", True)
+    simulator = Simulator(sim_cfg, register_atexit=False)
+
+    slo_options = RequestSLOOptions(
+        prefill_slos=tuple(cfg.constraints.prefill_slos),
+        decode_slos=tuple(cfg.constraints.decode_slos),
+    )
+    constraints = MCTSConstraintConfig(
+        maximum_qps=cfg.constraints.maximum_qps,
+        min_request_tokens=cfg.constraints.min_request_tokens,
+        max_request_tokens=cfg.constraints.max_request_tokens,
+        interval_request_size=cfg.constraints.interval_request_size,
+        request_slo_options=slo_options,
+        prefill_slowdown=cfg.constraints.prefill_slowdown,
+        prefill_profile_path=cfg.constraints.prefill_profile_path,
+    )
+    explore_cfg = MCTSExploreConfig(
+        simulation_depth=cfg.explore.simulation_depth,
+        simulation_random_tries=cfg.explore.simulation_random_tries,
+        exploration_constant=cfg.explore.exploration_constant,
+        max_branching=cfg.explore.max_branching,
+        controller_budget_combs=cfg.explore.controller_budget_combs,
+    )
+    setattr(explore_cfg, "controller_min_prior_threshold", float(cfg.explore.controller_min_prior_threshold))
+    setattr(explore_cfg, "adversary_min_prior_threshold", float(cfg.explore.adversary_min_prior_threshold))
+
+    env = VidurMCTSEnvironment(base_simulator=simulator, constraints=constraints, explore_cfg=explore_cfg)
+
+    # Build model once per process; reload weights each generation
+    model = AlphaZeroModel(
+        num_actions_controller=cfg.model.num_actions_controller,
+        num_actions_adversary=cfg.model.num_actions_adversary,
+    ).to(torch.device("cpu"))
+    model.eval()
+
+    while True:
+        task = task_q.get()
+        if task is None:
+            break
+
+        # Unpack task
+        gen = int(task["gen"])
+        out_dir = Path(task["out_dir"])
+        weights_path = Path(task["weights_path"])
+        game_id = int(task["game_id"])
+        start_root_id = int(task["start_root_id"])
+        history_seed = int(task["history_seed"])
+        roots = int(task["num_roots"])
+
+        # Load frozen weights for this generation
+        ckpt = torch.load(weights_path, map_location="cpu")
+        model.load_state_dict(ckpt["model_state"])
+        model.eval()
+
+        # Per-worker writer
+        writer = ReplayWriter(ReplayWriterConfig(out_dir=out_dir, shard_size=cfg.dataset.shard_size))
+
+        # IMPORTANT: per-worker MCTS instance (don’t share across processes)
+        # Also IMPORTANT: logs must be unique per worker, or disable by passing None.
+        # If you want logs:
+        #   iter_log = out_dir / "mcts_iter.csv"
+        #   root_log = out_dir / "mcts_root.csv"
+        # Else (faster, no contention):
+        # iter_log = None
+        # root_log = None
+
+        # Put per-worker logs in the global logs dir (not inside dataset dir)
+        logs_base = Path(cfg.logging.mcts_iter_log).parent  # simulator_output/mcts_dnn_logs
+        logs_dir = logs_base / f"gen_{gen:06d}"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+
+        iter_log = logs_dir / f"mcts_iter_p{worker_id:02d}.csv"
+        root_log = logs_dir / f"mcts_root_p{worker_id:02d}.csv"
+
+
+
+        mcts = VidurMCTS(env=env, explore_cfg=explore_cfg, log_path=iter_log, tree_log_path=root_log, logger_flush_every=cfg.logging.flush_every)
+        runner = SelfPlayRunner(env=env, mcts=mcts, model=model, writer=writer, device_for_features=torch.device("cpu"))
+
+        # Make history different per worker/gen by changing game_id and/or seed.
+        # Right now run_n_roots only takes history_nontrivial_hops, so “seed” comes from game_id/root_id_for_logs.
+        # If you want explicit control, add a `history_seed` arg to run_n_roots and forward it to HistoryRootGenerator.
+        runner.run_n_roots(
+            game_id=game_id,
+            num_roots=roots,
+            adv_iterations_per_root=adv_iterations_per_root,
+            cont_iterations_per_root=cont_iterations_per_root,
+            max_batch_size=max_batch_size,
+            start_root_id=start_root_id,
+            start_root_depth=0,
+            start_player="adversary",
+            history_nontrivial_hops=history_nontrivial_hops,
+            feature_version=cfg.run.feature_version,
+        )
+
+        writer.close()
+        mcts.close()
+
+        result_q.put(
+            {
+                "worker_id": worker_id,
+                "gen": gen,
+                "out_dir": str(out_dir),
+            }
+        )
+
+
+
+
+
+
+
+
+
+
 def selfImprovementPolicy(
     *,
     cfg: "AlphaZeroConfig",
-    env: VidurMCTSEnvironment,
-    mcts: VidurMCTS,
     model: AlphaZeroModel,
+    num_selfPlay_workers: int = 1,
     num_generations: int,
     roots_per_generation: int,
     # iterations_per_root: int,
     adv_iterations_per_root: int,
     cont_iterations_per_root: int,
-    history_nontrivial_hops: int = 0,
+    history_nontrivial_hops: int | Sequence[int] = 0,
     max_batch_size: int = 72,
     train_steps_per_generation: int,
     ckpt_dir: Path,
@@ -204,6 +346,41 @@ def selfImprovementPolicy(
             "resume_ckpt": str(resume_ckpt) if resume_ckpt else "",
         },
     )
+    
+    ctx = mp.get_context("spawn")
+    task_q = ctx.Queue()
+    result_q = ctx.Queue()
+
+    def _hops_for_worker(wid: int) -> int:
+        if isinstance(history_nontrivial_hops, int):
+            return int(history_nontrivial_hops)
+        hops_list = list(history_nontrivial_hops)
+        if len(hops_list) != int(num_selfPlay_workers):
+            raise ValueError(
+                f"history_nontrivial_hops must have len == num_selfPlay_workers "
+                f"({len(hops_list)} != {int(num_selfPlay_workers)})"
+            )
+        return int(hops_list[wid])
+
+
+    workers = []
+    for wid in range(int(num_selfPlay_workers)):
+        p = ctx.Process(
+            target=_selfplay_worker_main,
+            args=(
+                wid,
+                task_q,
+                result_q,
+                cfg,
+                adv_iterations_per_root,
+                cont_iterations_per_root,
+                max_batch_size,
+                _hops_for_worker(wid),
+            ),
+        )
+        p.start()
+        workers.append(p)
+
 
     dataset_base = Path(cfg.dataset.out_dir)
     gen0 = _next_generation_index(dataset_base)
@@ -212,66 +389,67 @@ def selfImprovementPolicy(
         gen = gen0 + j
         gen_dataset_dir = dataset_base / f"gen_{gen:06d}"
 
-        gen_writer = ReplayWriter(
-            ReplayWriterConfig(out_dir=gen_dataset_dir, shard_size=cfg.dataset.shard_size)
-        )
-        runner = SelfPlayRunner(
-            env=env,
-            mcts=mcts,
-            model=trainer.model,   # always use the current weights
-            writer=gen_writer,
-            device_for_features=device_for_features,
-        )
+        # 0) freeze current weights for self-play workers
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        weights_path = ckpt_dir / f"selfplay_weights_gen_{gen:06d}.pt"
+        state = {k: v.detach().cpu() for k, v in trainer.model.state_dict().items()}
+        torch.save({"model_state": state}, weights_path)
 
-        # 1) self-play: generate roots_per_generation samples
-        trainer.model.eval()
-        runner.run_n_roots(
-            game_id=cfg.run.game_id + gen,
-            num_roots=roots_per_generation,
-            adv_iterations_per_root=adv_iterations_per_root,
-            cont_iterations_per_root=cont_iterations_per_root,
-            max_batch_size=max_batch_size,
-            start_root_id=0,
-            start_root_depth=0,
-            start_player="adversary",
-            history_nontrivial_hops=history_nontrivial_hops,
-            feature_version=cfg.run.feature_version,
-        )
-        gen_writer.close()
+        # 1) dispatch tasks
+        gen_dataset_dir.mkdir(parents=True, exist_ok=True)
+
+        # split roots across workers
+        per = int(math.ceil(roots_per_generation / float(num_selfPlay_workers)))
+        tasks_sent = 0
+        for wid in range(int(num_selfPlay_workers)):
+            start = wid * per
+            end = min(roots_per_generation, (wid + 1) * per)
+            n_roots = max(0, end - start)
+            if n_roots == 0:
+                continue
+
+            out_dir = gen_dataset_dir / f"proc_{wid:02d}"
+            # ensure unique game_id per worker so history randomness differs
+            worker_game_id = int(cfg.run.game_id) + gen * 1000 + wid
+            # ensure root_id ranges don’t collide (optional, but helps debugging)
+            worker_start_root_id = start
+
+            task_q.put(
+                {
+                    "gen": gen,
+                    "out_dir": str(out_dir),
+                    "weights_path": str(weights_path),
+                    "game_id": worker_game_id,
+                    "start_root_id": worker_start_root_id,
+                    "history_seed": (gen * 100000 + wid),
+                    "num_roots": n_roots,
+                }
+            )
+            tasks_sent += 1
+
+        # 2) wait for all worker results
+        results = []
+        for _ in range(tasks_sent):
+            results.append(result_q.get())
+
 
         # 2) load ALL samples from this generation (train on exactly these)
         samples = []
-        for entry in load_manifest(gen_dataset_dir / "manifest.jsonl"):
-            samples.extend(torch.load(entry.path, map_location="cpu"))
+        for proc_dir in sorted(gen_dataset_dir.glob("proc_*")):
+            manifest = proc_dir / "manifest.jsonl"
+            if not manifest.exists():
+                continue
+            for entry in load_manifest(manifest):
+                samples.extend(torch.load(entry.path, map_location="cpu"))
+
+        ## -- Safety check for samples :
         if not samples:
             raise RuntimeError(f"No samples written for gen={gen} in {gen_dataset_dir}")
+
 
         num_controller = sum(1 for s in samples if s.get("player") == "controller")
         num_adversary = sum(1 for s in samples if s.get("player") == "adversary")
 
-        eval_batch = collate_mixed_samples(samples, device=trainer.device)
-
-        # 3) train multiple optimizer steps on this batch (few samples => multiple epochs)
-        # for _ in range(int(train_steps_per_generation)):
-        #     train_metrics = trainer.train_step(batch)
-        #     _append_train_log_row(
-        #         train_log_csv,
-        #         {
-        #             "time": time.time(),
-        #             "event": "train",
-        #             "gen": gen,
-        #             "trainer_step": int(trainer.step),
-        #             "dataset_dir": str(gen_dataset_dir),
-        #             "num_samples": int(len(samples)),
-        #             "num_controller": int(num_controller),
-        #             "num_adversary": int(num_adversary),
-        #             **train_metrics,
-        #             "saved_best": "",
-        #             "ckpt_path": "",
-        #             "best_path": str(best_path),
-        #             "resume_ckpt": str(resume_ckpt) if resume_ckpt else "",
-        #         },
-        #     )
 
         # Eval on full latest-generation dataset (stable metric)
         eval_batch = collate_mixed_samples(samples, device=trainer.device)
@@ -332,6 +510,12 @@ def selfImprovementPolicy(
             },
         )
 
+    for _ in workers:
+        task_q.put(None)
+    for p in workers:
+        p.join()
+        if p.exitcode != 0:
+            raise RuntimeError(f"selfplay worker died: pid={p.pid} exitcode={p.exitcode}")
 
 
 # -----------------------------
@@ -384,8 +568,6 @@ class MCTSExploreGroup:
     controller_budget_combs: int = 10
     controller_min_prior_threshold : float = 0.01
     adversary_min_prior_threshold : float = 0.1
-
-
 
 
 @dataclass(frozen=True)
@@ -489,8 +671,6 @@ def main() -> None:
             exploration_constant=1.7,
             max_branching=10,
             controller_budget_combs=10,
-            controller_min_prior_threshold=0.01,
-            adversary_min_prior_threshold=0.1,
         ),
         model=ModelGroup(
             num_actions_controller=24,
@@ -518,56 +698,16 @@ def main() -> None:
 
 
     ## MODEL TRAINING PARMS FOR SELF-IMPROVEMENT LOOP:
-    num_generations = 1
-    history_nontrivial_hops = 0
-    roots_per_generation = 1
+    num_selfPlay_workers = 8
+    num_generations = 100
+    history_nontrivial_hops = [0, 5 , 10 , 15 , 20, 25, 30, 35]  # per worker
+    roots_per_generation = 400
     adv_iterations_per_root = 2000
     cont_iterations_per_root = 2000
-    train_steps_per_generation = 200   
+    train_steps_per_generation = 600   
     max_batch_size = 256
     train_log_csv = Path("simulator_output/mcts_dnn_logs/train_metrics.csv")
     ckpt_dir = Path("simulator_output/mcts_dnn_checkpoints")
-
-
-    # ---- Build simulator/env/mcts/model/writer ----
-    sim_cfg = configure_simulation(cfg.sim.cli_args)
-    setattr(sim_cfg.cluster_config.cache_config, "assume_infinite_kv", True)
-    simulator = Simulator(sim_cfg, register_atexit=False)
-    # print("Simulator initialized.")
-    # print(simulator._execution_time_predictor.to_dict())
-
-    slo_options = RequestSLOOptions(
-        prefill_slos=tuple(cfg.constraints.prefill_slos),
-        decode_slos=tuple(cfg.constraints.decode_slos),
-    )
-
-    constraints = MCTSConstraintConfig(
-        maximum_qps=cfg.constraints.maximum_qps,
-        min_request_tokens=cfg.constraints.min_request_tokens,
-        max_request_tokens=cfg.constraints.max_request_tokens,
-        interval_request_size=cfg.constraints.interval_request_size,
-        request_slo_options=slo_options,
-        prefill_slowdown=cfg.constraints.prefill_slowdown,
-        prefill_profile_path=cfg.constraints.prefill_profile_path,
-    )
-
-    explore_cfg = MCTSExploreConfig(
-        simulation_depth=cfg.explore.simulation_depth,
-        simulation_random_tries=cfg.explore.simulation_random_tries,
-        exploration_constant=cfg.explore.exploration_constant,
-        max_branching=cfg.explore.max_branching,
-        controller_budget_combs=cfg.explore.controller_budget_combs,
-    )
-
-    setattr(explore_cfg, "controller_min_prior_threshold", float(cfg.explore.controller_min_prior_threshold))
-    setattr(explore_cfg, "adversary_min_prior_threshold", float(cfg.explore.adversary_min_prior_threshold))
-
-
-    env = VidurMCTSEnvironment(
-        base_simulator=simulator,
-        constraints=constraints,
-        explore_cfg=explore_cfg,
-    )
 
     model = AlphaZeroModel(
         num_actions_controller=cfg.model.num_actions_controller,
@@ -575,54 +715,9 @@ def main() -> None:
     ).to(torch.device(cfg.model.device))
     model.eval()
 
-    writer = ReplayWriter(
-        ReplayWriterConfig(out_dir=Path(cfg.dataset.out_dir), shard_size=cfg.dataset.shard_size)
-    )
-
-    mcts = VidurMCTS(
-        env=env,
-        explore_cfg=explore_cfg,
-        log_path=cfg.logging.mcts_iter_log,
-        tree_log_path=cfg.logging.mcts_root_log,
-        logger_flush_every=cfg.logging.flush_every,
-    )
-
-    runner = SelfPlayRunner(
-        env=env,
-        mcts=mcts,
-        model=model,
-        writer=writer,
-        device_for_features=torch.device("cpu"),
-    )
 
 
     ## 
-
-    # try:
-        # runner.run_single_root(
-        #     SingleRootRun(
-        #         game_id=cfg.run.game_id,
-        #         root_id=cfg.run.root_id,
-        #         root_depth=cfg.run.root_depth,
-        #         root_player=cfg.run.root_player,
-        #         iterations=cfg.run.iterations,
-        #         feature_version=cfg.run.feature_version,
-        #     )
-        # )
-
-        # runner.run_n_roots(
-        #     game_id=cfg.run.game_id,
-        #     num_roots=10,                 # how many root positions to collect
-        #     iterations_per_root=cfg.run.iterations,     # MCTS sims per root
-        #     start_root_id=cfg.run.root_id,
-        #     start_root_depth=cfg.run.root_depth,
-        #     start_player=cfg.run.root_player,  # usually "adversary"
-        #     feature_version=cfg.run.feature_version,
-        # )
-        # writer.close()
-
-    # finally:
-    #     mcts.close()
 
     try:
 
@@ -637,13 +732,11 @@ def main() -> None:
         #     )
         # )
 
-
         selfImprovementPolicy(
             cfg=cfg,
-            env=env,
-            mcts=mcts,
             model=model,
             num_generations=num_generations,
+            num_selfPlay_workers=num_selfPlay_workers,
             roots_per_generation=roots_per_generation,
             adv_iterations_per_root=adv_iterations_per_root,
             cont_iterations_per_root=cont_iterations_per_root,
@@ -654,8 +747,10 @@ def main() -> None:
             train_log_csv=train_log_csv,
             device_for_features=torch.device("cpu"),
         )
-    finally:
-        mcts.close()
+    except Exception as e:
+        print(f"ERROR during self-improvement policy: {e}")
+        raise
+    
 
 
 

@@ -79,6 +79,8 @@ class DNNMCTSIterationLogger:
         "action_index",
         "action_repr",
         "prior",
+        "model_prior_json",
+        "normalized_prior_json",
         "reward",
         # "action_cost_softcap",
 
@@ -163,6 +165,9 @@ class DNNMCTSIterationLogger:
         action_index: Optional[int],
         action_repr: str,
         prior: float,
+        model_prior_json: str = "[]",
+        normalized_prior_json: str = "[]",
+
         reward: float,
         # action_cost_softcap: float,
 
@@ -218,6 +223,9 @@ class DNNMCTSIterationLogger:
             "action_index": "" if action_index is None else int(action_index),
             "action_repr": action_repr,
             "prior": _safe_float(prior),
+            "model_prior_json": str(model_prior_json),
+            "normalized_prior_json": str(normalized_prior_json),
+
             "reward": _safe_float(reward),
             # "action_cost_softcap": _safe_float(action_cost_softcap),
 
@@ -284,6 +292,7 @@ class DNNMCTSRootSummaryLogger:
 
         "model_root_value_controller",
         "model_root_prior_json",
+        "normalized_root_prior_json",
         "valid_action_mask_json",
 
         "mcts_root_value_controller",
@@ -354,6 +363,7 @@ class DNNMCTSRootSummaryLogger:
 
         model_root_value_controller: float,
         model_root_prior: Sequence[float],
+        normalized_root_prior: Sequence[float],
         valid_action_mask: Sequence[bool],
 
         mcts_root_value_controller: float,
@@ -380,6 +390,7 @@ class DNNMCTSRootSummaryLogger:
 
             "model_root_value_controller": _safe_float(model_root_value_controller),
             "model_root_prior_json": _j(list(model_root_prior)),
+            "normalized_root_prior_json": _j(list(normalized_root_prior)),
             "valid_action_mask_json": _j(list(valid_action_mask)),
 
             "mcts_root_value_controller": _safe_float(mcts_root_value_controller),

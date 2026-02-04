@@ -1,0 +1,18 @@
+player_acted,action_repr,violations,lateness,requests_violated,sim_time,objective_cost
+controller,"ControllerAction(token_budget=512, heuristic='SJF', strategy='Fixed', token_allocations={1: 512})",6,0.120091480,6,0.407462042,6.120091480
+controller,"ControllerAction(token_budget=512, heuristic='SJF', strategy='Fixed', token_allocations={1: 512})",6,0.260591565,6,0.430878723,6.260591565
+controller,"ControllerAction(token_budget=513, heuristic='SJF', strategy='Fixed', token_allocations={2: 512, 1: 1})",6,0.392013188,6,0.457163047,6.392013188
+controller,"ControllerAction(token_budget=513, heuristic='SJF', strategy='Fixed', token_allocations={2: 512, 1: 1})",6,0.525805648,6,0.483921539,6.525805648
+controller,"ControllerAction(token_budget=514, heuristic='LST', strategy='Fixed', token_allocations={3: 512, 1: 1, 2: 1})",6,0.627195369,6,0.509268970,6.627195369
+controller,"ControllerAction(token_budget=514, heuristic='SJF', strategy='Fixed', token_allocations={0: 512, 1: 1, 2: 1})",6,0.730360264,6,0.535060193,6.730360264
+controller,"ControllerAction(token_budget=514, heuristic='SJF', strategy='Fixed', token_allocations={0: 512, 1: 1, 2: 1})",6,0.835440612,6,0.561330280,6.835440612
+controller,"ControllerAction(token_budget=514, heuristic='SJF', strategy='Fixed', token_allocations={0: 512, 1: 1, 2: 1})",6,0.942568837,6,0.588112336,6.942568837
+controller,"ControllerAction(token_budget=515, heuristic='SJF', strategy='Fixed', token_allocations={3: 512, 0: 1, 1: 1, 2: 1})",6,1.020049413,6,0.613939195,7.020049413
+controller,"ControllerAction(token_budget=515, heuristic='LST', strategy='Fixed', token_allocations={5: 512, 0: 1, 1: 1, 2: 1})",6,1.096198609,6,0.639322261,7.096198609
+controller,"ControllerAction(token_budget=515, heuristic='SJF', strategy='Fixed', token_allocations={3: 512, 0: 1, 1: 1, 2: 1})",6,1.175115776,6,0.665627983,7.175115776
+controller,"ControllerAction(token_budget=515, heuristic='SJF', strategy='Fixed', token_allocations={3: 512, 0: 1, 1: 1, 2: 1})",6,1.255568850,6,0.692445674,7.255568850
+controller,"ControllerAction(token_budget=516, heuristic='SJF', strategy='Fixed', token_allocations={4: 512, 0: 1, 1: 1, 2: 1, 3: 1})",6,1.307272318,6,0.718297408,7.307272318
+controller,"ControllerAction(token_budget=516, heuristic='SJF', strategy='Fixed', token_allocations={4: 512, 0: 1, 1: 1, 2: 1, 3: 1})",6,1.359933513,6,0.744628005,7.359933513
+controller,"ControllerAction(token_budget=516, heuristic='LST', strategy='Fixed', token_allocations={5: 512, 0: 1, 1: 1, 2: 1, 3: 1})",6,1.411636980,6,0.770479739,7.411636980
+controller,"ControllerAction(token_budget=516, heuristic='SJF', strategy='Fixed', token_allocations={4: 512, 0: 1, 1: 1, 2: 1, 3: 1})",6,1.465322113,6,0.797322306,7.465322113
+controller,"ControllerAction(token_budget=1029, heuristic='SJF', strategy='Fixed', token_allocations={5: 1024, 0: 1, 1: 1, 2: 1, 3: 1, 4: 1})",6,1.512723686,6,1.002156243,7.512723686

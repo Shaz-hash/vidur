@@ -587,6 +587,9 @@ class VidurMCTSEnvironment:
                 # self._advance_simulation(new_state, tracker)
 
                 self._advance_simulation_fast(new_state, tracker, activated_replicas)
+                # Only run this when controller did NO prefill work this step (decode-only trivial period)
+                if not action.prefill_allocations:
+                    self._maybe_fast_forward_decode_only_to_next_adv_second(new_state)
                 # t1 = time.perf_counter()
                 # print(f"[PROFILE] CONTROLLER ACTION ADVANCE SIM PHASE={t1 - t0:.6f}s")
             # t0 = time.perf_counter()
@@ -794,6 +797,7 @@ class VidurMCTSEnvironment:
         Set[Any],
         Dict[Any, List[Request]],
     ]:
+        # print("Controller Action is : ", action)
         scheduler_snapshot = self._snapshot_scheduler_budget_state(simulator)
 
         request_lookup = self._build_request_lookup(simulator)   
@@ -1041,6 +1045,8 @@ class VidurMCTSEnvironment:
         get_stage_sched = global_sched.get_replica_stage_scheduler
         set_time = sim._set_time
 
+        blocked_ids: set[int] = set()
+        # print("Tracker is : ", tracker.allocations)
         while batches_executed < max_batches and not tracker.is_satisfied():
             made_progress = False
 
@@ -1073,9 +1079,15 @@ class VidurMCTSEnvironment:
 
                     b, batch_stage, _exec_time = stage_scheduler.on_schedule()
                     # if len(batch.num_tokens) == 1 and batch.num_tokens[0] in (512, 1024, 1536, 2048, 2560, 3072):
-                    #     print("DEBUG tokens", batch.num_tokens,
-                    #         "stage_total", batch_stage.execution_time,
-                    #         "stage_model", batch_stage.model_execution_time)
+                    # print("overall batch :", batch)
+                    # print("DEBUG tokens", batch.num_tokens,
+                    #     "stage_total", batch_stage.execution_time,
+                    #     "stage_model", batch_stage.model_execution_time)
+                    # print("\n")
+                    # print("DEBUG req->tokens", [(r.id, n) for r, n in zip(batch.requests, batch.num_tokens)])
+                    # print("DEBUG overrides(before)", getattr(replica_scheduler, "_token_budget_overrides", None))
+                    # print("DEBUG chunk_size", getattr(getattr(replica_scheduler, "_config", None), "chunk_size", None))
+                    # print("\n")
                     
 
                     if b is None or batch_stage is None:
@@ -1097,8 +1109,9 @@ class VidurMCTSEnvironment:
                     batch.on_batch_end(end_time)
                     global_sched.on_batch_end(batch)
                     replica_scheduler.on_batch_end(batch)
-
+                    
                     batches_executed += 1
+                    # print("Batches executed so far: ", batches_executed)
                     made_progress = True
 
                     # With 1 stage, we can't schedule another concurrent batch anyway.
@@ -1112,6 +1125,56 @@ class VidurMCTSEnvironment:
 
         if tracker.is_satisfied():
             self._prune_pending_replica_schedule_events(sim)
+
+
+    def _maybe_fast_forward_decode_only_to_next_adv_second(self, state: VidurMCTSState) -> None:
+        sim = state.simulator
+        stats = state.stats
+
+        last = getattr(stats, "last_prefill_batch_time", None)
+        if last is None:
+            return
+
+        sim_t = float(sim._time)
+        target_t = float(last) + 1.0
+        if sim_t >= target_t - 1e-9:
+            return  # adversary already allowed
+
+        # full-system lookup (includes "hidden" requests since they remain in _requests)
+        reqs = self._build_request_lookup(sim)
+        if not reqs:
+            return
+
+        decode_active: list[Request] = []
+        for r in reqs.values():
+            remaining_prefill = max(0, int(r.num_prefill_tokens) - int(r.num_processed_prefill_tokens))
+            prefill_done = bool(getattr(r, "_is_prefill_complete", r.is_prefill_complete))
+            if remaining_prefill > 0 and not prefill_done:
+                return  # still prefill in system -> do NOT fast-forward
+
+            remaining_decode = max(0, int(r.num_decode_tokens) - int(r.num_processed_decode_tokens))
+            if prefill_done and remaining_decode > 0:
+                decode_active.append(r)
+
+        if not decode_active:
+            return
+
+        # Make time jump explicit
+        sim._set_time(target_t)
+
+        # Reset decode deadlines so “skipped” time doesn’t create artificial decode lateness
+        for r in decode_active:
+            rid = int(r.id)
+            decode_slo = getattr(r, "_decode_slo_time", None)
+            if decode_slo is None:
+                continue
+            stats.decode_next_deadline_by_id[rid] = float(target_t) + float(decode_slo)
+
+
+
+
+
+
 
 
     def _update_stats(self, state: VidurMCTSState) -> None:

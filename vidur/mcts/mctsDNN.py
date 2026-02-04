@@ -74,6 +74,7 @@ class MCTSNode:
     sim_time: float = 0.0   # NEW: simulator time at this node after performing action
     nn_value_controller: float | None = None        # value from controller perspective
     nn_priors: list[float] | None = None            # length = full action space size
+    nn_priors_after_threshold: list[float] | None = None  # length = full action space size, nornalized after min_prior enforcement
     nn_valid_mask: list[bool] | None = None         # length = full action space size
     num_valid_actions: int = 0  # last computed valid-actions count at this node
 
@@ -127,7 +128,7 @@ class VidurMCTS:
 
         self._iter_logger = DNNMCTSIterationLogger(log_path, flush_every=logger_flush_every)
         # Disable per-simulation iteration logging (mcts_iter.csv)
-        # self._iter_logger = DNNMCTSIterationLogger(None, flush_every=logger_flush_every)
+        #self._iter_logger = DNNMCTSIterationLogger(None, flush_every=logger_flush_every)
 
         self._root_logger = DNNMCTSRootSummaryLogger(tree_log_path, flush_every=logger_flush_every)
 
@@ -322,6 +323,99 @@ class VidurMCTS:
         value, priors = dnn_model.infer_from_inputs(inputs, player, device=device)
         return float(value), list(priors)
 
+
+    def _apply_min_prior_threshold_dict(
+        self,
+        prior_by_idx: Dict[int, float],
+        *,
+        min_prior: float,
+        eps: float = 1e-12,
+        max_iters: int = 64,
+    ) -> Dict[int, float]:
+        """
+        Enforce p_i >= min_prior for all keys in prior_by_idx, while keeping sum(p)=1.
+        If min_prior is infeasible (min_prior * N >= 1), fall back to uniform over keys.
+
+        Important: expects prior_by_idx to represent ONLY valid actions you want MCTS to consider
+        (e.g., canonical controller children, or adversary valid indices).
+        """
+        if not prior_by_idx:
+            return {}
+
+        keys = list(prior_by_idx.keys())
+        n = len(keys)
+
+        mp = float(min_prior or 0.0)
+        if mp <= 0.0 or n <= 1:
+            # just normalize and return
+            s = float(sum(max(0.0, float(prior_by_idx[k])) for k in keys))
+            if s <= eps:
+                u = 1.0 / float(n)
+                return {k: u for k in keys}
+            return {k: max(0.0, float(prior_by_idx[k])) / s for k in keys}
+
+        if mp * float(n) >= 1.0 - eps:
+            u = 1.0 / float(n)
+            return {k: u for k in keys}
+
+        # normalize original (p0) -> used as proportional weights when subtracting mass
+        p0 = {k: max(0.0, float(prior_by_idx[k])) for k in keys}
+        s0 = float(sum(p0.values()))
+        if s0 <= eps:
+            u = 1.0 / float(n)
+            p0 = {k: u for k in keys}
+        else:
+            inv = 1.0 / s0
+            p0 = {k: v * inv for k, v in p0.items()}
+
+        # clamp low probs to min_prior
+        q = {k: (p0[k] if p0[k] >= mp else mp) for k in keys}
+
+        # if we increased some entries, we must remove the excess from entries above mp
+        for _ in range(max_iters):
+            total = float(sum(q.values()))
+            over = total - 1.0
+            if abs(over) <= 1e-10:
+                break
+
+            if over > 0.0:
+                adjustable = [k for k in keys if q[k] > mp + eps]
+                if not adjustable:
+                    u = 1.0 / float(n)
+                    return {k: u for k in keys}
+
+                wsum = float(sum(p0[k] for k in adjustable))
+                if wsum <= eps:
+                    u = 1.0 / float(n)
+                    return {k: u for k in keys}
+
+                # subtract overage proportional to original p0 mass (NN prior)
+                for k in adjustable:
+                    q[k] -= over * (p0[k] / wsum)
+
+                # re-clamp any that dropped below mp, then loop again if needed
+                for k in keys:
+                    if q[k] < mp:
+                        q[k] = mp
+
+            else:
+                # (rare) total < 1 due to numerical issues: add missing mass proportional to p0
+                under = -over
+                wsum = float(sum(p0.values()))
+                for k in keys:
+                    q[k] += under * (p0[k] / wsum)
+
+        # final tiny correction (keep sum=1 without breaking the floor)
+        total = float(sum(q.values()))
+        if abs(total - 1.0) > 1e-8:
+            # adjust the largest entry (must exist and should be >= mp)
+            kmax = max(keys, key=lambda k: q[k])
+            q[kmax] = max(mp, q[kmax] + (1.0 - total))
+
+        return q
+
+
+
     def _actions_and_mask(self, state: VidurMCTSState, player: str) -> Tuple[List[Optional[object]], torch.Tensor]:
         if player == "controller":
             actions_by_index, mask = self._env.sample_controller_actions(state, self._cfg.max_branching)
@@ -395,6 +489,33 @@ class VidurMCTS:
         node.nn_priors = list(priors)
         node.nn_valid_mask = [bool(x) for x in mask.tolist()]
 
+
+        # --- NEW: apply min-prior threshold on ALL valid indices (not canonical) ---
+        if node.player == "controller":
+            min_p = float(getattr(self._cfg, "controller_min_prior_threshold", 0.0) or 0.0)
+        else:
+            min_p = float(getattr(self._cfg, "adversary_min_prior_threshold", 0.0) or 0.0)
+
+        valid_prior_by_idx = {
+            int(i): (float(priors[i]) if 0 <= i < len(priors) else 0.0)
+            for i in valid
+        }
+
+        # This normalizes across valid indices and applies the floor.
+        # (If min_p==0 it still normalizes and cleans negatives.)
+        norm_prior_by_idx = self._apply_min_prior_threshold_dict(
+            valid_prior_by_idx,
+            min_prior=float(min_p),
+        )
+
+        # store per-index thresholded prior vector for debugging/logging
+        thr_vec = [0.0] * len(priors)
+        for i, p in norm_prior_by_idx.items():
+            if 0 <= int(i) < len(thr_vec):
+                thr_vec[int(i)] = float(p)
+        node.nn_priors_after_threshold = thr_vec
+
+
         # But only USE the value for backup if parent had multiple children.
         # If parent had a single child -> "trivial-multiple-child": value passed upward is 0.0.
         # value_used_for_backup = float(model_value) if parent_had_multiple_children else 0.0
@@ -444,14 +565,16 @@ class VidurMCTS:
                 psum = 0.0
                 for aidx in aliases:
                     if 0 <= aidx < len(priors):
-                        psum += float(priors[aidx])
+                        # psum += float(priors[aidx])
+                        psum += float(norm_prior_by_idx.get(int(aidx), 0.0))
                 canonical_prior[canon] = psum
 
         else:
             # No dedup: all valid indices are canonical
             canonical_indices = valid
             for idx in canonical_indices:
-                canonical_prior[idx] = float(priors[idx]) if 0 <= idx < len(priors) else 0.0
+                # canonical_prior[idx] = float(priors[idx]) if 0 <= idx < len(priors) else 0.0
+                canonical_prior[int(idx)] = float(norm_prior_by_idx.get(int(idx), 0.0))
 
 
 
@@ -482,8 +605,8 @@ class VidurMCTS:
 
 
     def ucb_score(self, parent: MCTSNode, child: MCTSNode, min_max_stats: MinMaxStats) -> float:
-        pb_c_base = getattr(self._cfg, "pb_c_base", 19652)
-        pb_c_init = getattr(self._cfg, "pb_c_init", 1.25)
+        pb_c_base = getattr(self._cfg, "pb_c_base", 20000)
+        pb_c_init = getattr(self._cfg, "pb_c_init", 0.60)
 
         parent_is_branching = (getattr(parent, "num_valid_actions", 0) > 1) or (len(parent.children) > 1)
 
@@ -758,6 +881,8 @@ class VidurMCTS:
                     action_index=forced_node.parent_action_index,
                     action_repr=(repr(forced_node.parent_action) if forced_node.parent_action else ""),
                     prior=float(getattr(forced_node, "prior", 0.0)),
+                    model_prior_json="[]",
+                    normalized_prior_json="[]",
                     reward=float(getattr(forced_node, "reward", 0.0)),
                     # action_cost_softcap=float(
                     #     max(0.0, min(1.0, -float(getattr(forced_node, "reward", 0.0))))
@@ -783,6 +908,14 @@ class VidurMCTS:
 
             nn_value_controller = float(leaf_node.nn_value_controller) if _nn_called else None
 
+            model_prior_json = "[]"
+            normalized_prior_json = "[]"
+            if _nn_called and leaf_node.nn_priors is not None:
+                model_prior_json = json.dumps(list(leaf_node.nn_priors))
+            if _nn_called and leaf_node.nn_priors_after_threshold is not None:
+                normalized_prior_json = json.dumps(list(leaf_node.nn_priors_after_threshold))
+
+
             self._iter_logger.log_expand(
                 game_id=int(game_id),
                 root_id=int(root_id),
@@ -800,6 +933,9 @@ class VidurMCTS:
                 action_index=leaf_node.parent_action_index,
                 action_repr=(repr(leaf_node.parent_action) if leaf_node.parent_action else ""),
                 prior=float(getattr(leaf_node, "prior", 0.0)),
+                model_prior_json=model_prior_json,
+                normalized_prior_json=normalized_prior_json,    
+
                 reward=float(getattr(leaf_node, "reward", 0.0)),
 
                 nn_called=bool(_nn_called),
@@ -888,9 +1024,11 @@ class VidurMCTS:
 
         ## Filling Logging details for root node after MCTS Search is done :
 
-        model_v, model_prior, mask, mcts_prior, best_idx = self._compute_root_log_payload_from_cache(
-            root=self._root,
-        )
+        # model_v, model_prior, mask, mcts_prior, best_idx = self._compute_root_log_payload_from_cache(
+        #     root=self._root,
+        # )
+        model_v, model_prior, normalized_prior, mask, mcts_prior, best_idx = self._compute_root_log_payload_from_cache(root=self._root)
+
        
         ### DEBUGGING LOG ###
         best_action = None
@@ -954,6 +1092,7 @@ class VidurMCTS:
             num_simulations=iterations,
             model_root_value_controller=model_v,
             model_root_prior=model_prior,
+            normalized_root_prior=normalized_prior,
             valid_action_mask=mask,
             mcts_root_value_controller= self._root.mean_value(),
             mcts_root_prior=mcts_prior,
@@ -981,6 +1120,11 @@ class VidurMCTS:
 
         model_v = root.nn_value_controller
         model_prior = root.nn_priors
+        normalized_prior = root.nn_priors_after_threshold
+        if normalized_prior is None:
+            # fallback (shouldn't happen for multi-child roots)
+            normalized_prior = model_prior
+
         mask = root.nn_valid_mask
         num_actions = len(mask)
 
@@ -1011,10 +1155,16 @@ class VidurMCTS:
                 for i in valid_idx:
                     mcts_prior[i] = p
 
-        best_idx = max((i for i, ok in enumerate(mask) if ok), key=lambda i: visit_mass[i], default=0)
+        # best_idx = max((i for i, ok in enumerate(mask) if ok), key=lambda i: visit_mass[i], default=0)
+        # Pick best action by CANONICAL visits (children keys), not alias-split visit_mass
+        valid_canons = [int(i) for i in root.children.keys() if 0 <= int(i) < num_actions and mask[int(i)]]
+        if valid_canons:
+            best_idx = max(valid_canons, key=lambda i: int(root.children[i].visits))
+        else:
+            best_idx = next((i for i, ok in enumerate(mask) if ok), 0)
 
         
-        return model_v, model_prior, mask, mcts_prior, best_idx
+        return model_v, model_prior, normalized_prior, mask, mcts_prior, best_idx
 
     def _adversary_prefill_deadlines_by_id_json(
         self, state: VidurMCTSState, action: AdversaryAction
