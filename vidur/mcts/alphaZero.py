@@ -471,6 +471,7 @@ def main() -> None:
                 "--global_scheduler_config_type", "round_robin",
                 "--replica_scheduler_config_type", "vllm_v1",
                 "--vllm_v1_scheduler_config_batch_size_cap", "512",
+                "--no-snapshot_rng_state"
             ]
         ),
         constraints=MCTSConstraintsGroup(
@@ -626,34 +627,34 @@ def main() -> None:
 
     try:
 
-        # runner.run_single_root(
-        #     SingleRootRun(
-        #         game_id=cfg.run.game_id,
-        #         root_id=cfg.run.root_id,
-        #         root_depth=cfg.run.root_depth,
-        #         root_player=cfg.run.root_player,
-        #         iterations=cfg.run.iterations,
-        #         feature_version=cfg.run.feature_version,
-        #     )
-        # )
-
-
-        selfImprovementPolicy(
-            cfg=cfg,
-            env=env,
-            mcts=mcts,
-            model=model,
-            num_generations=num_generations,
-            roots_per_generation=roots_per_generation,
-            adv_iterations_per_root=adv_iterations_per_root,
-            cont_iterations_per_root=cont_iterations_per_root,
-            history_nontrivial_hops=history_nontrivial_hops,
-            max_batch_size=max_batch_size,
-            train_steps_per_generation=train_steps_per_generation,
-            ckpt_dir=ckpt_dir,
-            train_log_csv=train_log_csv,
-            device_for_features=torch.device("cpu"),
+        runner.run_single_root(
+            SingleRootRun(
+                game_id=cfg.run.game_id,
+                root_id=cfg.run.root_id,
+                root_depth=cfg.run.root_depth,
+                root_player=cfg.run.root_player,
+                iterations=cfg.run.iterations,
+                feature_version=cfg.run.feature_version,
+            )
         )
+
+
+        # selfImprovementPolicy(
+        #     cfg=cfg,
+        #     env=env,
+        #     mcts=mcts,
+        #     model=model,
+        #     num_generations=num_generations,
+        #     roots_per_generation=roots_per_generation,
+        #     adv_iterations_per_root=adv_iterations_per_root,
+        #     cont_iterations_per_root=cont_iterations_per_root,
+        #     history_nontrivial_hops=history_nontrivial_hops,
+        #     max_batch_size=max_batch_size,
+        #     train_steps_per_generation=train_steps_per_generation,
+        #     ckpt_dir=ckpt_dir,
+        #     train_log_csv=train_log_csv,
+        #     device_for_features=torch.device("cpu"),
+        # )
     finally:
         mcts.close()
 

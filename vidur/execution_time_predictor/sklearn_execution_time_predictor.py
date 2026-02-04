@@ -1,9 +1,14 @@
 import hashlib
 import os
 import pickle
+import sys
 from abc import abstractmethod
 from itertools import product
 from typing import Any, Dict, List, Tuple
+import json
+import numpy as np
+from dataclasses import dataclass
+
 
 import numpy as np
 import pandas as pd
@@ -27,6 +32,136 @@ from vidur.logger import init_logger
 from vidur.types import ExecutionTimePredictorCacheMode
 
 logger = init_logger(__name__)
+
+
+def _approx_size(obj, seen=None):
+    seen = seen or set()
+    if id(obj) in seen:
+        return 0
+    seen.add(id(obj))
+    size = sys.getsizeof(obj)
+    if isinstance(obj, dict):
+        size += sum(_approx_size(k, seen) + _approx_size(v, seen) for k, v in obj.items())
+    elif isinstance(obj, (list, tuple, set)):
+        size += sum(_approx_size(x, seen) for x in obj)
+    return size
+
+def _sizeof_mb(obj):
+    import sys
+    seen = set()
+    def _walk(o):
+        if id(o) in seen: return 0
+        seen.add(id(o))
+        size = sys.getsizeof(o)
+        if isinstance(o, dict):
+            size += sum(_walk(k) + _walk(v) for k,v in o.items())
+        elif isinstance(o, (list, tuple, set)):
+            size += sum(_walk(x) for x in o)
+        return size
+    return _walk(obj)/ (1024*1024)
+
+
+@dataclass
+class _MemmapTable:
+    mmap: np.memmap
+    kind: str  # "num_tokens" | "batch_size" | "decode" | "prefill"
+    max_tokens: int
+    max_batch_size: int
+    kv_gran: int
+    prefill_gran: int
+
+    def __contains__(self, key):
+        return self._is_valid_key(key)
+
+    def keys(self):
+        # Avoid huge key lists; fallback will use nearest() instead.
+        return ()
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except Exception:
+            return default
+
+    def __getitem__(self, key):
+        k = self._normalize_key(key)
+        i, j = self._key_to_index(k)
+        return float(self.mmap[i] if j is None else self.mmap[i, j])
+
+    def nearest(self, key):
+        k = self._normalize_key(key)
+        return self._clamp_key(k)
+
+    def _normalize_key(self, key):
+        if not isinstance(key, tuple):
+            key = (key,)
+        return key
+
+    # def _is_valid_key(self, key):
+    #     k = self._normalize_key(key)
+    #     try:
+    #         self._key_to_index(k)
+    #         return True
+    #     except Exception:
+    #         return False
+
+    def _is_valid_key(self, key):
+        k = self._normalize_key(key)
+        if self.kind == "num_tokens":
+            t = int(k[0]); return 1 <= t <= self.max_tokens
+        if self.kind == "batch_size":
+            b = int(k[0]); return 1 <= b <= self.max_batch_size
+        if self.kind == "decode":
+            b = int(k[0]); kv = int(k[1])
+            return (1 <= b <= self.max_batch_size) and (0 <= kv <= self.max_tokens) and (kv % self.kv_gran == 0)
+        if self.kind == "prefill":
+            kv = int(k[0]); ch = int(k[1])
+            return (0 <= kv <= self.max_tokens) and (kv % self.kv_gran == 0) and (ch % self.prefill_gran == 0) and (ch >= self.prefill_gran)
+        return False
+
+
+    def _clamp_key(self, k):
+        if self.kind in ("num_tokens", "batch_size"):
+            v = int(k[0])
+            v = max(1, min(v, self.max_tokens if self.kind=="num_tokens" else self.max_batch_size))
+            return (v,)
+        elif self.kind == "decode":
+            b = int(k[0])
+            kv = int(k[1])
+            b = max(1, min(b, self.max_batch_size))
+            kv = max(0, min(kv, self.max_tokens))
+            kv = (kv // self.kv_gran) * self.kv_gran
+            return (b, kv)
+        elif self.kind == "prefill":
+            kv = int(k[0])
+            ch = int(k[1])
+            kv = max(0, min(kv, self.max_tokens))
+            kv = (kv // self.kv_gran) * self.kv_gran
+            ch = max(self.prefill_gran, min(ch, self._max_prefill_chunk()))
+            ch = (ch // self.prefill_gran) * self.prefill_gran
+            return (kv, ch)
+        else:
+            return k
+
+    def _max_prefill_chunk(self):
+        # for prefill, mmap shape[1] = num chunks
+        return self.prefill_gran * self.mmap.shape[1]
+
+    def _key_to_index(self, k):
+        if self.kind == "num_tokens":
+            t = int(k[0]); return (t - 1, None)
+        if self.kind == "batch_size":
+            b = int(k[0]); return (b - 1, None)
+        if self.kind == "decode":
+            b = int(k[0]); kv = int(k[1])
+            return (b - 1, kv // self.kv_gran)
+        if self.kind == "prefill":
+            kv = int(k[0]); ch = int(k[1])
+            return (kv // self.kv_gran, (ch // self.prefill_gran) - 1)
+        raise KeyError(k)
+
+
+
 
 
 class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
@@ -76,22 +211,161 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
             self._cpu_overhead_input_file,
         ) = self._get_input_files()
         self._predictions = self._predict_from_models()
+        # print("PREDICTOR TABLE SIZE (MB):", _approx_size(self._predictions) / (1024*1024))
+        # for k,v in self._predictions.items():
+        #     print("pred table", k, "MB=", _sizeof_mb(v))
 
     @staticmethod
-    def _lookup_with_fallback(
-        table: Dict[Tuple[int, ...], float], key: Tuple[int, ...]
-    ) -> float:
+    # def _lookup_with_fallback(
+    #     table: Dict[Tuple[int, ...], float], key: Tuple[int, ...]
+    # ) -> float:
+    #     if key in table:
+    #         return table[key]
+    #     if not table:
+    #         raise KeyError("Prediction table is empty; cannot approximate value.")
+    #     closest_key = min(
+    #         table.keys(),
+    #         key=lambda existing: sum(
+    #             abs(existing[idx] - key[idx]) for idx in range(len(key))
+    #         ),
+    #     )
+    #     return table[closest_key]
+
+    @staticmethod
+    def _lookup_with_fallback(table, key):
+        # memmap table knows how to clamp to nearest
+        if hasattr(table, "nearest"):
+            if key in table:
+                return table[key]
+            return table[table.nearest(key)]
+
+        # dict fallback (old behavior)
         if key in table:
             return table[key]
         if not table:
             raise KeyError("Prediction table is empty; cannot approximate value.")
         closest_key = min(
             table.keys(),
-            key=lambda existing: sum(
-                abs(existing[idx] - key[idx]) for idx in range(len(key))
-            ),
+            key=lambda existing: sum(abs(existing[i] - key[i]) for i in range(len(key))),
         )
         return table[closest_key]
+
+
+    def _memmap_paths(self, model_name: str, model_hash: str):
+        base = f"{self._config.cache_dir}/{model_name}_{model_hash}_pred"
+        return base + ".dat", base + ".meta.json"
+
+    def _load_memmap_prediction_cache(self, model_name, model_hash):
+        data_path, meta_path = self._memmap_paths(model_name, model_hash)
+        if not (os.path.exists(data_path) and os.path.exists(meta_path)):
+            return None
+
+        try:
+            meta = json.load(open(meta_path, "r"))
+            shape = tuple(meta["shape"])
+
+            # config compatibility check
+            if meta.get("max_tokens") != int(self._config.prediction_max_tokens_per_request):
+                return None
+            if meta.get("max_batch_size") != int(self._config.prediction_max_batch_size):
+                return None
+            if meta.get("kv_gran") != int(self._config.kv_cache_prediction_granularity):
+                return None
+            if meta.get("prefill_gran") != int(self._config.prefill_chunk_size_prediction_granularity):
+                return None
+
+            # file size check
+            expected_bytes = int(np.prod(shape)) * 8  # float64
+            if os.path.getsize(data_path) != expected_bytes:
+                return None
+
+            mmap = np.memmap(data_path, mode="r", dtype=np.float64, shape=shape)
+            return _MemmapTable(
+                mmap=mmap,
+                kind=meta["kind"],
+                max_tokens=meta["max_tokens"],
+                max_batch_size=meta["max_batch_size"],
+                kv_gran=meta["kv_gran"],
+                prefill_gran=meta["prefill_gran"],
+            )
+        except Exception:
+            return None
+
+
+    def _store_memmap_prediction_cache(self, model_name, model_hash, arr, kind):
+        data_path, meta_path = self._memmap_paths(model_name, model_hash)
+        tmp_data = data_path + ".tmp"
+
+        mmap = np.memmap(tmp_data, mode="w+", dtype=np.float64, shape=arr.shape)
+        mmap[:] = arr
+        mmap.flush()
+        del mmap
+
+        meta = {
+            "kind": kind,
+            "shape": list(arr.shape),
+            "max_tokens": int(self._config.prediction_max_tokens_per_request),
+            "max_batch_size": int(self._config.prediction_max_batch_size),
+            "kv_gran": int(self._config.kv_cache_prediction_granularity),
+            "prefill_gran": int(self._config.prefill_chunk_size_prediction_granularity),
+        }
+        json.dump(meta, open(meta_path, "w"))
+        os.replace(tmp_data, data_path)
+
+    def _convert_dict_to_memmap(self, model_name, model_hash, predictions_dict, kind):
+        # Build dense array
+        if kind == "num_tokens":
+            n = self._max_tokens
+            arr = np.zeros((n,), dtype=np.float64)
+            for (t,), v in predictions_dict.items():
+                if 1 <= t <= n:
+                    arr[t - 1] = float(v)
+
+        elif kind == "batch_size":
+            n = self._config.prediction_max_batch_size
+            arr = np.zeros((n,), dtype=np.float64)
+            for (b,), v in predictions_dict.items():
+                if 1 <= b <= n:
+                    arr[b - 1] = float(v)
+
+        elif kind == "decode":
+            nB = self._config.prediction_max_batch_size
+            nK = (self._max_tokens // self._config.kv_cache_prediction_granularity) + 1
+            arr = np.zeros((nB, nK), dtype=np.float64)
+            for (b, kv), v in predictions_dict.items():
+                if 1 <= b <= nB and 0 <= kv <= self._max_tokens:
+                    if kv % self._config.kv_cache_prediction_granularity == 0:
+                        arr[b - 1, kv // self._config.kv_cache_prediction_granularity] = float(v)
+
+        elif kind == "prefill":
+            nK = (self._max_tokens // self._config.kv_cache_prediction_granularity) + 1
+            nC = (self._config.prediction_max_prefill_chunk_size //
+                self._config.prefill_chunk_size_prediction_granularity)
+            arr = np.zeros((nK, nC), dtype=np.float64)
+            for (kv, ch), v in predictions_dict.items():
+                if 0 <= kv <= self._max_tokens and ch >= self._config.prefill_chunk_size_prediction_granularity:
+                    if kv % self._config.kv_cache_prediction_granularity == 0 and ch % self._config.prefill_chunk_size_prediction_granularity == 0:
+                        arr[kv // self._config.kv_cache_prediction_granularity,
+                            (ch // self._config.prefill_chunk_size_prediction_granularity) - 1] = float(v)
+        else:
+            return None
+
+        self._store_memmap_prediction_cache(model_name, model_hash, arr, kind)
+        return self._load_memmap_prediction_cache(model_name, model_hash)
+
+    def _infer_kind_from_X(self, X):
+        cols = list(X.columns)
+        if cols == ["num_tokens"]:
+            return "num_tokens"
+        if cols == ["batch_size"]:
+            return "batch_size"
+        if cols == ["batch_size", "kv_cache_size"]:
+            return "decode"
+        if cols == ["kv_cache_size", "prefill_chunk_size"]:
+            return "prefill"
+        return None
+
+
 
     def get_batch_execution_time(
         self, batch: Batch, pipeline_stage: int
@@ -564,24 +838,88 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
     def _get_model_prediction(
         self, model_name: str, model: BaseEstimator, X: pd.DataFrame
     ) -> Dict[Tuple, float]:
-        X = X.copy()
-
+        # print("here1")
         model_hash = self._get_model_hash(model_name, df=None)
+        # print("here2")
+        # ---- READ LOCK (reuse existing memmap if already built) ----
+        if getattr(self._config, "use_memmap_prediction_cache", False):
+            lock_path = f"{self._config.cache_dir}/{model_name}_{model_hash}_pred_lock.file"
+            with InterProcessReaderWriterLock(lock_path).read_lock():
+                cached = self._load_memmap_prediction_cache(model_name, model_hash)
+                if cached:
+                    return cached
+            # NEW: try dict cache and convert if found
+            dict_cached = self._load_model_predication_cache(model_name, model_hash)
+            if dict_cached:
+                with InterProcessReaderWriterLock(lock_path).write_lock():
+                    cached = self._load_memmap_prediction_cache(model_name, model_hash)
+                    if cached:
+                        return cached
+                    return self._convert_dict_to_memmap(
+                        model_name, model_hash, dict_cached,
+                        kind=self._infer_kind_from_X(X)
+                    )
 
-        cached_predictions = self._load_model_predication_cache(model_name, model_hash)
-        if cached_predictions:
-            return cached_predictions
-
-        logger.info(f"Predicting execution time for model {model_name}")
-
+        # print("here3")
+        # compute predictions
         predictions_array = model.predict(X)
+        # print("here4")
+        # ---- BUILD MEMMAP (write lock) ----
+        if getattr(self._config, "use_memmap_prediction_cache", False):
+            cols = list(X.columns)
+            if cols == ["num_tokens"]:
+                arr = predictions_array.reshape((self._max_tokens,))
+                kind = "num_tokens"
+            elif cols == ["batch_size"]:
+                arr = predictions_array.reshape((self._config.prediction_max_batch_size,))
+                kind = "batch_size"
+            elif cols == ["batch_size", "kv_cache_size"]:
+                nB = self._config.prediction_max_batch_size
+                nK = (self._max_tokens // self._config.kv_cache_prediction_granularity) + 1
+                arr = predictions_array.reshape((nB, nK))
+                kind = "decode"
+            elif cols == ["kv_cache_size", "prefill_chunk_size"]:
+                nK = (self._max_tokens // self._config.kv_cache_prediction_granularity) + 1
+                nC = (self._config.prediction_max_prefill_chunk_size // self._config.prefill_chunk_size_prediction_granularity)
+                arr = predictions_array.reshape((nK, nC))
+                kind = "prefill"
+            else:
+                # fallback to dict if unexpected
+                predictions_dict = dict(zip([tuple(x) for x in X.values], predictions_array))
+                return predictions_dict
 
-        # turn this into a dict, so we can store use it as a cache
-        # the key is tuple for each row of X
+            with InterProcessReaderWriterLock(lock_path).write_lock():
+                cached = self._load_memmap_prediction_cache(model_name, model_hash)
+                if cached:
+                    return cached
+                self._store_memmap_prediction_cache(model_name, model_hash, arr, kind)
+
+            return self._load_memmap_prediction_cache(model_name, model_hash)
+
+        # default dict path
         predictions_dict = dict(zip([tuple(x) for x in X.values], predictions_array))
-        X["prediction"] = predictions_array  # predictions_df
-        self._store_model_predication_cache(model_name, model_hash, predictions_dict, X)
         return predictions_dict
+
+
+
+        # X = X.copy()
+
+        # model_hash = self._get_model_hash(model_name, df=None)
+
+        # cached_predictions = self._load_model_predication_cache(model_name, model_hash)
+        # if cached_predictions:
+        #     return cached_predictions
+
+        # logger.info(f"Predicting execution time for model {model_name}")
+
+        # predictions_array = model.predict(X)
+
+        # # turn this into a dict, so we can store use it as a cache
+        # # the key is tuple for each row of X
+        # predictions_dict = dict(zip([tuple(x) for x in X.values], predictions_array))
+        # X["prediction"] = predictions_array  # predictions_df
+        # self._store_model_predication_cache(model_name, model_hash, predictions_dict, X)
+        # return predictions_dict
 
     def _train_compute_models(self) -> Dict[str, BaseEstimator]:
         compute_df = self._load_compute_df(self._compute_input_file)

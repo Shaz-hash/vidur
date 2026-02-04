@@ -228,80 +228,156 @@ class Batch(BaseEntity):
     # --- Snapshot helpers -------------------------------------------------
 
     # --- in Batch.snapshot_state ---
+    # def snapshot_state(self) -> Dict[str, Any]:
+    #     # Safely normalize replica id to a plain int for the snapshot
+    #     rid = int(getattr(self._replica_id, "id", self._replica_id))
+    #     snap = BatchSnapshot(
+    #         __v__=_SNAP_VERSION_BATCH,
+    #         id=int(self._id),
+    #         replica_id=rid,                               # <-- was int(self._replica_id)
+    #         request_ids=[r.id for r in self._requests],
+    #         num_tokens=list(self._num_tokens),
+    #         scheduled=bool(self._scheduled),
+    #         completed=bool(self._completed),
+    #         scheduled_at=float(self._scheduled_at) if self._scheduled_at is not None else None,
+    #         completed_at=float(self._completed_at) if self._completed_at is not None else None,
+    #         kv_free_blocks_before=getattr(self, "kv_free_blocks_before", None),
+    #         kv_free_blocks_after=getattr(self, "kv_free_blocks_after", None),
+    #         request_ids_in_batch=getattr(self, "request_ids_in_batch", None),
+    #         num_requests_not_selected=getattr(self, "num_requests_not_selected", None),
+    #         num_requests_initiated_not_completed=getattr(self, "num_requests_initiated_not_completed", None),
+    #         num_decode_phase_total=getattr(self, "num_decode_phase_total", None),
+    #         num_prefill_queue_total=getattr(self, "num_prefill_queue_total", None),
+    #         num_not_initiated_in_queue=getattr(self, "num_not_initiated_in_queue", None),
+    #         total_requests_batch_start=getattr(self, "total_requests_batch_start", None),
+    #     )
+    #     return to_primitive_tree(asdict(snap))
+
     def snapshot_state(self) -> Dict[str, Any]:
-        # Safely normalize replica id to a plain int for the snapshot
-        rid = int(getattr(self._replica_id, "id", self._replica_id))
-        snap = BatchSnapshot(
-            __v__=_SNAP_VERSION_BATCH,
-            id=int(self._id),
-            replica_id=rid,                               # <-- was int(self._replica_id)
-            request_ids=[r.id for r in self._requests],
-            num_tokens=list(self._num_tokens),
-            scheduled=bool(self._scheduled),
-            completed=bool(self._completed),
-            scheduled_at=float(self._scheduled_at) if self._scheduled_at is not None else None,
-            completed_at=float(self._completed_at) if self._completed_at is not None else None,
-            kv_free_blocks_before=getattr(self, "kv_free_blocks_before", None),
-            kv_free_blocks_after=getattr(self, "kv_free_blocks_after", None),
-            request_ids_in_batch=getattr(self, "request_ids_in_batch", None),
-            num_requests_not_selected=getattr(self, "num_requests_not_selected", None),
-            num_requests_initiated_not_completed=getattr(self, "num_requests_initiated_not_completed", None),
-            num_decode_phase_total=getattr(self, "num_decode_phase_total", None),
-            num_prefill_queue_total=getattr(self, "num_prefill_queue_total", None),
-            num_not_initiated_in_queue=getattr(self, "num_not_initiated_in_queue", None),
-            total_requests_batch_start=getattr(self, "total_requests_batch_start", None),
-        )
-        return to_primitive_tree(asdict(snap))
+        return {
+            "__v__": _SNAP_VERSION_BATCH,
+            "id": int(self._id),
+            "replica_id": int(getattr(self._replica_id, "id", self._replica_id)),
+            "request_ids": [int(r.id) for r in self._requests],
+            "num_tokens": [int(x) for x in self._num_tokens],
+            "scheduled": bool(self._scheduled),
+            "completed": bool(self._completed),
+            "scheduled_at": float(self._scheduled_at) if self._scheduled_at is not None else None,
+            "completed_at": float(self._completed_at) if self._completed_at is not None else None,
+
+            # Optional debug/metrics annotations (present only if scheduler attached them)
+            "kv_free_blocks_before": getattr(self, "kv_free_blocks_before", None),
+            "kv_free_blocks_after": getattr(self, "kv_free_blocks_after", None),
+            "request_ids_in_batch": getattr(self, "request_ids_in_batch", None),
+            "num_requests_not_selected": getattr(self, "num_requests_not_selected", None),
+            "num_requests_initiated_not_completed": getattr(self, "num_requests_initiated_not_completed", None),
+            "num_decode_phase_total": getattr(self, "num_decode_phase_total", None),
+            "num_prefill_queue_total": getattr(self, "num_prefill_queue_total", None),
+            "num_not_initiated_in_queue": getattr(self, "num_not_initiated_in_queue", None),
+            "total_requests_batch_start": getattr(self, "total_requests_batch_start", None),
+        }
+
+
+    
 
     # --- in Batch.from_snapshot ---
     @classmethod
+    # def from_snapshot(cls, snap: Dict[str, Any], request_lookup: Dict[int, Request]) -> "Batch":
+    #     assert int(snap["__v__"]) == _SNAP_VERSION_BATCH, "Batch snapshot version mismatch"
+
+    #     req_ids = list(snap["request_ids"])
+    #     num_tokens = list(snap["num_tokens"])
+    #     assert len(req_ids) == len(num_tokens), "request_ids/num_tokens length mismatch"
+
+    #     req_objs: List[Request] = []
+    #     for rid in req_ids:
+    #         assert isinstance(rid, int), "request_ids must be ints"
+    #         assert rid in request_lookup, f"unknown request id {rid} in BatchSnapshot"
+    #         req_objs.append(request_lookup[rid])
+
+    #     # Re-wrap the stored int back into a ReplicaId for the constructor
+    #     replica_id_obj = ReplicaId(int(snap["replica_id"]))   # <-- was int(...)
+
+    #     batch = cls(
+    #         replica_id=replica_id_obj,
+    #         requests=req_objs,
+    #         num_tokens=num_tokens,
+    #     )
+    #     batch._id = int(snap["id"])
+    #     batch._scheduled = bool(snap["scheduled"])
+    #     batch._completed = bool(snap["completed"])
+    #     batch._scheduled_at = snap.get("scheduled_at", None)
+    #     batch._completed_at = snap.get("completed_at", None)
+
+    #     if "kv_free_blocks_before" in snap:
+    #         batch.kv_free_blocks_before = snap["kv_free_blocks_before"]
+    #     if "kv_free_blocks_after" in snap:
+    #         batch.kv_free_blocks_after = snap["kv_free_blocks_after"]
+    #     if "request_ids_in_batch" in snap:
+    #         batch.request_ids_in_batch = snap["request_ids_in_batch"]
+    #     if "num_requests_not_selected" in snap:
+    #         batch.num_requests_not_selected = snap["num_requests_not_selected"]
+    #     if "num_requests_initiated_not_completed" in snap:
+    #         batch.num_requests_initiated_not_completed = snap["num_requests_initiated_not_completed"]
+    #     if "num_decode_phase_total" in snap:
+    #         batch.num_decode_phase_total = snap["num_decode_phase_total"]
+    #     if "num_prefill_queue_total" in snap:
+    #         batch.num_prefill_queue_total = snap["num_prefill_queue_total"]
+    #     if "num_not_initiated_in_queue" in snap:
+    #         batch.num_not_initiated_in_queue = snap["num_not_initiated_in_queue"]
+    #     if "total_requests_batch_start" in snap:
+    #         batch.total_requests_batch_start = snap["total_requests_batch_start"]
+
+    #     return batch
+
+
+    @classmethod
     def from_snapshot(cls, snap: Dict[str, Any], request_lookup: Dict[int, Request]) -> "Batch":
-        assert int(snap["__v__"]) == _SNAP_VERSION_BATCH, "Batch snapshot version mismatch"
+        b = cls.__new__(cls)
 
-        req_ids = list(snap["request_ids"])
-        num_tokens = list(snap["num_tokens"])
-        assert len(req_ids) == len(num_tokens), "request_ids/num_tokens length mismatch"
+        b._id = int(snap["id"])
+        b._replica_id = ReplicaId(int(snap["replica_id"]))
 
-        req_objs: List[Request] = []
-        for rid in req_ids:
-            assert isinstance(rid, int), "request_ids must be ints"
-            assert rid in request_lookup, f"unknown request id {rid} in BatchSnapshot"
-            req_objs.append(request_lookup[rid])
+        b._requests = [request_lookup[int(rid)] for rid in snap["request_ids"]]
+        b._num_tokens = [int(x) for x in snap["num_tokens"]]
+        b._num_tokens_dict = {r.id: b._num_tokens[i] for i, r in enumerate(b._requests)}
 
-        # Re-wrap the stored int back into a ReplicaId for the constructor
-        replica_id_obj = ReplicaId(int(snap["replica_id"]))   # <-- was int(...)
-
-        batch = cls(
-            replica_id=replica_id_obj,
-            requests=req_objs,
-            num_tokens=num_tokens,
+        b._total_num_tokens = int(sum(b._num_tokens))
+        b._num_prefill_tokens = int(
+            sum((t if not r.is_prefill_complete else 0) for r, t in zip(b._requests, b._num_tokens))
         )
-        batch._id = int(snap["id"])
-        batch._scheduled = bool(snap["scheduled"])
-        batch._completed = bool(snap["completed"])
-        batch._scheduled_at = snap.get("scheduled_at", None)
-        batch._completed_at = snap.get("completed_at", None)
 
+        decode_ctx = [int(r.num_processed_tokens) for r in b._requests if r.is_prefill_complete]
+        b._decode_context_sum = int(sum(decode_ctx))
+        b._decode_context_spread = int((max(decode_ctx) - min(decode_ctx)) if decode_ctx else 0)
+        b._decode_context_iqr = 0  # keep cheap unless you actually use it
+
+        b._scheduled = bool(snap["scheduled"])
+        b._completed = bool(snap["completed"])
+        b._scheduled_at = snap.get("scheduled_at", None)
+        b._completed_at = snap.get("completed_at", None)
+
+        # Optional debug/metrics annotations
         if "kv_free_blocks_before" in snap:
-            batch.kv_free_blocks_before = snap["kv_free_blocks_before"]
+            b.kv_free_blocks_before = snap.get("kv_free_blocks_before", None)
         if "kv_free_blocks_after" in snap:
-            batch.kv_free_blocks_after = snap["kv_free_blocks_after"]
+            b.kv_free_blocks_after = snap.get("kv_free_blocks_after", None)
         if "request_ids_in_batch" in snap:
-            batch.request_ids_in_batch = snap["request_ids_in_batch"]
+            b.request_ids_in_batch = snap.get("request_ids_in_batch", None)
         if "num_requests_not_selected" in snap:
-            batch.num_requests_not_selected = snap["num_requests_not_selected"]
+            b.num_requests_not_selected = snap.get("num_requests_not_selected", None)
         if "num_requests_initiated_not_completed" in snap:
-            batch.num_requests_initiated_not_completed = snap["num_requests_initiated_not_completed"]
+            b.num_requests_initiated_not_completed = snap.get("num_requests_initiated_not_completed", None)
         if "num_decode_phase_total" in snap:
-            batch.num_decode_phase_total = snap["num_decode_phase_total"]
+            b.num_decode_phase_total = snap.get("num_decode_phase_total", None)
         if "num_prefill_queue_total" in snap:
-            batch.num_prefill_queue_total = snap["num_prefill_queue_total"]
+            b.num_prefill_queue_total = snap.get("num_prefill_queue_total", None)
         if "num_not_initiated_in_queue" in snap:
-            batch.num_not_initiated_in_queue = snap["num_not_initiated_in_queue"]
+            b.num_not_initiated_in_queue = snap.get("num_not_initiated_in_queue", None)
         if "total_requests_batch_start" in snap:
-            batch.total_requests_batch_start = snap["total_requests_batch_start"]
+            b.total_requests_batch_start = snap.get("total_requests_batch_start", None)
 
-        return batch
+        return b
 
 
 

@@ -55,8 +55,8 @@ class SimulatorSnapshot:
     request_states: Dict[int, dict]
     batch_states: Dict[int, dict]
     batch_stage_states: Dict[int, dict]
-    python_random_state: tuple
-    numpy_random_state: tuple  # we’ll make this JSON-safe below if you persist
+    python_random_state: tuple | None
+    numpy_random_state: tuple | None  # we’ll make this JSON-safe below if you persist
 
 
 
@@ -95,6 +95,7 @@ class Simulator:
             self._time_limit = float("inf")
 
         self._event_queue: List[BaseEvent] = []
+
 
         self._event_trace = []
         self._event_chrome_trace = []
@@ -354,6 +355,14 @@ class Simulator:
             # so we keep using the global counter for them.
             "ExecutionTime": ExecutionTime._id,
         }
+
+        # Avoiding capturing RNG state if not needed
+        snapshot_rng = bool(getattr(self._config, "snapshot_rng_state", True))
+        snapshot_rng = None
+        python_state = random.getstate() if snapshot_rng else None
+        numpy_state = _encode_numpy_state(np.random.get_state()) if snapshot_rng else None
+
+
         snapshot = SimulatorSnapshot(
             __v__=_SNAP_VERSION_SIM,
             time=self._time,
@@ -366,8 +375,8 @@ class Simulator:
             request_states=request_states,
             batch_states=batch_states,
             batch_stage_states=batch_stage_states,
-            python_random_state=random.getstate(),
-            numpy_random_state=_encode_numpy_state(np.random.get_state()),
+            python_random_state=python_state,
+            numpy_random_state=numpy_state,
         )
     
 
@@ -376,11 +385,14 @@ class Simulator:
     def restore_state(self, snapshot: SimulatorSnapshot) -> None:
         assert int(snapshot.__v__) == _SNAP_VERSION_SIM, "Simulator snapshot version mismatch"
 
+
         self._time = float(snapshot.time)
         self._time_limit_reached = bool(snapshot.time_limit_reached)
 
-        random.setstate(snapshot.python_random_state)
-        np.random.set_state(_decode_numpy_state(snapshot.numpy_random_state))
+        if snapshot.python_random_state is not None:
+            random.setstate(snapshot.python_random_state)
+        if snapshot.numpy_random_state is not None:
+            np.random.set_state(_decode_numpy_state(snapshot.numpy_random_state))
 
         # Restore entity counters first
         Request._id = snapshot.entity_counters.get("Request", Request._id)

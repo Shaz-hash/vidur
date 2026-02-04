@@ -126,9 +126,9 @@ class VidurMCTS:
         self._history_root_state: Optional[VidurMCTSState] = None
         self._history_root_node: Optional[MCTSNode] = None
 
-        self._iter_logger = DNNMCTSIterationLogger(log_path, flush_every=logger_flush_every)
+        # self._iter_logger = DNNMCTSIterationLogger(log_path, flush_every=logger_flush_every)
         # Disable per-simulation iteration logging (mcts_iter.csv)
-        #self._iter_logger = DNNMCTSIterationLogger(None, flush_every=logger_flush_every)
+        self._iter_logger = DNNMCTSIterationLogger(None, flush_every=logger_flush_every)
 
         self._root_logger = DNNMCTSRootSummaryLogger(tree_log_path, flush_every=logger_flush_every)
 

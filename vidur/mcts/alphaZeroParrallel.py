@@ -653,6 +653,7 @@ def main() -> None:
                 "--global_scheduler_config_type", "round_robin",
                 "--replica_scheduler_config_type", "vllm_v1",
                 "--vllm_v1_scheduler_config_batch_size_cap", "512",
+                "--no-snapshot_rng_state"
             ]
         ),
         constraints=MCTSConstraintsGroup(
@@ -702,8 +703,8 @@ def main() -> None:
     num_generations = 100
     history_nontrivial_hops = [0, 5 , 10 , 15 , 20, 25, 30, 35]  # per worker
     roots_per_generation = 400
-    adv_iterations_per_root = 2000
-    cont_iterations_per_root = 2000
+    adv_iterations_per_root = 5000
+    cont_iterations_per_root = 5000
     train_steps_per_generation = 600   
     max_batch_size = 256
     train_log_csv = Path("simulator_output/mcts_dnn_logs/train_metrics.csv")

@@ -795,7 +795,10 @@ class BaseExecutionTimePredictorConfig(BasePolyConfig):
         default=True,
         metadata={"help": "Whether to skip CPU overhead modeling."},
     )
+    # Whether to use memory-mapped files for prediction cache.
+    use_memmap_prediction_cache: bool = True
 
+    
     def __post_init__(self):
         self._location = os.path.dirname(os.path.abspath(__file__))
         self.compute_input_file = os.path.join(self._location, self.compute_input_file)
@@ -888,6 +891,10 @@ class SimulationConfig(ABC):
     seed: int = field(
         default=42,
         metadata={"help": "Seed for the random number generator."},
+    )
+    snapshot_rng_state: bool = field(
+        default=True,
+        metadata={"help": "Whether to snapshot/restore global python/numpy RNG state."},
     )
     log_level: str = field(
         default="info",
