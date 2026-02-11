@@ -659,9 +659,57 @@ class Request(BaseEntity):
 
         return req
 
-    def restore_state(self, s: Dict[str, Any]) -> None:
-        """Mutate this Request to match a snapshot."""
-        rebuilt = Request.from_snapshot(s)
-        # Copy fields over (keeps object identity stable if external maps hold this instance)
-        self.__dict__.update(rebuilt.__dict__)
+    # def restore_state(self, s: Dict[str, Any]) -> None:
+    #     """Mutate this Request to match a snapshot."""
+    #     rebuilt = Request.from_snapshot(s)
+    #     # Copy fields over (keeps object identity stable if external maps hold this instance)
+    #     self.__dict__.update(rebuilt.__dict__)
 
+
+
+    def restore_state(self, s: Dict[str, Any]) -> None:
+        assert int(s["__v__"]) == _SNAP_VERSION_REQ, "Request snapshot version mismatch"
+
+        self._id = int(s["id"])
+        self._arrived_at = float(s["arrived_at"])
+        self._queued_at = float(s["queued_at"])
+
+        rid = s.get("replica_id", None)
+        self._replica_id = ReplicaId(int(rid)) if rid is not None else None
+
+        self._num_prefill_tokens = int(s["num_prefill_tokens"])
+        self._num_prefill_tokens_cached = int(s.get("num_prefill_tokens_cached", 0))
+        self._num_decode_tokens = int(s["num_decode_tokens"])
+        self._num_processed_tokens = int(s["num_processed_tokens"])
+
+        self._block_hash_ids = list(s["block_hash_ids"]) if s.get("block_hash_ids") is not None else None
+        self._block_size = int(s["block_size"]) if s.get("block_size") is not None else None
+        self._session_id = int(s["session_id"]) if s.get("session_id") is not None else None
+
+        self._scheduled = bool(s["scheduled"])
+        self._preempted = bool(s["preempted"])
+        self._completed = bool(s["completed"])
+        self._is_prefill_complete = bool(s["is_prefill_complete"])
+        self._num_restarts = int(s.get("num_restarts", 0))
+
+        self._scheduled_at = float(s.get("scheduled_at", 0.0))
+        self._preempted_time = float(s.get("preempted_time", 0.0))
+        self._completed_at = float(s.get("completed_at", 0.0))
+        self._prefill_completed_at = float(s.get("prefill_completed_at", 0.0))
+
+        self._scheduling_delay = float(s.get("scheduling_delay", 0.0))
+        self._execution_time = float(s.get("execution_time", 0.0))
+        self._model_execution_time = float(s.get("model_execution_time", 0.0))
+        self._latest_stage_scheduled_at = float(s.get("latest_stage_scheduled_at", 0.0))
+        self._latest_stage_completed_at = float(s.get("latest_stage_completed_at", 0.0))
+        self._latest_iteration_scheduled_at = float(s.get("latest_iteration_scheduled_at", 0.0))
+        self._latest_iteration_completed_at = float(s.get("latest_iteration_completed_at", 0.0))
+        self._latest_iteration_scheduling_delay = float(s.get("latest_iteration_scheduling_delay", 0.0))
+
+        self._prefill_slo_time = float(s["prefill_slo_time"]) if s.get("prefill_slo_time") is not None else None
+        self._decode_slo_time = float(s.get("decode_slo_time", -1.0))
+        self._completion_slo_time = float(s.get("completion_slo_time", -1.0))
+
+        # keep decode tracking fields present (env uses stats.*, but keep invariants)
+        self._decode_next_deadline = None
+        self._decode_tokens_counted = 0

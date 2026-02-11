@@ -39,8 +39,6 @@ from vidur.simulator import Simulator
 
 from .environment import VidurMCTSEnvironment
 from .mctsDNN import VidurMCTS
-from .virtual_environment import VirtualVidurMCTSEnvironment
-from .virtual_simulator import VirtualSimulator
 
 # environment.py currently imports configs from launch_mcts_job.py
 from .launch_mcts_job import MCTSConstraintConfig, MCTSExploreConfig, RequestSLOOptions
@@ -51,15 +49,9 @@ from .DNN.selfPlay import SelfPlayRunner, SingleRootRun
 
 from .DNN.replay_dataset import load_manifest, collate_mixed_samples
 from .DNN.trainer import Trainer, TrainerConfig
-from .DNN.replay_buffer import BestModelReplayBuffer
 
 # Evaluator for controller vs adversary matches 
-from .DNN.evaluator import (
-    EvaluatorConfig,
-    FixedEvalHarness,
-    FixedEvalStatesEvaluator,
-    save_eval_roots_payload_from_cfg,
-)
+from .DNN.evaluator import EvaluatorConfig, FixedEvalHarness, save_eval_roots_payload_from_cfg
 from .logger.eval_logger import EvalArenaGenerationLogger
 
 
@@ -110,114 +102,6 @@ def _append_train_log_row(path: Path, row: dict) -> None:
         if write_header:
             w.writeheader()
         w.writerow(full)
-
-
-def _build_constraints_and_explore(cfg: "AlphaZeroConfig") -> tuple[MCTSConstraintConfig, MCTSExploreConfig]:
-    slo_options = RequestSLOOptions(
-        prefill_slos=tuple(cfg.constraints.prefill_slos),
-        decode_slos=tuple(cfg.constraints.decode_slos),
-    )
-    constraints = MCTSConstraintConfig(
-        maximum_qps=cfg.constraints.maximum_qps,
-        min_request_tokens=cfg.constraints.min_request_tokens,
-        max_request_tokens=cfg.constraints.max_request_tokens,
-        interval_request_size=cfg.constraints.interval_request_size,
-        request_slo_options=slo_options,
-        prefill_slowdown=cfg.constraints.prefill_slowdown,
-        prefill_profile_path=cfg.constraints.prefill_profile_path,
-    )
-    explore_cfg = MCTSExploreConfig(
-        simulation_depth=cfg.explore.simulation_depth,
-        simulation_random_tries=cfg.explore.simulation_random_tries,
-        exploration_constant=cfg.explore.exploration_constant,
-        max_branching=cfg.explore.max_branching,
-        controller_budget_combs=cfg.explore.controller_budget_combs,
-    )
-    setattr(
-        explore_cfg,
-        "controller_min_prior_threshold",
-        float(cfg.explore.controller_min_prior_threshold),
-    )
-    setattr(
-        explore_cfg,
-        "adversary_min_prior_threshold",
-        float(cfg.explore.adversary_min_prior_threshold),
-    )
-    return constraints, explore_cfg
-
-
-def _build_env_and_simulator(
-    cfg: "AlphaZeroConfig",
-    *,
-    use_virtual_env: bool,
-) -> tuple[object, object, MCTSConstraintConfig, MCTSExploreConfig]:
-    sim_cfg = configure_simulation(cfg.sim.cli_args)
-    setattr(sim_cfg.cluster_config.cache_config, "assume_infinite_kv", True)
-    constraints, explore_cfg = _build_constraints_and_explore(cfg)
-
-    if use_virtual_env:
-        simulator = VirtualSimulator(sim_cfg, register_atexit=False)
-        env = VirtualVidurMCTSEnvironment(
-            base_simulator=simulator,
-            constraints=constraints,
-            explore_cfg=explore_cfg,
-        )
-    else:
-        simulator = Simulator(sim_cfg, register_atexit=False)
-        env = VidurMCTSEnvironment(
-            base_simulator=simulator,
-            constraints=constraints,
-            explore_cfg=explore_cfg,
-        )
-
-    return simulator, env, constraints, explore_cfg
-
-
-def _save_eval_roots_payload_virtual(
-    *,
-    cfg: "AlphaZeroConfig",
-    evaluator_cfg: EvaluatorConfig,
-    gen: int,
-    out_path: Path,
-) -> Path:
-    _, env_eval, _, _ = _build_env_and_simulator(cfg, use_virtual_env=True)
-    evaluator = FixedEvalStatesEvaluator(env=env_eval, cfg=evaluator_cfg)
-    payload = evaluator.build_eval_roots_for_generation(
-        gen=int(gen),
-        start_player="adversary",
-    )
-    out = Path(out_path)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(payload, out)
-    return out
-
-
-def _build_virtual_arena_harness(
-    *,
-    cfg: "AlphaZeroConfig",
-    evaluator_cfg: EvaluatorConfig,
-) -> FixedEvalHarness:
-    simulator_eval, env_eval, _, _ = _build_env_and_simulator(cfg, use_virtual_env=True)
-    evaluator = FixedEvalStatesEvaluator(env=env_eval, cfg=evaluator_cfg)
-
-    cpu_candidate_for_mcts = AlphaZeroModel(
-        num_actions_controller=cfg.model.num_actions_controller,
-        num_actions_adversary=cfg.model.num_actions_adversary,
-    ).to(torch.device("cpu"))
-    cpu_candidate_for_mcts.eval()
-
-    cpu_best_for_mcts = AlphaZeroModel(
-        num_actions_controller=cfg.model.num_actions_controller,
-        num_actions_adversary=cfg.model.num_actions_adversary,
-    ).to(torch.device("cpu"))
-    cpu_best_for_mcts.eval()
-
-    return FixedEvalHarness(
-        evaluator=evaluator,
-        cpu_candidate_for_mcts=cpu_candidate_for_mcts,
-        cpu_best_for_mcts=cpu_best_for_mcts,
-        _simulator=simulator_eval,  # type: ignore[arg-type]
-    )
 
 
 def _next_generation_index(dataset_base: Path) -> int:
@@ -295,24 +179,15 @@ def _eval_roots_worker_main(
     evaluator_cfg: EvaluatorConfig,
     gen: int,
     out_path: str,
-    use_virtual_env: bool,
 ) -> None:
     try:
-        if use_virtual_env:
-            p = _save_eval_roots_payload_virtual(
-                cfg=cfg,
-                evaluator_cfg=evaluator_cfg,
-                gen=int(gen),
-                out_path=Path(out_path),
-            )
-        else:
-            p = save_eval_roots_payload_from_cfg(
-                az_cfg=cfg,
-                eval_cfg=evaluator_cfg,
-                gen=int(gen),
-                out_path=Path(out_path),
-                start_player="adversary",
-            )
+        p = save_eval_roots_payload_from_cfg(
+            az_cfg=cfg,
+            eval_cfg=evaluator_cfg,
+            gen=int(gen),
+            out_path=Path(out_path),
+            start_player="adversary",
+        )
         result_q.put({"ok": True, "path": str(p)})
     except Exception as e:
         result_q.put({"ok": False, "error": repr(e)})
@@ -328,7 +203,6 @@ def _selfplay_worker_main(
     max_batch_size: int,
     # history_nontrivial_hops: int,
     default_history_nontrivial_hops: int,
-    use_virtual_env: bool,
 ) -> None:
     # Important: avoid CPU oversubscription when you run many processes
     try:
@@ -345,7 +219,34 @@ def _selfplay_worker_main(
     #     pass
 
     # Build simulator/env ONCE per process (big speed win vs rebuilding every gen)
-    _, env, _, explore_cfg = _build_env_and_simulator(cfg, use_virtual_env=use_virtual_env)
+    sim_cfg = configure_simulation(cfg.sim.cli_args)
+    setattr(sim_cfg.cluster_config.cache_config, "assume_infinite_kv", True)
+    simulator = Simulator(sim_cfg, register_atexit=False)
+
+    slo_options = RequestSLOOptions(
+        prefill_slos=tuple(cfg.constraints.prefill_slos),
+        decode_slos=tuple(cfg.constraints.decode_slos),
+    )
+    constraints = MCTSConstraintConfig(
+        maximum_qps=cfg.constraints.maximum_qps,
+        min_request_tokens=cfg.constraints.min_request_tokens,
+        max_request_tokens=cfg.constraints.max_request_tokens,
+        interval_request_size=cfg.constraints.interval_request_size,
+        request_slo_options=slo_options,
+        prefill_slowdown=cfg.constraints.prefill_slowdown,
+        prefill_profile_path=cfg.constraints.prefill_profile_path,
+    )
+    explore_cfg = MCTSExploreConfig(
+        simulation_depth=cfg.explore.simulation_depth,
+        simulation_random_tries=cfg.explore.simulation_random_tries,
+        exploration_constant=cfg.explore.exploration_constant,
+        max_branching=cfg.explore.max_branching,
+        controller_budget_combs=cfg.explore.controller_budget_combs,
+    )
+    setattr(explore_cfg, "controller_min_prior_threshold", float(cfg.explore.controller_min_prior_threshold))
+    setattr(explore_cfg, "adversary_min_prior_threshold", float(cfg.explore.adversary_min_prior_threshold))
+
+    env = VidurMCTSEnvironment(base_simulator=simulator, constraints=constraints, explore_cfg=explore_cfg)
 
     # Build model once per process; reload weights each generation
     model = AlphaZeroModel(
@@ -445,7 +346,6 @@ def selfImprovementPolicy(
     ckpt_dir: Path,
     train_log_csv: Path,
     device_for_features: torch.device = torch.device("cpu"),
-    use_virtual_env: bool = False,
 ) -> None:
 
     # def _sample_worker_hops_for_generation(gen: int) -> list[int]:
@@ -515,13 +415,10 @@ def selfImprovementPolicy(
     )
 
 
-    if use_virtual_env:
-        arena_harness = _build_virtual_arena_harness(cfg=cfg, evaluator_cfg=evaluator_cfg)
-    else:
-        arena_harness = FixedEvalHarness.from_alpha_zero_cfg(
-            az_cfg=cfg,
-            eval_cfg=evaluator_cfg,
-            start_player="adversary",
+    arena_harness = FixedEvalHarness.from_alpha_zero_cfg(
+        az_cfg=cfg,
+        eval_cfg=evaluator_cfg,
+        start_player="adversary",
         )
 
     if not best_path.exists():
@@ -558,7 +455,6 @@ def selfImprovementPolicy(
                 cont_iterations_per_root,
                 max_batch_size,
                 _hops_for_worker(wid),
-                use_virtual_env,
             ),
         )
         p.start()
@@ -594,14 +490,7 @@ def selfImprovementPolicy(
         eval_root_cache_path = gen_dataset_dir / "arena_eval_roots.pt"
         eval_root_p = ctx.Process(
             target=_eval_roots_worker_main,
-            args=(
-                eval_root_result_q,
-                cfg,
-                evaluator_cfg,
-                gen,
-                str(eval_root_cache_path),
-                use_virtual_env,
-            ),
+            args=(eval_root_result_q, cfg, evaluator_cfg, gen, str(eval_root_cache_path)),
         )
         eval_root_p.start()
 
@@ -1011,7 +900,6 @@ def main() -> None:
     max_batch_size = 256
     train_log_csv = Path("simulator_output/mcts_dnn_logs/train_metrics.csv")
     ckpt_dir = Path("simulator_output/mcts_dnn_checkpoints")
-    use_virtual_env = True
 
     model = AlphaZeroModel(
         num_actions_controller=cfg.model.num_actions_controller,
@@ -1051,7 +939,6 @@ def main() -> None:
             ckpt_dir=ckpt_dir,
             train_log_csv=train_log_csv,
             device_for_features=torch.device("cpu"),
-            use_virtual_env=use_virtual_env,
         )
     except Exception as e:
         print(f"ERROR during self-improvement policy: {e}")
@@ -1062,3 +949,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+

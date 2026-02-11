@@ -37,7 +37,7 @@ from .types import ModelInputs, Player
 # =============================================================================
 
 # Input tensor shapes (your planned feature schema)
-N_REQ: int = 20          # max number of (prefill) requests represented
+N_REQ: int = 20         # max number of (prefill) requests represented
 D_REQ: int = 3           # features per request
 D_GLOBAL: int = 9        # global features
 
@@ -45,14 +45,31 @@ D_GLOBAL: int = 9        # global features
 NUM_ACTIONS_CONTROLLER: int = 24
 NUM_ACTIONS_ADVERSARY: int = 6  # placeholder; update once adversary action indexing is finalized
 
+
+
+# Embedding sizes
+D_REQ_EMB: int = 16
+D_GLOBAL_EMB: int = 16
+D_TRUNK: int = 32
+
+# Value support (real units, controller perspective)
+V_MIN: float = -50.0
+V_MAX: float = 0.0
+NUM_BINS: int = 101  # NOTE: step=4.0 => 101 bins from -400..0 inclusive
+V_STEP: float = (V_MAX - V_MIN) / (NUM_BINS - 1)  # = 4.0
+
+
+
 # MuZero-style value support (optional, but you already started it) * Note : Penalty and Max SLO cost in real units in seconds
 # HARD_MISS_PENALTY: float = 5
 # MAX_SLO_COST: float = 10
-GAMMA: float = 0.98
-VALUE_SCALE: float = 0.5  # scale between real and scaled units
+# GAMMA: float = 0.98
+# VALUE_SCALE: float = 0.5  # scale between real and scaled units
 
-# SUPPORT_SIZE: int = math.ceil(((MAX_SLO_COST + HARD_MISS_PENALTY) / (1.0 - GAMMA)) / VALUE_SCALE)
-SUPPORT_SIZE: int = math.ceil(((1) / (1.0 - GAMMA)) / VALUE_SCALE)
+# # SUPPORT_SIZE: int = math.ceil(((MAX_SLO_COST + HARD_MISS_PENALTY) / (1.0 - GAMMA)) / VALUE_SCALE)
+# SUPPORT_SIZE: int = math.ceil(((1) / (1.0 - GAMMA)) / VALUE_SCALE)
+
+
 
 ##------------------------------
 # HELPER FUNCTIONS
@@ -139,82 +156,118 @@ def masked_min(x, mask, dim):
 # Support Helpers for AlphaZeroModel
 #------------------------------
 
-def scalar_to_support(x: torch.Tensor, support_size: int) -> torch.Tensor:
+# def scalar_to_support(x: torch.Tensor, support_size: int) -> torch.Tensor:
+#     """
+#     Converts scalar values to a categorical distribution over a discrete support i.e. with (2 * support_size + 1) categories.
+#     x: [B] or [B, 1] or [B, T]
+#     returns: [..., 2*support_size+1] distribution logits target (soft one-hot)
+#     Uses MuZero scaling: y = sign(x)*(sqrt(|x|+1)-1) + 0.001*x
+
+
+#     Args:
+#         x (torch.Tensor): Input tensor of shape [B] containing scalar values.
+#         support_size (int): Size of the discrete support.
+
+#     Returns:
+#         torch.Tensor: Categorical distribution tensor of shape [B, support_size].
+#     """
+#     # Ensure Shape [.... , 1] for generality
+#     if x.dim() == 1:
+#         x = x.unsqueeze(-1)  # [B, 1]
+
+#     # Scale (compress) value range
+#     x = torch.sign(x) * (torch.sqrt(torch.abs(x) + 1.0) - 1.0) + 0.001 * x
+
+#     # Clamp to support 
+#     x = torch.clamp(x, -support_size, support_size)
+
+#     floor = torch.floor(x)
+#     prob = x - floor # fractional part
+
+#     # One/Two hot distribution
+#     # Output shape : [..., 2*support_size + 1]
+#     last_dim = 2 * support_size + 1
+#     out_shape = list(x.shape[:-1]) + [last_dim]
+#     dist = torch.zeros(out_shape, device=x.device, dtype=x.dtype)
+
+#     # Put mass on floor bin 
+#     idx0 = (floor + support_size).long()  # shift to [0, 2*support_size]
+#     idx1 = (idx0 + 1).clamp(0, last_dim - 1)
+
+#     p0 = (1.0 - prob)
+#     p1 = prob
+
+#     dist.scatter_add_(-1, idx0, p0)
+#     dist.scatter_add_(-1, idx1, p1)
+#     return dist
+
+
+# def support_to_scalar(logits: torch.Tensor, support_size: int) -> torch.Tensor:
+#     """
+#     Converts a categorical distribution over a discrete support back to scalar values.
+#     logits: [..., 2*support_size + 1]
+#     returns: [...] scalar values
+
+#     Args:
+#         logits (torch.Tensor): Input tensor of shape [..., 2*support_size + 1] containing logits.
+#         support_size (int): Size of the discrete support.
+
+#     Returns:
+#         torch.Tensor: Scalar tensor of shape [...].
+#     """
+#     probs = F.softmax(logits, dim= -1)  # [..., 2*support_size + 1]
+#     support_values = torch.arange(-support_size, support_size + 1, device= logits.device, dtype= probs.dtype)  # [2*support_size + 1]
+    
+#     # broadcast support_values to match probs shape
+#     x = (probs * support_values).sum(dim= -1)
+#     # Inverse scaling (MuZero)
+#     # x = sign(x) * ( ((sqrt(1+4*0.001*(|x|+1+0.001)) - 1) / (2*0.001))^2 - 1 )
+#     eps = 0.001
+#     x = torch.sign(x) * (
+#         (
+#             (torch.sqrt(1.0 + 4.0 * eps * (torch.abs(x) + 1.0 + eps)) - 1.0)
+#             / (2.0 * eps)
+#         )
+#         ** 2
+#         - 1.0
+#     )
+#     return x
+
+
+def scalar_to_support(x: torch.Tensor) -> torch.Tensor:
     """
-    Converts scalar values to a categorical distribution over a discrete support i.e. with (2 * support_size + 1) categories.
-    x: [B] or [B, 1] or [B, T]
-    returns: [..., 2*support_size+1] distribution logits target (soft one-hot)
-    Uses MuZero scaling: y = sign(x)*(sqrt(|x|+1)-1) + 0.001*x
-
-
-    Args:
-        x (torch.Tensor): Input tensor of shape [B] containing scalar values.
-        support_size (int): Size of the discrete support.
-
-    Returns:
-        torch.Tensor: Categorical distribution tensor of shape [B, support_size].
+    x: [B] or [B, 1] or [B, T]  (real units in [V_MIN, V_MAX])
+    returns: [..., NUM_BINS]  2-hot distribution over bins
     """
-    # Ensure Shape [.... , 1] for generality
     if x.dim() == 1:
-        x = x.unsqueeze(-1)  # [B, 1]
+        x = x.unsqueeze(-1)
 
-    # Scale (compress) value range
-    x = torch.sign(x) * (torch.sqrt(torch.abs(x) + 1.0) - 1.0) + 0.001 * x
+    x = torch.clamp(x, V_MIN, V_MAX)
 
-    # Clamp to support 
-    x = torch.clamp(x, -support_size, support_size)
+    pos = (x - V_MIN) / V_STEP  # in [0, NUM_BINS-1]
+    idx0 = torch.floor(pos).to(torch.long)                      # [..., 1]
+    frac = (pos - idx0.to(dtype=pos.dtype)).clamp(0.0, 1.0)     # [..., 1]
+    idx1 = (idx0 + 1).clamp(0, NUM_BINS - 1)
 
-    floor = torch.floor(x)
-    prob = x - floor # fractional part
-
-    # One/Two hot distribution
-    # Output shape : [..., 2*support_size + 1]
-    last_dim = 2 * support_size + 1
-    out_shape = list(x.shape[:-1]) + [last_dim]
+    out_shape = list(x.shape[:-1]) + [NUM_BINS]
     dist = torch.zeros(out_shape, device=x.device, dtype=x.dtype)
 
-    # Put mass on floor bin 
-    idx0 = (floor + support_size).long()  # shift to [0, 2*support_size]
-    idx1 = (idx0 + 1).clamp(0, last_dim - 1)
-
-    p0 = (1.0 - prob)
-    p1 = prob
-
-    dist.scatter_add_(-1, idx0, p0)
-    dist.scatter_add_(-1, idx1, p1)
+    dist.scatter_add_(-1, idx0, (1.0 - frac))
+    dist.scatter_add_(-1, idx1, frac)
     return dist
 
 
-def support_to_scalar(logits: torch.Tensor, support_size: int) -> torch.Tensor:
+def support_to_scalar(logits: torch.Tensor) -> torch.Tensor:
     """
-    Converts a categorical distribution over a discrete support back to scalar values.
-    logits: [..., 2*support_size + 1]
-    returns: [...] scalar values
-
-    Args:
-        logits (torch.Tensor): Input tensor of shape [..., 2*support_size + 1] containing logits.
-        support_size (int): Size of the discrete support.
-
-    Returns:
-        torch.Tensor: Scalar tensor of shape [...].
+    logits: [..., NUM_BINS]
+    returns: [...] scalar in [V_MIN, V_MAX] (expectation under softmax)
     """
-    probs = F.softmax(logits, dim= -1)  # [..., 2*support_size + 1]
-    support_values = torch.arange(-support_size, support_size + 1, device= logits.device, dtype= probs.dtype)  # [2*support_size + 1]
-    
-    # broadcast support_values to match probs shape
-    x = (probs * support_values).sum(dim= -1)
-    # Inverse scaling (MuZero)
-    # x = sign(x) * ( ((sqrt(1+4*0.001*(|x|+1+0.001)) - 1) / (2*0.001))^2 - 1 )
-    eps = 0.001
-    x = torch.sign(x) * (
-        (
-            (torch.sqrt(1.0 + 4.0 * eps * (torch.abs(x) + 1.0 + eps)) - 1.0)
-            / (2.0 * eps)
-        )
-        ** 2
-        - 1.0
-    )
-    return x
+    probs = F.softmax(logits, dim=-1)
+    support = (torch.arange(NUM_BINS, device=logits.device, dtype=probs.dtype) * V_STEP) + V_MIN
+    return (probs * support).sum(dim=-1)
+
+
+
 
 
 class AlphaZeroModel(nn.Module):
@@ -244,18 +297,18 @@ class AlphaZeroModel(nn.Module):
         self.norm_req = nn.Identity()
         self.norm_global = nn.Identity()
 
-        self.req_encoder = mlp(in_dim=D_REQ, hidden=[128, 128], out_dim=64)
-        self.global_encoder = mlp(in_dim=D_GLOBAL, hidden=[128], out_dim=64)
+        self.req_encoder = nn.Linear(D_REQ, D_REQ_EMB)           # 3 -> 16
+        self.global_encoder = nn.Linear(D_GLOBAL, D_GLOBAL_EMB)  # 9 -> 16
 
-        trunk_in = 64 * 4  # mean pooled + max pooled + min pooled + global
-        self.trunk = mlp(in_dim=trunk_in, hidden=[128, 128], out_dim=128)
+        trunk_in = D_REQ_EMB * 3 + D_GLOBAL_EMB  # mean + max + min + global = 16*4 = 64
+        self.trunk = nn.Linear(trunk_in, D_TRUNK)  # 64 -> 32
 
         # Two policy heads (one per player)
-        self.policy_head_controller = nn.Linear(128, self.num_actions_controller)
-        self.policy_head_adversary = nn.Linear(128, self.num_actions_adversary)
+        self.policy_head_controller = nn.Linear(D_TRUNK, self.num_actions_controller)  # 32 -> 24
+        self.policy_head_adversary = nn.Linear(D_TRUNK, self.num_actions_adversary)    # 32 -> 6
 
         # Value head (categorical support in SCALED units)
-        self.value_head = nn.Linear(128, 2 * SUPPORT_SIZE + 1)
+        self.value_head = nn.Linear(D_TRUNK, NUM_BINS)  # 32 -> 101
 
 
     def forward(
@@ -283,7 +336,7 @@ class AlphaZeroModel(nn.Module):
         req_features = self.norm_req(req_features)
         global_features = self.norm_global(global_features)
 
-        req_encoded = self.req_encoder(req_features.reshape(bsz * N_REQ, D_REQ)).reshape(bsz, N_REQ, 64)
+        req_encoded = self.req_encoder(req_features.reshape(bsz * N_REQ, D_REQ)).reshape(bsz, N_REQ, D_REQ_EMB)
 
         req_mean = masked_mean(req_encoded, req_mask, dim=1)  # [B,64]
         req_max = masked_max(req_encoded, req_mask, dim=1)    # [B,64]
@@ -391,22 +444,27 @@ class AlphaZeroModel(nn.Module):
         """
         return value_scaled * VALUE_SCALE
 
+    # def value_target_to_support(self, value_real: torch.Tensor) -> torch.Tensor:
+    #     """
+    #     v_real: [B] or [B, T]
+    #     Converts real value targets to support logits        
+    #     """
+    #     value_scaled = self.scale_value(value_real)
+    #     return scalar_to_support(value_scaled, SUPPORT_SIZE)
+
+    # def value_scalar_from_logits(self, value_logits: torch.Tensor) -> torch.Tensor:
+    #     """
+    #     value_logits: [B, 2*support_size + 1] predicted logits in SCALED units 
+    #     Converts value logits to real scalar values
+    #     """
+    #     value_scaled = support_to_scalar(value_logits, SUPPORT_SIZE)
+    #     return self.unscale_value(value_scaled)
+
     def value_target_to_support(self, value_real: torch.Tensor) -> torch.Tensor:
-        """
-        v_real: [B] or [B, T]
-        Converts real value targets to support logits        
-        """
-        value_scaled = self.scale_value(value_real)
-        return scalar_to_support(value_scaled, SUPPORT_SIZE)
+        return scalar_to_support(value_real)
 
     def value_scalar_from_logits(self, value_logits: torch.Tensor) -> torch.Tensor:
-        """
-        value_logits: [B, 2*support_size + 1] predicted logits in SCALED units 
-        Converts value logits to real scalar values
-        """
-        value_scaled = support_to_scalar(value_logits, SUPPORT_SIZE)
-        return self.unscale_value(value_scaled)
-
+        return support_to_scalar(value_logits)
 
 
 

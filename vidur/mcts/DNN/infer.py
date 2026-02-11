@@ -303,6 +303,13 @@ def build_model_inputs(
             slack = time_left - est_remaining_exec
             slack_ratio = slack / float(slo)
 
+            # if slack_ratio > 1 :
+            #     print("SLACK RATIO > 1: time_left=", time_left, " est_remaining_exec=", est_remaining_exec, " slo=", slo)
+            #     print("  (queued_at=", queued_at, " sim_time=", sim_time, " remaining_pref=", remaining_pref, " total_pref=", total_pref, ")")
+            # elif slack_ratio < -1:
+            #     print("SLACK RATIO < -1: time_left=", time_left, " est_remaining_exec=", est_remaining_exec, " slo=", slo)
+            #     print("  (queued_at=", queued_at, " sim_time=", sim_time, " remaining_pref=", remaining_pref, " total_pref=", total_pref, ")")
+
             # clip for stability
             if slack_ratio > slack_clip:
                 slack_ratio = slack_clip

@@ -48,9 +48,6 @@ from .DNN.selfPlay import SelfPlayRunner, SingleRootRun
 from .DNN.replay_dataset import load_manifest, collate_mixed_samples
 from .DNN.trainer import Trainer, TrainerConfig
 
-from .virtual_environment import VirtualVidurMCTSEnvironment
-from .virtual_simulator import VirtualSimulator
-
 
 
 # ----- 
@@ -151,7 +148,7 @@ def _maybe_resume_best(
 def selfImprovementPolicy(
     *,
     cfg: "AlphaZeroConfig",
-    env: VidurMCTSEnvironment | VirtualVidurMCTSEnvironment,
+    env: VidurMCTSEnvironment,
     mcts: VidurMCTS,
     model: AlphaZeroModel,
     num_generations: int,
@@ -461,9 +458,6 @@ def configure_simulation(sim_args: Iterable[str]) -> SimulationConfig:
 # -----------------------------
 
 def main() -> None:
-
-    use_virtual_env = True
-
     # ---- Edit values here (single source of truth) ----
     cfg = AlphaZeroConfig(
         sim=SimulationCLIGroup(
@@ -539,15 +533,9 @@ def main() -> None:
     # ---- Build simulator/env/mcts/model/writer ----
     sim_cfg = configure_simulation(cfg.sim.cli_args)
     setattr(sim_cfg.cluster_config.cache_config, "assume_infinite_kv", True)
-    # simulator = Simulator(sim_cfg, register_atexit=False)
+    simulator = Simulator(sim_cfg, register_atexit=False)
     # print("Simulator initialized.")
     # print(simulator._execution_time_predictor.to_dict())
-
-    if use_virtual_env:
-        simulator = VirtualSimulator(sim_cfg, register_atexit=False)
-    else:
-        simulator = Simulator(sim_cfg, register_atexit=False)
-
 
     slo_options = RequestSLOOptions(
         prefill_slos=tuple(cfg.constraints.prefill_slos),
@@ -576,18 +564,11 @@ def main() -> None:
     setattr(explore_cfg, "adversary_min_prior_threshold", float(cfg.explore.adversary_min_prior_threshold))
 
 
-    if use_virtual_env:
-        env = VirtualVidurMCTSEnvironment(
-            base_simulator=simulator,
-            constraints=constraints,
-            explore_cfg=explore_cfg,
-        )
-    else:
-        env = VidurMCTSEnvironment(
-            base_simulator=simulator,
-            constraints=constraints,
-            explore_cfg=explore_cfg,
-        )
+    env = VidurMCTSEnvironment(
+        base_simulator=simulator,
+        constraints=constraints,
+        explore_cfg=explore_cfg,
+    )
 
     model = AlphaZeroModel(
         num_actions_controller=cfg.model.num_actions_controller,

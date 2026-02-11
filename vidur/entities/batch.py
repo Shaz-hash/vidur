@@ -281,7 +281,7 @@ class Batch(BaseEntity):
     
 
     # --- in Batch.from_snapshot ---
-    @classmethod
+    # @classmethod
     # def from_snapshot(cls, snap: Dict[str, Any], request_lookup: Dict[int, Request]) -> "Batch":
     #     assert int(snap["__v__"]) == _SNAP_VERSION_BATCH, "Batch snapshot version mismatch"
 
@@ -331,54 +331,101 @@ class Batch(BaseEntity):
     #     return batch
 
 
+    # @classmethod
+    # def from_snapshot(cls, snap: Dict[str, Any], request_lookup: Dict[int, Request]) -> "Batch":
+    #     b = cls.__new__(cls)
+
+    #     b._id = int(snap["id"])
+    #     b._replica_id = ReplicaId(int(snap["replica_id"]))
+
+    #     b._requests = [request_lookup[int(rid)] for rid in snap["request_ids"]]
+    #     b._num_tokens = [int(x) for x in snap["num_tokens"]]
+    #     b._num_tokens_dict = {r.id: b._num_tokens[i] for i, r in enumerate(b._requests)}
+
+    #     b._total_num_tokens = int(sum(b._num_tokens))
+    #     b._num_prefill_tokens = int(
+    #         sum((t if not r.is_prefill_complete else 0) for r, t in zip(b._requests, b._num_tokens))
+    #     )
+
+    #     decode_ctx = [int(r.num_processed_tokens) for r in b._requests if r.is_prefill_complete]
+    #     b._decode_context_sum = int(sum(decode_ctx))
+    #     b._decode_context_spread = int((max(decode_ctx) - min(decode_ctx)) if decode_ctx else 0)
+    #     b._decode_context_iqr = 0  # keep cheap unless you actually use it
+
+    #     b._scheduled = bool(snap["scheduled"])
+    #     b._completed = bool(snap["completed"])
+    #     b._scheduled_at = snap.get("scheduled_at", None)
+    #     b._completed_at = snap.get("completed_at", None)
+
+    #     # Optional debug/metrics annotations
+    #     if "kv_free_blocks_before" in snap:
+    #         b.kv_free_blocks_before = snap.get("kv_free_blocks_before", None)
+    #     if "kv_free_blocks_after" in snap:
+    #         b.kv_free_blocks_after = snap.get("kv_free_blocks_after", None)
+    #     if "request_ids_in_batch" in snap:
+    #         b.request_ids_in_batch = snap.get("request_ids_in_batch", None)
+    #     if "num_requests_not_selected" in snap:
+    #         b.num_requests_not_selected = snap.get("num_requests_not_selected", None)
+    #     if "num_requests_initiated_not_completed" in snap:
+    #         b.num_requests_initiated_not_completed = snap.get("num_requests_initiated_not_completed", None)
+    #     if "num_decode_phase_total" in snap:
+    #         b.num_decode_phase_total = snap.get("num_decode_phase_total", None)
+    #     if "num_prefill_queue_total" in snap:
+    #         b.num_prefill_queue_total = snap.get("num_prefill_queue_total", None)
+    #     if "num_not_initiated_in_queue" in snap:
+    #         b.num_not_initiated_in_queue = snap.get("num_not_initiated_in_queue", None)
+    #     if "total_requests_batch_start" in snap:
+    #         b.total_requests_batch_start = snap.get("total_requests_batch_start", None)
+
+    #     return b
+
+    def restore_state_inplace(self, snap: Dict[str, Any], request_lookup: Dict[int, Request]) -> None:
+        assert int(snap["__v__"]) == _SNAP_VERSION_BATCH, "Batch snapshot version mismatch"
+
+        req_ids = [int(rid) for rid in snap["request_ids"]]
+        num_tokens = [int(x) for x in snap["num_tokens"]]
+        assert len(req_ids) == len(num_tokens), "request_ids/num_tokens length mismatch"
+
+        self._id = int(snap["id"])
+        type(self)._id = max(type(self)._id, self._id)
+        self._replica_id = ReplicaId(int(snap["replica_id"]))
+
+        self._requests = [request_lookup[rid] for rid in req_ids]
+        self._num_tokens = num_tokens
+        self._num_tokens_dict = {r.id: self._num_tokens[i] for i, r in enumerate(self._requests)}
+
+        self._total_num_tokens = int(sum(self._num_tokens))
+        self._num_prefill_tokens = int(
+            sum((t if not r.is_prefill_complete else 0) for r, t in zip(self._requests, self._num_tokens))
+        )
+
+        decode_ctx = [int(r.num_processed_tokens) for r in self._requests if r.is_prefill_complete]
+        self._decode_context_sum = int(sum(decode_ctx))
+        self._decode_context_spread = int((max(decode_ctx) - min(decode_ctx)) if decode_ctx else 0)
+        self._decode_context_iqr = 0  # keep same behavior as current from_snapshot
+
+        self._scheduled = bool(snap["scheduled"])
+        self._completed = bool(snap["completed"])
+        self._scheduled_at = snap.get("scheduled_at", None)
+        self._completed_at = snap.get("completed_at", None)
+
+        # always overwrite optional debug fields to avoid stale values when reusing pooled objects
+        self.kv_free_blocks_before = snap.get("kv_free_blocks_before", None)
+        self.kv_free_blocks_after = snap.get("kv_free_blocks_after", None)
+        self.request_ids_in_batch = snap.get("request_ids_in_batch", None)
+        self.num_requests_not_selected = snap.get("num_requests_not_selected", None)
+        self.num_requests_initiated_not_completed = snap.get("num_requests_initiated_not_completed", None)
+        self.num_decode_phase_total = snap.get("num_decode_phase_total", None)
+        self.num_prefill_queue_total = snap.get("num_prefill_queue_total", None)
+        self.num_not_initiated_in_queue = snap.get("num_not_initiated_in_queue", None)
+        self.total_requests_batch_start = snap.get("total_requests_batch_start", None)
+
+
     @classmethod
     def from_snapshot(cls, snap: Dict[str, Any], request_lookup: Dict[int, Request]) -> "Batch":
         b = cls.__new__(cls)
-
-        b._id = int(snap["id"])
-        b._replica_id = ReplicaId(int(snap["replica_id"]))
-
-        b._requests = [request_lookup[int(rid)] for rid in snap["request_ids"]]
-        b._num_tokens = [int(x) for x in snap["num_tokens"]]
-        b._num_tokens_dict = {r.id: b._num_tokens[i] for i, r in enumerate(b._requests)}
-
-        b._total_num_tokens = int(sum(b._num_tokens))
-        b._num_prefill_tokens = int(
-            sum((t if not r.is_prefill_complete else 0) for r, t in zip(b._requests, b._num_tokens))
-        )
-
-        decode_ctx = [int(r.num_processed_tokens) for r in b._requests if r.is_prefill_complete]
-        b._decode_context_sum = int(sum(decode_ctx))
-        b._decode_context_spread = int((max(decode_ctx) - min(decode_ctx)) if decode_ctx else 0)
-        b._decode_context_iqr = 0  # keep cheap unless you actually use it
-
-        b._scheduled = bool(snap["scheduled"])
-        b._completed = bool(snap["completed"])
-        b._scheduled_at = snap.get("scheduled_at", None)
-        b._completed_at = snap.get("completed_at", None)
-
-        # Optional debug/metrics annotations
-        if "kv_free_blocks_before" in snap:
-            b.kv_free_blocks_before = snap.get("kv_free_blocks_before", None)
-        if "kv_free_blocks_after" in snap:
-            b.kv_free_blocks_after = snap.get("kv_free_blocks_after", None)
-        if "request_ids_in_batch" in snap:
-            b.request_ids_in_batch = snap.get("request_ids_in_batch", None)
-        if "num_requests_not_selected" in snap:
-            b.num_requests_not_selected = snap.get("num_requests_not_selected", None)
-        if "num_requests_initiated_not_completed" in snap:
-            b.num_requests_initiated_not_completed = snap.get("num_requests_initiated_not_completed", None)
-        if "num_decode_phase_total" in snap:
-            b.num_decode_phase_total = snap.get("num_decode_phase_total", None)
-        if "num_prefill_queue_total" in snap:
-            b.num_prefill_queue_total = snap.get("num_prefill_queue_total", None)
-        if "num_not_initiated_in_queue" in snap:
-            b.num_not_initiated_in_queue = snap.get("num_not_initiated_in_queue", None)
-        if "total_requests_batch_start" in snap:
-            b.total_requests_batch_start = snap.get("total_requests_batch_start", None)
-
+        b.restore_state_inplace(snap, request_lookup)
         return b
-
 
 
     @classmethod

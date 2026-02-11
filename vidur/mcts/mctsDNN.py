@@ -171,22 +171,47 @@ class VidurMCTS:
     #     # Essentially the cost will always increase therefore, reward will be negative 
     #     return parent_cost - child_cost
 
+    # def _transition_reward(self, parent_cost: float, child_cost: float) -> float:
+    #     """
+    #     Immediate controller-perspective reward for parent -> child.
+
+    #     We treat *increases* in objective cost as immediate action cost:
+    #         delta_cost = max(0, child_cost - parent_cost)
+
+    #     Soft-cap it to [0, 1):
+    #         soft_cost = 1 - exp(-delta_cost)
+
+    #     And propagate as negative reward:
+    #         reward = -soft_cost   in (-1, 0]
+    #     """
+    #     delta_cost = max(0.0, float(child_cost) - float(parent_cost))
+    #     soft_cost = 1.0 - math.exp(-delta_cost)
+    #     return -soft_cost
+
+
     def _transition_reward(self, parent_cost: float, child_cost: float) -> float:
-        """
-        Immediate controller-perspective reward for parent -> child.
+        delta = max(0.0, float(child_cost) - float(parent_cost))
 
-        We treat *increases* in objective cost as immediate action cost:
-            delta_cost = max(0, child_cost - parent_cost)
+        knee = float(getattr(self._cfg, "reward_knee", 8.0))
+        max_penalty = float(getattr(self._cfg, "reward_max_penalty", 10.0))
 
-        Soft-cap it to [0, 1):
-            soft_cost = 1 - exp(-delta_cost)
+        if max_penalty <= knee:
+            # fallback: pure linear
+            return -min(delta, max_penalty)
 
-        And propagate as negative reward:
-            reward = -soft_cost   in (-1, 0]
-        """
-        delta_cost = max(0.0, float(child_cost) - float(parent_cost))
-        soft_cost = 1.0 - math.exp(-delta_cost)
-        return -soft_cost
+        headroom = max_penalty - knee
+
+        # alpha controls how fast we saturate after the knee.
+        # alpha = 1/headroom makes slope continuous at the knee (linear slope=1).
+        alpha = float(getattr(self._cfg, "reward_tail_alpha", 1.0 / headroom))
+
+        if delta <= knee:
+            penalty = delta
+        else:
+            penalty = knee + headroom * math.tanh(alpha * (delta - knee))
+
+        return -penalty
+
 
 
     def _time_discount(self, t_child_time: float, t_parent_branch: float) -> float:
@@ -296,7 +321,7 @@ class VidurMCTS:
         do_debug = (getattr(state, "simulator", None) is not None) and (player in ("adversary","controller"))
         do_debug = do_debug and (self._root is not None) and (self._root.player == player) and (self._did_root_infer_debug is False)
 
-
+        # t_nn = time.perf_counter()
         inputs = dnn_infer.build_model_inputs(
             state,
             player,
@@ -306,6 +331,7 @@ class VidurMCTS:
             debug=do_debug,
             debug_out_path="simulator_output/mcts_dnn_logs/infer_root_debug.txt" if do_debug else None,
         )
+        # self._perf["nn_build_inputs"] += time.perf_counter() - t_nn
 
         if do_debug:
             self._did_root_infer_debug = True
@@ -320,7 +346,9 @@ class VidurMCTS:
                 action_mask=action_mask,
             )
 
+        # t_nn = time.perf_counter()
         value, priors = dnn_model.infer_from_inputs(inputs, player, device=device)
+        # self._perf["nn_infer"] += time.perf_counter() - t_nn
         return float(value), list(priors)
 
 
@@ -819,28 +847,30 @@ class VidurMCTS:
             search_path.append(node)
 
         # 2) Restore scratch sim straight to the selected node state (or materialize it once)
-        # t0 = time.time()
+     
+        # t_phase = time.perf_counter()
         state = self._restore_state_for_node(node)
-        # t1 = time.time()
-        # print(f"  [MCTS] _restore_state_for_node took {t1 - t0:.6f} sec for sim_iteration={sim_iteration}")
+        # self._perf["restore"] += time.perf_counter() - t_phase
+       
 
         iter_logging = getattr(self._iter_logger, "_path", None) is not None
         forced_logs = [] if iter_logging else None
 
         # 3) Skip forced single-child chains so we end on branching/terminal
-        # t0 = time.time()
+        # t_phase = time.perf_counter()
         leaf_node, leaf_state = self._advance_through_single_child_chain(node, state, search_path, forced_step_logs=forced_logs)
-        # t1 = time.time()
-        # print(f"  [MCTS] advance_through_single_child_chain took {t1 - t0:.6f} , sec for sim_iteration={sim_iteration}")
+        # self._perf["forced_chain"] += time.perf_counter() - t_phase
+
         # (Safety) If we bailed out due to max_hops etc, don’t silently proceed
         if getattr(leaf_node, "num_valid_actions", 0) == 1:
             raise RuntimeError("advance_through_single_child_chain ended on single-child node; check max_hops/no-progress")
 
         # t0 = time.time()
         # 4) Expand + NN evaluation at final node
+        # t_phase = time.perf_counter()
         leaf_value, _nn_called, _num_valid = self._expand_node(leaf_node, leaf_state, dnn_model)
-        # t1 = time.time()
-        # print(f"  [MCTS] expand_node took {t1 - t0:.6f} sec for sim_iteration={sim_iteration}")
+        # self._perf["expand"] += time.perf_counter() - t_phase
+
         if iter_logging:
             parent_multi = (leaf_node.parent is None) or (len(leaf_node.parent.children) > 1)
 
@@ -951,7 +981,10 @@ class VidurMCTS:
 
 
         # 5) Backprop
+        # t_phase = time.perf_counter()
         self.backpropagate(search_path, float(leaf_value), min_max_stats)
+        # self._perf["backprop"] += time.perf_counter() - t_phase
+        # self._perf["sim_count"] += 1
 
         # # LOGGING MCTS:
         # DUMP_EVERY = 1  # or 50/100 to reduce overhead
@@ -991,6 +1024,22 @@ class VidurMCTS:
         self._did_root_infer_debug = False
 
         min_max_stats = MinMaxStats()
+
+        # PROFILING :
+        # self._perf = {
+        #     "restore": 0.0,
+        #     "forced_chain": 0.0,
+        #     "expand": 0.0,
+        #     "backprop": 0.0,
+        #     "nn_build_inputs": 0.0,
+        #     "nn_infer": 0.0,
+        #     "sim_count": 0,
+        # }
+        # if hasattr(self._env, "_perf"):
+        #     for k in self._env._perf:
+        #         self._env._perf[k] = 0.0
+
+
 
         # --- Root evaluation (NOT counted as a simulation) ---
         # This seeds priors / nn cache so PUCT is defined, but we do NOT let it bias MCTS value.
@@ -1100,6 +1149,36 @@ class VidurMCTS:
             best_action_repr=best_action_repr,
             best_action_json=best_action_json,
         )
+
+
+
+        #PRINTING PROFILING :
+        # p = getattr(self, "_perf", None)
+        # if p is not None:
+        #     n = max(1, int(p.get("sim_count", 0)))
+        #     total_core = p["restore"] + p["forced_chain"] + p["expand"] + p["backprop"]
+        #     print(
+        #         "[MCTS_PERF] "
+        #         f"root_id={root_id} iters={iterations} "
+        #         f"restore={p['restore']:.3f}s forced_chain={p['forced_chain']:.3f}s "
+        #         f"expand={p['expand']:.3f}s backprop={p['backprop']:.3f}s "
+        #         f"nn_build={p['nn_build_inputs']:.3f}s nn_infer={p['nn_infer']:.3f}s "
+        #         f"core_total={total_core:.3f}s core_per_sim={total_core/n:.6f}s"
+        #     )
+        #     ep = getattr(self._env, "_perf", None)
+        #     if ep is not None:
+        #         print(
+        #             "[ENV_PERF] "
+        #             f"ctrl_calls={int(ep.get('apply_ctrl_calls', 0))} "
+        #             f"ctrl_total={ep.get('apply_ctrl_total', 0.0):.3f}s "
+        #             f"lookup={ep.get('lookup', 0.0):.3f}s "
+        #             f"alloc_norm={ep.get('alloc_norm', 0.0):.3f}s "
+        #             f"predictor={ep.get('predictor', 0.0):.3f}s "
+        #             f"stats={ep.get('stats', 0.0):.3f}s "
+        #             f"rebuild={ep.get('rebuild', 0.0):.3f}s "
+        #             f"ff_decode={ep.get('ff_decode', 0.0):.3f}s"
+        #         )
+
 
 
         return next_player, action_space

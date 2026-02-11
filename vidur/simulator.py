@@ -128,6 +128,15 @@ class Simulator:
         if register_atexit:
             atexit.register(self._write_output)
 
+        self._restore_pool_requests_by_id: dict[int, Request] = {}
+        self._restore_pool_requests_free: list[Request] = []
+        self._restore_pool_batches_by_id: dict[int, Batch] = {}
+        self._restore_pool_batches_free: list[Batch] = []
+        self._restore_pool_stages_by_id: dict[int, BatchStage] = {}
+        self._restore_pool_stages_free: list[BatchStage] = []
+
+
+
     def run(self) -> None:
         logger.info(f"Starting simulation with cluster: {self._cluster}")
 
@@ -254,18 +263,26 @@ class Simulator:
         scheduler_snapshot = self._scheduler.snapshot_state()
         
         # handle dataclass or dict uniformly
-        if hasattr(scheduler_snapshot, "request_states"):
-            req_states = getattr(scheduler_snapshot, "request_states")
-        elif isinstance(scheduler_snapshot, dict):
-            req_states = scheduler_snapshot.get("request_states", {})
-        else:
-            req_states = {}
+        # if hasattr(scheduler_snapshot, "request_states"):
+        #     req_states = getattr(scheduler_snapshot, "request_states")
+        # elif isinstance(scheduler_snapshot, dict):
+        #     req_states = scheduler_snapshot.get("request_states", {})
+        # else:
+        #     req_states = {}
 
+        
         # for req_id, state in getattr(req_states, "items", lambda: [])():
-        #     request_states.setdefault(req_id, clone_mutable(state))
+        #     request_states.setdefault(int(req_id), state)
 
-        for req_id, state in getattr(req_states, "items", lambda: [])():
-            request_states.setdefault(int(req_id), state)
+        if hasattr(scheduler_snapshot, "request_states"):
+            request_states = getattr(scheduler_snapshot, "request_states") or {}
+        elif isinstance(scheduler_snapshot, dict):
+            request_states = scheduler_snapshot.get("request_states", {}) or {}
+        else:
+            request_states = {}
+
+       
+
        
 
         # for req_id, state in scheduler_snapshot.get("request_states", {}).items():
@@ -401,29 +418,93 @@ class Simulator:
         ExecutionTime._id = snapshot.entity_counters.get("ExecutionTime", ExecutionTime._id)
         BaseEvent._id = snapshot.base_event_counter
 
-        # Rebuild objects
-        request_lookup: Dict[int, Request] = {}
+        new_active: dict[int, Request] = {}
+        request_lookup: dict[int, Request] = {}
+
         for request_id, state in snapshot.request_states.items():
-            # req = Request.__new__(Request)
-            # req.restore_state(state)
-            req = Request.from_snapshot(state)
-            request_lookup[int(request_id)] = req
+            rid = int(request_id)
 
-            # Optional: assert id matches key
-            assert req._id == int(request_id), "Request id mismatch during restore"
-            # request_lookup[int(request_id)] = req
+            req = self._restore_pool_requests_by_id.get(rid)
+            if req is None:
+                if self._restore_pool_requests_free:
+                    req = self._restore_pool_requests_free.pop()
+                else:
+                    req = Request.__new__(Request)
 
+            req.restore_state(state)  # now in-place, no allocation
+            new_active[rid] = req
+            request_lookup[rid] = req
+
+        # move old actives not present anymore to free list
+        for old_rid, old_req in self._restore_pool_requests_by_id.items():
+            if old_rid not in new_active:
+                self._restore_pool_requests_free.append(old_req)
+
+        self._restore_pool_requests_by_id = new_active
+
+
+        # batch_lookup: Dict[int, Batch] = {}
+        # for batch_id, state in snapshot.batch_states.items():
+        #     batch = Batch.restore_state(state, request_lookup)
+        #     assert batch._id == int(batch_id), "Batch id mismatch during restore"
+        #     batch_lookup[int(batch_id)] = batch
+
+        # batch_stage_lookup: Dict[int, BatchStage] = {}
+        # for stage_id, state in snapshot.batch_stage_states.items():
+        #     stg = BatchStage.restore_state(state, request_lookup)
+        #     assert stg._id == int(stage_id), "BatchStage id mismatch during restore"
+        #     batch_stage_lookup[int(stage_id)] = stg
+
+        new_active_batches: dict[int, Batch] = {}
         batch_lookup: Dict[int, Batch] = {}
         for batch_id, state in snapshot.batch_states.items():
-            batch = Batch.restore_state(state, request_lookup)
-            assert batch._id == int(batch_id), "Batch id mismatch during restore"
-            batch_lookup[int(batch_id)] = batch
+            bid = int(batch_id)
 
+            batch = self._restore_pool_batches_by_id.get(bid)
+            if batch is None:
+                if self._restore_pool_batches_free:
+                    batch = self._restore_pool_batches_free.pop()
+                else:
+                    batch = Batch.__new__(Batch)
+
+            batch.restore_state_inplace(state, request_lookup)
+            assert batch._id == bid, "Batch id mismatch during restore"
+
+            new_active_batches[bid] = batch
+            batch_lookup[bid] = batch
+
+        for old_bid, old_batch in self._restore_pool_batches_by_id.items():
+            if old_bid not in new_active_batches:
+                self._restore_pool_batches_free.append(old_batch)
+
+        self._restore_pool_batches_by_id = new_active_batches
+
+
+        new_active_stages: dict[int, BatchStage] = {}
         batch_stage_lookup: Dict[int, BatchStage] = {}
         for stage_id, state in snapshot.batch_stage_states.items():
-            stg = BatchStage.restore_state(state, request_lookup)
-            assert stg._id == int(stage_id), "BatchStage id mismatch during restore"
-            batch_stage_lookup[int(stage_id)] = stg
+            sid = int(stage_id)
+
+            stg = self._restore_pool_stages_by_id.get(sid)
+            if stg is None:
+                if self._restore_pool_stages_free:
+                    stg = self._restore_pool_stages_free.pop()
+                else:
+                    stg = BatchStage.__new__(BatchStage)
+
+            stg.restore_state_inplace(state, request_lookup)
+            assert stg._id == sid, "BatchStage id mismatch during restore"
+
+            new_active_stages[sid] = stg
+            batch_stage_lookup[sid] = stg
+
+        for old_sid, old_stage in self._restore_pool_stages_by_id.items():
+            if old_sid not in new_active_stages:
+                self._restore_pool_stages_free.append(old_stage)
+
+        self._restore_pool_stages_by_id = new_active_stages
+
+
 
         # Request generator + scheduler
         self._request_generator.restore_state(snapshot.request_generator_state, request_lookup)

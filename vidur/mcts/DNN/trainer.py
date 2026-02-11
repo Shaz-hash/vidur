@@ -76,8 +76,12 @@ class Trainer:
         value_logits: torch.Tensor,      # [B, support]
         target_value: torch.Tensor,      # [B]
     ) -> torch.Tensor:
-        pred_value = self.model.value_scalar_from_logits(value_logits).view(-1)
-        return F.mse_loss(pred_value, target_value.view(-1))
+        # pred_value = self.model.value_scalar_from_logits(value_logits).view(-1)
+            # return F.mse_loss(pred_value, target_value.view(-1))
+        target_dist = self.model.value_target_to_support(target_value)      # [B, NUM_BINS]
+        log_probs = F.log_softmax(value_logits, dim=-1)                     # [B, NUM_BINS]
+        return -(target_dist * log_probs).sum(dim=-1).mean()
+
 
     def train_step(self, batch_by_player: Dict[str, Optional[Dict[str, Any]]]) -> Dict[str, float]:
         self.model.train()

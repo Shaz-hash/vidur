@@ -187,42 +187,84 @@ class BatchStage(BaseEntity):
         # Already primitives via .to_dict and lists of ints
         return asdict(snap)
 
-    @classmethod
-    def from_snapshot(cls, snap: Dict[str, Any], request_lookup: Dict[int, Request]) -> "BatchStage":
+   
+    # def from_snapshot(cls, snap: Dict[str, Any], request_lookup: Dict[int, Request]) -> "BatchStage":
+    #     assert int(snap["__v__"]) == _SNAP_VERSION_BATCH_STAGE, "BatchStage snapshot version mismatch"
+    #     req_ids = list(snap["request_ids"])
+    #     toks    = list(snap["num_tokens"])
+    #     assert len(req_ids) == len(toks), "BatchStage snapshot: request_ids/num_tokens length mismatch"
+
+    #     # Rebuild ExecutionTime without calling its constructor (to avoid extra logic).
+    #     et_dict = dict(snap["execution_time"])
+    #     et = ExecutionTime.__new__(ExecutionTime)
+    #     et.__dict__ = et_dict
+    #     # keep global id counter monotonic if ExecutionTime uses BaseEntity
+    #     if hasattr(ExecutionTime, "_id") and hasattr(et, "_id"):
+    #         ExecutionTime._id = max(ExecutionTime._id, et._id)
+
+    #     req_objs = [request_lookup[rid] for rid in snap["request_ids"]]
+
+    #     obj = cls(
+    #         batch_id=int(snap["batch_id"]),
+    #         replica_id=int(snap["replica_id"]),
+    #         stage_id=int(snap["stage_id"]),
+    #         execution_time=et,
+    #         requests=req_objs,
+    #         num_tokens=list(snap["num_tokens"]),
+    #     )
+    #     # identity + flags/timestamps (don’t call lifecycle hooks)
+    #     obj._id = int(snap["id"])
+    #     type(obj)._id = max(type(obj)._id, obj._id)
+
+    #     obj._scheduled = bool(snap["scheduled"])
+    #     obj._scheduled_at = snap.get("scheduled_at", None)
+    #     obj._completed_at = snap.get("completed_at", None)
+
+    #     # Derived fields from execution_time
+    #     obj._total_execution_time = et.total_time
+    #     obj._model_execution_time = et.model_time
+    #     return obj
+    
+    # @classmethod
+    def restore_state_inplace(self, snap: Dict[str, Any], request_lookup: Dict[int, Request]) -> None:
         assert int(snap["__v__"]) == _SNAP_VERSION_BATCH_STAGE, "BatchStage snapshot version mismatch"
-        req_ids = list(snap["request_ids"])
-        toks    = list(snap["num_tokens"])
+
+        req_ids = [int(rid) for rid in snap["request_ids"]]
+        toks = [int(x) for x in snap["num_tokens"]]
         assert len(req_ids) == len(toks), "BatchStage snapshot: request_ids/num_tokens length mismatch"
 
-        # Rebuild ExecutionTime without calling its constructor (to avoid extra logic).
+        self._id = int(snap["id"])
+        type(self)._id = max(type(self)._id, self._id)
+
+        self._batch_id = int(snap["batch_id"])
+        self._replica_id = ReplicaId(int(snap["replica_id"]))
+        self._stage_id = int(snap["stage_id"])
+
         et_dict = dict(snap["execution_time"])
-        et = ExecutionTime.__new__(ExecutionTime)
-        et.__dict__ = et_dict
-        # keep global id counter monotonic if ExecutionTime uses BaseEntity
+        et = getattr(self, "_execution_time", None)
+        if et is None:
+            et = ExecutionTime.__new__(ExecutionTime)
+        et.__dict__.clear()
+        et.__dict__.update(et_dict)
+        self._execution_time = et
+
         if hasattr(ExecutionTime, "_id") and hasattr(et, "_id"):
             ExecutionTime._id = max(ExecutionTime._id, et._id)
 
-        req_objs = [request_lookup[rid] for rid in snap["request_ids"]]
+        self._requests = [request_lookup[rid] for rid in req_ids]
+        self._num_tokens = toks
 
-        obj = cls(
-            batch_id=int(snap["batch_id"]),
-            replica_id=int(snap["replica_id"]),
-            stage_id=int(snap["stage_id"]),
-            execution_time=et,
-            requests=req_objs,
-            num_tokens=list(snap["num_tokens"]),
-        )
-        # identity + flags/timestamps (don’t call lifecycle hooks)
-        obj._id = int(snap["id"])
-        type(obj)._id = max(type(obj)._id, obj._id)
+        self._scheduled = bool(snap["scheduled"])
+        self._scheduled_at = snap.get("scheduled_at", None)
+        self._completed_at = snap.get("completed_at", None)
 
-        obj._scheduled = bool(snap["scheduled"])
-        obj._scheduled_at = snap.get("scheduled_at", None)
-        obj._completed_at = snap.get("completed_at", None)
+        self._total_execution_time = self._execution_time.total_time
+        self._model_execution_time = self._execution_time.model_time
 
-        # Derived fields from execution_time
-        obj._total_execution_time = et.total_time
-        obj._model_execution_time = et.model_time
+    @classmethod
+    def from_snapshot(cls, snap: Dict[str, Any], request_lookup: Dict[int, Request]) -> "BatchStage":
+        obj = cls.__new__(cls)
+        obj.restore_state_inplace(snap, request_lookup)
         return obj
 
     @classmethod

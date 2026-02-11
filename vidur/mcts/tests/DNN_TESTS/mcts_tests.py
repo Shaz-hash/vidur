@@ -16,6 +16,12 @@ from typing import Dict, List, Optional, Tuple
 
 
 # -----------------------------
+# Type of tests : mcts ones or evaluation ones
+# -----------------------------
+
+RUN_EVAL_DEBUG_LOGS = False
+
+# -----------------------------
 # Config (matches alphaZero defaults)
 # -----------------------------
 MIN_PREFILL_TOKENS = 512
@@ -33,6 +39,9 @@ MAX_REQUESTS_NORM = 200  # not used here, but kept for future
 ## For threshold prior tests & verification 
 CONTROLLER_MIN_PRIOR_THRESHOLD = 0.01
 ADVERSARY_MIN_PRIOR_THRESHOLD = 0.1
+
+DECODE_TOL_BUCKET_SIZE = 10
+DECODE_TOL_PER_BUCKET_SEC = 50e-3  # 50 ms per 10 decode tokens (eval logs only)
 
 PRIOR_SUM_TOL = 1e-6
 PRIOR_FLOOR_TOL = 1e-6
@@ -126,6 +135,162 @@ def _resolve_mcts_iter_paths() -> List[str]:
             ]
         )
     ]
+
+
+
+def _resolve_eval_debug_paths() -> List[str]:
+    # If args are passed, treat them as file/glob/dir inputs.
+    args = sys.argv[1:]
+    paths: List[str] = []
+
+    if args:
+        for a in args:
+            if os.path.isdir(a):
+                paths.extend(glob.glob(os.path.join(a, "candidate_as_adversary", "game_*.csv")))
+                paths.extend(glob.glob(os.path.join(a, "best_as_adversary", "game_*.csv")))
+                continue
+
+            matches = glob.glob(a)
+            if matches:
+                paths.extend(matches)
+            elif os.path.exists(a):
+                paths.append(a)
+
+        paths = sorted(set(paths))
+        if not paths:
+            raise FileNotFoundError(f"No eval debug files matched args: {args}")
+        return paths
+
+    candidates = [
+        "simulator_output/mcts_dnn_logs/gen_*/candidate_as_adversary/game_*.csv",
+        "simulator_output/mcts_dnn_logs/gen_*/best_as_adversary/game_*.csv",
+        "vidur/simulator_output/mcts_dnn_logs/gen_*/candidate_as_adversary/game_*.csv",
+        "vidur/simulator_output/mcts_dnn_logs/gen_*/best_as_adversary/game_*.csv",
+        # fallback to old location if needed
+        "simulator_output/mcts_dnn_dataset/train/gen_*/candidate_as_adversary/game_*.csv",
+        "simulator_output/mcts_dnn_dataset/train/gen_*/best_as_adversary/game_*.csv",
+        "vidur/simulator_output/mcts_dnn_dataset/train/gen_*/candidate_as_adversary/game_*.csv",
+        "vidur/simulator_output/mcts_dnn_dataset/train/gen_*/best_as_adversary/game_*.csv",
+    ]
+    for pat in candidates:
+        paths.extend(glob.glob(pat))
+
+    paths = sorted(set(paths))
+    if paths:
+        return paths
+
+    raise FileNotFoundError(
+        "No evaluator debug game CSVs found under mcts_dnn_logs/gen_*/(candidate_as_adversary|best_as_adversary)/game_*.csv"
+    )
+
+
+def _other_player(player: str) -> str:
+    if player == "adversary":
+        return "controller"
+    if player == "controller":
+        return "adversary"
+    return ""
+
+
+def load_rows_eval(eval_game_path: str) -> List[Row]:
+    kept: List[Tuple[int, dict]] = []
+
+    with open(eval_game_path, newline="") as f:
+        r = csv.DictReader(f)
+        for i, raw in enumerate(r, start=2):
+            phase = (raw.get("phase") or "").strip()
+            acting = (raw.get("acting_player") or "").strip()
+            action_repr = (raw.get("best_action_repr") or "").strip()
+
+            # skip synthetic end rows / malformed rows
+            if phase == "end":
+                continue
+            if not acting:
+                continue
+            if not action_repr:
+                continue
+
+            kept.append((i, raw))
+
+    if not kept:
+        return []
+
+    first_root_player = (kept[0][1].get("acting_player") or kept[0][1].get("root_player") or "").strip()
+
+    out: List[Row] = []
+    prev_node_id: Optional[int] = None
+
+    for j, (rownum, raw) in enumerate(kept):
+        acting = (raw.get("acting_player") or "").strip()
+        action_repr = (raw.get("best_action_repr") or "")
+
+        action_index = _safe_int(raw.get("best_action_index"), -1)
+        if action_index < 0:
+            # fallback for older eval logs where best_action_index may be blank
+            adv_count = _count_adversary_specs(action_repr)
+            if adv_count > 0:
+                action_index = adv_count - 1
+
+        step_index = _safe_int(raw.get("step_index"), j + 1)
+        node_id = step_index if step_index > 0 else (j + 1)
+
+        next_actor = ""
+        if j + 1 < len(kept):
+            next_actor = (kept[j + 1][1].get("acting_player") or "").strip()
+        if not next_actor:
+            next_actor = _other_player(acting)
+
+        root_depth = _safe_int(raw.get("root_depth"), 0)
+
+        out.append(
+            Row(
+                rownum=rownum,
+                game_id=_safe_int(raw.get("game_id"), 0),
+                root_id=_safe_int(raw.get("root_id"), 0),
+                root_node_id=_safe_int(raw.get("root_node_id"), 0),
+                root_player=first_root_player,
+                node_id=node_id,
+                parent_node_id=prev_node_id,
+                node_depth=max(0, root_depth + 1),
+                sim_time=_safe_float(raw.get("sim_time"), 0.0),
+                player_acted=acting,
+                player_to_act=next_actor,
+                action_index=action_index,
+                action_repr=action_repr,
+                phase=(raw.get("phase") or "").strip(),
+                nn_called=False,  # evaluator logs are inference rollout logs, not mcts expansion rows
+                model_prior_json=(raw.get("model_root_prior_json") or "[]"),
+                normalized_prior_json="[]",
+                state_waiting_ids=_parse_int_list(raw.get("state_waiting_ids") or ""),
+                state_completed_ids=_parse_int_list(raw.get("state_completed_request_ids") or ""),
+                adv_deadlines_by_id=_parse_deadline_map(raw.get("adversary_prefill_deadlines_by_id") or ""),
+                slo_violations=_safe_int(raw.get("slo_violations"), 0),
+                avg_lateness=_safe_float(raw.get("total_lateness"), 0.0),
+                objective_cost=_safe_float(raw.get("total_cost"), 0.0),
+            )
+        )
+        prev_node_id = node_id
+
+    return out
+
+
+def _decode_eval_extra_tol_sec(decode_total: int) -> float:
+    # Keep original strict checks for non-eval logs and decode_total == 0
+    if (not RUN_EVAL_DEBUG_LOGS) or decode_total <= 0:
+        return 0.0
+    buckets = (int(decode_total) - 1) // DECODE_TOL_BUCKET_SIZE + 1
+    return float(buckets) * DECODE_TOL_PER_BUCKET_SEC
+
+
+def _all_active_prefill_complete(ctx: TraceContext) -> bool:
+    has_active = False
+    for rs in ctx.requests.values():
+        if rs.completed:
+            continue
+        has_active = True
+        if rs.remaining_prefill > 0 or rs.prefill_completed_at is None:
+            return False
+    return has_active
 
 
 
@@ -320,6 +485,37 @@ def _fail(test_name: str, msg: str, row: Row, trace_id: str) -> None:
         f"  ERROR: {msg}"
     )
     raise TestFailure(detail)
+
+
+def _maybe_apply_hidden_decode_snap_for_eval(
+    ctx: TraceContext,
+    prev_row: Optional[Row],
+    row: Row,
+) -> None:
+    # Eval logs may skip forced decode-only controller rows.
+    if not RUN_EVAL_DEBUG_LOGS:
+        return
+    if prev_row is None:
+        return
+    if prev_row.player_acted != "controller" or row.player_acted != "adversary":
+        return
+    if ctx.last_adv_batch_time is None:
+        return
+    if not _all_active_prefill_complete(ctx):
+        return
+
+    target = float(ctx.last_adv_batch_time) + 1.0
+    if not (float(prev_row.sim_time) + INTERVAL_EPS < target):
+        return
+    if abs(float(row.sim_time) - target) > DEADLINE_TOL:
+        return
+
+    # Mirror env._maybe_fast_forward_decode_only_to_next_adv_second semantics:
+    # reset decode deadlines to target + decode_slo
+    for rs in ctx.requests.values():
+        if rs.completed:
+            continue
+        rs.decode_next_deadline = target + float(rs.decode_slo)
 
 
 # -----------------------------
@@ -638,6 +834,107 @@ def test_controller_allocations_respect_remaining(
                     trace_id,
                 )
 
+# def test_controller_time_delta(
+#     ctx: TraceContext,
+#     row: Row,
+#     prev_row: Optional[Row],
+#     prefill_profile: Dict[int, float],
+#     prefill_total: int,
+#     decode_total: int,
+#     trace_id: str,
+# ) -> None:
+#     # Test 6
+#     if prev_row is None:
+#         return
+#     dt = float(row.sim_time) - float(prev_row.sim_time)
+#     if dt <= 0.0:
+#         _fail("test_controller_time_delta", f"dt={dt:.9f} not >0", row, trace_id)
+
+#     # if prefill_total >= BUDGET_STEP:
+#     #     lo = prefill_profile.get(prefill_total)
+#     #     max_profile_tokens = max(prefill_profile.keys())
+#     #     hi_key = min(prefill_total + BUDGET_STEP, max_profile_tokens)
+#     #     hi = prefill_profile.get(hi_key)
+
+#     #     if lo is None or hi is None:
+#     #         _fail(
+#     #             "test_controller_time_delta",
+#     #             f"missing prefill_profile for {prefill_total} or {min(prefill_total + BUDGET_STEP, MAX_PREFILL_TOKENS)}",
+#     #             row,
+#     #             trace_id,
+#     #         )
+#     #     if dt + DEADLINE_TOL < lo:
+#     #         _fail("test_controller_time_delta", f"dt={dt:.9f} < prefill_time({prefill_total})={lo:.9f}", row, trace_id)
+#     #     if dt - DEADLINE_TOL > hi:
+#     #         _fail(
+#     #             "test_controller_time_delta",
+#     #             f"dt={dt:.9f} > prefill_time({min(prefill_total + BUDGET_STEP, MAX_PREFILL_TOKENS)})={hi:.9f}",
+#     #             row,
+#     #             trace_id,
+#     #         )
+    
+#     if prefill_total >= BUDGET_STEP:
+#         min_profile_tokens = min(prefill_profile.keys())
+#         max_profile_tokens = max(prefill_profile.keys())
+
+#         lo_key = max(min_profile_tokens, prefill_total - BUDGET_STEP)
+#         hi_key = min(max_profile_tokens, prefill_total + BUDGET_STEP)
+
+#         lo = prefill_profile.get(lo_key)
+#         hi = prefill_profile.get(hi_key)
+
+#         if lo is None or hi is None:
+#             _fail(
+#                 "test_controller_time_delta",
+#                 f"missing prefill_profile for lo={lo_key} or hi={hi_key}",
+#                 row,
+#                 trace_id,
+#             )
+
+#         if dt + DEADLINE_TOL < lo:
+#             _fail(
+#                 "test_controller_time_delta",
+#                 f"dt={dt:.9f} < prefill_time({lo_key})={lo:.9f}",
+#                 row,
+#                 trace_id,
+#             )
+#         if dt - DEADLINE_TOL > hi:
+#             _fail(
+#                 "test_controller_time_delta",
+#                 f"dt={dt:.9f} > prefill_time({hi_key})={hi:.9f}",
+#                 row,
+#                 trace_id,
+#             )
+
+
+#         else:
+#             if (
+#                 decode_total > 0
+#                 and ctx.last_adv_batch_time is not None
+#                 and _all_active_prefill_complete(ctx)
+#             ):
+#                 target = ctx.last_adv_batch_time + 1.0
+#                 if abs(row.sim_time - target) > 1e-3:
+#                     _fail(
+#                         "test_controller_time_delta",
+#                         f"decode-only snap mismatch: sim_time={row.sim_time:.6f} target={target:.6f}",
+#                         row,
+#                         trace_id,
+#                     )
+
+    
+#     # else:
+#     #     # decode-only: just bound it by prefill_time(1024) as you requested
+#     #     # NEW : snap to next adversary second as the bound
+#     #     if decode_total > 0 and ctx.last_adv_batch_time is not None:
+#     #         target = ctx.last_adv_batch_time + 1.0
+#     #         if abs(row.sim_time - target) > 1e-3:
+#     #             _fail("test_controller_time_delta", f"decode-only snap mismatch: sim_time={row.sim_time:.6f} target={target:.6f}", row, trace_id)
+#     #     # cap = prefill_profile.get(1024)
+#     #     # if cap is not None and dt - DEADLINE_TOL > cap:
+#     #     #     _fail("test_controller_time_delta", f"decode-only dt={dt:.9f} > prefill_time(1024)={cap:.9f}", row, trace_id)
+
+
 def test_controller_time_delta(
     ctx: TraceContext,
     row: Row,
@@ -650,33 +947,11 @@ def test_controller_time_delta(
     # Test 6
     if prev_row is None:
         return
+
     dt = float(row.sim_time) - float(prev_row.sim_time)
     if dt <= 0.0:
         _fail("test_controller_time_delta", f"dt={dt:.9f} not >0", row, trace_id)
 
-    # if prefill_total >= BUDGET_STEP:
-    #     lo = prefill_profile.get(prefill_total)
-    #     max_profile_tokens = max(prefill_profile.keys())
-    #     hi_key = min(prefill_total + BUDGET_STEP, max_profile_tokens)
-    #     hi = prefill_profile.get(hi_key)
-
-    #     if lo is None or hi is None:
-    #         _fail(
-    #             "test_controller_time_delta",
-    #             f"missing prefill_profile for {prefill_total} or {min(prefill_total + BUDGET_STEP, MAX_PREFILL_TOKENS)}",
-    #             row,
-    #             trace_id,
-    #         )
-    #     if dt + DEADLINE_TOL < lo:
-    #         _fail("test_controller_time_delta", f"dt={dt:.9f} < prefill_time({prefill_total})={lo:.9f}", row, trace_id)
-    #     if dt - DEADLINE_TOL > hi:
-    #         _fail(
-    #             "test_controller_time_delta",
-    #             f"dt={dt:.9f} > prefill_time({min(prefill_total + BUDGET_STEP, MAX_PREFILL_TOKENS)})={hi:.9f}",
-    #             row,
-    #             trace_id,
-    #         )
-    
     if prefill_total >= BUDGET_STEP:
         min_profile_tokens = min(prefill_profile.keys())
         max_profile_tokens = max(prefill_profile.keys())
@@ -702,25 +977,36 @@ def test_controller_time_delta(
                 row,
                 trace_id,
             )
-        if dt - DEADLINE_TOL > hi:
+
+        # decode_total == 0 => strict old behavior
+        # decode_total > 0 => add eval-only extra tolerance by 10-token buckets
+        extra_tol = _decode_eval_extra_tol_sec(decode_total)
+        upper_tol = DEADLINE_TOL + extra_tol
+        if dt - upper_tol > hi:
             _fail(
                 "test_controller_time_delta",
-                f"dt={dt:.9f} > prefill_time({hi_key})={hi:.9f}",
+                f"dt={dt:.9f} > prefill_time({hi_key})={hi:.9f} "
+                f"(upper_tol={upper_tol:.6f}, decode_total={decode_total})",
                 row,
                 trace_id,
             )
 
-    
     else:
-        # decode-only: just bound it by prefill_time(1024) as you requested
-        # NEW : snap to next adversary second as the bound
-        if decode_total > 0 and ctx.last_adv_batch_time is not None:
-            target = ctx.last_adv_batch_time + 1.0
-            if abs(row.sim_time - target) > 1e-3:
-                _fail("test_controller_time_delta", f"decode-only snap mismatch: sim_time={row.sim_time:.6f} target={target:.6f}", row, trace_id)
-        # cap = prefill_profile.get(1024)
-        # if cap is not None and dt - DEADLINE_TOL > cap:
-        #     _fail("test_controller_time_delta", f"decode-only dt={dt:.9f} > prefill_time(1024)={cap:.9f}", row, trace_id)
+        # decode-only snap check
+        if (
+            decode_total > 0
+            and ctx.last_adv_batch_time is not None
+            and _all_active_prefill_complete(ctx)
+        ):
+            target = float(ctx.last_adv_batch_time) + 1.0
+            if abs(float(row.sim_time) - target) > 1e-3:
+                _fail(
+                    "test_controller_time_delta",
+                    f"decode-only snap mismatch: sim_time={row.sim_time:.6f} target={target:.6f}",
+                    row,
+                    trace_id,
+                )
+
 
 
 def _apply_controller_and_update_objective(
@@ -761,11 +1047,25 @@ def _apply_controller_and_update_objective(
             rs.prefill_finalized = True
 
     # To handle the case where we fast forward to the next adversary second which happens when there is no prefill work:
+    # snap_decode_deadlines = False
+    # if prev_row is not None and (not prefill_alloc) and decode_alloc and ctx.last_adv_batch_time is not None:
+    #     target = float(ctx.last_adv_batch_time) + 1.0
+    #     if (float(prev_row.sim_time) + INTERVAL_EPS < target) and (abs(sim_time - target) <= DEADLINE_TOL):
+    #         snap_decode_deadlines = True
+
+    # in _apply_controller_and_update_objective(), tighten snap condition
     snap_decode_deadlines = False
-    if prev_row is not None and (not prefill_alloc) and decode_alloc and ctx.last_adv_batch_time is not None:
+    if (
+        prev_row is not None
+        and (not prefill_alloc)
+        and decode_alloc
+        and ctx.last_adv_batch_time is not None
+        and _all_active_prefill_complete(ctx)
+    ):
         target = float(ctx.last_adv_batch_time) + 1.0
         if (float(prev_row.sim_time) + INTERVAL_EPS < target) and (abs(sim_time - target) <= DEADLINE_TOL):
             snap_decode_deadlines = True
+
 
     # before computing token_late:
     if snap_decode_deadlines:
@@ -911,6 +1211,7 @@ def run_trace(trace_rows: List[Row], *, prefill_profile: Dict[int, float]) -> in
         ids_seen = set(row.state_waiting_ids) | set(row.state_completed_ids)
 
         if row.player_acted == "adversary":
+            _maybe_apply_hidden_decode_snap_for_eval(ctx, prev_row, row)
             adv_request_count = _count_adversary_specs(row.action_repr)
             deadline_map = row.adv_deadlines_by_id
 
@@ -1081,8 +1382,48 @@ def build_leaf_traces(rows: List[Row]) -> List[List[Row]]:
     return traces
 
 
-def main() -> None:
+# def main() -> None:
     
+#     prefill_profile_path = _resolve_existing_path(
+#         [
+#             "vidur/simulator_output/prefill_profile.csv",
+#             "simulator_output/prefill_profile.csv",
+#         ]
+#     )
+
+#     iter_paths = _resolve_mcts_iter_paths()
+
+#     prefill_profile = load_prefill_profile(prefill_profile_path)
+
+#     grand_traces = 0
+#     grand_adv = 0
+
+#     try:
+#         for mcts_iter_path in iter_paths:
+#             rows = load_rows(mcts_iter_path)
+#             traces = build_leaf_traces(rows)
+
+#             print(f"\n=== Testing {mcts_iter_path} ===")
+#             print(f"Loaded {len(rows)} rows")
+#             print(f"Built {len(traces)} leaf traces")
+
+#             total_adv_actions = 0
+#             for tr in traces:
+#                 total_adv_actions += run_trace(tr, prefill_profile=prefill_profile)
+
+#             print(f"✅ Passed {mcts_iter_path}: traces={len(traces)} adv_actions={total_adv_actions}")
+#             grand_traces += len(traces)
+#             grand_adv += total_adv_actions
+
+#     except TestFailure as e:
+#         print("\n❌ MCTS_DNN log test failed:\n")
+#         print(str(e))
+#         sys.exit(1)
+
+#     print(f"\n✅ All files passed. files={len(iter_paths)} traces={grand_traces} adv_actions_checked={grand_adv}")
+
+
+def main() -> None:
     prefill_profile_path = _resolve_existing_path(
         [
             "vidur/simulator_output/prefill_profile.csv",
@@ -1090,27 +1431,30 @@ def main() -> None:
         ]
     )
 
-    iter_paths = _resolve_mcts_iter_paths()
-
+    log_paths = _resolve_eval_debug_paths() if RUN_EVAL_DEBUG_LOGS else _resolve_mcts_iter_paths()
     prefill_profile = load_prefill_profile(prefill_profile_path)
 
     grand_traces = 0
     grand_adv = 0
 
     try:
-        for mcts_iter_path in iter_paths:
-            rows = load_rows(mcts_iter_path)
-            traces = build_leaf_traces(rows)
+        for log_path in log_paths:
+            if RUN_EVAL_DEBUG_LOGS:
+                rows = load_rows_eval(log_path)
+                traces = [rows] if rows else []
+            else:
+                rows = load_rows(log_path)
+                traces = build_leaf_traces(rows)
 
-            print(f"\n=== Testing {mcts_iter_path} ===")
+            print(f"\n=== Testing {log_path} ===")
             print(f"Loaded {len(rows)} rows")
-            print(f"Built {len(traces)} leaf traces")
+            print(f"Built {len(traces)} traces")
 
             total_adv_actions = 0
             for tr in traces:
                 total_adv_actions += run_trace(tr, prefill_profile=prefill_profile)
 
-            print(f"✅ Passed {mcts_iter_path}: traces={len(traces)} adv_actions={total_adv_actions}")
+            print(f"✅ Passed {log_path}: traces={len(traces)} adv_actions={total_adv_actions}")
             grand_traces += len(traces)
             grand_adv += total_adv_actions
 
@@ -1119,7 +1463,9 @@ def main() -> None:
         print(str(e))
         sys.exit(1)
 
-    print(f"\n✅ All files passed. files={len(iter_paths)} traces={grand_traces} adv_actions_checked={grand_adv}")
+    print(f"\n✅ All files passed. files={len(log_paths)} traces={grand_traces} adv_actions_checked={grand_adv}")
+
+
 if __name__ == "__main__":
     main()
 

@@ -13,6 +13,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+import torch
+from vidur.mcts.DNN.infer import build_model_inputs
 
 from vidur.config import SimulationConfig
 from vidur.simulator import Simulator
@@ -34,7 +36,7 @@ _TOKEN_ALLOC_RE = re.compile(r"token_allocations\s*=\s*(\{.*\})")
 # User config (edit these)
 # -----------------------------
 
-JUST_VERIFY_COST = True  # If True, only verify cost at root; skip best-path search
+JUST_VERIFY_COST = False  # If True, only verify cost at root; skip best-path search
 
 # Put the copied mcts_root_pXX.csv here as root.csv
 ROOT_CSV_PATH = Path(__file__).with_name("root.csv")
@@ -68,18 +70,24 @@ BEST_PATH_OUT = Path("simulator_output/best_path.csv")
 # -----------------------------
 # Fixed controller policy runner
 # -----------------------------
-CHECK_TRIVIAL = True # If True, run fixed policy verifier after MCTS verifier, You need to have adversary.csv with just one action from mcts_root logs
+CHECK_TRIVIAL = True # If True, run fixed policy verifier after MCTS verifier, You need to have the last row to be adversary in the adversary.csv for it to work, and the fixed policy will start from the state right after applying that adversary action.
 ADVERSARY_CSV_PATH = Path(__file__).with_name("adversary.csv")
 
-FIXED_POLICY_PREFILL_BUDGET = 512  # e.g. 512, 1024, ..., 3072
-FIXED_POLICY_HEURISTIC = "LST"     # one of: SJF, EDF, LST, LJF
+FIXED_POLICY_PREFILL_BUDGET = 1024  # e.g. 512, 1024, ..., 3072
+FIXED_POLICY_HEURISTIC = "SJF"     # one of: SJF, EDF, LST, LJF
 FIXED_POLICY_MAX_STEPS = 200       # safety cap
-FIXED_POLICY_PRINT_EACH_STEP = True
+FIXED_POLICY_PRINT_EACH_STEP = False
 
 
 _CONTROLLER_HEUR_ORDER = ["SJF", "EDF", "LST", "LJF"]
 _HEUR_TO_IDX = {h: i for i, h in enumerate(_CONTROLLER_HEUR_ORDER)}
 
+
+
+## Verifying the features :
+DUMP_INFER_FEATURES: bool = True
+INFER_FEATURES_OUT: Optional[Path] = Path("simulator_output/verifier_infer_features.jsonl")
+INFER_FEATURES_PRINT: bool = False  # set True if you want stdout too
 
 
 # -----------------------------
@@ -252,6 +260,33 @@ def has_prefill_work(env: VidurMCTSEnvironment, state: VidurMCTSState) -> bool:
     return False
 
 
+def _dump_infer_features(state: VidurMCTSState, *, tag: str = "") -> None:
+    # CPU-only so this never touches CUDA
+    inputs = build_model_inputs(state, player="controller", device=torch.device("cpu"))
+
+    req_mask = inputs.req_mask.squeeze(0).to("cpu").tolist()          # [20] bools
+    req_feat = inputs.req_features.squeeze(0).to("cpu").tolist()      # [20][3]
+    req_valid = [req_feat[i] for i, ok in enumerate(req_mask) if ok]  # only real req slots
+
+    glob = inputs.global_features.squeeze(0).to("cpu").tolist()       # [9]
+
+    rec = {
+        "tag": tag,
+        "sim_time": float(getattr(state.simulator, "_time", 0.0)),
+        "global_features": glob,
+        "req_features": req_valid,
+    }
+
+    if INFER_FEATURES_OUT is not None:
+        INFER_FEATURES_OUT.parent.mkdir(parents=True, exist_ok=True)
+        with INFER_FEATURES_OUT.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
+
+    if INFER_FEATURES_PRINT:
+        print(f"[INFER] {tag} t={rec['sim_time']:.6f} global={glob}")
+        for j, (rem_norm, cached_norm, slack) in enumerate(req_valid):
+            print(f"  req[{j}] rem={rem_norm:.6f} cached={cached_norm:.6f} slack={slack:.6f}")
+
 
 @dataclass(frozen=True)
 class RootLogRow:
@@ -396,6 +431,7 @@ def compute_metrics(env: VidurMCTSEnvironment, state: VidurMCTSState) -> StepMet
     violated = len(getattr(state.stats, "violated_request_ids", set()) or set())
     t = float(getattr(state.simulator, "_time", 0.0))
     cost = float(v) + float(late)
+   
     return StepMetrics(sim_time=t, violations=int(v), lateness=float(late), violated_requests=int(violated), objective_cost=cost)
 
 
@@ -481,13 +517,41 @@ def run_fixed_controller_policy_from_adversary_csv(
         raise FileNotFoundError(f"Missing adversary csv at {adversary_csv}")
 
     env = build_env()
-    adv_row = load_root_csv(adversary_csv)[0]
+    # adv_row = load_root_csv(adversary_csv)[0]
 
-    state = env.initial_state()
-    player = "adversary"
+    # state = env.initial_state()
+    # player = "adversary"
 
-    # Ensure we start on a branching node before applying the logged adversary action
-    state, player = advance_forced_until_branching(env, state, player, max_hops=MAX_FORCED_HOPS)
+    # # Ensure we start on a branching node before applying the logged adversary action
+    # state, player = advance_forced_until_branching(env, state, player, max_hops=MAX_FORCED_HOPS)
+    # if adv_row.root_player and adv_row.root_player != player:
+    #     raise RuntimeError(
+    #         f"adversary.csv root_player mismatch: row.root_player={adv_row.root_player!r} but current player={player!r}"
+    #     )
+
+    # adv_action = _parse_action_json(adv_row.best_action_json)
+    # if not isinstance(adv_action, AdversaryAction):
+    #     raise RuntimeError("adversary.csv best_action_json must be an adversary action.")
+    # state = env.apply_adversary_action_only(state, adv_action, inplace=True)
+
+    adv_rows = load_root_csv(adversary_csv)
+
+    if len(adv_rows) == 1:
+        state = env.initial_state()
+        player = "adversary"
+        state, player = advance_forced_until_branching(env, state, player, max_hops=MAX_FORCED_HOPS)
+        adv_row = adv_rows[0]
+    else:
+        # Replay history up to last row's root; last row should be the adversary action root.
+        state, player, target_row = replay_history_to_root_state(
+            env,
+            adv_rows,
+            verify_last_root_state=True,
+        )
+        if target_row is None:
+            raise RuntimeError("Failed to recover target row from adversary history.")
+        adv_row = target_row
+
     if adv_row.root_player and adv_row.root_player != player:
         raise RuntimeError(
             f"adversary.csv root_player mismatch: row.root_player={adv_row.root_player!r} but current player={player!r}"
@@ -497,6 +561,7 @@ def run_fixed_controller_policy_from_adversary_csv(
     if not isinstance(adv_action, AdversaryAction):
         raise RuntimeError("adversary.csv best_action_json must be an adversary action.")
     state = env.apply_adversary_action_only(state, adv_action, inplace=True)
+
 
     m0 = compute_metrics(env, state)
     print("=" * 100)
@@ -602,6 +667,9 @@ def replay_history_to_root_state(
             raise RuntimeError(
                 f"History replay mismatch at row {i}: row.root_player={row.root_player} but current player={player}"
             )
+
+        if DUMP_INFER_FEATURES:
+            _dump_infer_features(state, tag="compute_metrics")
 
         action = _parse_action_json(row.best_action_json)
 
