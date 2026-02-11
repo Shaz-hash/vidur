@@ -114,7 +114,13 @@ class SelfPlayRunner:
         self.model = model
         self.writer = writer
         self.device = device_for_features
-        self.history = HistoryRootGenerator(env=self.env , max_branching = self.mcts._cfg.max_branching, iter_logger = getattr(self.mcts, '_iter_logger', None))
+        #self.history = HistoryRootGenerator(env=self.env , max_branching = self.mcts._cfg.max_branching, iter_logger = getattr(self.mcts, '_iter_logger', None))
+        self.history = HistoryRootGenerator(
+            env=self.env,
+            max_branching=self.mcts._cfg.max_branching,
+            iter_logger=getattr(self.mcts, "_iter_logger", None),
+            root_logger=getattr(self.mcts, "_root_logger", None),
+        )
 
 
     def _advance_to_branching_root(

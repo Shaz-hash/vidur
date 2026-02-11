@@ -7,8 +7,18 @@ from typing import Any, Optional, Tuple
 
 import torch
 
-from ..environment import VidurMCTSEnvironment, VidurMCTSState
-from ..logger.mctsDNN_logger import DNNMCTSIterationLogger
+# from ..environment import VidurMCTSEnvironment, VidurMCTSState
+# from ..logger.mctsDNN_logger import DNNMCTSIterationLogger
+
+
+from ..environment import (
+    VidurMCTSEnvironment,
+    VidurMCTSState,
+    ControllerAction,
+    AdversaryAction,
+)
+from ..logger.mctsDNN_logger import DNNMCTSIterationLogger, DNNMCTSRootSummaryLogger
+
 
 ## TODO: Use this class later for the verification of a given trace
 def _mask_to_list(mask) -> list[bool]:
@@ -33,11 +43,12 @@ class HistoryRootGenerator:
         env: VidurMCTSEnvironment,
         max_branching: int,
         iter_logger: Optional[DNNMCTSIterationLogger] = None,
+        root_logger: Optional[DNNMCTSRootSummaryLogger] = None,
     ) -> None:
         self.env = env
         self.max_branching = int(max_branching)
         self.iter_logger = iter_logger
-
+        self.root_logger = root_logger
     def _actions_valid(self, state: VidurMCTSState, player: str) -> tuple[list[Optional[object]], list[int], list[bool]]:
         if player == "controller":
             actions_by_index, mask = self.env.sample_controller_actions(state, self.max_branching)
@@ -65,6 +76,44 @@ class HistoryRootGenerator:
         state = self.env.apply_controller_action_only(state, action, inplace=True)
         return state, "adversary"
 
+
+
+    def _history_action_json(self, action: object, phase: str) -> str:
+        if isinstance(action, ControllerAction):
+            payload = {
+                "type": "controller",
+                "token_budget": int(action.token_budget),
+                "selected_request_ids": [int(x) for x in (action.selected_request_ids or [])],
+                "token_allocations": {str(int(k)): int(v) for k, v in (action.token_allocations or {}).items()},
+                "prefill_allocations": {str(int(k)): int(v) for k, v in (action.prefill_allocations or {}).items()},
+                "decode_allocations": {str(int(k)): int(v) for k, v in (action.decode_allocations or {}).items()},
+                "heuristic": action.heuristic,
+                "strategy": action.strategy,
+                "history_phase": phase,
+            }
+            return json.dumps(payload, ensure_ascii=False)
+
+        if isinstance(action, AdversaryAction):
+            payload = {
+                "type": "adversary",
+                "requests": [
+                    {
+                        "prefill_tokens": int(r.prefill_tokens),
+                        "decode_tokens": int(r.decode_tokens),
+                        "prefill_slo": float(r.prefill_slo),
+                        "decode_slo": float(r.decode_slo),
+                    }
+                    for r in (action.requests or [])
+                ],
+                "stop_decode_ids": [int(x) for x in (action.stop_decode_ids or [])],
+                "history_phase": phase,
+            }
+            return json.dumps(payload, ensure_ascii=False)
+
+        return json.dumps({"type": "unknown", "repr": repr(action), "history_phase": phase}, ensure_ascii=False)
+
+
+
     def _log_step(
         self,
         *,
@@ -82,59 +131,76 @@ class HistoryRootGenerator:
         phase: str,
         state_after: VidurMCTSState,
     ) -> None:
-        if self.iter_logger is None:
-            print("returningg")
-            return
-
-        violations, lateness_sum = self.env.evaluate_objective(state_after)
-        objective_cost = float(violations) + float(lateness_sum)
-        snap = self.env.describe_state(state_after)
+        if self.iter_logger is not None:
+            violations, lateness_sum = self.env.evaluate_objective(state_after)
+            objective_cost = float(violations) + float(lateness_sum)
+            snap = self.env.describe_state(state_after)
 
 
-        adv_deadlines_json = "{}"
-        if player_acted == "adversary":
-            req_specs = getattr(action, "requests", None) or []
-            if req_specs:
-                lookup = self.env._build_request_lookup(state_after.simulator)
-                if lookup:
-                    k = len(req_specs)
-                    new_ids = sorted(lookup.keys())[-k:]  # assumes newest have largest ids
-                    out = {}
-                    for rid in new_ids:
-                        req = lookup.get(rid)
-                        if req is None:
-                            continue
-                        queued_at = float(getattr(req, "queued_at", getattr(req, "arrived_at", 0.0)) or 0.0)
-                        slo = float(getattr(req, "prefill_slo_time", 0.0) or 0.0)
-                        out[int(rid)] = queued_at + slo
-                    adv_deadlines_json = json.dumps(out)
+            adv_deadlines_json = "{}"
+            if player_acted == "adversary":
+                req_specs = getattr(action, "requests", None) or []
+                if req_specs:
+                    lookup = self.env._build_request_lookup(state_after.simulator)
+                    if lookup:
+                        k = len(req_specs)
+                        new_ids = sorted(lookup.keys())[-k:]  # assumes newest have largest ids
+                        out = {}
+                        for rid in new_ids:
+                            req = lookup.get(rid)
+                            if req is None:
+                                continue
+                            queued_at = float(getattr(req, "queued_at", getattr(req, "arrived_at", 0.0)) or 0.0)
+                            slo = float(getattr(req, "prefill_slo_time", 0.0) or 0.0)
+                            out[int(rid)] = queued_at + slo
+                        adv_deadlines_json = json.dumps(out)
 
 
-        self.iter_logger.log_expand(
-            game_id=int(game_id),
-            root_id=int(root_id),
-            sim_iteration=-1,  # history row
-            root_depth=int(root_depth),
-            root_node_id=0,
-            root_player=str(player_acted),
-            node_depth=int(node_depth),
-            parent_node_id=None if parent_node_id is None else int(parent_node_id),
-            node_id=int(node_id),
-            player_to_act=str(next_player),
-            player_acted_to_create_this_node=str(player_acted),
-            action_index=int(action_index),
-            action_repr=repr(action),
-            prior=1.0,
-            reward=0.0,
-            nn_called=False,
-            num_valid_actions=int(n_valid),
-            unique_actions=int(n_valid),
-            nn_value_controller=None,
-            objective_cost=float(objective_cost),
-            adversary_prefill_deadlines_by_id_json=adv_deadlines_json,
-            state_snapshot=snap,
-            phase=f"history-{phase}",
-        )
+            self.iter_logger.log_expand(
+                game_id=int(game_id),
+                root_id=int(root_id),
+                sim_iteration=-1,  # history row
+                root_depth=int(root_depth),
+                root_node_id=0,
+                root_player=str(player_acted),
+                node_depth=int(node_depth),
+                parent_node_id=None if parent_node_id is None else int(parent_node_id),
+                node_id=int(node_id),
+                player_to_act=str(next_player),
+                player_acted_to_create_this_node=str(player_acted),
+                action_index=int(action_index),
+                action_repr=repr(action),
+                prior=1.0,
+                reward=0.0,
+                nn_called=False,
+                num_valid_actions=int(n_valid),
+                unique_actions=int(n_valid),
+                nn_value_controller=None,
+                objective_cost=float(objective_cost),
+                adversary_prefill_deadlines_by_id_json=adv_deadlines_json,
+                state_snapshot=snap,
+                phase=f"history-{phase}",
+            )
+
+        if self.root_logger is not None:
+            self.root_logger.log_root(
+                game_id=int(game_id),
+                root_id=int(root_id),
+                root_depth=int(root_depth),
+                root_node_id=int(node_id),
+                root_player=str(player_acted),
+                num_simulations=0,  # marks history rows
+                model_root_value_controller=0.0,
+                model_root_prior=[],
+                normalized_root_prior=[],
+                valid_action_mask=[],
+                mcts_root_value_controller=0.0,
+                mcts_root_prior=[],
+                best_action_index=int(action_index),
+                best_action_repr=repr(action),
+                best_action_json=self._history_action_json(action, phase),
+            )
+
 
     def advance_to_branching_root(
         self,
@@ -224,6 +290,7 @@ class HistoryRootGenerator:
         if target <= 0:
             # still make sure we're at a branching root if caller wants
             return state, player, int(depth)
+            # return state, player, int(depth), int(log_node_id), log_parent_id
 
         rng = random.Random(int(seed) if seed is not None else (1000003 * int(game_id) + int(root_id_for_logs)))
 

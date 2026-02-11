@@ -232,6 +232,16 @@ def _parse_token_allocations_from_action_repr(action_repr: str) -> Dict[int, int
     return {int(k): int(v) for k, v in d.items()}
 
 
+def _is_explicit_history_row(row: RootLogRow) -> bool:
+    s = (row.best_action_json or "").strip()
+    if not s:
+        return False
+    try:
+        d = json.loads(s)
+    except Exception:
+        return False
+    return isinstance(d, dict) and ("history_phase" in d)
+
 
 
 
@@ -660,9 +670,14 @@ def replay_history_to_root_state(
     player = (history[0].root_player if history else (target.root_player if target else "adversary")) or "adversary"
 
     # Make sure we’re actually at a branching node before applying the first recorded action
-    state, player = advance_forced_until_branching(env, state, player, max_hops=MAX_FORCED_HOPS)
+    #state, player = advance_forced_until_branching(env, state, player, max_hops=MAX_FORCED_HOPS)
 
     for i, row in enumerate(history):
+        is_hist = _is_explicit_history_row(row)
+
+        if not is_hist:
+            state, player = advance_forced_until_branching(env, state, player, max_hops=MAX_FORCED_HOPS)
+
         if row.root_player and row.root_player != player:
             raise RuntimeError(
                 f"History replay mismatch at row {i}: row.root_player={row.root_player} but current player={player}"
@@ -692,7 +707,8 @@ def replay_history_to_root_state(
 
 
         # Skip forced moves to next branching root (this mimics self-play advance)
-        state, player = advance_forced_until_branching(env, state, player, max_hops=MAX_FORCED_HOPS)
+        if not is_hist:
+            state, player = advance_forced_until_branching(env, state, player, max_hops=MAX_FORCED_HOPS)
         
     # If we’re verifying last root row, enforce player alignment
     if verify_last_root_state and target is not None:

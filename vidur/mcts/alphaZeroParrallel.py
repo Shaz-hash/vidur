@@ -61,6 +61,8 @@ from .DNN.evaluator import (
     save_eval_roots_payload_from_cfg,
 )
 from .logger.eval_logger import EvalArenaGenerationLogger
+from .logger.replay_logger import ReplayBufferLogger
+
 
 
 
@@ -249,6 +251,80 @@ def _restore_trainer_from_ckpt(*, trainer: Trainer, path: Path) -> None:
 
 
 
+def _infer_best_generation_from_train_log(path: Path) -> int:
+    if not path.exists():
+        return -1
+
+    best_gen = -1
+    with path.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if str(row.get("event", "")).strip() != "eval_arena":
+                continue
+            saved = str(row.get("saved_best", "")).strip().lower()
+            if saved not in {"true", "1", "yes"}:
+                continue
+            try:
+                best_gen = max(best_gen, int(row.get("gen", "")))
+            except Exception:
+                pass
+    return best_gen
+
+
+def _csv_bool(v: object) -> bool:
+    return str(v).strip().lower() in {"true", "1", "yes"}
+
+def _bootstrap_replay_from_train_log(
+    *,
+    replay_buffer: BestModelReplayBuffer,
+    train_log_csv: Path,
+    best_generation: int,
+) -> tuple[int, int]:
+    """
+    Load replay from generations AFTER current best where arena failed.
+    Returns: (num_generations_loaded, raw_samples_added)
+    """
+    if best_generation < 0 or not train_log_csv.exists():
+        return 0, 0
+
+    rows: list[tuple[int, bool, Path | None]] = []
+    with train_log_csv.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if str(row.get("event", "")).strip() != "eval_arena":
+                continue
+            try:
+                gen = int(row.get("gen", ""))
+            except Exception:
+                continue
+            saved_best = _csv_bool(row.get("saved_best", ""))
+            ds = str(row.get("dataset_dir", "")).strip()
+            dataset_dir = Path(ds) if ds else None
+            rows.append((gen, saved_best, dataset_dir))
+
+    rows.sort(key=lambda x: x[0])
+
+    loaded_gens = 0
+    raw_added = 0
+    seen_gens: set[int] = set()
+
+    for gen, saved_best, dataset_dir in rows:
+        if gen <= int(best_generation):
+            continue
+        if saved_best:
+            continue
+        if gen in seen_gens:
+            continue
+        if dataset_dir is None or not dataset_dir.exists():
+            continue
+
+        raw_added += int(replay_buffer.add_generation_dir(dataset_dir))
+        seen_gens.add(gen)
+        loaded_gens += 1
+
+    return loaded_gens, raw_added
+
+
 def _maybe_resume_best(
     *,
     trainer: Trainer,
@@ -376,15 +452,6 @@ def _selfplay_worker_main(
         # Per-worker writer
         writer = ReplayWriter(ReplayWriterConfig(out_dir=out_dir, shard_size=cfg.dataset.shard_size))
 
-        # IMPORTANT: per-worker MCTS instance (don’t share across processes)
-        # Also IMPORTANT: logs must be unique per worker, or disable by passing None.
-        # If you want logs:
-        #   iter_log = out_dir / "mcts_iter.csv"
-        #   root_log = out_dir / "mcts_root.csv"
-        # Else (faster, no contention):
-        # iter_log = None
-        # root_log = None
-
         # Put per-worker logs in the global logs dir (not inside dataset dir)
         logs_base = Path(cfg.logging.mcts_iter_log).parent  # simulator_output/mcts_dnn_logs
         logs_dir = logs_base / f"gen_{gen:06d}"
@@ -446,6 +513,9 @@ def selfImprovementPolicy(
     train_log_csv: Path,
     device_for_features: torch.device = torch.device("cpu"),
     use_virtual_env: bool = False,
+    replay_capacity_samples: int = 12_000,
+    replay_max_cached_shards: int = 8,
+    replay_seed: int = 2026,
 ) -> None:
 
     # def _sample_worker_hops_for_generation(gen: int) -> list[int]:
@@ -528,7 +598,23 @@ def selfImprovementPolicy(
         trainer.save_checkpoint(best_path)    
 
 
+    replay_buffer = BestModelReplayBuffer(
+        capacity_samples=int(replay_capacity_samples),
+        max_cached_shards=int(replay_max_cached_shards),
+        seed=int(replay_seed),
+    )
+
     
+
+    replay_log_csv = train_log_csv.parent / "replay_logs.csv"
+    replay_logger = ReplayBufferLogger(replay_log_csv, flush_every=1)
+    best_model_generation = _infer_best_generation_from_train_log(train_log_csv)
+
+    boot_gens, boot_raw = _bootstrap_replay_from_train_log(
+        replay_buffer=replay_buffer,
+        train_log_csv=train_log_csv,
+        best_generation=best_model_generation,
+        )
     ctx = mp.get_context("spawn")
     task_q = ctx.Queue()
     result_q = ctx.Queue()
@@ -655,6 +741,12 @@ def selfImprovementPolicy(
         if not samples:
             raise RuntimeError(f"No samples written for gen={gen} in {gen_dataset_dir}")
 
+        added_from_gen = replay_buffer.add_generation_dir(gen_dataset_dir)
+        if replay_buffer.total_samples <= 0:
+            raise RuntimeError(
+                f"Replay buffer empty after gen={gen}. "
+                f"added_from_gen={added_from_gen}, gen_dir={gen_dataset_dir}"
+            )
 
         num_controller = sum(1 for s in samples if s.get("player") == "controller")
         num_adversary = sum(1 for s in samples if s.get("player") == "adversary")
@@ -664,11 +756,53 @@ def selfImprovementPolicy(
         eval_batch = collate_mixed_samples(samples, device=trainer.device)
 
         # Train with random minibatches from latest generation (replay-style)
-        rng = random.Random(1000 + int(gen))   # deterministic per gen; change seed if you want
-        train_minibatch_size = 32
+        # rng = random.Random(1000 + int(gen))   # deterministic per gen; change seed if you want
+        # train_minibatch_size = 32
 
-        for _ in range(int(train_steps_per_generation)):
-            minibatch_samples = rng.choices(samples, k=train_minibatch_size)  # with replacement
+        # for _ in range(int(train_steps_per_generation)):
+        #     minibatch_samples = rng.choices(samples, k=train_minibatch_size)  # with replacement
+        #     train_batch = collate_mixed_samples(minibatch_samples, device=trainer.device)
+
+        #     train_metrics = trainer.train_step(train_batch)
+        #     _append_train_log_row(
+        #         train_log_csv,
+        #         {
+        #             "time": time.time(),
+        #             "event": "train",
+        #             "gen": gen,
+        #             "trainer_step": int(trainer.step),
+        #             "dataset_dir": str(gen_dataset_dir),
+        #             "num_samples": int(len(samples)),
+        #             "num_controller": int(num_controller),
+        #             "num_adversary": int(num_adversary),
+        #             **train_metrics,
+        #             "saved_best": "",
+        #             "ckpt_path": "",
+        #             "best_path": str(best_path),
+        #             "resume_ckpt": str(resume_ckpt) if resume_ckpt else "",
+        #         },
+        #     )
+
+        # Train with random minibatches from replay buffer
+        train_minibatch_size = 32
+        replay_buffer.reseed(1000 + int(gen))  # deterministic per generation
+
+        # Dynamic train steps: base_steps * round(replay_size / roots_per_generation)
+        ratio = float(replay_buffer.total_samples) / float(max(1, int(roots_per_generation)))
+        step_multiplier = max(1, int(math.floor(ratio + 0.5)))  # nearest positive integer
+        effective_train_steps = int(train_steps_per_generation) * step_multiplier
+
+        replay_gen_ids_csv = replay_buffer.active_generation_ids_csv(max_items=256)
+        replay_logger.log_row(
+            candidate_generation=int(gen),
+            best_model_generation=int(best_model_generation),
+            replay_samples_size=int(replay_buffer.total_samples),
+            effective_training_steps=int(effective_train_steps),
+            replay_generation_ids=replay_gen_ids_csv,
+        )
+
+        for _ in range(int(effective_train_steps)):
+            minibatch_samples = replay_buffer.sample_batch(train_minibatch_size)
             train_batch = collate_mixed_samples(minibatch_samples, device=trainer.device)
 
             train_metrics = trainer.train_step(train_batch)
@@ -680,7 +814,7 @@ def selfImprovementPolicy(
                     "gen": gen,
                     "trainer_step": int(trainer.step),
                     "dataset_dir": str(gen_dataset_dir),
-                    "num_samples": int(len(samples)),
+                    "num_samples": int(replay_buffer.total_samples),  # now training pool size
                     "num_controller": int(num_controller),
                     "num_adversary": int(num_adversary),
                     **train_metrics,
@@ -690,6 +824,8 @@ def selfImprovementPolicy(
                     "resume_ckpt": str(resume_ckpt) if resume_ckpt else "",
                 },
             )
+
+
 
 
         # 4) train-set eval (keep your existing behavior)
@@ -760,11 +896,15 @@ def selfImprovementPolicy(
         finally:
             if arena_generation_logger is not None:
                 arena_generation_logger.close()
+            replay_logger.close()
 
         arena_passed = bool(arena_metrics["passed"])
 
         if arena_passed:
             trainer.save_checkpoint(best_path)  # promote
+            replay_buffer.reset_for_new_best()   # discard old-best replay samples
+            best_model_generation = int(gen)
+
         else:
             _restore_trainer_from_ckpt(trainer=trainer, path=best_path)  # keep old best active
 
@@ -800,6 +940,7 @@ def selfImprovementPolicy(
         p.join()
         if p.exitcode != 0:
             raise RuntimeError(f"selfplay worker died: pid={p.pid} exitcode={p.exitcode}")
+
 
 
 # -----------------------------
@@ -1006,12 +1147,16 @@ def main() -> None:
     history_nontrivial_hops = [0, 5 , 10 , 15 , 20, 25, 30, 35]  # per worker
     roots_per_generation = 400
     adv_iterations_per_root = 4000
-    cont_iterations_per_root = 4000
-    train_steps_per_generation = 500  
+    cont_iterations_per_root = 8000
+    train_steps_per_generation = 400  
     max_batch_size = 256
     train_log_csv = Path("simulator_output/mcts_dnn_logs/train_metrics.csv")
     ckpt_dir = Path("simulator_output/mcts_dnn_checkpoints")
     use_virtual_env = True
+    replay_capacity_samples = 12000
+    replay_max_cached_shards = 1024
+    replay_seed = 2026
+
 
     model = AlphaZeroModel(
         num_actions_controller=cfg.model.num_actions_controller,
@@ -1052,6 +1197,9 @@ def main() -> None:
             train_log_csv=train_log_csv,
             device_for_features=torch.device("cpu"),
             use_virtual_env=use_virtual_env,
+            replay_capacity_samples=replay_capacity_samples,
+            replay_max_cached_shards=replay_max_cached_shards,
+            replay_seed=replay_seed,
         )
     except Exception as e:
         print(f"ERROR during self-improvement policy: {e}")
