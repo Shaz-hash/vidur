@@ -9,6 +9,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
+import multiprocessing as mp
+from dataclasses import dataclass, replace
+
+
 import torch
 
 from ..environment import AdversaryAction, VidurMCTSEnvironment, VidurMCTSState
@@ -18,11 +22,185 @@ from vidur.simulator import Simulator
 from .infer import build_model_inputs
 from .types import ModelInputs
 from ..launch_mcts_job import MCTSConstraintConfig, MCTSExploreConfig, RequestSLOOptions
-from ..logger.eval_logger import EvalArenaGenerationLogger
+# from ..logger.eval_logger import EvalArenaGenerationLogger
+from ..logger.eval_logger import EvalArenaGenerationLogger, EvalArenaStepLogger
+
 from .models import AlphaZeroModel
 from .trainer import Trainer
 from .selfPlay import _mask_to_list
 from .history_root import HistoryRootGenerator
+from ..mctsDNN import VidurMCTS
+
+
+
+@dataclass(frozen=True)
+class _ArenaWorkerArgs:
+    worker_id: int
+    env_kind: str  # "standard" | "virtual"
+    # sim_cfg: Any
+    sim_cli_args: List[str]
+    assume_infinite_kv: bool
+    constraints: MCTSConstraintConfig
+    explore_cfg: MCTSExploreConfig
+    eval_cfg: EvaluatorConfig
+    root_entries: List[Dict[str, Any]]
+    history_trace_by_game: Dict[int, List[Dict[str, Any]]]
+    candidate_state_dict: Dict[str, torch.Tensor]
+    best_state_dict: Dict[str, torch.Tensor]
+    num_actions_controller: int
+    num_actions_adversary: int
+    sampled_game_ids: List[int]
+    gen_dir: str
+    debug_flush_every: int
+
+
+def _split_even_ranges(total: int, parts: int) -> List[tuple[int, int]]:
+    total = max(0, int(total))
+    parts = max(1, min(int(parts), total if total > 0 else 1))
+    base = total // parts
+    rem = total % parts
+    out: List[tuple[int, int]] = []
+    start = 0
+    for i in range(parts):
+        size = base + (1 if i < rem else 0)
+        if size <= 0:
+            continue
+        end = start + size
+        out.append((start, end))
+        start = end
+    return out
+
+
+class _NoopSummary:
+    def log_row(self, row: Dict[str, Any]) -> None:
+        return
+
+
+class _StepOnlyArenaLogger:
+    def __init__(self, *, gen_dir: Path, sampled_game_ids: Sequence[int], flush_every: int = 1) -> None:
+        self.gen_dir = Path(gen_dir)
+        self.sampled_game_ids = {int(x) for x in sampled_game_ids}
+        self.flush_every = max(1, int(flush_every))
+        self._step_loggers: Dict[tuple[int, str], EvalArenaStepLogger] = {}
+        self.summary = _NoopSummary()  # evaluate_arena expects .summary.log_row(...)
+
+    def step_logger(self, game_id: int, cycle_label: str) -> Optional[EvalArenaStepLogger]:
+        gid = int(game_id)
+        if gid not in self.sampled_game_ids:
+            return None
+        key = (gid, str(cycle_label))
+        lg = self._step_loggers.get(key)
+        if lg is not None:
+            return lg
+        path = self.gen_dir / str(cycle_label) / f"game_{gid}.csv"
+        lg = EvalArenaStepLogger(path, flush_every=self.flush_every)
+        self._step_loggers[key] = lg
+        return lg
+
+    def close(self) -> None:
+        for lg in self._step_loggers.values():
+            lg.close()
+        self._step_loggers.clear()
+
+
+def _arena_worker_main(result_q: "mp.Queue", args: _ArenaWorkerArgs) -> None:
+    try:
+
+        sim_cfg = _configure_simulation_from_cli_args(args.sim_cli_args)
+        if bool(args.assume_infinite_kv):
+            setattr(sim_cfg.cluster_config.cache_config, "assume_infinite_kv", True)
+
+        if args.env_kind == "virtual":
+            from ..virtual_simulator import VirtualSimulator
+            from ..virtual_environment import VirtualVidurMCTSEnvironment
+
+            sim = VirtualSimulator(sim_cfg, register_atexit=False)
+            env = VirtualVidurMCTSEnvironment(
+                base_simulator=sim,
+                constraints=args.constraints,
+                explore_cfg=args.explore_cfg,
+            )
+        else:
+            sim = Simulator(sim_cfg, register_atexit=False)
+            env = VidurMCTSEnvironment(
+                base_simulator=sim,
+                constraints=args.constraints,
+                explore_cfg=args.explore_cfg,
+            )
+
+        mcts = VidurMCTS(
+            env=env,
+            explore_cfg=args.explore_cfg,
+            log_path=None,
+            tree_log_path=None,
+            logger_flush_every=1,
+        )
+
+        worker_cfg = replace(args.eval_cfg, arena_num_processes=1)
+        evaluator = FixedEvalStatesEvaluator(env=env, mcts=mcts, cfg=worker_cfg)
+
+        roots: List[EvalRoot] = []
+        for e in args.root_entries:
+            state = env.clone_state_from_snapshot(e["snapshot"], e["stats"])
+            roots.append(
+                EvalRoot(
+                    hops=int(e["history_hops"]),
+                    seed=int(e["seed"]),
+                    game_id=int(e["game_id"]),
+                    root_id=int(e["root_id"]),
+                    state=state,
+                    player_to_act=str(e["player_to_act"]),
+                    depth=int(e["depth"]),
+                )
+            )
+
+        evaluator.eval_roots = roots
+        evaluator.history_trace_by_game = {
+            int(k): v for k, v in args.history_trace_by_game.items()
+        }
+
+        candidate = AlphaZeroModel(
+            num_actions_controller=int(args.num_actions_controller),
+            num_actions_adversary=int(args.num_actions_adversary),
+        ).to(torch.device("cpu"))
+        candidate.load_state_dict(args.candidate_state_dict, strict=True)
+        candidate.eval()
+
+        best = AlphaZeroModel(
+            num_actions_controller=int(args.num_actions_controller),
+            num_actions_adversary=int(args.num_actions_adversary),
+        ).to(torch.device("cpu"))
+        best.load_state_dict(args.best_state_dict, strict=True)
+        best.eval()
+
+        step_logger = _StepOnlyArenaLogger(
+            gen_dir=Path(args.gen_dir),
+            sampled_game_ids=args.sampled_game_ids,
+            flush_every=int(args.debug_flush_every),
+        )
+
+        try:
+            metrics = evaluator.evaluate_arena(
+                candidate_model=candidate,
+                best_model=best,
+                generation_logger=step_logger,
+            )
+        finally:
+            step_logger.close()
+            mcts.close()
+
+        # fix root_index to global index provided in payload
+        gid_to_idx = {int(e["game_id"]): int(e["global_root_index"]) for e in args.root_entries}
+        for row in metrics.get("per_root", []):
+            gid = int(row.get("game_id", -1))
+            if gid in gid_to_idx:
+                row["root_index"] = int(gid_to_idx[gid])
+
+        result_q.put({"ok": True, "worker_id": int(args.worker_id), "metrics": metrics})
+    except Exception as exc:
+        result_q.put({"ok": False, "worker_id": int(args.worker_id), "error": repr(exc)})
+
+
 
 
 def _configure_simulation_from_cli_args(sim_args: Sequence[str]) -> SimulationConfig:
@@ -49,10 +227,16 @@ class EvaluatorConfig:
     max_history_depth: int = 20
     random_seed_base: int = 12345
 
+    arena_num_processes: int = 1
+
     eval_game_id_base: int = 900_000
     eval_root_id_base: int = 0
     history_max_total_steps: int = 200_000
 
+    adv_iterations_per_root: int = 2000
+    cont_iterations_per_root: int = 2000
+
+    # TODO: Remove these later onwards 
     arena_iters_adversary: int = 2000
     arena_iters_controller: int = 2000
 
@@ -94,14 +278,17 @@ class FixedEvalStatesEvaluator:
         self,
         *,
         env: VidurMCTSEnvironment,
+        mcts: VidurMCTS,
         cfg: EvaluatorConfig,
+        sim_cli_args: Optional[Sequence[str]] = None
     ) -> None:
         self.env = env
+        self.mcts = mcts
         self.cfg = cfg
 
         self.eval_roots: List[EvalRoot] = []
         self.history_trace_by_game: Dict[int, List[Dict[str, Any]]] = {}
-
+        self._sim_cli_args = list(sim_cli_args) if sim_cli_args is not None else None
         self.max_branching = int(getattr(getattr(self.env, "_cfg", None), "max_branching", 10))
 
         self.history = HistoryRootGenerator(
@@ -172,8 +359,16 @@ class FixedEvalStatesEvaluator:
             )
         return specs
 
+
+
     def _iters_for_player(self, player: str) -> int:
-        return int(self.cfg.arena_iters_adversary if player == "adversary" else self.cfg.arena_iters_controller)
+        if player == "adversary":
+            return int(getattr(self.cfg, "adv_iterations_per_root",
+                            getattr(self.cfg, "arena_iters_adversary", 2000)))
+        return int(getattr(self.cfg, "cont_iterations_per_root",
+                        getattr(self.cfg, "arena_iters_controller", 2000)))
+
+
 
     def _has_prefill_pending(self, state: VidurMCTSState) -> bool:
         req_lookup = self.env._build_request_lookup(state.simulator)
@@ -515,7 +710,8 @@ class FixedEvalStatesEvaluator:
         }
         return roots
 
-    def _pick_action_with_model(
+    
+    def _pick_action_with_mcts(
         self,
         *,
         state: VidurMCTSState,
@@ -524,30 +720,80 @@ class FixedEvalStatesEvaluator:
         game_id: int,
         root_id: int,
         root_depth: int,
-        prefer_nonempty_adversary: bool = False
+        prefer_nonempty_adversary: bool = False,
     ) -> tuple[Optional[object], int, Dict[str, Any]]:
+        iters = max(1, int(self._iters_for_player(player)))
+        self.mcts.search_dnn(
+            dnn_model=model,
+            rootState=state,
+            root_player=player,
+            iterations=iters,
+            game_id=int(game_id),
+            root_id=int(root_id),
+            root_node_id_override=0,
+            root_depth=int(root_depth),
+        )
+
         actions_by_index, mask_list = self._sample_actions_and_mask(state, player)
         valid = [i for i, ok in enumerate(mask_list) if ok and actions_by_index[i] is not None]
-
         if not valid:
             return None, -1, {
                 "root_node_id": None,
                 "model_root_value_controller": None,
                 "model_root_prior_json": "[]",
+                "mcts_root_value_controller": None,
+                "mcts_root_prior_json": "[]",
                 "adversary_requests_generated": 0,
                 "best_action_index": None,
                 "best_action_repr": "",
             }
 
-        model_v, model_priors = self._infer_policy_with_env_mask(
-            state=state,
-            player=player,
-            model=model,
-            env_mask=mask_list,
-        )
+        root = getattr(self.mcts, "_root", None)
+        action_dim = len(mask_list)
 
-        # choose best only among valid actions
-        # best_idx = max(valid, key=lambda i: (model_priors[i], -i))
+        model_v = None
+        model_prior = [0.0] * action_dim
+        mcts_prior = [0.0] * action_dim
+        mcts_v = None
+        best_idx: Optional[int] = None
+        root_node_id = None
+
+        if root is not None:
+            root_node_id = int(getattr(root, "node_id", 0))
+            mcts_v = float(root.mean_value())
+            try:
+                m_v, m_p, _norm_p, _mask, mc_p, b_idx = self.mcts._compute_root_log_payload_from_cache(root=root)
+                model_v = float(m_v)
+                if len(m_p) == action_dim:
+                    model_prior = [float(x) for x in m_p]
+                if len(mc_p) == action_dim:
+                    mcts_prior = [float(x) for x in mc_p]
+                best_idx = int(b_idx)
+            except Exception:
+                pass
+
+        # forced/single-child fallback: still log model prior if enabled
+        if (model_v is None or sum(model_prior) <= 0.0) and bool(
+            getattr(self.cfg, "arena_log_model_prior_on_forced_adv_noop", True)
+        ):
+            mv, mp = self._infer_policy_with_env_mask(
+                state=state,
+                player=player,
+                model=model,
+                env_mask=mask_list,
+            )
+            model_v = float(mv)
+            if len(mp) == action_dim:
+                model_prior = [float(x) for x in mp]
+
+        # mcts prior fallback if unavailable
+        if sum(mcts_prior) <= 0.0:
+            if best_idx is not None and best_idx in valid:
+                mcts_prior = [1.0 if i == best_idx else 0.0 for i in range(action_dim)]
+            else:
+                u = 1.0 / float(len(valid))
+                mcts_prior = [u if i in valid else 0.0 for i in range(action_dim)]
+
         candidate_valid = list(valid)
         if prefer_nonempty_adversary and player == "adversary":
             nonempty = [
@@ -558,33 +804,38 @@ class FixedEvalStatesEvaluator:
             if nonempty:
                 candidate_valid = nonempty
 
-        best_idx = max(candidate_valid, key=lambda i: (model_priors[i], -i))
-        action = actions_by_index[best_idx]
+        if best_idx is None or best_idx not in candidate_valid:
+            best_idx = max(candidate_valid, key=lambda i: (mcts_prior[i], -i))
 
-        adv_req_generated = len(action.requests) if isinstance(action, AdversaryAction) else 0
-
+        action = actions_by_index[int(best_idx)]
         if action is None:
-            best_idx = int(valid[0])
+            best_idx = int(candidate_valid[0])
             action = actions_by_index[best_idx]
             if action is None:
                 return None, -1, {
-                    "root_node_id": None,
+                    "root_node_id": root_node_id,
                     "model_root_value_controller": model_v,
-                    "model_root_prior_json": json.dumps(model_priors, ensure_ascii=False),
+                    "model_root_prior_json": json.dumps(model_prior, ensure_ascii=False),
+                    "mcts_root_value_controller": mcts_v,
+                    "mcts_root_prior_json": json.dumps(mcts_prior, ensure_ascii=False),
                     "adversary_requests_generated": 0,
                     "best_action_index": None,
                     "best_action_repr": "",
                 }
 
-        adv_req_generated = len(action.requests) if isinstance(action, AdversaryAction) else 0        
+        adv_req_generated = len(action.requests) if isinstance(action, AdversaryAction) else 0
         return action, int(best_idx), {
-            "root_node_id": None,  # no tree node in inference-only evaluator
-            "model_root_value_controller": float(model_v),
-            "model_root_prior_json": json.dumps(model_priors, ensure_ascii=False),
+            "root_node_id": root_node_id,
+            "model_root_value_controller": model_v,
+            "model_root_prior_json": json.dumps(model_prior, ensure_ascii=False),
+            "mcts_root_value_controller": mcts_v,
+            "mcts_root_prior_json": json.dumps(mcts_prior, ensure_ascii=False),
             "adversary_requests_generated": int(adv_req_generated),
             "best_action_index": int(best_idx),
             "best_action_repr": repr(action),
         }
+
+
 
     def _run_cycle(
         self,
@@ -618,7 +869,7 @@ class FixedEvalStatesEvaluator:
 
 
         step_logger = generation_logger.step_logger(int(root.game_id), cycle_label) if generation_logger else None
-
+        # TODO: Make a function that can call this log step with 4 different phases: history, mcts, post-mcts, and cleanup, and use it for all logging in this function
         if step_logger is not None:
             for hist_row in self.history_trace_by_game.get(int(root.game_id), []):
                 step_logger.log_step(
@@ -662,7 +913,7 @@ class FixedEvalStatesEvaluator:
             model = adversary_model if player == "adversary" else controller_model
             cur_depth = int(depth)
             prefer_nonempty_adv = bool(getattr(self.cfg, "arena_require_request_generating_adversary", True)) and player == "adversary"
-            action, _best_idx, meta = self._pick_action_with_model(
+            action, _best_idx, meta = self._pick_action_with_mcts(
                 state=state,
                 player=player,
                 model=model,
@@ -719,6 +970,8 @@ class FixedEvalStatesEvaluator:
                         "root_player": acting_player,
                         "model_root_value_controller": meta.get("model_root_value_controller"),
                         "model_root_prior_json": meta.get("model_root_prior_json", "[]"),
+                        "mcts_root_value_controller": meta.get("mcts_root_value_controller"),
+                        "mcts_root_prior_json": meta.get("mcts_root_prior_json", "[]"),
                         "best_action_index": meta.get("best_action_index"),
                         "best_action_repr": meta.get("best_action_repr", ""),
                         "requests_in_system": row["requests_in_system"],
@@ -787,6 +1040,8 @@ class FixedEvalStatesEvaluator:
                             "root_player": acting_player,
                             "model_root_value_controller": None,
                             "model_root_prior_json": "[]",
+                            "mcts_root_value_controller": None,
+                            "mcts_root_prior_json": "[]",
                             "best_action_index": None,
                             "best_action_repr": "AdversaryAction(requests=[], stop_decode_ids=[])",
                             "requests_in_system": row["requests_in_system"],
@@ -809,7 +1064,7 @@ class FixedEvalStatesEvaluator:
                     )
                 continue
 
-            action, _best_idx, meta = self._pick_action_with_model(
+            action, _best_idx, meta = self._pick_action_with_mcts(
                 state=state,
                 player="controller",
                 model=controller_model,
@@ -844,6 +1099,8 @@ class FixedEvalStatesEvaluator:
                         "root_player": acting_player,
                         "model_root_value_controller": meta.get("model_root_value_controller"),
                         "model_root_prior_json": meta.get("model_root_prior_json", "[]"),
+                        "mcts_root_value_controller": meta.get("mcts_root_value_controller"),
+                        "mcts_root_prior_json": meta.get("mcts_root_prior_json", "[]"),
                         "best_action_index": meta.get("best_action_index"),
                         "best_action_repr": meta.get("best_action_repr", ""),
                         "requests_in_system": row["requests_in_system"],
@@ -952,6 +1209,158 @@ class FixedEvalStatesEvaluator:
         cand_adv_cost_sum = 0.0
         best_adv_cost_sum = 0.0
         per_root: List[Dict[str, Any]] = []
+
+        # TODO: Condense the code here so that we don't have to duplicate the logic for parallel vs. single-process evaluation. We can still have a worker function that runs the cycle and returns results, but we can call it directly in the single-process case instead of spawning processes.
+        
+        num_procs = int(getattr(self.cfg, "arena_num_processes", 1))
+        if num_procs > 1 and len(self.eval_roots) > 1:
+
+            if not self._sim_cli_args:
+                raise RuntimeError("arena_num_processes>1 requires sim_cli_args on evaluator")
+
+            sim_cli_args = list(self._sim_cli_args)
+            assume_infinite_kv = bool(
+                getattr(getattr(self.env._base._config.cluster_config, "cache_config", None), "assume_infinite_kv", False))
+
+            ctx = mp.get_context("spawn")
+            n = len(self.eval_roots)
+            ranges = _split_even_ranges(n, num_procs)
+
+            # serialize roots for workers
+            serialized: List[Dict[str, Any]] = []
+            for i, r in enumerate(self.eval_roots):
+                serialized.append(
+                    {
+                        "global_root_index": int(i),
+                        "game_id": int(r.game_id),
+                        "root_id": int(r.root_id),
+                        "history_hops": int(r.hops),
+                        "seed": int(r.seed),
+                        "player_to_act": str(r.player_to_act),
+                        "depth": int(r.depth),
+                        "snapshot": r.state.simulator.snapshot_state(),
+                        "stats": r.state.stats.clone(),
+                    }
+                )
+
+            env_kind = "virtual" if self.env.__class__.__name__ == "VirtualVidurMCTSEnvironment" else "standard"
+            sim_cfg = self.env._base._config
+            constraints = self.env._constraints
+            explore_cfg = self.env._cfg
+
+            candidate_sd = {k: v.detach().cpu() for k, v in candidate_model.state_dict().items()}
+            best_sd = {k: v.detach().cpu() for k, v in best_model.state_dict().items()}
+
+            num_actions_controller = int(getattr(candidate_model, "num_actions_controller"))
+            num_actions_adversary = int(getattr(candidate_model, "num_actions_adversary"))
+
+            sampled_ids = list(getattr(generation_logger, "sampled_game_ids", set())) if generation_logger else []
+            gen_dir = str(getattr(generation_logger, "gen_dir", Path(".")))
+            flush_every = int(getattr(self.cfg, "debug_flush_every", 1))
+
+            result_q = ctx.Queue()
+            procs = []
+
+            for wid, (lo, hi) in enumerate(ranges):
+                chunk = serialized[lo:hi]
+                chunk_game_ids = {int(x["game_id"]) for x in chunk}
+                chunk_sampled = [gid for gid in sampled_ids if gid in chunk_game_ids]
+                chunk_hist = {gid: self.history_trace_by_game.get(gid, []) for gid in chunk_game_ids}
+
+                args = _ArenaWorkerArgs(
+                    worker_id=int(wid),
+                    env_kind=env_kind,
+                    sim_cli_args=sim_cli_args,
+                    assume_infinite_kv=assume_infinite_kv,
+                    constraints=constraints,
+                    explore_cfg=explore_cfg,
+                    eval_cfg=self.cfg,
+                    root_entries=chunk,
+                    history_trace_by_game=chunk_hist,
+                    candidate_state_dict=candidate_sd,
+                    best_state_dict=best_sd,
+                    num_actions_controller=num_actions_controller,
+                    num_actions_adversary=num_actions_adversary,
+                    sampled_game_ids=chunk_sampled,
+                    gen_dir=gen_dir,
+                    debug_flush_every=flush_every,
+                )
+
+                p = ctx.Process(target=_arena_worker_main, args=(result_q, args))
+                p.start()
+                procs.append(p)
+
+            worker_msgs = [result_q.get() for _ in procs]
+            for p in procs:
+                p.join()
+                if p.exitcode != 0:
+                    raise RuntimeError(f"arena worker died: pid={p.pid} exitcode={p.exitcode}")
+
+            for msg in worker_msgs:
+                if not bool(msg.get("ok", False)):
+                    raise RuntimeError(f"arena worker failed: {msg.get('error', 'unknown error')}")
+
+            all_per_root: List[Dict[str, Any]] = []
+            for msg in worker_msgs:
+                all_per_root.extend(list(msg["metrics"].get("per_root", [])))
+            all_per_root.sort(key=lambda x: int(x.get("root_index", 0)))
+
+            candidate_points = float(sum(float(x.get("candidate_points", 0.0)) for x in all_per_root))
+            best_points = float(sum(float(x.get("best_points", 0.0)) for x in all_per_root))
+            total_points = candidate_points + best_points
+
+            cand_adv_cost_sum = float(sum(float(x.get("candidate_as_adv_cost", 0.0)) for x in all_per_root))
+            best_adv_cost_sum = float(sum(float(x.get("best_as_adv_cost", 0.0)) for x in all_per_root))
+
+            if generation_logger is not None:
+                for row in all_per_root:
+                    winner = str(row.get("winner", "tie"))
+                    ca = float(row.get("candidate_as_adv_cost", 0.0))
+                    cb = float(row.get("best_as_adv_cost", 0.0))
+                    cycle_a = row.get("cycle_a", {})
+                    cycle_b = row.get("cycle_b", {})
+                    generation_logger.summary.log_row(
+                        {
+                            "game_id": int(row.get("game_id", 0)),
+                            "history_length": int(row.get("hops", 0)),
+                            "best_model_player": cycle_a.get("best_model_player", "controller"),
+                            "candidate_model_player": cycle_a.get("candidate_model_player", "adversary"),
+                            "slo_cost": ca,
+                            "winner": winner,
+                            "cycle_label": cycle_a.get("cycle_label", "candidate_as_adversary"),
+                        }
+                    )
+                    generation_logger.summary.log_row(
+                        {
+                            "game_id": int(row.get("game_id", 0)),
+                            "history_length": int(row.get("hops", 0)),
+                            "best_model_player": cycle_b.get("best_model_player", "adversary"),
+                            "candidate_model_player": cycle_b.get("candidate_model_player", "controller"),
+                            "slo_cost": cb,
+                            "winner": winner,
+                            "cycle_label": cycle_b.get("cycle_label", "best_as_adversary"),
+                        }
+                    )
+
+            n_roots = float(len(self.eval_roots))
+            candidate_win_rate = (candidate_points / total_points) if total_points > 0 else 0.0
+            passed = candidate_win_rate > float(self.cfg.arena_win_threshold)
+
+            return {
+                "num_eval_roots": n_roots,
+                "candidate_points": candidate_points,
+                "best_points": best_points,
+                "total_points": float(total_points),
+                "candidate_win_rate": float(candidate_win_rate),
+                "arena_win_threshold": float(self.cfg.arena_win_threshold),
+                "passed": bool(passed),
+                "candidate_as_adv_mean_cost": float(cand_adv_cost_sum / max(n_roots, 1.0)),
+                "best_as_adv_mean_cost": float(best_adv_cost_sum / max(n_roots, 1.0)),
+                "per_root": all_per_root,
+            }
+
+
+
 
         for i, root in enumerate(self.eval_roots):
             cycle_a = self._run_cycle(
@@ -1137,15 +1546,15 @@ class FixedEvalHarness:
             constraints=constraints_eval,
             explore_cfg=explore_cfg_eval,
         )
-        # mcts_eval = VidurMCTS(
-        #     env=env_eval,
-        #     explore_cfg=explore_cfg_eval,
-        #     log_path=None,
-        #     tree_log_path=None,
-        #     logger_flush_every=1,
-        # )
+        mcts_eval = VidurMCTS(
+            env=env_eval,
+            explore_cfg=explore_cfg_eval,
+            log_path=None,
+            tree_log_path=None,
+            logger_flush_every=1,
+        )
 
-        evaluator = FixedEvalStatesEvaluator(env=env_eval, cfg=eval_cfg)
+        evaluator = FixedEvalStatesEvaluator(env=env_eval, cfg=eval_cfg, mcts=mcts_eval, sim_cli_args=sim_cli_args)
 
         cpu_candidate_for_mcts = AlphaZeroModel(
             num_actions_controller=int(getattr(model_group, "num_actions_controller")),

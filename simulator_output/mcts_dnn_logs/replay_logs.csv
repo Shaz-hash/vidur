@@ -1,0 +1,9 @@
+candidate_generation,best_model_generation,replay_samples_size,effective_training_steps,replay_generation_ids
+1,-1,400,100,000001
+2,1,400,100,000002
+3,2,400,100,000003
+5,3,400,100,000005
+6,5,400,100,000006
+7,6,400,100,000007
+8,7,400,100,000008
+9,7,800,200,"000008,000009"

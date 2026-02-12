@@ -1,0 +1,1 @@
+{"time": 1770922884.1990175, "path": "simulator_output/mcts_dnn_dataset/train/gen_000003/proc_07/replay_000000.pt", "shard_index": 0, "num_samples": 50, "feature_version": 1, "min_game_id": 3007, "max_game_id": 3007, "min_root_id": 350, "max_root_id": 399}

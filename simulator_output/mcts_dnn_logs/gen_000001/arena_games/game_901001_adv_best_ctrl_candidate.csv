@@ -1,0 +1,2 @@
+game_id,cycle_label,phase,total_cost,slo_violations,total_lateness
+901001,best_as_adversary,arena_end,48.1086153828369,30,18.108615382836902

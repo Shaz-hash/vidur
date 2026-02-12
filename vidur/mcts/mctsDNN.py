@@ -120,7 +120,7 @@ class VidurMCTS:
         self._cfg = explore_cfg
         self._rng = rng or random.Random(0)
         self._verbose = verbose
-
+        self._scratch_state: Optional[VidurMCTSState] = None
         self._node_counter = 0
         self._root: Optional[MCTSNode] = None
         self._history_root_state: Optional[VidurMCTSState] = None
@@ -156,6 +156,7 @@ class VidurMCTS:
         if getattr(self, "_root_logger", None) is not None:
             self._root_logger.close()
             self._root_logger = None
+        self.clear_search_state(drop_scratch=True)
 
     # ------------------------------------------------------------------ #
     # Core phases
@@ -188,12 +189,12 @@ class VidurMCTS:
     #     soft_cost = 1.0 - math.exp(-delta_cost)
     #     return -soft_cost
 
-
+    # TODO: pass this via the config and experiment with different reward shaping functions
     def _transition_reward(self, parent_cost: float, child_cost: float) -> float:
         delta = max(0.0, float(child_cost) - float(parent_cost))
 
-        knee = float(getattr(self._cfg, "reward_knee", 8.0))
-        max_penalty = float(getattr(self._cfg, "reward_max_penalty", 10.0))
+        knee = float(getattr(self._cfg, "reward_knee", 25.0))
+        max_penalty = float(getattr(self._cfg, "reward_max_penalty", 40.0))
 
         if max_penalty <= knee:
             # fallback: pure linear
@@ -1004,8 +1005,9 @@ class VidurMCTS:
 
 
 
-    def search_dnn(self, dnn_model: Any, rootState: VidurMCTSState, root_player: str, iterations: int , * , game_id: int , root_id: int, root_node_id_override: int , root_depth: int) -> Tuple[str, List[Union[AdversaryAction, ControllerAction]]]:
+    def search_dnn(self, dnn_model: Any, rootState: VidurMCTSState, root_player: str, iterations: int , * , game_id: int , root_id: int, root_node_id_override: int | None , root_depth: int , root_phase: str = "train_root", cycle_label: str = "",) -> Tuple[str, List[Union[AdversaryAction, ControllerAction]]]:
         
+        self.clear_search_state(drop_scratch=True)
         self._history_root_state = rootState
         if root_node_id_override is None:
             root_node_id = self._next_node_id()
@@ -1130,7 +1132,8 @@ class VidurMCTS:
 
         # Only log roots where we actually queried the NN (i.e., real branching).
         # Forced-move roots (<=1 valid action) intentionally skip NN + skip root logging.
-        
+        viol, lateness = self._env.evaluate_objective(rootState)
+        total_cost = float(viol) + float(lateness)
 
         self._root_logger.log_root(
             game_id=game_id,
@@ -1148,6 +1151,12 @@ class VidurMCTS:
             best_action_index=best_idx,
             best_action_repr=best_action_repr,
             best_action_json=best_action_json,
+            phase=str(root_phase),
+            cycle_label=str(cycle_label),
+            sim_time=float(rootState.simulator._time),
+            slo_violations=int(viol),
+            total_lateness=float(lateness),
+            total_cost=float(total_cost),
         )
 
 
@@ -1274,3 +1283,37 @@ class VidurMCTS:
         node_id = self._node_counter
         self._node_counter += 1
         return node_id
+
+
+    # add near other methods in VidurMCTS
+    def clear_search_state(self, *, drop_scratch: bool = True) -> None:
+        root = self._root
+        self._root = None
+        self._history_root_state = None
+        self._history_root_node = None
+        self._did_root_infer_debug = False
+        if drop_scratch:
+            self._scratch_state = None
+
+        if root is None:
+            return
+
+        stack = [root]
+        seen = set()
+        while stack:
+            n = stack.pop()
+            oid = id(n)
+            if oid in seen:
+                continue
+            seen.add(oid)
+
+            if n.children:
+                stack.extend(n.children.values())
+                n.children.clear()
+
+            n.parent = None
+            n.parent_action = None
+            n.cached_sim_snapshot = None
+            n.cached_stats = None
+            n.action_alias_to_canonical.clear()
+            n.canonical_to_action_aliases.clear()

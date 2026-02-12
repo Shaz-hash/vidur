@@ -302,6 +302,12 @@ class DNNMCTSRootSummaryLogger:
         "best_action_model_prob",
         "best_action_repr",
         "best_action_json",
+        "phase",
+        "cycle_label",
+        "sim_time",
+        "slo_violations",
+        "total_lateness",
+        "total_cost",
     ]
 
     def __init__(self, path: Optional[Union[str, Path]], *, flush_every: int = 1) -> None:
@@ -368,17 +374,29 @@ class DNNMCTSRootSummaryLogger:
 
         mcts_root_value_controller: float,
         mcts_root_prior: Sequence[float],
-        best_action_index: int,
+        # best_action_index: int,
+        best_action_index: Optional[int],
         best_action_repr: str = "",
         best_action_json: str = "",
+        phase: str = "train_root",
+        cycle_label: str = "",
+        sim_time: float = 0.0,
+        slo_violations: int = 0,
+        total_lateness: float = 0.0,
+        total_cost: float = 0.0,
     ) -> None:
         if not self._path:
             return
         self._ensure()
         assert self._writer is not None
 
-        best_mcts = float(mcts_root_prior[best_action_index]) if best_action_index < len(mcts_root_prior) else 0.0
-        best_model = float(model_root_prior[best_action_index]) if best_action_index < len(model_root_prior) else 0.0
+        # best_mcts = float(mcts_root_prior[best_action_index]) if best_action_index < len(mcts_root_prior) else 0.0
+        # best_model = float(model_root_prior[best_action_index]) if best_action_index < len(model_root_prior) else 0.0
+
+        idx_ok = best_action_index is not None and 0 <= int(best_action_index) < len(mcts_root_prior)
+        best_mcts = float(mcts_root_prior[int(best_action_index)]) if idx_ok else 0.0
+        best_model = float(model_root_prior[int(best_action_index)]) if (idx_ok and int(best_action_index) < len(model_root_prior)) else 0.0
+
 
         row = {
             "game_id": int(game_id),
@@ -395,11 +413,18 @@ class DNNMCTSRootSummaryLogger:
 
             "mcts_root_value_controller": _safe_float(mcts_root_value_controller),
             "mcts_root_prior_json": _j(list(mcts_root_prior)),
-            "best_action_index": int(best_action_index),
+            # "best_action_index": int(best_action_index),
+            "best_action_index": "" if best_action_index is None else int(best_action_index),
             "best_action_mcts_prob": _safe_float(best_mcts),
             "best_action_model_prob": _safe_float(best_model),
             "best_action_repr": str(best_action_repr or ""),
             "best_action_json": str(best_action_json or ""),
+            "phase": str(phase),
+            "cycle_label": str(cycle_label),
+            "sim_time": float(sim_time),
+            "slo_violations": int(slo_violations),
+            "total_lateness": float(total_lateness),
+            "total_cost": float(total_cost),
         }
 
         self._writer.writerow(row)

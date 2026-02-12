@@ -18,9 +18,11 @@ from dataclasses import dataclass
 from typing import Optional, Sequence, Tuple
 
 import torch
-import time  # add at file top if missing
+import time  
 
-from ..environment import VidurMCTSEnvironment, VidurMCTSState
+# from ..environment import VidurMCTSEnvironment, VidurMCTSState
+from ..environment import VidurMCTSEnvironment, VidurMCTSState, AdversaryAction
+
 from ..mctsDNN import VidurMCTS
 from .history_root import HistoryRootGenerator
 from .infer import build_model_inputs
@@ -359,4 +361,325 @@ class SelfPlayRunner:
                 player = "adversary"
             depth += 1
 
+            if hasattr(self.mcts, "clear_search_state"):
+                self.mcts.clear_search_state(drop_scratch=True)
         return state
+
+
+
+    ### ARENA GAME FUNCTIONS FOR EVAL
+    def _has_prefill_pending(self, state: VidurMCTSState) -> bool:
+        reqs = self.env._build_request_lookup(state.simulator).values()
+        for req in reqs:
+            if not bool(getattr(req, "is_prefill_complete", False)):
+                return True
+        return False
+
+
+    def _pick_mcts_action_for_arena_step(
+        self,
+        *,
+        state: VidurMCTSState,
+        player: str,
+        model,
+        game_id: int,
+        root_id: int,
+        root_depth: int,
+        iterations: int,
+        feature_version: int,
+        cycle_label: str,
+        prefer_nonempty_adversary: bool,
+    ):
+        # search on fork so arena state is not mutated by search
+        search_state = state.fork(flag=False)
+
+        self.mcts.search_dnn(
+            dnn_model=model,
+            rootState=search_state,
+            root_player=player,
+            iterations=int(iterations),
+            game_id=int(game_id),
+            root_id=int(root_id),
+            root_depth=int(root_depth),
+            root_node_id_override=None,
+            root_phase="arena_root",
+            cycle_label=str(cycle_label),
+        )
+
+        try:
+            if player == "controller":
+                actions_by_index, mask = self.env.sample_controller_actions(state, self.mcts._cfg.max_branching)
+            else:
+                actions_by_index, mask = self.env.sample_adversary_actions(state, self.mcts._cfg.max_branching)
+
+            mask_list = _mask_to_list(mask)
+            valid = [i for i, ok in enumerate(mask_list) if ok and actions_by_index[i] is not None]
+            if not valid:
+                return None, -1
+
+            candidate_valid = list(valid)
+            if player == "adversary" and prefer_nonempty_adversary:
+                nonempty = [
+                    i for i in valid
+                    if isinstance(actions_by_index[i], AdversaryAction)
+                    and len((actions_by_index[i].requests or [])) > 0
+                ]
+                if nonempty:
+                    candidate_valid = nonempty
+
+            root = self.mcts._root
+            mcts_prior, best_idx = _compute_mcts_prior_from_root(root, mask_list)
+            if best_idx not in candidate_valid:
+                best_idx = max(candidate_valid, key=lambda i: (float(mcts_prior[i]), -int(i)))
+
+            action = actions_by_index[int(best_idx)]
+            return action, int(best_idx)
+        finally:
+            if hasattr(self.mcts, "clear_search_state"):
+                self.mcts.clear_search_state(drop_scratch=True)
+
+
+    def _run_arena_cycle(
+        self,
+        *,
+        base_snapshot,
+        base_stats,
+        base_player: str,
+        base_depth: int,
+        game_id: int,
+        root_id_base: int,
+        adversary_model,
+        controller_model,
+        cycle_label: str,
+        adv_iterations_per_root: int,
+        cont_iterations_per_root: int,
+        arena_max_adversary_moves: int,
+        arena_max_controller_cleanup_steps: int,
+        arena_max_total_turns: int,
+        arena_max_adversary_total_turns: int,
+        feature_version: int,
+    ) -> dict:
+        state = self.env.clone_state_from_snapshot(base_snapshot, base_stats)
+        player = str(base_player)
+        depth = int(base_depth)
+
+        turns = 0
+        cleanup_steps = 0
+        adv_moves_total = 0
+        adv_request_moves = 0
+
+        while (
+            turns < int(arena_max_total_turns)
+            and adv_request_moves < int(arena_max_adversary_moves)
+            # and adv_moves_total < int(arena_max_adversary_total_turns)
+        ):
+            model = adversary_model if player == "adversary" else controller_model
+            iters = int(adv_iterations_per_root if player == "adversary" else cont_iterations_per_root)
+
+            action, _ = self._pick_mcts_action_for_arena_step(
+                state=state,
+                player=player,
+                model=model,
+                game_id=int(game_id),
+                root_id=int(root_id_base + turns),
+                root_depth=int(depth),
+                iterations=iters,
+                feature_version=int(feature_version),
+                cycle_label=str(cycle_label),
+                prefer_nonempty_adversary=True,
+            )
+            if action is None:
+                break
+
+            if player == "adversary":
+                generated = len((action.requests or [])) if isinstance(action, AdversaryAction) else 0
+                state = self.env.apply_adversary_action_only(state, action, inplace=True)
+                player = "controller"
+                
+                if generated > 0:
+                    adv_request_moves += 1
+                    adv_moves_total += 1
+            else:
+                state = self.env.apply_controller_action_only(state, action, inplace=True)
+                player = "adversary"
+
+            depth += 1
+            turns += 1
+
+        while (
+            turns < int(arena_max_total_turns)
+            and cleanup_steps < int(arena_max_controller_cleanup_steps)
+            and self._has_prefill_pending(state)
+        ):
+            if player == "adversary":
+                state = self.env.apply_adversary_action_only(
+                    state,
+                    AdversaryAction(requests=[], stop_decode_ids=[]),
+                    inplace=True,
+                )
+                player = "controller"
+                depth += 1
+                turns += 1
+                continue
+
+            action, _ = self._pick_mcts_action_for_arena_step(
+                state=state,
+                player="controller",
+                model=controller_model,
+                game_id=int(game_id),
+                root_id=int(root_id_base + turns),
+                root_depth=int(depth),
+                iterations=int(cont_iterations_per_root),
+                feature_version=int(feature_version),
+                cycle_label=str(cycle_label),
+                prefer_nonempty_adversary=False,
+            )
+            if action is None:
+                break
+
+            state = self.env.apply_controller_action_only(state, action, inplace=True)
+            player = "adversary"
+            depth += 1
+            turns += 1
+            cleanup_steps += 1
+
+        viol, lateness = self.env.evaluate_objective(state)
+        total_cost = float(viol) + float(lateness)
+
+        # explicit end marker row in root log for easy parser grading
+        if self.mcts._root_logger is not None:
+            self.mcts._root_logger.log_root(
+                game_id=int(game_id),
+                root_id=int(root_id_base + turns + 1),
+                root_depth=int(depth),
+                root_node_id=-1,
+                root_player="",
+                num_simulations=0,
+                model_root_value_controller=0.0,
+                model_root_prior=[],
+                normalized_root_prior=[],
+                valid_action_mask=[],
+                mcts_root_value_controller=0.0,
+                mcts_root_prior=[],
+                best_action_index=None,
+                best_action_repr="",
+                best_action_json="",
+                phase="arena_end",
+                cycle_label=str(cycle_label),
+                sim_time=float(state.simulator._time),
+                slo_violations=int(viol),
+                total_lateness=float(lateness),
+                total_cost=float(total_cost),
+            )
+
+        return {
+            "total_cost": float(total_cost),
+            "slo_violations": int(viol),
+            "total_lateness": float(lateness),
+            "turns": int(turns),
+            "cleanup_steps": int(cleanup_steps),
+            "adversary_moves_total": int(adv_moves_total),
+            "adversary_request_moves": int(adv_request_moves),
+        }
+
+
+    def run_arena_game(
+        self,
+        *,
+        game_id: int,
+        candidate_model,
+        best_model,
+        history_nontrivial_hops: int,
+        adv_iterations_per_root: int,
+        cont_iterations_per_root: int,
+        arena_max_adversary_moves: int,
+        arena_max_controller_cleanup_steps: int,
+        arena_max_total_turns: int,
+        feature_version: int = 1,
+        tie_points: float = 0.5,
+        start_player: str = "adversary",
+        start_root_depth: int = 0,
+        history_root_id_for_logs: int = 0,
+    ) -> dict:
+        state = self.env.initial_state()
+        player = str(start_player)
+        depth = int(start_root_depth)
+        next_log_node_id = int(getattr(self.mcts, "_node_counter", 0))
+        last_log_node_id = None
+
+        if int(history_nontrivial_hops) > 0:
+            state, player, depth, next_log_node_id, last_log_node_id = self.history.generate_history_root(
+                state,
+                player,
+                depth,
+                nontrivial_hops=int(history_nontrivial_hops),
+                game_id=int(game_id),
+                root_id_for_logs=int(history_root_id_for_logs),
+                log_history=True,
+                log_node_id_start=next_log_node_id,
+                log_parent_id_start=last_log_node_id,
+            )
+            self.mcts._node_counter = int(next_log_node_id)
+
+        base_snapshot = state.simulator.snapshot_state()
+        base_stats = state.stats.clone()
+
+        max_adv_total = max(1, 4 * int(arena_max_adversary_moves))
+
+        cycle_a = self._run_arena_cycle(
+            base_snapshot=base_snapshot,
+            base_stats=base_stats,
+            base_player=player,
+            base_depth=depth,
+            game_id=int(game_id),
+            root_id_base=0,
+            adversary_model=candidate_model,
+            controller_model=best_model,
+            cycle_label="candidate_as_adversary",
+            adv_iterations_per_root=int(adv_iterations_per_root),
+            cont_iterations_per_root=int(cont_iterations_per_root),
+            arena_max_adversary_moves=int(arena_max_adversary_moves),
+            arena_max_controller_cleanup_steps=int(arena_max_controller_cleanup_steps),
+            arena_max_total_turns=int(arena_max_total_turns),
+            arena_max_adversary_total_turns=int(max_adv_total),
+            feature_version=int(feature_version),
+        )
+
+        cycle_b = self._run_arena_cycle(
+            base_snapshot=base_snapshot,
+            base_stats=base_stats,
+            base_player=player,
+            base_depth=depth,
+            game_id=int(game_id),
+            root_id_base=1_000_000,
+            adversary_model=best_model,
+            controller_model=candidate_model,
+            cycle_label="best_as_adversary",
+            adv_iterations_per_root=int(adv_iterations_per_root),
+            cont_iterations_per_root=int(cont_iterations_per_root),
+            arena_max_adversary_moves=int(arena_max_adversary_moves),
+            arena_max_controller_cleanup_steps=int(arena_max_controller_cleanup_steps),
+            arena_max_total_turns=int(arena_max_total_turns),
+            arena_max_adversary_total_turns=int(max_adv_total),
+            feature_version=int(feature_version),
+        )
+
+        ca = float(cycle_a["total_cost"])
+        cb = float(cycle_b["total_cost"])
+        if ca > cb + 1e-9:
+            cp, bp, winner = 1.0, 0.0, "candidate"
+        elif cb > ca + 1e-9:
+            cp, bp, winner = 0.0, 1.0, "best"
+        else:
+            cp, bp, winner = float(tie_points), float(tie_points), "tie"
+
+        return {
+            "game_id": int(game_id),
+            "candidate_as_adv_cost": ca,
+            "best_as_adv_cost": cb,
+            "candidate_points": float(cp),
+            "best_points": float(bp),
+            "winner": str(winner),
+            "cycle_a": cycle_a,
+            "cycle_b": cycle_b,
+        }

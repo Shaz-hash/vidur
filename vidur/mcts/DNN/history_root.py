@@ -289,8 +289,8 @@ class HistoryRootGenerator:
 
         if target <= 0:
             # still make sure we're at a branching root if caller wants
-            return state, player, int(depth)
-            # return state, player, int(depth), int(log_node_id), log_parent_id
+            # return state, player, int(depth)
+            return state, player, int(depth), int(log_node_id), log_parent_id
 
         rng = random.Random(int(seed) if seed is not None else (1000003 * int(game_id) + int(root_id_for_logs)))
 
@@ -318,8 +318,8 @@ class HistoryRootGenerator:
             # 2) branching / terminal check
             actions_by_index, valid, _mask = self._actions_valid(state, player)
             if not valid:
-                return state, player, int(depth)  # terminal
-
+                # return state, player, int(depth)  # terminal
+                return state, player, int(depth), int(log_node_id), log_parent_id
             if len(valid) == 1:
                 # should not happen because advance_to_branching_root would have consumed it
                 print("Error in the creation of the root history, expected branching node but got single child")

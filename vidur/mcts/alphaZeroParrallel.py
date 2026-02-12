@@ -15,7 +15,11 @@ Single entrypoint that owns configuration for:
 
 For now: runs ONE root search (5000 sims) and writes ONE dataset sample.
 Training hookup comes next.
+
+# TODO: We need a worker pool for the selfImprovementPolicy and Evaluator that can run multiple MCTS-DNN arenas in parallel. 
 """
+
+
 
 from __future__ import annotations
 
@@ -53,17 +57,16 @@ from .DNN.replay_dataset import load_manifest, collate_mixed_samples
 from .DNN.trainer import Trainer, TrainerConfig
 from .DNN.replay_buffer import BestModelReplayBuffer
 
-# Evaluator for controller vs adversary matches 
-from .DNN.evaluator import (
-    EvaluatorConfig,
-    FixedEvalHarness,
-    FixedEvalStatesEvaluator,
-    save_eval_roots_payload_from_cfg,
-)
 from .logger.eval_logger import EvalArenaGenerationLogger
 from .logger.replay_logger import ReplayBufferLogger
+from .DNN.evaluator import EvaluatorConfig
 
-
+from .DNN.eval_utils import (
+    grade_arena_from_game_logs,
+    extract_model_state,
+    NoopReplayWriter,
+    write_arena_cycle_end_csv,
+)
 
 
 
@@ -175,52 +178,6 @@ def _build_env_and_simulator(
     return simulator, env, constraints, explore_cfg
 
 
-def _save_eval_roots_payload_virtual(
-    *,
-    cfg: "AlphaZeroConfig",
-    evaluator_cfg: EvaluatorConfig,
-    gen: int,
-    out_path: Path,
-) -> Path:
-    _, env_eval, _, _ = _build_env_and_simulator(cfg, use_virtual_env=True)
-    evaluator = FixedEvalStatesEvaluator(env=env_eval, cfg=evaluator_cfg)
-    payload = evaluator.build_eval_roots_for_generation(
-        gen=int(gen),
-        start_player="adversary",
-    )
-    out = Path(out_path)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(payload, out)
-    return out
-
-
-def _build_virtual_arena_harness(
-    *,
-    cfg: "AlphaZeroConfig",
-    evaluator_cfg: EvaluatorConfig,
-) -> FixedEvalHarness:
-    simulator_eval, env_eval, _, _ = _build_env_and_simulator(cfg, use_virtual_env=True)
-    evaluator = FixedEvalStatesEvaluator(env=env_eval, cfg=evaluator_cfg)
-
-    cpu_candidate_for_mcts = AlphaZeroModel(
-        num_actions_controller=cfg.model.num_actions_controller,
-        num_actions_adversary=cfg.model.num_actions_adversary,
-    ).to(torch.device("cpu"))
-    cpu_candidate_for_mcts.eval()
-
-    cpu_best_for_mcts = AlphaZeroModel(
-        num_actions_controller=cfg.model.num_actions_controller,
-        num_actions_adversary=cfg.model.num_actions_adversary,
-    ).to(torch.device("cpu"))
-    cpu_best_for_mcts.eval()
-
-    return FixedEvalHarness(
-        evaluator=evaluator,
-        cpu_candidate_for_mcts=cpu_candidate_for_mcts,
-        cpu_best_for_mcts=cpu_best_for_mcts,
-        _simulator=simulator_eval,  # type: ignore[arg-type]
-    )
-
 
 def _next_generation_index(dataset_base: Path) -> int:
     if not dataset_base.exists():
@@ -234,6 +191,17 @@ def _next_generation_index(dataset_base: Path) -> int:
             continue
         best = max(best, int(m.group(1)))
     return best + 1
+
+def _build_arena_root_entries(gen: int , evaluator_cfg: EvaluatorConfig , cfg: "AlphaZeroConfig") -> list[dict]:
+    rng = random.Random(int(evaluator_cfg.random_seed_base) + int(gen))
+    n = int(evaluator_cfg.num_random_games)
+    max_hops = int(evaluator_cfg.max_history_depth)
+    hops = [0] + [int(rng.randint(0, max_hops)) for _ in range(max(0, n - 1))]
+    base_gid = int(cfg.run.game_id) + 900000 + int(gen) * 1000
+    return [
+        {"game_id": base_gid + i, "history_hops": h, "player_to_act": "adversary", "depth": 0, "root_id": i}
+        for i, h in enumerate(hops)
+    ]
 
 
 def _load_ckpt_model_state_cpu(path: Path) -> dict[str, torch.Tensor]:
@@ -365,34 +333,6 @@ def _maybe_resume_best(
     return None
 
 
-def _eval_roots_worker_main(
-    result_q: "mp.Queue",
-    cfg: "AlphaZeroConfig",
-    evaluator_cfg: EvaluatorConfig,
-    gen: int,
-    out_path: str,
-    use_virtual_env: bool,
-) -> None:
-    try:
-        if use_virtual_env:
-            p = _save_eval_roots_payload_virtual(
-                cfg=cfg,
-                evaluator_cfg=evaluator_cfg,
-                gen=int(gen),
-                out_path=Path(out_path),
-            )
-        else:
-            p = save_eval_roots_payload_from_cfg(
-                az_cfg=cfg,
-                eval_cfg=evaluator_cfg,
-                gen=int(gen),
-                out_path=Path(out_path),
-                start_player="adversary",
-            )
-        result_q.put({"ok": True, "path": str(p)})
-    except Exception as e:
-        result_q.put({"ok": False, "error": repr(e)})
-
 
 def _selfplay_worker_main(
     worker_id: int,
@@ -430,70 +370,207 @@ def _selfplay_worker_main(
     ).to(torch.device("cpu"))
     model.eval()
 
+
+    arena_candidate_model = AlphaZeroModel(
+        num_actions_controller=cfg.model.num_actions_controller,
+        num_actions_adversary=cfg.model.num_actions_adversary,
+    ).to(torch.device("cpu"))
+    arena_candidate_model.eval()
+
+    arena_best_model = AlphaZeroModel(
+        num_actions_controller=cfg.model.num_actions_controller,
+        num_actions_adversary=cfg.model.num_actions_adversary,
+    ).to(torch.device("cpu"))
+    arena_best_model.eval()
+
+    _loaded_candidate_path: Optional[Path] = None
+    _loaded_best_path: Optional[Path] = None
+
+
     while True:
+
+
+
+
         task = task_q.get()
         if task is None:
             break
 
-        # Unpack task
-        gen = int(task["gen"])
-        out_dir = Path(task["out_dir"])
-        weights_path = Path(task["weights_path"])
-        game_id = int(task["game_id"])
-        start_root_id = int(task["start_root_id"])
-        history_seed = int(task["history_seed"])
-        roots = int(task["num_roots"])
+        task_kind = str(task.get("task_kind", "selfplay"))
+        if task_kind == "selfplay":
+            # Unpack task
+            gen = int(task["gen"])
+            out_dir = Path(task["out_dir"])
+            weights_path = Path(task["weights_path"])
+            game_id = int(task["game_id"])
+            start_root_id = int(task["start_root_id"])
+            history_seed = int(task["history_seed"])
+            roots = int(task["num_roots"])
 
-        # Load frozen weights for this generation
-        ckpt = torch.load(weights_path, map_location="cpu")
-        model.load_state_dict(ckpt["model_state"])
-        model.eval()
+            # Load frozen weights for this generation
+            ckpt = torch.load(weights_path, map_location="cpu")
+            model.load_state_dict(ckpt["model_state"])
+            model.eval()
 
-        # Per-worker writer
-        writer = ReplayWriter(ReplayWriterConfig(out_dir=out_dir, shard_size=cfg.dataset.shard_size))
+            # Per-worker writer
+            writer = ReplayWriter(ReplayWriterConfig(out_dir=out_dir, shard_size=cfg.dataset.shard_size))
 
-        # Put per-worker logs in the global logs dir (not inside dataset dir)
-        logs_base = Path(cfg.logging.mcts_iter_log).parent  # simulator_output/mcts_dnn_logs
-        logs_dir = logs_base / f"gen_{gen:06d}"
-        logs_dir.mkdir(parents=True, exist_ok=True)
+            # Put per-worker logs in the global logs dir (not inside dataset dir)
+            logs_base = Path(cfg.logging.mcts_iter_log).parent  # simulator_output/mcts_dnn_logs
+            logs_dir = logs_base / f"gen_{gen:06d}"
+            logs_dir.mkdir(parents=True, exist_ok=True)
 
-        iter_log = logs_dir / f"mcts_iter_p{worker_id:02d}.csv"
-        root_log = logs_dir / f"mcts_root_p{worker_id:02d}.csv"
+            iter_log = logs_dir / f"mcts_iter_p{worker_id:02d}.csv"
+            root_log = logs_dir / f"mcts_root_p{worker_id:02d}.csv"
 
 
 
-        mcts = VidurMCTS(env=env, explore_cfg=explore_cfg, log_path=iter_log, tree_log_path=root_log, logger_flush_every=cfg.logging.flush_every)
-        runner = SelfPlayRunner(env=env, mcts=mcts, model=model, writer=writer, device_for_features=torch.device("cpu"))
+            mcts = VidurMCTS(env=env, explore_cfg=explore_cfg, log_path=iter_log, tree_log_path=root_log, logger_flush_every=cfg.logging.flush_every)
+            runner = SelfPlayRunner(env=env, mcts=mcts, model=model, writer=writer, device_for_features=torch.device("cpu"))
 
-        # Make history different per worker/gen by changing game_id and/or seed.
-        # Right now run_n_roots only takes history_nontrivial_hops, so “seed” comes from game_id/root_id_for_logs.
-        # If you want explicit control, add a `history_seed` arg to run_n_roots and forward it to HistoryRootGenerator.
-        hops_for_task = int(task.get("history_nontrivial_hops", default_history_nontrivial_hops))
-        runner.run_n_roots(
-            game_id=game_id,
-            num_roots=roots,
-            adv_iterations_per_root=adv_iterations_per_root,
-            cont_iterations_per_root=cont_iterations_per_root,
-            max_batch_size=max_batch_size,
-            start_root_id=start_root_id,
-            start_root_depth=0,
-            start_player="adversary",
-            history_nontrivial_hops=hops_for_task,
-            feature_version=cfg.run.feature_version,
-        )
+            # Make history different per worker/gen by changing game_id and/or seed.
+            # Right now run_n_roots only takes history_nontrivial_hops, so “seed” comes from game_id/root_id_for_logs.
+            # If you want explicit control, add a `history_seed` arg to run_n_roots and forward it to HistoryRootGenerator.
+            hops_for_task = int(task.get("history_nontrivial_hops", default_history_nontrivial_hops))
+            runner.run_n_roots(
+                game_id=game_id,
+                num_roots=roots,
+                adv_iterations_per_root=adv_iterations_per_root,
+                cont_iterations_per_root=cont_iterations_per_root,
+                max_batch_size=max_batch_size,
+                start_root_id=start_root_id,
+                start_root_depth=0,
+                start_player="adversary",
+                history_nontrivial_hops=hops_for_task,
+                feature_version=cfg.run.feature_version,
+            )
 
-        writer.close()
-        mcts.close()
+            writer.close()
+            mcts.close()
+
+            result_q.put(
+                {
+                    "worker_id": worker_id,
+                    "gen": gen,
+                    "out_dir": str(out_dir),
+                }
+            )
+            continue
+
+        if task_kind == "arena":
+            gen = int(task["gen"])
+            arena_roots = list(task["arena_roots"])
+            arena_games_dir = Path(task["arena_games_dir"])
+
+            candidate_weights_path = Path(task["candidate_weights_path"])
+            best_weights_path = Path(task["best_weights_path"])
+
+            if _loaded_candidate_path != candidate_weights_path:
+                ckpt_c = torch.load(candidate_weights_path, map_location="cpu")
+                arena_candidate_model.load_state_dict(extract_model_state(ckpt_c), strict=True)
+                arena_candidate_model.eval()
+                _loaded_candidate_path = candidate_weights_path
+
+            if _loaded_best_path != best_weights_path:
+                ckpt_b = torch.load(best_weights_path, map_location="cpu")
+                arena_best_model.load_state_dict(extract_model_state(ckpt_b), strict=True)
+                arena_best_model.eval()
+                _loaded_best_path = best_weights_path
+
+            adv_iters = int(task["adv_iterations_per_root"])
+            cont_iters = int(task["cont_iterations_per_root"])
+            max_adv_moves = int(task["arena_max_adversary_moves"])
+            max_cleanup = int(task["arena_max_controller_cleanup_steps"])
+            max_turns = int(task["arena_max_total_turns"])
+            feature_version = int(task["feature_version"])
+            tie_points = float(task["tie_points"])
+
+            noop_writer = NoopReplayWriter()
+
+            for entry in arena_roots:
+                game_id = int(entry["game_id"])
+                history_hops = int(entry["history_hops"])
+                start_player = str(entry.get("player_to_act", "adversary"))
+                start_depth = int(entry.get("depth", 0))
+                history_root_id = int(entry.get("root_id", 0))
+
+                # debug full log (single file with both cycles)
+                debug_root_log = arena_games_dir / f"game_{game_id}.csv"
+
+                mcts = VidurMCTS(
+                    env=env,
+                    explore_cfg=explore_cfg,
+                    log_path=None,
+                    tree_log_path=debug_root_log,
+                    logger_flush_every=cfg.logging.flush_every,
+                )
+                runner = SelfPlayRunner(
+                    env=env,
+                    mcts=mcts,
+                    model=arena_candidate_model,
+                    writer=noop_writer,
+                    device_for_features=torch.device("cpu"),
+                )
+
+                try:
+                    out = runner.run_arena_game(
+                        game_id=game_id,
+                        candidate_model=arena_candidate_model,
+                        best_model=arena_best_model,
+                        history_nontrivial_hops=history_hops,
+                        adv_iterations_per_root=adv_iters,
+                        cont_iterations_per_root=cont_iters,
+                        arena_max_adversary_moves=max_adv_moves,
+                        arena_max_controller_cleanup_steps=max_cleanup,
+                        arena_max_total_turns=max_turns,
+                        feature_version=feature_version,
+                        tie_points=tie_points,
+                        start_player=start_player,
+                        start_root_depth=start_depth,
+                        history_root_id_for_logs=history_root_id,
+                    )
+                finally:
+                    mcts.close()
+
+                cycle_a = dict(out["cycle_a"])
+                cycle_b = dict(out["cycle_b"])
+
+                write_arena_cycle_end_csv(
+                    arena_games_dir / f"game_{game_id}_adv_candidate_ctrl_best.csv",
+                    game_id=game_id,
+                    cycle_label="candidate_as_adversary",
+                    total_cost=float(out["candidate_as_adv_cost"]),
+                    slo_violations=int(cycle_a.get("slo_violations", 0)),
+                    total_lateness=float(cycle_a.get("total_lateness", 0.0)),
+                )
+                write_arena_cycle_end_csv(
+                    arena_games_dir / f"game_{game_id}_adv_best_ctrl_candidate.csv",
+                    game_id=game_id,
+                    cycle_label="best_as_adversary",
+                    total_cost=float(out["best_as_adv_cost"]),
+                    slo_violations=int(cycle_b.get("slo_violations", 0)),
+                    total_lateness=float(cycle_b.get("total_lateness", 0.0)),
+                )
+
+            result_q.put(
+                {
+                    "ok": True,
+                    "task_kind": "arena",
+                    "worker_id": worker_id,
+                    "gen": gen,
+                    "num_games": len(arena_roots),
+                }
+            )
+            continue
 
         result_q.put(
             {
+                "ok": False,
+                "task_kind": str(task_kind),
                 "worker_id": worker_id,
-                "gen": gen,
-                "out_dir": str(out_dir),
+                "error": f"unknown task_kind={task_kind}",
             }
         )
-
-
 
 def selfImprovementPolicy(
     *,
@@ -518,12 +595,7 @@ def selfImprovementPolicy(
     replay_seed: int = 2026,
 ) -> None:
 
-    # def _sample_worker_hops_for_generation(gen: int) -> list[int]:
-    #     rng = random.Random(91337 + int(gen))
-    #     max_hops = int(evaluator_cfg.max_history_depth)
-    #     hops = [int(rng.randint(0, max_hops)) for _ in range(int(num_selfPlay_workers))]
-    #     hops[rng.randrange(int(num_selfPlay_workers))] = 0
-    #     return hops
+
 
     def _sample_worker_hops_for_generation(gen: int) -> list[int]:
         rng = random.Random(91337 + int(gen))
@@ -584,16 +656,7 @@ def selfImprovementPolicy(
         },
     )
 
-
-    if use_virtual_env:
-        arena_harness = _build_virtual_arena_harness(cfg=cfg, evaluator_cfg=evaluator_cfg)
-    else:
-        arena_harness = FixedEvalHarness.from_alpha_zero_cfg(
-            az_cfg=cfg,
-            eval_cfg=evaluator_cfg,
-            start_player="adversary",
-        )
-
+    sim_cli_args = list(getattr(cfg.sim, "cli_args"))
     if not best_path.exists():
         trainer.save_checkpoint(best_path)    
 
@@ -661,6 +724,10 @@ def selfImprovementPolicy(
 
         gen = gen0 + j
         gen_dataset_dir = dataset_base / f"gen_{gen:06d}"
+        logs_base = Path(cfg.logging.mcts_iter_log).parent
+        gen_logs_dir = logs_base / f"gen_{gen:06d}"
+        gen_logs_dir.mkdir(parents=True, exist_ok=True)
+
         worker_hops_for_gen = _sample_worker_hops_for_generation(gen)
 
         # 0) freeze current weights for self-play workers
@@ -668,28 +735,6 @@ def selfImprovementPolicy(
         weights_path = ckpt_dir / f"selfplay_weights_gen_{gen:06d}.pt"
         state = {k: v.detach().cpu() for k, v in trainer.model.state_dict().items()}
         torch.save({"model_state": state}, weights_path)
-
-        # 1) dispatch tasks
-        gen_dataset_dir.mkdir(parents=True, exist_ok=True)
-        logs_base = Path(cfg.logging.mcts_iter_log).parent
-        gen_logs_dir = logs_base / f"gen_{gen:06d}"
-        gen_logs_dir.mkdir(parents=True, exist_ok=True)
-
-
-        eval_root_result_q = ctx.Queue()
-        eval_root_cache_path = gen_dataset_dir / "arena_eval_roots.pt"
-        eval_root_p = ctx.Process(
-            target=_eval_roots_worker_main,
-            args=(
-                eval_root_result_q,
-                cfg,
-                evaluator_cfg,
-                gen,
-                str(eval_root_cache_path),
-                use_virtual_env,
-            ),
-        )
-        eval_root_p.start()
 
 
         # split roots across workers
@@ -754,34 +799,6 @@ def selfImprovementPolicy(
 
         # Eval on full latest-generation dataset (stable metric)
         eval_batch = collate_mixed_samples(samples, device=trainer.device)
-
-        # Train with random minibatches from latest generation (replay-style)
-        # rng = random.Random(1000 + int(gen))   # deterministic per gen; change seed if you want
-        # train_minibatch_size = 32
-
-        # for _ in range(int(train_steps_per_generation)):
-        #     minibatch_samples = rng.choices(samples, k=train_minibatch_size)  # with replacement
-        #     train_batch = collate_mixed_samples(minibatch_samples, device=trainer.device)
-
-        #     train_metrics = trainer.train_step(train_batch)
-        #     _append_train_log_row(
-        #         train_log_csv,
-        #         {
-        #             "time": time.time(),
-        #             "event": "train",
-        #             "gen": gen,
-        #             "trainer_step": int(trainer.step),
-        #             "dataset_dir": str(gen_dataset_dir),
-        #             "num_samples": int(len(samples)),
-        #             "num_controller": int(num_controller),
-        #             "num_adversary": int(num_adversary),
-        #             **train_metrics,
-        #             "saved_best": "",
-        #             "ckpt_path": "",
-        #             "best_path": str(best_path),
-        #             "resume_ckpt": str(resume_ckpt) if resume_ckpt else "",
-        #         },
-        #     )
 
         # Train with random minibatches from replay buffer
         train_minibatch_size = 32
@@ -854,59 +871,62 @@ def selfImprovementPolicy(
         ckpt_path = ckpt_dir / f"ckpt_gen_{gen:06d}_step_{trainer.step:06d}.pt"
         trainer.save_checkpoint(ckpt_path)
 
-        eval_root_msg = eval_root_result_q.get()
-        eval_root_p.join()
-        if eval_root_p.exitcode != 0:
-            raise RuntimeError(f"eval-root worker died: pid={eval_root_p.pid} exitcode={eval_root_p.exitcode}")
-        if not bool(eval_root_msg.get("ok", False)):
-            raise RuntimeError(f"eval-root worker failed: {eval_root_msg.get('error', 'unknown error')}")
+        # 5) arena evaluation against current best 
+   
+        arena_root_entries = _build_arena_root_entries(gen, evaluator_cfg, cfg)
+        if not arena_root_entries:
+            raise RuntimeError("arena root payload is empty")
 
-        # arena_payload = torch.load(eval_root_msg["path"], map_location="cpu")
-        arena_payload = torch.load(eval_root_msg["path"], map_location="cpu", weights_only=False)
-        arena_harness.evaluator.load_eval_roots_payload(arena_payload)
+        arena_games_dir = gen_logs_dir / "arena_games"
+        arena_games_dir.mkdir(parents=True, exist_ok=True)
 
-        # Sampling the games for which we will log detailed step-by-step info during the arena fights. We can only do this for a few games because of the overhead of logging every MCTS iteration and root evaluation.
-        all_game_ids = [int(r.game_id) for r in arena_harness.evaluator.eval_roots]
-        sampled_game_ids: list[int] = []
-        sample_k = max(0, int(evaluator_cfg.debug_sample_games))
+        per_arena = int(math.ceil(len(arena_root_entries) / float(num_selfPlay_workers)))
+        arena_tasks_sent = 0
 
-        if sample_k > 0 and all_game_ids:
-            if len(all_game_ids) <= sample_k:
-                sampled_game_ids = list(all_game_ids)
-            else:
-                rng_dbg = random.Random(int(evaluator_cfg.random_seed_base) + int(gen) * 99991 + 17)
-                sampled_game_ids = rng_dbg.sample(all_game_ids, k=sample_k)
+        for wid in range(int(num_selfPlay_workers)):
+            lo = wid * per_arena
+            hi = min(len(arena_root_entries), (wid + 1) * per_arena)
+            if hi <= lo:
+                continue
 
-
-
-        arena_generation_logger = EvalArenaGenerationLogger(
-            gen_dir=gen_logs_dir,   # was gen_dataset_dir
-            sampled_game_ids=sampled_game_ids,
-            flush_every=int(evaluator_cfg.debug_flush_every),
-        )
-
-
-        # 5) arena fight on fixed history roots
-        try:
-            arena_metrics = arena_harness.run_arena(
-                trainer=trainer,
-                best_state_dict=best_state_cpu,
-                generation_logger=arena_generation_logger,
+            task_q.put(
+                {
+                    "task_kind": "arena",
+                    "gen": gen,
+                    "arena_roots": arena_root_entries[lo:hi],
+                    "arena_games_dir": str(arena_games_dir),
+                    "candidate_weights_path": str(ckpt_path),
+                    "best_weights_path": str(best_path),
+                    "adv_iterations_per_root": int(evaluator_cfg.adv_iterations_per_root),
+                    "cont_iterations_per_root": int(evaluator_cfg.cont_iterations_per_root),
+                    "arena_max_adversary_moves": int(evaluator_cfg.arena_max_adversary_moves),
+                    "arena_max_controller_cleanup_steps": int(evaluator_cfg.arena_max_controller_cleanup_steps),
+                    "arena_max_total_turns": int(evaluator_cfg.arena_max_total_turns),
+                    "feature_version": int(cfg.run.feature_version),
+                    "tie_points": float(evaluator_cfg.tie_points),
+                }
             )
-        finally:
-            if arena_generation_logger is not None:
-                arena_generation_logger.close()
-            replay_logger.close()
+            arena_tasks_sent += 1
 
+        arena_msgs = [result_q.get() for _ in range(arena_tasks_sent)]
+        for msg in arena_msgs:
+            if not bool(msg.get("ok", False)):
+                raise RuntimeError(f"arena worker failed: {msg.get('error', 'unknown error')}")
+
+        arena_metrics = grade_arena_from_game_logs(
+            game_log_dir=arena_games_dir,
+            out_csv=gen_logs_dir / "arena_results.csv",
+            tie_points=float(evaluator_cfg.tie_points),
+            win_threshold=float(evaluator_cfg.arena_win_threshold),
+        )
         arena_passed = bool(arena_metrics["passed"])
 
         if arena_passed:
-            trainer.save_checkpoint(best_path)  # promote
-            replay_buffer.reset_for_new_best()   # discard old-best replay samples
+            trainer.save_checkpoint(best_path)
+            replay_buffer.reset_for_new_best()
             best_model_generation = int(gen)
-
         else:
-            _restore_trainer_from_ckpt(trainer=trainer, path=best_path)  # keep old best active
+            _restore_trainer_from_ckpt(trainer=trainer, path=best_path)
 
         _append_train_log_row(
             train_log_csv,
@@ -930,10 +950,9 @@ def selfImprovementPolicy(
                 "arena_win_threshold": float(arena_metrics["arena_win_threshold"]),
                 "arena_passed": bool(arena_passed),
             },
-        )
+        )       
 
-
-
+    replay_logger.close() 
     for _ in workers:
         task_q.put(None)
     for p in workers:
@@ -1123,14 +1142,17 @@ def main() -> None:
     )
 
 
-
+    # TODO: Remove useless feilds and move the config class to eval_utils
     evaluator_cfg = EvaluatorConfig(
-        num_random_games=50,
-        max_history_depth=70,
+        num_random_games=8,
+        max_history_depth=100,
         random_seed_base=12345,
+        adv_iterations_per_root=4000,
+        cont_iterations_per_root=4000,
+        arena_num_processes=8,
         # arena_iters_adversary=2000,
         # arena_iters_controller=2000,
-        arena_max_adversary_moves=5,
+        arena_max_adversary_moves=1,
         arena_max_controller_cleanup_steps=24,
         arena_max_total_turns=512,
         arena_win_threshold=0.52,
@@ -1148,7 +1170,7 @@ def main() -> None:
     roots_per_generation = 400
     adv_iterations_per_root = 4000
     cont_iterations_per_root = 8000
-    train_steps_per_generation = 400  
+    train_steps_per_generation = 100  
     max_batch_size = 256
     train_log_csv = Path("simulator_output/mcts_dnn_logs/train_metrics.csv")
     ckpt_dir = Path("simulator_output/mcts_dnn_checkpoints")
