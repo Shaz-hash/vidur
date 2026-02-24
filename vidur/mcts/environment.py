@@ -97,8 +97,9 @@ class VidurGameStats:
 
     # Prefill bookkeeping: once prefill is complete, we can stop recomputing prefill lateness
     prefill_lateness_finalized: Set[int] = field(default_factory=set)
-
     violated_request_ids: Set[int] = field(default_factory=set)
+
+    active_request_ids: Set[int] = field(default_factory=set)
 
     # Used for the Adversary to track arrivals within the  prefill reqs containing batches
     last_prefill_batch_time: Optional[float] = None
@@ -117,6 +118,7 @@ class VidurGameStats:
             decode_next_deadline_by_id=dict(self.decode_next_deadline_by_id),
             prefill_lateness_finalized=set(self.prefill_lateness_finalized),
             violated_request_ids=set(self.violated_request_ids),
+            active_request_ids=set(self.active_request_ids),
             last_prefill_batch_time=self.last_prefill_batch_time,
         )
 

@@ -120,6 +120,7 @@ class Request(BaseEntity):
         self._replica_id = None
         self._num_prefill_tokens = num_prefill_tokens
         self._num_prefill_tokens_cached = 0
+        self._remaining_prefill_tokens = int(num_prefill_tokens)
         self._num_decode_tokens = num_decode_tokens
         self._num_processed_tokens = 0
         self._block_hash_ids = block_hash_ids
@@ -261,6 +262,18 @@ class Request(BaseEntity):
     def num_decode_tokens(self) -> int:
         return self._num_decode_tokens
 
+    def _sync_remaining_prefill_tokens(self) -> None:
+        self._remaining_prefill_tokens = max(
+            0, int(self._num_prefill_tokens) - int(self.num_processed_prefill_tokens)
+        )
+
+    @property
+    def remaining_prefill_tokens(self) -> int:
+        return int(self._remaining_prefill_tokens)
+
+
+
+
     @property
     def pd_ratio(self) -> float:
         return self._num_prefill_tokens / self._num_decode_tokens
@@ -364,6 +377,7 @@ class Request(BaseEntity):
         ), f"Request {self._id} has {num_tokens_cached} cached tokens, but only {self._num_prefill_tokens} prefill tokens."
         self._num_processed_tokens = num_tokens_cached
         self._num_prefill_tokens_cached = num_tokens_cached
+        self._sync_remaining_prefill_tokens()
 
     def restart(self):
         logger.debug(f"Restarting request {self._id}")
@@ -373,7 +387,7 @@ class Request(BaseEntity):
         total_tokens = self._num_prefill_tokens + self._num_decode_tokens
         self._num_prefill_tokens = self._num_processed_tokens
         self._num_decode_tokens = total_tokens - self._num_prefill_tokens
-
+        
         self._num_processed_tokens = 0
         self._scheduled = False
         self._preempted = False
@@ -383,7 +397,9 @@ class Request(BaseEntity):
         # reset decode tracking
         self._decode_next_deadline = None
         self._decode_tokens_counted = 0
-
+        
+        self._sync_remaining_prefill_tokens()
+        
         self._num_restarts += 1
 
     def on_batch_schedule(
@@ -438,6 +454,8 @@ class Request(BaseEntity):
             self._completed_at = time
             self._completed = True
             logger.debug(f"Request {self._id} completed at {self._completed_at}")
+
+        self._sync_remaining_prefill_tokens()
 
     def on_batch_stage_schedule(
         self,
@@ -566,6 +584,7 @@ class Request(BaseEntity):
             "num_prefill_tokens_cached": int(self._num_prefill_tokens_cached),
             "num_decode_tokens": int(self._num_decode_tokens),
             "num_processed_tokens": int(self._num_processed_tokens),
+            "remaining_prefill_tokens": int(self._remaining_prefill_tokens),
             "block_hash_ids": list(self._block_hash_ids) if self._block_hash_ids is not None else None,
             "block_size": int(self._block_size) if self._block_size is not None else None,
             "scheduled": bool(self._scheduled),
@@ -626,6 +645,7 @@ class Request(BaseEntity):
         req._num_prefill_tokens_cached = int(s["num_prefill_tokens_cached"])
         req._num_decode_tokens = int(s["num_decode_tokens"])
         req._num_processed_tokens = int(s["num_processed_tokens"])
+        req._sync_remaining_prefill_tokens()
 
         # Flags & counters
         req._scheduled = bool(s["scheduled"])
@@ -657,6 +677,7 @@ class Request(BaseEntity):
         req._decode_next_deadline = None
         req._decode_tokens_counted = 0
 
+
         return req
 
     # def restore_state(self, s: Dict[str, Any]) -> None:
@@ -681,6 +702,7 @@ class Request(BaseEntity):
         self._num_prefill_tokens_cached = int(s.get("num_prefill_tokens_cached", 0))
         self._num_decode_tokens = int(s["num_decode_tokens"])
         self._num_processed_tokens = int(s["num_processed_tokens"])
+        self._sync_remaining_prefill_tokens()
 
         self._block_hash_ids = list(s["block_hash_ids"]) if s.get("block_hash_ids") is not None else None
         self._block_size = int(s["block_size"]) if s.get("block_size") is not None else None

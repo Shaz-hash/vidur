@@ -55,7 +55,7 @@ BEST_AS_HISTORY_EXTEND: bool = True
 # Root selection:
 # - True: replay history using all rows except the last, and verify the last row's root state
 # - False: replay ALL rows and verify the resulting state (less "verifier-ish", but sometimes useful)
-VERIFY_LAST_ROOT_STATE = False
+VERIFY_LAST_ROOT_STATE = True
 
 # Hard cap to avoid infinite loops when auto-advancing forced single-action chains
 MAX_FORCED_HOPS = 20_000

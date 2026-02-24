@@ -21,7 +21,6 @@ from .environment import (
 from .launch_mcts_job import MCTSConstraintConfig, MCTSExploreConfig
 from .prefill_calibrator import PrefillProfile
 from .virtual_simulator import VirtualSimulator
-from vidur.entities.execution_time_predictor_request import ExecutionTimePredictorRequest
 
 
 class VirtualVidurMCTSEnvironment:
@@ -69,7 +68,6 @@ class VirtualVidurMCTSEnvironment:
         if self._constraints.max_request_tokens is None:
             self._constraints.max_request_tokens = self._prefill_profile.max_tokens
 
-        self._controller_budgets_cache: Dict[int, Tuple[int, ...]] = {}
         self._perf = {
             "apply_ctrl_calls": 0.0,
             "apply_ctrl_total": 0.0,
@@ -79,18 +77,6 @@ class VirtualVidurMCTSEnvironment:
             "stats": 0.0,
             "rebuild": 0.0,
             "ff_decode": 0.0,
-
-             # stats profiler
-            "stats_calls": 0.0,
-            "stats_total_internal": 0.0,
-            "stats_batch_unpack": 0.0,
-            "stats_ids_union": 0.0,
-            "stats_req_get": 0.0,
-            "stats_hooks": 0.0,
-            "stats_prefill": 0.0,
-            "stats_decode": 0.0,
-            "stats_violation": 0.0,
-            "stats_complete": 0.0,
         }
 
 
@@ -223,7 +209,6 @@ class VirtualVidurMCTSEnvironment:
 
         return actions_by_index, mask
 
-
     def sample_controller_actions(
         self,
         state: VidurMCTSState,
@@ -236,153 +221,160 @@ class VirtualVidurMCTSEnvironment:
         sim_time = float(state.simulator._time)
         step = int(self._constraints.interval_request_size or 512)
 
-        # Cache budgets per step (avoids rebuilding every call)
-        budget_cache = self._controller_budgets_cache
-        budgets = budget_cache.get(step)
-        if budgets is None:
-            budgets = tuple(step * i for i in range(1, 7))
-            budget_cache[step] = budgets
-
+        budgets: List[int] = [step * i for i in range(1, 7)]
+        # request_lookup = self._build_request_lookup(state.simulator)
+        # waiting_ids_all = sorted(request_lookup.keys())
         req_map = self._req_map(state.simulator)
-        active_ids = state.stats.active_request_ids  # already a set
+        active_ids = sorted(rid for rid in state.stats.active_request_ids if rid in req_map)
+
 
         num_heur = 4
-        num_budgets = len(budgets)
+        num_budgets = 6
         num_actions = num_heur * num_budgets
         actions_by_index: List[Optional[ControllerAction]] = [None] * num_actions
         mask: List[bool] = [False] * num_actions
 
+        # if not waiting_ids_all:
         if not active_ids:
             actions_by_index[0] = ControllerAction(token_budget=0, selected_request_ids=None)
             mask[0] = True
             return actions_by_index, mask
 
-        # One pass over active ids
+        # def remaining_prefill(req: Request) -> int:
+        #     return max(0, int(req.num_prefill_tokens) - int(req.num_processed_prefill_tokens))
+
+        def remaining_prefill(req: Request) -> int:
+            return self._remaining_prefill(req)
+
+        def prefill_done(req: Request) -> bool:
+            return bool(getattr(req, "_is_prefill_complete", req.is_prefill_complete))
+
         prefill_ids: List[int] = []
-        rem_pref_by_id: Dict[int, int] = {}
-        edf_key_by_id: Dict[int, float] = {}
-        lst_key_by_id: Dict[int, float] = {}
-        total_remaining_prefill = 0
-        decode_candidates: List[int] = []
-        decode_base_template: Dict[int, int] = {}
-
-
-        for rid0 in active_ids:
-            rid = int(rid0)
-            req = req_map.get(rid)
+        # for rid in waiting_ids_all:
+        for rid in active_ids:
+            # req = request_lookup.get(rid)
+            req = req_map[rid]
             if req is None:
-                continue  # stale active id safety
+                continue
+            if remaining_prefill(req) > 0 and not prefill_done(req):
+                prefill_ids.append(rid)
 
-            prefill_done = bool(getattr(req, "_is_prefill_complete", req.is_prefill_complete))
+        decode_candidates: List[int] = []
+        for rid in active_ids:
+            # req = request_lookup.get(rid)
+            req = req_map[rid]
+            if req is None:
+                continue
+            remaining_decode = max(0, int(req.num_decode_tokens) - int(req.num_processed_decode_tokens))
+            if prefill_done(req) and remaining_decode > 0:
+                decode_candidates.append(rid)
+        decode_candidates = sorted(decode_candidates)
 
-            if not prefill_done:
-                rem_pref = self._remaining_prefill(req)
-                if rem_pref > 0:
-                    prefill_ids.append(rid)
-                    rem_pref_by_id[rid] = rem_pref
-                    total_remaining_prefill += rem_pref
-
-                    arrived_at = float(getattr(req, "arrived_at", 0.0))
-                    prefill_slo = float(getattr(req, "prefill_slo_time", 0.0))
-                    edf_key_by_id[rid] = arrived_at + prefill_slo
-
-                    remaining_slo = prefill_slo - max(0.0, sim_time - arrived_at)
-                    est = float(self._prefill_profile.lookup(rem_pref))
-                    lst_key_by_id[rid] = remaining_slo - est
-            else:
-                if self._remaining_decode(req) > 0:
-                    decode_candidates.append(rid)
-                    decode_base_template[rid] = 1
-
-     
-        # decode_candidates.sort()
+        total_remaining_prefill = 0
+        for rid in prefill_ids:
+            # total_remaining_prefill += remaining_prefill(request_lookup[rid])
+            total_remaining_prefill += remaining_prefill(req_map[rid])
 
         if total_remaining_prefill == 0:
-            decode_base = dict(decode_base_template)
+            decode_base = {rid: 1 for rid in decode_candidates}
             token_alloc = dict(decode_base)
-            selected = decode_candidates if decode_candidates else None
+            selected = sorted(token_alloc.keys())
             a = ControllerAction(
                 token_budget=len(decode_base),
-                selected_request_ids=list(token_alloc.keys()) if token_alloc else None,
+                selected_request_ids=selected if selected else None,
                 token_allocations=token_alloc,
                 prefill_allocations={},
                 decode_allocations=decode_base,
                 heuristic="SJF",
                 strategy="Fixed",
             )
+            actions_by_index = [None] * num_actions
+            mask = [False] * num_actions
             actions_by_index[0] = a
             mask[0] = True
             return actions_by_index, mask
 
-        # Precompute sorted orders once
-        ordered_sjf = sorted(prefill_ids, key=rem_pref_by_id.__getitem__)
-        ordered_edf = sorted(prefill_ids, key=edf_key_by_id.__getitem__)
-        ordered_lst = sorted(prefill_ids, key=lst_key_by_id.__getitem__)
-        ordered_ljf = list(reversed(ordered_sjf))
+        def order_sjf(ids: List[int]) -> List[int]:
+            return sorted(ids, key=lambda rid: remaining_prefill(req_map[rid]))
+
+        def order_edf(ids: List[int]) -> List[int]:
+            return sorted(
+                ids,
+                key=lambda rid: (
+                    # getattr(request_lookup[rid], "arrived_at", 0.0)
+                    # + getattr(request_lookup[rid], "prefill_slo_time", 0.0)
+                    getattr(req_map[rid], "arrived_at", 0.0)
+                    + getattr(req_map[rid], "prefill_slo_time", 0.0)
+                ),
+            )
+
+        def order_lst(ids: List[int]) -> List[int]:
+            def slack(rid: int) -> float:
+                req = req_map[rid]
+                remaining_slo = (
+                    float(getattr(req, "prefill_slo_time", 0.0))
+                    - max(0.0, sim_time - float(getattr(req, "arrived_at", 0.0)))
+                )
+                est = float(self._prefill_profile.lookup(remaining_prefill(req)))
+                return remaining_slo - est
+
+            return sorted(ids, key=slack)
+
+        def order_ljf(ids: List[int]) -> List[int]:
+            return sorted(ids, key=lambda rid: remaining_prefill(req_map[rid]), reverse=True)
 
         heuristics = [
-            ("SJF", ordered_sjf),
-            ("EDF", ordered_edf),
-            ("LST", ordered_lst),
-            ("LJF", ordered_ljf),
+            ("SJF", order_sjf),
+            ("EDF", order_edf),
+            ("LST", order_lst),
+            ("LJF", order_ljf),
         ]
-
-        # decode_base_template = {rid: 1 for rid in decode_candidates}
-        decode_budget = len(decode_candidates)
 
         def build_action(ordered_prefill: List[int], prefill_budget: int, heur_name: str) -> ControllerAction:
             remaining_budget = max(0, int(prefill_budget))
             pre: Dict[int, int] = {}
-            used_prefill = 0
-
             for rid in ordered_prefill:
                 if remaining_budget <= 0:
                     break
-                cap = rem_pref_by_id[rid]
+                # cap = remaining_prefill(request_lookup[rid])
+                cap = remaining_prefill(req_map[rid])
                 if cap <= 0:
                     continue
-                alloc = cap if cap < remaining_budget else remaining_budget
-                pre[rid] = alloc
-                remaining_budget -= alloc
-                used_prefill += alloc
+                alloc = min(cap, remaining_budget)
+                if alloc > 0:
+                    pre[rid] = alloc
+                    remaining_budget -= alloc
 
-            decode_alloc = dict(decode_base_template)  # avoid shared dicts across actions
-            token_alloc = dict(decode_alloc)
-            token_alloc.update(pre)
+            dec = {rid: 1 for rid in decode_candidates}
+            token_alloc = {**pre, **dec}
+            selected = sorted(set(token_alloc.keys()))
 
-            # selected = sorted(token_alloc.keys()) if token_alloc else None
-            selected = list(token_alloc.keys()) if token_alloc else None
             return ControllerAction(
-                token_budget=decode_budget + used_prefill,
-                selected_request_ids=selected,
+                token_budget=sum(token_alloc.values()),
+                selected_request_ids=selected if selected else None,
                 token_allocations=token_alloc,
                 prefill_allocations=pre,
-                decode_allocations=decode_alloc,
+                decode_allocations=dec,
                 heuristic=heur_name,
                 strategy="Fixed",
             )
 
         for b_idx, budget in enumerate(budgets):
             budget_valid = (budget <= total_remaining_prefill) if total_remaining_prefill > 0 else (b_idx == 0)
-            for h_idx, (h_name, ordered_prefill) in enumerate(heuristics):
+            for h_idx, (h_name, order_fn) in enumerate(heuristics):
                 idx = b_idx * num_heur + h_idx
                 if not budget_valid:
                     mask[idx] = False
                     actions_by_index[idx] = None
                     continue
                 mask[idx] = True
+                ordered_prefill = order_fn(prefill_ids) if prefill_ids else []
                 actions_by_index[idx] = build_action(ordered_prefill, budget, h_name)
 
         if not any(mask):
             actions_by_index[0] = ControllerAction(token_budget=0, selected_request_ids=None)
             mask[0] = True
-
         return actions_by_index, mask
-
-
-
-
-
 
     def apply_adversary_action_only(
         self, state: VidurMCTSState, action: AdversaryAction, *, inplace: bool = False
@@ -396,81 +388,81 @@ class VirtualVidurMCTSEnvironment:
         self, state: VidurMCTSState, action: ControllerAction, *, inplace: bool = False
     ) -> VidurMCTSState:
 
-        # t_all = time.perf_counter()
-        # self._perf["apply_ctrl_calls"] += 1
-
+        t_all = time.perf_counter()
+        self._perf["apply_ctrl_calls"] += 1
+        # TODO: Confirm if we need to create this fork or not ?
         new_state = state if inplace else state.fork()
         self._drain_arrivals(new_state.simulator)
-
-        # t = time.perf_counter()
+        t = time.perf_counter()
+        # request_lookup = self._build_request_lookup(new_state.simulator)
         req_map = self._req_map(new_state.simulator)
-        active_ids = new_state.stats.active_request_ids
-
-        if __debug__:
-            missing = [rid for rid in active_ids if rid not in req_map]
-            assert not missing, f"active_request_ids not in req_map: {missing[:8]}"
-        # self._perf["lookup"] += time.perf_counter() - t
-
-        if not active_ids:
-            # t = time.perf_counter()
-            self._update_requests_and_stats(new_state, batch_exec=None)
-            # self._perf["stats"] += time.perf_counter() - t
-            # self._perf["apply_ctrl_total"] += time.perf_counter() - t_all
+        request_lookup = {rid: req_map[rid] for rid in new_state.stats.active_request_ids if rid in req_map}
+        # request_lookup = {rid: req for rid, req in req_map.items() if int(rid) in new_state.stats.active_request_ids}
+        self._perf["lookup"] += time.perf_counter() - t
+        
+        if not request_lookup:
+            self._update_stats(new_state)
             return new_state
 
-        # t = time.perf_counter()
-        (
-            prefill_alloc,
-            decode_alloc,
-            token_alloc,
-            req_ids,
-            _requests,      # returned by normalize; not passed onward
-            num_tokens,
-            pred_reqs,
-        ) = self._normalize_and_collect_batch(
-            action,
-            req_map=req_map,
-            active_ids=active_ids,
-        )
-        # self._perf["alloc_norm"] += time.perf_counter() - t
 
-        batch_exec = None
-
-        if pred_reqs:
+        t = time.perf_counter()
+        prefill_alloc, decode_alloc, token_alloc = self._normalized_action_allocations(action, request_lookup)
+        self._perf["alloc_norm"] += time.perf_counter() - t
+        if token_alloc:
+            
+            
+            req_ids = sorted(token_alloc.keys())
+            requests = [request_lookup[rid] for rid in req_ids]
+            num_tokens = [token_alloc[rid] for rid in req_ids]
+            t = time.perf_counter()
+            batch = Batch(new_state.simulator.replica_id, requests, num_tokens)
+            self._perf["predictor"] += time.perf_counter() - t
             start_time = float(new_state.simulator._time)
-
-            # t = time.perf_counter()
-            execution_time = new_state.simulator._execution_time_predictor.get_execution_time(
-                pred_reqs, 0
+           
+            batch.on_schedule(start_time)
+           
+            
+            execution_time = new_state.simulator._execution_time_predictor.get_batch_execution_time(
+                batch, 0
             )
-            # self._perf["predictor"] += time.perf_counter() - t
+            
+            stage = BatchStage(
+                batch.id,
+                new_state.simulator.replica_id,
+                0,
+                execution_time,
+                batch.requests,
+                batch.num_tokens,
+            )
+            stage.on_schedule(start_time)
 
             end_time = start_time + float(execution_time.total_time)
             new_state.simulator._set_time(end_time)
+            stage.on_stage_end(end_time)
+            batch.on_batch_end(end_time)
 
-            # only ids/tokens/times are passed (no request objects)
-            batch_exec = {
-                "request_ids": list(req_ids),
-                "num_tokens": list(num_tokens),
-                "start_time": start_time,
-                "end_time": end_time,
-                "stage_total_time": float(execution_time.total_time),
-                "stage_model_time": float(execution_time.model_time),
-            }
+            self._update_active_ids_for(new_state, req_ids)
+
+            t = time.perf_counter()
+            for req in batch.requests:
+                if req.completed and req.id not in new_state.stats.completed_request_ids:
+                    new_state.stats.requests_completed += 1
+                    new_state.stats.completed_request_ids.add(req.id)
+            
+            # self._rebuild_scheduler_views(new_state.simulator)
+            self._perf["rebuild"] += time.perf_counter() - t
 
         if not prefill_alloc:
-            # t = time.perf_counter()
+            t = time.perf_counter()
             self._maybe_fast_forward_decode_only_to_next_adv_second(new_state)
-            # self._perf["ff_decode"] += time.perf_counter() - t
+            self._perf["ff_decode"] += time.perf_counter() - t
 
-        # t = time.perf_counter()
-        self._update_requests_and_stats(new_state, batch_exec=batch_exec)
-        # self._perf["stats"] += time.perf_counter() - t
+        t = time.perf_counter()
+        self._update_stats(new_state)
+        self._perf["stats"] += time.perf_counter() - t
 
-        # self._perf["apply_ctrl_total"] += time.perf_counter() - t_all
+        self._perf["apply_ctrl_total"] += time.perf_counter() - t_all
         return new_state
-
-
 
     def apply_actions(
         self,
@@ -567,116 +559,72 @@ class VirtualVidurMCTSEnvironment:
         state.stats.recent_arrivals = [t for t in state.stats.recent_arrivals if float(t) >= window_start]
         # self._rebuild_scheduler_views(sim)
 
-
-
-    def _normalize_and_collect_batch(
+    def _normalized_action_allocations(
         self,
         action: ControllerAction,
-        *,
-        req_map: Dict[int, Request],
-        active_ids: set[int],
-    ) -> tuple[
-        Dict[int, int],  # prefill_alloc
-        Dict[int, int],  # decode_alloc
-        Dict[int, int],  # token_alloc
-        List[int],       # req_ids (batch order)
-        List[Request],   # requests (batch order)
-        List[int],       # num_tokens (batch order)
-        List[ExecutionTimePredictorRequest],  # predictor requests (batch order)
-    ]:
+        request_lookup: Dict[int, Request],
+    ) -> tuple[Dict[int, int], Dict[int, int], Dict[int, int]]:
         prefill_alloc_in = dict(action.prefill_allocations or {})
         decode_alloc_in = dict(action.decode_allocations or {})
         token_alloc_in = dict(action.token_allocations or {})
 
-        # Fast path: trust selected ids when present.
-        # Fallback keeps correctness for externally-constructed actions.
-        if action.selected_request_ids is not None:
-            selected_ids = [int(x) for x in dict.fromkeys(action.selected_request_ids)]
-        else:
-            selected_ids = [
-                int(x)
-                for x in dict.fromkeys(
-                    list(token_alloc_in.keys())
-                    + list(prefill_alloc_in.keys())
-                    + list(decode_alloc_in.keys())
-                )
-            ]
+        if not prefill_alloc_in and not decode_alloc_in and token_alloc_in:
+            for rid, tok in token_alloc_in.items():
+                req = request_lookup.get(int(rid))
+                if req is None:
+                    continue
+                if bool(getattr(req, "_is_prefill_complete", req.is_prefill_complete)):
+                    decode_alloc_in[int(rid)] = int(tok)
+                else:
+                    prefill_alloc_in[int(rid)] = int(tok)
+
+        selected_ids = (
+            list(action.selected_request_ids)
+            if action.selected_request_ids is not None
+            else sorted(set(prefill_alloc_in.keys()) | set(decode_alloc_in.keys()) | set(token_alloc_in.keys()))
+        )
 
         prefill_alloc: Dict[int, int] = {}
         decode_alloc: Dict[int, int] = {}
         token_alloc: Dict[int, int] = {}
 
-        req_ids: List[int] = []
-        requests: List[Request] = []
-        num_tokens: List[int] = []
-        pred_reqs: List[ExecutionTimePredictorRequest] = []
-
         for rid in selected_ids:
-            if rid not in active_ids:
-                continue
-
-            req = req_map.get(rid)
+            rid = int(rid)
+            req = request_lookup.get(rid)
             if req is None:
                 continue
 
             prefill_done = bool(getattr(req, "_is_prefill_complete", req.is_prefill_complete))
-            rem_pref = self._remaining_prefill(req)
-            rem_dec = self._remaining_decode(req)
+            # rem_prefill = max(0, int(req.num_prefill_tokens) - int(req.num_processed_prefill_tokens))
+            rem_prefill = self._remaining_prefill(req)
+            rem_decode = max(0, int(req.num_decode_tokens) - int(req.num_processed_decode_tokens))
 
             pre_tok = max(0, int(prefill_alloc_in.get(rid, 0)))
             dec_tok = max(0, int(decode_alloc_in.get(rid, 0)))
+            if pre_tok == 0 and dec_tok == 0 and rid in token_alloc_in:
+                if prefill_done:
+                    dec_tok = int(token_alloc_in[rid])
+                else:
+                    pre_tok = int(token_alloc_in[rid])
 
-            # Single fallback from generic token_alloc_in if specific split not provided.
-            if pre_tok == 0 and dec_tok == 0:
-                base_tok = max(0, int(token_alloc_in.get(rid, 0)))
-                if base_tok > 0:
-                    if prefill_done:
-                        dec_tok = base_tok
-                    else:
-                        pre_tok = base_tok
-
-            pre_tok = min(pre_tok, rem_pref)
+            pre_tok = min(pre_tok, rem_prefill)
             if not prefill_done:
                 dec_tok = 0
-            dec_tok = min(dec_tok, rem_dec)
-
-            total = pre_tok + dec_tok
-            if total <= 0:
-                continue
+            dec_tok = min(dec_tok, rem_decode)
 
             if pre_tok > 0:
                 prefill_alloc[rid] = pre_tok
             if dec_tok > 0:
                 decode_alloc[rid] = dec_tok
-            token_alloc[rid] = total
-
-            req_ids.append(rid)
-            requests.append(req)
-            num_tokens.append(total)
-            pred_reqs.append(
-                ExecutionTimePredictorRequest(
-                    num_processed_tokens=int(req.num_processed_tokens),
-                    num_tokens_to_process=int(total),
-                    is_prefill_complete=prefill_done,
-                )
-            )
+            if pre_tok + dec_tok > 0:
+                token_alloc[rid] = pre_tok + dec_tok
 
         action.prefill_allocations = dict(prefill_alloc)
         action.decode_allocations = dict(decode_alloc)
         action.token_allocations = dict(token_alloc)
-        action.selected_request_ids = list(req_ids) if req_ids else None
-        action.token_budget = int(sum(num_tokens))
-
-        return (
-            prefill_alloc,
-            decode_alloc,
-            token_alloc,
-            req_ids,
-            requests,
-            num_tokens,
-            pred_reqs,
-        )
-
+        action.selected_request_ids = sorted(token_alloc.keys()) if token_alloc else None
+        action.token_budget = int(sum(token_alloc.values()))
+        return prefill_alloc, decode_alloc, token_alloc
 
     def _rebuild_scheduler_views(self, simulator: VirtualSimulator) -> None:
         rs = simulator._scheduler.get_replica_scheduler(simulator.replica_id)
@@ -725,7 +673,7 @@ class VirtualVidurMCTSEnvironment:
 
         decode_active: list[Request] = []
         # for req in reqs.values():
-
+        # TODO : 
         for rid in state.stats.active_request_ids:
             req = req_map.get(int(rid))
             if req is None:
@@ -751,264 +699,84 @@ class VirtualVidurMCTSEnvironment:
             stats.decode_next_deadline_by_id[rid] = float(target_t) + float(decode_slo)
 
     def _update_stats(self, state: VidurMCTSState) -> None:
-        self._update_requests_and_stats(state, batch_exec=None)
-
-
-    # def _update_requests_and_stats(
-    #     self,
-    #     state: VidurMCTSState,
-    #     *,
-    #     batch_exec: Optional[Dict[str, Any]] = None,
-    # ) -> None:
-
-    #     sim = state.simulator
-    #     stats = state.stats
-    #     sim_time = float(sim._time)
-    #     req_map = self._req_map(sim)
-
-    #     # O(batch) map for inline hook application 
-    #     if batch_exec is not None:
-    #         batch_tokens_by_id : Dict[int , int] = { int(rid) : int(rid_tokens) for rid , rid_tokens in zip(batch_exec["request_ids"], batch_exec["num_tokens"])}
-    #         st = float(batch_exec["start_time"])
-    #         et = float(batch_exec["end_time"])
-    #         stage_total = float(batch_exec["stage_total_time"])
-    #         stage_model = float(batch_exec["stage_model_time"])
-
-    #     else :
-    #         batch_tokens_by_id = {}
-    #         st = et = stage_total = stage_model = 0.0
-
-
-    #     # snapshot set (safe to mutate stats.active_request_ids in-loop)
-    #     ids = set(state.stats.active_request_ids)
-    #     ids.update(batch_tokens_by_id.keys())
-
-    #     for rid in ids:
-    #         rid = int(rid)
-    #         request = req_map.get(rid)
-
-    #         if request is None:
-    #             stats.active_request_ids.discard(rid)
-    #             continue
-            
-    #         # Inline lifecycle hooks for requests executed in this controller batch
-    #         tok = batch_tokens_by_id.get(rid)
-    #         if tok is not None:
-    #             request.on_batch_schedule(st)
-    #             request.on_batch_stage_schedule(st)
-    #             request.on_batch_stage_end(et, stage_total, stage_model)
-    #             request.on_batch_end(et, int(tok))            
-
-    #          # ---------- per-request lateness / violation accounting ----------
-    #         if rid not in stats.prefill_lateness_finalized:
-    #             prefill_slo = getattr(request, "_prefill_slo_time", None)
-    #             if prefill_slo is not None:
-    #                 arrived_at = float(getattr(request, "_arrived_at", request.arrived_at))
-    #                 deadline = arrived_at + float(prefill_slo)
-
-    #                 is_prefill_complete = bool(
-    #                     getattr(request, "_is_prefill_complete", request.is_prefill_complete)
-    #                 )
-    #                 prefill_completed_at = getattr(request, "_prefill_completed_at", None)
-
-    #                 if is_prefill_complete and prefill_completed_at not in (None, 0):
-    #                     actual = float(prefill_completed_at)
-    #                 else:
-    #                     actual = sim_time
-
-    #                 prefill_late = max(0.0, actual - deadline)
-    #                 prev_prefill = float(stats.per_request_prefill_lateness.get(rid, 0.0))
-    #                 if prefill_late > prev_prefill:
-    #                     stats.slo_lateness_sum += (prefill_late - prev_prefill)
-    #                     stats.per_request_prefill_lateness[rid] = prefill_late
-
-    #                 if is_prefill_complete:
-    #                     stats.prefill_lateness_finalized.add(rid)
-
-    #         decode_slo = getattr(request, "_decode_slo_time", None)
-    #         has_decode_tokens = int(getattr(request, "_num_decode_tokens", request.num_decode_tokens)) > 0
-    #         is_prefill_complete = bool(getattr(request, "_is_prefill_complete", request.is_prefill_complete))
-    #         prefill_completed_at = getattr(request, "_prefill_completed_at", None)
-
-    #         if (
-    #             decode_slo is not None
-    #             and float(decode_slo) >= 0.0
-    #             and has_decode_tokens
-    #             and is_prefill_complete
-    #             and prefill_completed_at not in (None, 0)
-    #         ):
-    #             if rid not in stats.decode_next_deadline_by_id:
-    #                 stats.decode_next_deadline_by_id[rid] = float(prefill_completed_at) + float(decode_slo)
-
-    #             done = int(request.num_processed_decode_tokens)
-    #             counted = int(stats.decode_tokens_counted.get(rid, 0))
-    #             new_tokens = done - counted
-
-    #             if new_tokens:
-    #                 assert new_tokens == 1, f"Expected 1 new decode token for req {rid}, got {new_tokens}"
-    #                 deadline = float(stats.decode_next_deadline_by_id[rid])
-    #                 token_late = max(0.0, sim_time - deadline)
-    #                 stats.per_request_decode_lateness[rid] = float(
-    #                     stats.per_request_decode_lateness.get(rid, 0.0)
-    #                 ) + float(token_late)
-    #                 stats.slo_lateness_sum += float(token_late)
-    #                 stats.decode_tokens_counted[rid] = done
-    #                 stats.decode_next_deadline_by_id[rid] = sim_time + float(decode_slo)
-
-    #         total_lateness = float(stats.per_request_prefill_lateness.get(rid, 0.0)) + float(
-    #             stats.per_request_decode_lateness.get(rid, 0.0)
-    #         )
-    #         if total_lateness > 0.0 and rid not in stats.violated_request_ids:
-    #             stats.violated_request_ids.add(rid)
-    #             stats.slo_violations += 1
-
-    #         # ---------- completion / active-set maintenance ----------
-    #         if request.completed:
-    #             if rid not in stats.completed_request_ids:
-    #                 stats.requests_completed += 1
-    #                 stats.completed_request_ids.add(rid)
-    #             stats.active_request_ids.discard(rid)
-    #         elif self._is_pending(request):
-    #             stats.active_request_ids.add(rid)
-    #         else:
-    #             stats.active_request_ids.discard(rid)
-
-    def _update_requests_and_stats(
-        self,
-        state: VidurMCTSState,
-        *,
-        batch_exec: Optional[Dict[str, Any]] = None,
-    ) -> None:
         sim = state.simulator
         stats = state.stats
         sim_time = float(sim._time)
-        req_map = self._req_map(sim)
 
-        # t_all = time.perf_counter()
-        # self._perf["stats_calls"] += 1
+        for replica_scheduler in sim._scheduler._replica_schedulers.values():
+            for request in list(replica_scheduler._requests.values()):
+                rid = int(request.id)
 
-        # t = time.perf_counter()
-        if batch_exec is not None:
-            batch_tokens_by_id: Dict[int, int] = {
-                int(rid): int(tok)
-                for rid, tok in zip(batch_exec["request_ids"], batch_exec["num_tokens"])
-            }
-            st = float(batch_exec["start_time"])
-            et = float(batch_exec["end_time"])
-            stage_total = float(batch_exec["stage_total_time"])
-            stage_model = float(batch_exec["stage_model_time"])
-        else:
-            batch_tokens_by_id = {}
-            st = et = stage_total = stage_model = 0.0
-        # self._perf["stats_batch_unpack"] += time.perf_counter() - t
+                if rid not in stats.prefill_lateness_finalized:
+                    prefill_slo = getattr(request, "_prefill_slo_time", None)
+                    if prefill_slo is not None:
+                        arrived_at = float(getattr(request, "_arrived_at", request.arrived_at))
+                        deadline = arrived_at + float(prefill_slo)
 
-        # t = time.perf_counter()
-        ids = set(stats.active_request_ids)
-        ids.update(batch_tokens_by_id.keys())
-        # self._perf["stats_ids_union"] += time.perf_counter() - t
+                        is_prefill_complete = bool(
+                            getattr(request, "_is_prefill_complete", request.is_prefill_complete)
+                        )
+                        prefill_completed_at = getattr(request, "_prefill_completed_at", None)
 
-        for rid in ids:
-            rid = int(rid)
+                        if is_prefill_complete and prefill_completed_at not in (None, 0):
+                            actual = float(prefill_completed_at)
+                        else:
+                            actual = sim_time
 
-            # t = time.perf_counter()
-            request = req_map.get(rid)
-            # self._perf["stats_req_get"] += time.perf_counter() - t
+                        prefill_late = max(0.0, actual - deadline)
+                        prev_prefill = float(stats.per_request_prefill_lateness.get(rid, 0.0))
+                        if prefill_late > prev_prefill:
+                            stats.slo_lateness_sum += (prefill_late - prev_prefill)
+                            stats.per_request_prefill_lateness[rid] = prefill_late
 
-            if request is None:
-                # t = time.perf_counter()
-                stats.active_request_ids.discard(rid)
-                # self._perf["stats_complete"] += time.perf_counter() - t
-                continue
+                        if is_prefill_complete:
+                            stats.prefill_lateness_finalized.add(rid)
 
-            tok = batch_tokens_by_id.get(rid)
-            if tok is not None:
-                # t = time.perf_counter()
-                request.on_batch_schedule(st)
-                request.on_batch_stage_schedule(st)
-                request.on_batch_stage_end(et, stage_total, stage_model)
-                request.on_batch_end(et, int(tok))
-                # self._perf["stats_hooks"] += time.perf_counter() - t
+                decode_slo = getattr(request, "_decode_slo_time", None)
+                has_decode_tokens = int(getattr(request, "_num_decode_tokens", request.num_decode_tokens)) > 0
+                is_prefill_complete = bool(
+                    getattr(request, "_is_prefill_complete", request.is_prefill_complete)
+                )
+                prefill_completed_at = getattr(request, "_prefill_completed_at", None)
 
-            # t = time.perf_counter()
-            if rid not in stats.prefill_lateness_finalized:
-                prefill_slo = getattr(request, "_prefill_slo_time", None)
-                if prefill_slo is not None:
-                    arrived_at = float(getattr(request, "_arrived_at", request.arrived_at))
-                    deadline = arrived_at + float(prefill_slo)
+                if (
+                    decode_slo is not None
+                    and float(decode_slo) >= 0.0
+                    and has_decode_tokens
+                    and is_prefill_complete
+                    and prefill_completed_at not in (None, 0)
+                ):
+                    if rid not in stats.decode_next_deadline_by_id:
+                        stats.decode_next_deadline_by_id[rid] = float(prefill_completed_at) + float(decode_slo)
 
-                    is_prefill_complete = bool(
-                        getattr(request, "_is_prefill_complete", request.is_prefill_complete)
-                    )
-                    prefill_completed_at = getattr(request, "_prefill_completed_at", None)
+                    done = int(request.num_processed_decode_tokens)
+                    counted = int(stats.decode_tokens_counted.get(rid, 0))
+                    new_tokens = done - counted
 
-                    actual = float(prefill_completed_at) if (is_prefill_complete and prefill_completed_at not in (None, 0)) else sim_time
-                    prefill_late = max(0.0, actual - deadline)
+                    if new_tokens:
+                        assert new_tokens == 1, f"Expected 1 new decode token for req {rid}, got {new_tokens}"
+                        deadline = float(stats.decode_next_deadline_by_id[rid])
+                        token_late = max(0.0, sim_time - deadline)
+                        stats.per_request_decode_lateness[rid] = float(
+                            stats.per_request_decode_lateness.get(rid, 0.0)
+                        ) + float(token_late)
+                        stats.slo_lateness_sum += float(token_late)
+                        stats.decode_tokens_counted[rid] = done
+                        stats.decode_next_deadline_by_id[rid] = sim_time + float(decode_slo)
 
-                    prev_prefill = float(stats.per_request_prefill_lateness.get(rid, 0.0))
-                    if prefill_late > prev_prefill:
-                        stats.slo_lateness_sum += (prefill_late - prev_prefill)
-                        stats.per_request_prefill_lateness[rid] = prefill_late
+                total_lateness = float(stats.per_request_prefill_lateness.get(rid, 0.0)) + float(
+                    stats.per_request_decode_lateness.get(rid, 0.0)
+                )
+                if total_lateness > 0.0 and rid not in stats.violated_request_ids:
+                    stats.violated_request_ids.add(rid)
+                    stats.slo_violations += 1
 
-                    if is_prefill_complete:
-                        stats.prefill_lateness_finalized.add(rid)
-            # self._perf["stats_prefill"] += time.perf_counter() - t
-
-            # t = time.perf_counter()
-            decode_slo = getattr(request, "_decode_slo_time", None)
-            has_decode_tokens = int(getattr(request, "_num_decode_tokens", request.num_decode_tokens)) > 0
-            is_prefill_complete = bool(getattr(request, "_is_prefill_complete", request.is_prefill_complete))
-            prefill_completed_at = getattr(request, "_prefill_completed_at", None)
-
-            if (
-                decode_slo is not None
-                and float(decode_slo) >= 0.0
-                and has_decode_tokens
-                and is_prefill_complete
-                and prefill_completed_at not in (None, 0)
-            ):
-                if rid not in stats.decode_next_deadline_by_id:
-                    stats.decode_next_deadline_by_id[rid] = float(prefill_completed_at) + float(decode_slo)
-
-                done = int(request.num_processed_decode_tokens)
-                counted = int(stats.decode_tokens_counted.get(rid, 0))
-                new_tokens = done - counted
-
-                if new_tokens:
-                    assert new_tokens == 1, f"Expected 1 new decode token for req {rid}, got {new_tokens}"
-                    deadline = float(stats.decode_next_deadline_by_id[rid])
-                    token_late = max(0.0, sim_time - deadline)
-                    stats.per_request_decode_lateness[rid] = float(
-                        stats.per_request_decode_lateness.get(rid, 0.0)
-                    ) + float(token_late)
-                    stats.slo_lateness_sum += float(token_late)
-                    stats.decode_tokens_counted[rid] = done
-                    stats.decode_next_deadline_by_id[rid] = sim_time + float(decode_slo)
-            # self._perf["stats_decode"] += time.perf_counter() - t
-
-            # t = time.perf_counter()
-            total_lateness = float(stats.per_request_prefill_lateness.get(rid, 0.0)) + float(
-                stats.per_request_decode_lateness.get(rid, 0.0)
-            )
-            if total_lateness > 0.0 and rid not in stats.violated_request_ids:
-                stats.violated_request_ids.add(rid)
-                stats.slo_violations += 1
-            # self._perf["stats_violation"] += time.perf_counter() - t
-
-            # t = time.perf_counter()
-            if request.completed:
-                if rid not in stats.completed_request_ids:
+        for replica_scheduler in sim._scheduler._replica_schedulers.values():
+            for request in list(replica_scheduler._requests.values()):
+                if request.completed and request.id not in stats.completed_request_ids:
                     stats.requests_completed += 1
-                    stats.completed_request_ids.add(rid)
-                stats.active_request_ids.discard(rid)
-            elif self._is_pending(request):
-                stats.active_request_ids.add(rid)
-            else:
-                stats.active_request_ids.discard(rid)
-            # self._perf["stats_complete"] += time.perf_counter() - t
-
-        # self._perf["stats_total_internal"] += time.perf_counter() - t_all
-
-
+                    stats.completed_request_ids.add(request.id)
+                    stats.active_request_ids.discard(int(request.id))
 
     # def _build_request_lookup(self, simulator: VirtualSimulator) -> Dict[int, Request]:
     #     lookup: Dict[int, Request] = {}

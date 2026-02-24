@@ -29,6 +29,8 @@ from .environment import (
     VidurMCTSState,
 )
 
+
+
 class MinMaxStats:
     """
     A class that holds the min-max values of the tree.
@@ -126,6 +128,9 @@ class VidurMCTS:
         self._history_root_state: Optional[VidurMCTSState] = None
         self._history_root_node: Optional[MCTSNode] = None
 
+
+        self._use_fast_sim_snapshot = True
+
         # self._iter_logger = DNNMCTSIterationLogger(log_path, flush_every=logger_flush_every)
         # Disable per-simulation iteration logging (mcts_iter.csv)
         self._iter_logger = DNNMCTSIterationLogger(None, flush_every=logger_flush_every)
@@ -166,28 +171,6 @@ class VidurMCTS:
     def _state_cost(self, state: VidurMCTSState) -> float:
         violations, avg_lateness = self._env.evaluate_objective(state)
         return float(violations) + float(avg_lateness)
-
-    # def _transition_reward(self, parent_cost: float, child_cost: float) -> float:
-    #     # controller-reward (higher better): reward = -(child_cost - parent_cost)
-    #     # Essentially the cost will always increase therefore, reward will be negative 
-    #     return parent_cost - child_cost
-
-    # def _transition_reward(self, parent_cost: float, child_cost: float) -> float:
-    #     """
-    #     Immediate controller-perspective reward for parent -> child.
-
-    #     We treat *increases* in objective cost as immediate action cost:
-    #         delta_cost = max(0, child_cost - parent_cost)
-
-    #     Soft-cap it to [0, 1):
-    #         soft_cost = 1 - exp(-delta_cost)
-
-    #     And propagate as negative reward:
-    #         reward = -soft_cost   in (-1, 0]
-    #     """
-    #     delta_cost = max(0.0, float(child_cost) - float(parent_cost))
-    #     soft_cost = 1.0 - math.exp(-delta_cost)
-    #     return -soft_cost
 
     # TODO: pass this via the config and experiment with different reward shaping functions
     def _transition_reward(self, parent_cost: float, child_cost: float) -> float:
@@ -256,7 +239,15 @@ class VidurMCTS:
             self._scratch_state = self._env.initial_state()  # creates Simulator(...) once
 
         # Reuse the same simulator instance; restore in-place.
-        self._scratch_state.simulator.restore_state(snapshot)
+        sim = self._scratch_state.simulator
+        if (
+            isinstance(snapshot, dict)
+            and snapshot.get("__mode__") == "mcts_fast"
+            and hasattr(sim, "restore_state_fast")
+        ):
+            sim.restore_state_fast(snapshot)
+        else:
+            sim.restore_state(snapshot)
 
         # Stats must correspond to that snapshot prefix.
         clone_fn = getattr(stats_template, "clone", None)
@@ -268,8 +259,15 @@ class VidurMCTS:
 
 
     def _store_node_snapshot(self, node: MCTSNode, state: VidurMCTSState) -> None:
-        node.cached_sim_snapshot = state.simulator.snapshot_state()
+        # node.cached_sim_snapshot = state.simulator.snapshot_state()
+        # node.cached_stats = state.stats.clone()
+        sim = state.simulator
+        if hasattr(sim, "snapshot_state_fast"):
+            node.cached_sim_snapshot = sim.snapshot_state_fast()
+        else:
+            node.cached_sim_snapshot = sim.snapshot_state()
         node.cached_stats = state.stats.clone()
+
 
     def _restore_state_for_node(self, node: MCTSNode) -> VidurMCTSState:
         """
@@ -277,6 +275,7 @@ class VidurMCTS:
         If `node` has no snapshot yet, it materializes it by restoring parent and applying the parent_action once.
         """
         # Fast path: node already has snapshot
+        # t = time.perf_counter()
         if node.cached_sim_snapshot is not None and node.cached_stats is not None:
             return self._scratch_restore(node.cached_sim_snapshot, node.cached_stats)
 
@@ -292,14 +291,20 @@ class VidurMCTS:
             raise RuntimeError(f"Missing parent_action for node_id={node.node_id}")
 
         parent_cost = float(parent.state_cost)
+        # self._perf["recursive_restore"] += time.perf_counter() - t
 
         # Apply parent->child transition on scratch state
         if parent.player == "adversary":
+            # t = time.perf_counter()
             state = self._env.apply_adversary_action_only(state, action, inplace=True)
+            # self._perf["adv_apply_actions"] += time.perf_counter() - t
         else:
+            # t = time.perf_counter()
             state = self._env.apply_controller_action_only(state, action, inplace=True)
+            # self._perf["ctrl_apply_actions"] += time.perf_counter() - t
 
         # Fill edge reward/cost/time now that we have the true child state
+        # t = time.perf_counter()
         child_cost = float(self._state_cost(state))
         node.reward = float(self._transition_reward(parent_cost, child_cost))
         node.state_cost = float(child_cost)
@@ -307,6 +312,7 @@ class VidurMCTS:
 
         # Snapshot this node so future rollouts can jump here
         self._store_node_snapshot(node, state)
+        # self._perf["cost_&_node_snap"] += time.perf_counter() - t
         return state
 
 
@@ -351,6 +357,92 @@ class VidurMCTS:
         value, priors = dnn_model.infer_from_inputs(inputs, player, device=device)
         # self._perf["nn_infer"] += time.perf_counter() - t_nn
         return float(value), list(priors)
+
+
+    def _maybe_add_root_dirichlet_noise(
+        self,
+        root: MCTSNode,
+        *,
+        nn_called: bool,
+        num_valid_actions: int,
+    ) -> None:
+        """
+        Apply AlphaZero-style root Dirichlet noise once:
+        p' = (1 - eps) * p + eps * Dir(alpha)
+
+        Applied only when enabled in config and only for true branching roots.
+        """
+        if not bool(getattr(self._cfg, "root_dirichlet_noise_enabled", False)):
+            return
+        if not bool(nn_called):
+            return
+        if int(num_valid_actions) <= 1:
+            return
+        if not root.children:
+            return
+
+        alpha = float(getattr(self._cfg, "root_dirichlet_alpha", 0.3) or 0.0)
+        eps = float(getattr(self._cfg, "root_dirichlet_epsilon", 0.25) or 0.0)
+
+        if alpha <= 0.0 or eps <= 0.0:
+            return
+        eps = max(0.0, min(1.0, eps))
+
+        child_indices = sorted(int(i) for i in root.children.keys())
+        n = len(child_indices)
+        if n <= 1:
+            return
+
+        # Sample Dir(alpha) via Gamma(alpha, 1) normalization, using MCTS RNG.
+        noise_raw = [self._rng.gammavariate(alpha, 1.0) for _ in range(n)]
+        s = float(sum(noise_raw))
+        if s <= 1e-12:
+            noise = [1.0 / float(n)] * n
+        else:
+            inv_s = 1.0 / s
+            noise = [x * inv_s for x in noise_raw]
+
+        mixed = {}
+        for j, idx in enumerate(child_indices):
+            p = max(0.0, float(root.children[idx].prior))
+            mixed[idx] = (1.0 - eps) * p + eps * float(noise[j])
+
+        z = float(sum(mixed.values()))
+        if z <= 1e-12:
+            u = 1.0 / float(n)
+            for idx in child_indices:
+                root.children[idx].prior = u
+        else:
+            inv_z = 1.0 / z
+            for idx in child_indices:
+                root.children[idx].prior = float(mixed[idx]) * inv_z
+
+        # Optional: keep normalized prior log payload aligned with actual noisy root priors for debug consistency.
+        if root.nn_priors_after_threshold is not None:
+            a = len(root.nn_priors_after_threshold)
+            noisy_full = [0.0] * a
+
+            if root.canonical_to_action_aliases:
+                for canon, aliases in root.canonical_to_action_aliases.items():
+                    child = root.children.get(int(canon))
+                    if child is None:
+                        continue
+                    alias_ids = [int(x) for x in aliases if 0 <= int(x) < a]
+                    if not alias_ids:
+                        continue
+                    share = float(child.prior) / float(len(alias_ids))
+                    for ai in alias_ids:
+                        noisy_full[ai] = share
+            else:
+                for idx, child in root.children.items():
+                    ii = int(idx)
+                    if 0 <= ii < a:
+                        noisy_full[ii] = float(child.prior)
+
+            root.nn_priors_after_threshold = noisy_full
+
+
+
 
 
     def _apply_min_prior_threshold_dict(
@@ -465,23 +557,29 @@ class VidurMCTS:
         Expand `node` by creating children nodes for all valid indexed actions, setting their priors.
         Returns the NN value at this node (controller perspective) for backup.
         """
+      
+
         actions_by_index, mask = self._actions_and_mask(state, node.player)
 
         # collect valid indices
-        valid = [i for i, ok in enumerate(mask) if ok and actions_by_index[i] is not None]
+        # t = time.perf_counter()
+        valid = [i for i, ok in enumerate(mask) if ok and actions_by_index[i] is not None] 
         num_valid_actions = len(valid)
         node.num_valid_actions = int(num_valid_actions)
-
+        # self._perf["expand_valid_scan"] += time.perf_counter() - t
 
         # Forced / terminal cases: skip NN entirely
         if len(valid) == 0:
             # terminal: no children, leaf value estimate = 0
+            # self._perf["expand_terminal_count"] += 1
             return 0.0, False , 0
 
         # parent_had_multiple_children = (node.parent is None) or (len(node.parent.children) > 1)
         # should_call_nn = bool(parent_has_multiple_children)
 
         if num_valid_actions == 1:
+            # self._perf["expand_single_count"] += 1
+            # t_single = time.perf_counter()
             idx = valid[0]
             next_player = "controller" if node.player == "adversary" else "adversary"
 
@@ -502,24 +600,28 @@ class VidurMCTS:
                     num_valid_actions=0,
                 )
 
+            # self._perf["expand_single_path"] += time.perf_counter() - t_single
             # NEW: never call NN on single-child states
             return 0.0, False, 1
 
-
+        # self._perf["expand_multi_count"] += 1
 
         # ------------------------
         # MULTIPLE-CHILD
         # ------------------------
         # Always call NN to get PRIORS for multi-child nodes
+        # t = time.perf_counter()
         model_value, priors = self._nn_value_and_priors(
             dnn_model, state, node.player, action_mask=mask.unsqueeze(0)
         )
+        # self._perf["expand_nn_total"] += time.perf_counter() - t
         node.nn_value_controller = float(model_value)
         node.nn_priors = list(priors)
         node.nn_valid_mask = [bool(x) for x in mask.tolist()]
 
 
         # --- NEW: apply min-prior threshold on ALL valid indices (not canonical) ---
+        # t = time.perf_counter()
         if node.player == "controller":
             min_p = float(getattr(self._cfg, "controller_min_prior_threshold", 0.0) or 0.0)
         else:
@@ -543,7 +645,7 @@ class VidurMCTS:
             if 0 <= int(i) < len(thr_vec):
                 thr_vec[int(i)] = float(p)
         node.nn_priors_after_threshold = thr_vec
-
+        # self._perf["expand_threshold"] += time.perf_counter() - t
 
         # But only USE the value for backup if parent had multiple children.
         # If parent had a single child -> "trivial-multiple-child": value passed upward is 0.0.
@@ -555,6 +657,7 @@ class VidurMCTS:
         # -----------------------------
         # Controller action dedup (multi-child only)
         # -----------------------------
+        # t = time.perf_counter() 
         canonical_indices: List[int] = []
         canonical_prior: Dict[int, float] = {}
 
@@ -605,9 +708,10 @@ class VidurMCTS:
                 # canonical_prior[idx] = float(priors[idx]) if 0 <= idx < len(priors) else 0.0
                 canonical_prior[int(idx)] = float(norm_prior_by_idx.get(int(idx), 0.0))
 
-
+        # self._perf["expand_dedup"] += time.perf_counter() - t
 
         # Create children ONLY for canonical indices
+        # t = time.perf_counter()
         for idx in canonical_indices:
             action = actions_by_index[idx]
             if action is None:
@@ -628,14 +732,15 @@ class VidurMCTS:
                 value_sum=0.0,
                 sim_time=state.simulator._time,
             )
+        # self._perf["expand_child_create"] += time.perf_counter() - t
 
         return value_used_for_backup, True, num_valid_actions
 
 
 
     def ucb_score(self, parent: MCTSNode, child: MCTSNode, min_max_stats: MinMaxStats) -> float:
-        pb_c_base = getattr(self._cfg, "pb_c_base", 20000)
-        pb_c_init = getattr(self._cfg, "pb_c_init", 0.60)
+        pb_c_base = getattr(self._cfg, "pb_c_base", 5000)
+        pb_c_init = getattr(self._cfg, "pb_c_init", 0.75)
 
         parent_is_branching = (getattr(parent, "num_valid_actions", 0) > 1) or (len(parent.children) > 1)
 
@@ -692,6 +797,7 @@ class VidurMCTS:
         """
         hops = 0
         while True:
+           
             if hops >= max_hops:
                 return node, state
 
@@ -843,10 +949,11 @@ class VidurMCTS:
         # 1) Selection (TREE ONLY)
         node = root
         search_path: List[MCTSNode] = [node]
+        # t_phase = time.perf_counter()
         while node.expanded():
             _, node = self.select_child(node, min_max_stats)
             search_path.append(node)
-
+        # self._perf["selection"] += time.perf_counter() - t_phase
         # 2) Restore scratch sim straight to the selected node state (or materialize it once)
      
         # t_phase = time.perf_counter()
@@ -1018,7 +1125,14 @@ class VidurMCTS:
         self._root = MCTSNode(player=root_player, node_id=root_node_id, depth=int(root_depth), parent=None)
         
         # Store the exact root state on the root node
-        self._root.cached_sim_snapshot = rootState.simulator.snapshot_state()
+        # self._root.cached_sim_snapshot = rootState.simulator.snapshot_state()
+        # self._root.cached_stats = rootState.stats.clone()
+
+        sim = rootState.simulator
+        if hasattr(sim, "snapshot_state_fast"):
+            self._root.cached_sim_snapshot = sim.snapshot_state_fast()
+        else:
+            self._root.cached_sim_snapshot = sim.snapshot_state()
         self._root.cached_stats = rootState.stats.clone()
 
         # One scratch simulator per search_dnn
@@ -1028,15 +1142,34 @@ class VidurMCTS:
         min_max_stats = MinMaxStats()
 
         # PROFILING :
-        # self._perf = {
-        #     "restore": 0.0,
-        #     "forced_chain": 0.0,
-        #     "expand": 0.0,
-        #     "backprop": 0.0,
-        #     "nn_build_inputs": 0.0,
-        #     "nn_infer": 0.0,
-        #     "sim_count": 0,
-        # }
+        self._perf = {
+            "restore": 0.0,
+            "selection": 0.0,
+            "forced_chain": 0.0,
+            "expand": 0.0,
+            "backprop": 0.0,
+            "nn_build_inputs": 0.0,
+            "nn_infer": 0.0,
+            "sim_count": 0,
+
+            "recursive_restore": 0.0,
+            "adv_apply_actions" : 0.0,
+            "ctrl_apply_actions" : 0.0,
+            "cost_&_node_snap" : 0.0,
+
+            "expand_actions_mask": 0.0,
+            "expand_valid_scan": 0.0,
+            "expand_single_path": 0.0,
+            "expand_nn_total": 0.0,
+            "expand_threshold": 0.0,
+            "expand_dedup": 0.0,
+            "expand_child_create": 0.0,
+
+            # NEW: branch counters
+            "expand_terminal_count": 0,
+            "expand_single_count": 0,
+            "expand_multi_count": 0,
+        }
         # if hasattr(self._env, "_perf"):
         #     for k in self._env._perf:
         #         self._env._perf[k] = 0.0
@@ -1047,6 +1180,13 @@ class VidurMCTS:
         # This seeds priors / nn cache so PUCT is defined, but we do NOT let it bias MCTS value.
         root_work = self._scratch_restore(self._root.cached_sim_snapshot, self._root.cached_stats)
         _ignored_value, _ignored_called, _ignored_num_valid = self._expand_node(self._root, root_work, dnn_model)
+
+        self._maybe_add_root_dirichlet_noise(
+            self._root,
+            nn_called=bool(_ignored_called),
+            num_valid_actions=int(_ignored_num_valid),
+        )
+
 
 
         for sim_iteration in range(int(iterations)):
@@ -1160,6 +1300,17 @@ class VidurMCTS:
         )
 
 
+        # p = getattr(self, "_perf", None)
+        # if p is not None:
+        #     total_core = p["restore"] + p["forced_chain"] + p["expand"] + p["backprop"]
+        #     print(
+        #         "[MCTS_PERF] "
+        #         f"root_id={root_id} iters={iterations} \n"
+        #         f"total_core={total_core:.3f}s \n"
+        #         f"restore={p['restore']:.3f}s \n selection={p['selection']:.3f}s \n forced_chain={p['forced_chain']:.3f}s \n "
+        #         f"expand={p['expand']:.3f}s \n backprop={p['backprop']:.3f}s \n"
+        #         f"sim_count={p.get('sim_count', 0)}\n"
+        #     )
 
         #PRINTING PROFILING :
         # p = getattr(self, "_perf", None)
@@ -1171,9 +1322,32 @@ class VidurMCTS:
         #         f"root_id={root_id} iters={iterations} "
         #         f"restore={p['restore']:.3f}s forced_chain={p['forced_chain']:.3f}s "
         #         f"expand={p['expand']:.3f}s backprop={p['backprop']:.3f}s "
-        #         f"nn_build={p['nn_build_inputs']:.3f}s nn_infer={p['nn_infer']:.3f}s "
-        #         f"core_total={total_core:.3f}s core_per_sim={total_core/n:.6f}s"
+        #         f"nn_build={p['nn_build_inputs']:.3f}s nn_infer={p['nn_infer']:.3f}s \n"
+        #         f"core_total={total_core:.3f}s core_per_sim={total_core/n:.6f}s \n"
+        #         f"adv_apply_actions={p['adv_apply_actions']:.3f}s ctrl_apply_actions={p['ctrl_apply_actions']:.3f}s\n"
+        #         f"cost_&_node_snap={p['cost_&_node_snap']:.3f}s recursive_restore={p['recursive_restore']:.3f}s \n"
         #     )
+
+        #     ex_total = max(float(p.get("expand", 0.0)), 1e-12)
+
+        #     def pct(v: float, tot: float) -> float:
+        #         return (100.0 * v / tot) if tot > 1e-12 else 0.0
+
+        #     print(
+        #         "[EXPAND_PERF]\n"
+        #         f"  root_id={root_id} iters={n}\n"
+        #         f"  expand_total={ex_total:.3f}s  expand_per_sim={ex_total/n:.6f}s\n"
+        #         f"  actions_mask={p['expand_actions_mask']:.3f}s ({pct(p['expand_actions_mask'], ex_total):.1f}%)\n"
+        #         f"  valid_scan={p['expand_valid_scan']:.3f}s ({pct(p['expand_valid_scan'], ex_total):.1f}%)\n"
+        #         f"  nn_total={p['expand_nn_total']:.3f}s ({pct(p['expand_nn_total'], ex_total):.1f}%)\n"
+        #         f"  threshold={p['expand_threshold']:.3f}s ({pct(p['expand_threshold'], ex_total):.1f}%)\n"
+        #         f"  dedup={p['expand_dedup']:.3f}s ({pct(p['expand_dedup'], ex_total):.1f}%)\n"
+        #         f"  child_create={p['expand_child_create']:.3f}s ({pct(p['expand_child_create'], ex_total):.1f}%)\n"
+        #         f"  single_path={p['expand_single_path']:.3f}s ({pct(p['expand_single_path'], ex_total):.1f}%)\n"
+        #         f"  counts(term/single/multi)="
+        #         f"({int(p['expand_terminal_count'])}/{int(p['expand_single_count'])}/{int(p['expand_multi_count'])})"
+        #     )
+
         #     ep = getattr(self._env, "_perf", None)
         #     if ep is not None:
         #         print(
@@ -1188,6 +1362,24 @@ class VidurMCTS:
         #             f"ff_decode={ep.get('ff_decode', 0.0):.3f}s"
         #         )
 
+        #     stats_total = ep.get("stats_total_internal", 0.0)
+        #     stats_calls = max(1, int(ep.get("stats_calls", 0)))
+        #     if stats_total > 0.0:
+        #         def _pct(x: float) -> float:
+        #             return (100.0 * x / stats_total) if stats_total > 1e-12 else 0.0
+
+        #         print(
+        #             "[ENV_STATS_PERF] "
+        #             f"calls={stats_calls} total={stats_total:.3f}s per_call={stats_total/stats_calls:.6f}s "
+        #             f"batch_unpack={ep.get('stats_batch_unpack',0.0):.3f}s({_pct(ep.get('stats_batch_unpack',0.0)):.1f}%) "
+        #             f"ids_union={ep.get('stats_ids_union',0.0):.3f}s({_pct(ep.get('stats_ids_union',0.0)):.1f}%) "
+        #             f"req_get={ep.get('stats_req_get',0.0):.3f}s({_pct(ep.get('stats_req_get',0.0)):.1f}%) "
+        #             f"hooks={ep.get('stats_hooks',0.0):.3f}s({_pct(ep.get('stats_hooks',0.0)):.1f}%) "
+        #             f"prefill={ep.get('stats_prefill',0.0):.3f}s({_pct(ep.get('stats_prefill',0.0)):.1f}%) "
+        #             f"decode={ep.get('stats_decode',0.0):.3f}s({_pct(ep.get('stats_decode',0.0)):.1f}%) "
+        #             f"violation={ep.get('stats_violation',0.0):.3f}s({_pct(ep.get('stats_violation',0.0)):.1f}%) "
+        #             f"complete={ep.get('stats_complete',0.0):.3f}s({_pct(ep.get('stats_complete',0.0)):.1f}%)"
+        #         )
 
 
         return next_player, action_space

@@ -28,12 +28,38 @@ from .history_root import HistoryRootGenerator
 from .infer import build_model_inputs
 from .types import ModelInputs
 from .replay_write import ReplayWriter, make_root_sample
+import math 
+import random
 
 
 def _mask_to_list(mask) -> list[bool]:
     if isinstance(mask, torch.Tensor):
         return [bool(x) for x in mask.to(dtype=torch.bool).cpu().tolist()]
     return [bool(x) for x in mask]
+
+
+def _sample_action_from_mcts_policy(
+    *,
+    prior: Sequence[float],
+    mask: Sequence[bool],
+    temperature: float,
+    seed: int,
+) -> int:
+    valid = [i for i, ok in enumerate(mask) if ok]
+    if not valid:
+        return -1
+
+    if temperature <= 1e-8:
+        return max(valid, key=lambda i: float(prior[i]))
+
+    inv_t = 1.0 / float(temperature)
+    weights = [(max(float(prior[i]), 0.0) + 1e-12) ** inv_t for i in valid]
+    if sum(weights) <= 0.0:
+        weights = [1.0] * len(valid)
+
+    rng = random.Random(int(seed) & 0xFFFFFFFF)
+    pick = rng.choices(range(len(valid)), weights=weights, k=1)[0]
+    return int(valid[pick])
 
 
 def _compute_mcts_prior_from_root(root, mask: Sequence[bool]) -> Tuple[list[float], int]:
@@ -205,6 +231,7 @@ class SelfPlayRunner:
         )
         t2 = time.perf_counter()
         # confirm real root state was NOT mutated by search_dnn
+        # TODO: Why are we doing this even ? should be removing it 
         snap_after = self.env.describe_state(state)
         print(
             f"[run_single_root_search_DNN:after_search] dt={t2 - t1:.3f}s "
@@ -256,7 +283,7 @@ class SelfPlayRunner:
             f"search_dt={t2 - t1:.6f}s encode/write_dt={t3 - t2:.6f}s"
         )
 
-    # TODO : seems like start_root_depth is unncessary 
+    # TODO : seems like start_root_depth is unncessary & we might not even need to use the best action if run_single_root is doing it 
     def run_n_roots(
         self,
         *,
@@ -272,6 +299,10 @@ class SelfPlayRunner:
         history_nontrivial_hops: int = 0,
         feature_version: int = 1,
         initial_state: Optional[VidurMCTSState] = None,
+        history_seed: Optional[int] = None,
+        sample_from_mcts_policy: bool = False,
+        selfplay_policy_temperature: float = 0.0,
+        action_seed_base: int = 0,
     ) -> VidurMCTSState:
         # state = initial_state or self.env.initial_state()
         # player = start_player
@@ -294,6 +325,7 @@ class SelfPlayRunner:
                 log_history=True,
                 log_node_id_start=next_log_node_id,
                 log_parent_id_start=last_log_node_id,
+                seed=history_seed,
             )
             # IMPORTANT: prevent MCTS from reusing history node ids
             self.mcts._node_counter = int(next_log_node_id)
@@ -306,7 +338,7 @@ class SelfPlayRunner:
             # force-advance until branching before running MCTS
             state, player, depth = self._advance_to_branching_root(state, player, depth)
 
-            ## TODO : This terminal condition needs to be later avoided. 
+            ## TODO : This terminal condition needs to be later avoided. NOT NEEDED ANYMORE, AVOID IT 
             # NEW: terminal cutoff for dataset collection
             requests_in_system = int(self.env.describe_state(state).get("requests_in_system", 0))
             if requests_in_system > int(max_batch_size):
@@ -342,7 +374,23 @@ class SelfPlayRunner:
             mask_list = _mask_to_list(mask)
 
             root = self.mcts._root
-            _, best_idx = _compute_mcts_prior_from_root(root, mask_list)
+            mcts_prior, best_idx = _compute_mcts_prior_from_root(root, mask_list)
+
+
+            ## Sampling done using MCTS generated Prior if set in the configuration 
+            if sample_from_mcts_policy and player == "controller":
+                node_seed = (
+                    int(action_seed_base) * 1000003 + int(game_id) * 9176 + int(root_id) * 37 + int(depth) * 13
+                )
+                sampled_idx = _sample_action_from_mcts_policy(
+                    prior=mcts_prior,
+                    mask=mask_list,
+                    temperature=float(selfplay_policy_temperature),
+                    seed=int(node_seed),
+                )
+                if 0 <= sampled_idx < len(actions_by_index) and actions_by_index[sampled_idx] is not None:
+                    best_idx = sampled_idx
+
 
             if not (0 <= best_idx < len(actions_by_index)):
                 raise RuntimeError(f"best_idx={best_idx} out of range for actions_by_index length={len(actions_by_index)}")
@@ -429,6 +477,7 @@ class SelfPlayRunner:
 
             root = self.mcts._root
             mcts_prior, best_idx = _compute_mcts_prior_from_root(root, mask_list)
+
             if best_idx not in candidate_valid:
                 best_idx = max(candidate_valid, key=lambda i: (float(mcts_prior[i]), -int(i)))
 

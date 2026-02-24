@@ -148,6 +148,22 @@ def _build_constraints_and_explore(cfg: "AlphaZeroConfig") -> tuple[MCTSConstrai
         "adversary_min_prior_threshold",
         float(cfg.explore.adversary_min_prior_threshold),
     )
+    setattr(
+    explore_cfg,
+    "root_dirichlet_noise_enabled",
+    bool(cfg.explore.root_dirichlet_noise_enabled),
+    )
+    setattr(
+        explore_cfg,
+        "root_dirichlet_alpha",
+        float(cfg.explore.root_dirichlet_alpha),
+    )
+    setattr(
+        explore_cfg,
+        "root_dirichlet_epsilon",
+        float(cfg.explore.root_dirichlet_epsilon),
+    )
+
     return constraints, explore_cfg
 
 
@@ -347,18 +363,27 @@ def _selfplay_worker_main(
     use_virtual_env: bool,
 ) -> None:
     # Important: avoid CPU oversubscription when you run many processes
-    try:
-        import torch
-        torch.set_num_threads(1)
-        torch.set_num_interop_threads(1)
-    except Exception:
-        pass
-
-    # Optional: pin to core (Linux)
     # try:
-    #     os.sched_setaffinity(0, {worker_id})
+    #     os.environ["OMP_NUM_THREADS"] = "1"
+    #     os.environ["MKL_NUM_THREADS"] = "1"
+    #     os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    #     os.environ["NUMEXPR_NUM_THREADS"] = "1"
+    #     import torch
+    #     torch.set_num_threads(1)
+    #     torch.set_num_interop_threads(1)
     # except Exception:
     #     pass
+    # Pin each worker to a dedicated logical CPU from current allowed set (Linux)
+    try:
+        avail_cpus = sorted(os.sched_getaffinity(0))
+        if avail_cpus:
+            cpu = avail_cpus[worker_id % len(avail_cpus)]
+            os.sched_setaffinity(0, {cpu})
+            print(f"[worker {worker_id}] pinned to CPU {cpu}")
+    except Exception as e:
+        print(f"[worker {worker_id}] affinity pin failed: {e}")
+
+
 
     # Build simulator/env ONCE per process (big speed win vs rebuilding every gen)
     _, env, _, explore_cfg = _build_env_and_simulator(cfg, use_virtual_env=use_virtual_env)
@@ -383,8 +408,18 @@ def _selfplay_worker_main(
     ).to(torch.device("cpu"))
     arena_best_model.eval()
 
-    _loaded_candidate_path: Optional[Path] = None
-    _loaded_best_path: Optional[Path] = None
+    _loaded_candidate_sig: Optional[tuple[Path, int, int]] = None
+    _loaded_best_sig: Optional[tuple[Path, int, int]] = None
+
+    def _weights_sig(path: Path) -> tuple[Path, int, int]:
+        # Path alone is not enough (best.pt path stays constant while contents change).
+        rp = path.resolve()
+        try:
+            st = path.stat()
+            return (rp, int(st.st_mtime_ns), int(st.st_size))
+        except OSError:
+            return (rp, -1, -1)
+
 
 
     while True:
@@ -400,12 +435,16 @@ def _selfplay_worker_main(
         if task_kind == "selfplay":
             # Unpack task
             gen = int(task["gen"])
+            round_idx = int(task.get("round_idx", 0)) 
             out_dir = Path(task["out_dir"])
             weights_path = Path(task["weights_path"])
             game_id = int(task["game_id"])
             start_root_id = int(task["start_root_id"])
             history_seed = int(task["history_seed"])
             roots = int(task["num_roots"])
+            sample_from_policy = bool(task.get("sample_from_mcts_policy", False))
+            policy_temp = float(task.get("selfplay_policy_temperature", 1.0))
+            action_seed_base = int(task.get("action_seed_base", task.get("history_seed", 0)))
 
             # Load frozen weights for this generation
             ckpt = torch.load(weights_path, map_location="cpu")
@@ -421,7 +460,7 @@ def _selfplay_worker_main(
             logs_dir.mkdir(parents=True, exist_ok=True)
 
             iter_log = logs_dir / f"mcts_iter_p{worker_id:02d}.csv"
-            root_log = logs_dir / f"mcts_root_p{worker_id:02d}.csv"
+            root_log = logs_dir / f"mcts_root_p{worker_id:02d}_gen{round_idx:02d}.csv"
 
 
 
@@ -443,6 +482,10 @@ def _selfplay_worker_main(
                 start_player="adversary",
                 history_nontrivial_hops=hops_for_task,
                 feature_version=cfg.run.feature_version,
+                history_seed=history_seed,
+                sample_from_mcts_policy=sample_from_policy,
+                selfplay_policy_temperature=policy_temp,
+                action_seed_base=action_seed_base,
             )
 
             writer.close()
@@ -465,17 +508,19 @@ def _selfplay_worker_main(
             candidate_weights_path = Path(task["candidate_weights_path"])
             best_weights_path = Path(task["best_weights_path"])
 
-            if _loaded_candidate_path != candidate_weights_path:
+            candidate_sig = _weights_sig(candidate_weights_path)
+            if _loaded_candidate_sig != candidate_sig:
                 ckpt_c = torch.load(candidate_weights_path, map_location="cpu")
                 arena_candidate_model.load_state_dict(extract_model_state(ckpt_c), strict=True)
                 arena_candidate_model.eval()
-                _loaded_candidate_path = candidate_weights_path
+                _loaded_candidate_sig = candidate_sig
 
-            if _loaded_best_path != best_weights_path:
+            best_sig = _weights_sig(best_weights_path)
+            if _loaded_best_sig != best_sig:
                 ckpt_b = torch.load(best_weights_path, map_location="cpu")
                 arena_best_model.load_state_dict(extract_model_state(ckpt_b), strict=True)
                 arena_best_model.eval()
-                _loaded_best_path = best_weights_path
+                _loaded_best_sig = best_sig
 
             adv_iters = int(task["adv_iterations_per_root"])
             cont_iters = int(task["cont_iterations_per_root"])
@@ -613,8 +658,8 @@ def selfImprovementPolicy(
     trainer = Trainer(
         model=model,
         cfg=TrainerConfig(
-            lr=1e-3,
-            weight_decay=1e-4,
+            lr=3e-4,
+            weight_decay=2e-4,
             policy_weight=1.0,
             value_weight=1.0,
             grad_clip_norm=5.0,
@@ -678,20 +723,41 @@ def selfImprovementPolicy(
         train_log_csv=train_log_csv,
         best_generation=best_model_generation,
         )
+
+    ## Limiting threads :
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+        
+
+
     ctx = mp.get_context("spawn")
     task_q = ctx.Queue()
     result_q = ctx.Queue()
 
+    # def _hops_for_worker(wid: int) -> int:
+    #     if isinstance(history_nontrivial_hops, int):
+    #         return int(history_nontrivial_hops)
+    #     hops_list = list(history_nontrivial_hops)
+    #     if len(hops_list) != int(num_selfPlay_workers):
+    #         raise ValueError(
+    #             f"history_nontrivial_hops must have len == num_selfPlay_workers "
+    #             f"({len(hops_list)} != {int(num_selfPlay_workers)})"
+    #         )
+    #     return int(hops_list[wid])
+
+
     def _hops_for_worker(wid: int) -> int:
         if isinstance(history_nontrivial_hops, int):
             return int(history_nontrivial_hops)
+
         hops_list = list(history_nontrivial_hops)
-        if len(hops_list) != int(num_selfPlay_workers):
-            raise ValueError(
-                f"history_nontrivial_hops must have len == num_selfPlay_workers "
-                f"({len(hops_list)} != {int(num_selfPlay_workers)})"
-            )
-        return int(hops_list[wid])
+        if not hops_list:
+            return 0
+
+        # No strict length requirement; repeat cyclically if workers > provided hops.
+        return int(hops_list[wid % len(hops_list)])
 
 
     workers = []
@@ -738,39 +804,82 @@ def selfImprovementPolicy(
 
 
         # split roots across workers
-        per = int(math.ceil(roots_per_generation / float(num_selfPlay_workers)))
-        tasks_sent = 0
-        for wid in range(int(num_selfPlay_workers)):
-            start = wid * per
-            end = min(roots_per_generation, (wid + 1) * per)
-            n_roots = max(0, end - start)
-            if n_roots == 0:
-                continue
+        # per = int(math.ceil(roots_per_generation / float(num_selfPlay_workers)))
+        # tasks_sent = 0
+        # for wid in range(int(num_selfPlay_workers)):
+        #     start = wid * per
+        #     end = min(roots_per_generation, (wid + 1) * per)
+        #     n_roots = max(0, end - start)
+        #     if n_roots == 0:
+        #         continue
 
-            out_dir = gen_dataset_dir / f"proc_{wid:02d}"
-            # ensure unique game_id per worker so history randomness differs
-            worker_game_id = int(cfg.run.game_id) + gen * 1000 + wid
-            # ensure root_id ranges don’t collide (optional, but helps debugging)
-            worker_start_root_id = start
+        #     out_dir = gen_dataset_dir / f"proc_{wid:02d}"
+        #     # ensure unique game_id per worker so history randomness differs
+        #     worker_game_id = int(cfg.run.game_id) + gen * 1000 + wid
+        #     # ensure root_id ranges don’t collide (optional, but helps debugging)
+        #     worker_start_root_id = start
 
-            task_q.put(
-                {
-                    "gen": gen,
-                    "out_dir": str(out_dir),
-                    "weights_path": str(weights_path),
-                    "game_id": worker_game_id,
-                    "start_root_id": worker_start_root_id,
-                    "history_seed": (gen * 100000 + wid),
-                    "num_roots": n_roots,
-                    "history_nontrivial_hops": int(worker_hops_for_gen[wid]),
-                }
-            )
-            tasks_sent += 1
+        #     task_q.put(
+        #         {
+        #             "gen": gen,
+        #             "out_dir": str(out_dir),
+        #             "weights_path": str(weights_path),
+        #             "game_id": worker_game_id,
+        #             "start_root_id": worker_start_root_id,
+        #             "history_seed": (gen * 100000 + wid),
+        #             "num_roots": n_roots,
+        #             "history_nontrivial_hops": int(worker_hops_for_gen[wid]),
+        #         }
+        #     )
+        #     tasks_sent += 1
 
-        # 2) wait for all worker results
-        results = []
-        for _ in range(tasks_sent):
-            results.append(result_q.get())
+
+        # Run self-play collection multiple times per generation (same frozen best/candidate weights)
+        arena_per_gen = max(1, int(getattr(evaluator_cfg, "arena_per_gen", 1)))
+        all_results = []
+
+        for round_idx in range(arena_per_gen):
+            per = int(math.ceil(roots_per_generation / float(num_selfPlay_workers)))
+            tasks_sent = 0
+
+            for wid in range(int(num_selfPlay_workers)):
+                start = wid * per
+                end = min(roots_per_generation, (wid + 1) * per)
+                n_roots = max(0, end - start)
+                if n_roots == 0:
+                    continue
+
+                out_dir = gen_dataset_dir / f"proc_{wid:02d}"
+
+                # keep ids/seeds unique across rounds
+                worker_game_id = int(cfg.run.game_id) + gen * 1_000_000 + round_idx * 10_000 + wid
+                worker_start_root_id = round_idx * int(roots_per_generation) + start
+
+                task_q.put(
+                    {
+                        "gen": gen,
+                        "round_idx": int(round_idx),
+                        "out_dir": str(out_dir),
+                        "weights_path": str(weights_path),
+                        "game_id": worker_game_id,
+                        "start_root_id": worker_start_root_id,
+                        "history_seed": (gen * 1_000_000 + round_idx * 1_000 + wid),
+                        "num_roots": n_roots,
+                        "history_nontrivial_hops": int(worker_hops_for_gen[wid]),
+                        "sample_from_mcts_policy": bool(getattr(cfg.run, "sample_from_mcts_policy", False)),
+                        "selfplay_policy_temperature": float(getattr(cfg.run, "selfplay_policy_temperature", 1.0)),
+                        "action_seed_base":(gen * 1_000_000 + round_idx * 1_000 + wid) ,
+                    }
+                )
+                tasks_sent += 1
+
+            for _ in range(tasks_sent):
+                all_results.append(result_q.get())
+
+        # # 2) wait for all worker results
+        # results = []
+        # for _ in range(tasks_sent):
+        #     results.append(result_q.get())
 
 
         # 2) load ALL samples from this generation (train on exactly these)
@@ -1012,6 +1121,9 @@ class MCTSExploreGroup:
     controller_budget_combs: int = 10
     controller_min_prior_threshold : float = 0.01
     adversary_min_prior_threshold : float = 0.1
+    root_dirichlet_noise_enabled: bool = False
+    root_dirichlet_alpha: float = 0.6
+    root_dirichlet_epsilon: float = 0.25
 
 
 @dataclass(frozen=True)
@@ -1042,6 +1154,8 @@ class RunGroup:
     root_player: str = "adversary"  # or "controller"
     iterations: int = 10
     feature_version: int = 1
+    sample_from_mcts_policy: bool = False
+    selfplay_policy_temperature: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -1116,6 +1230,11 @@ def main() -> None:
             exploration_constant=1.7,
             max_branching=10,
             controller_budget_combs=10,
+            controller_min_prior_threshold=0.01,
+            adversary_min_prior_threshold=0.1,
+            root_dirichlet_noise_enabled=True,
+            root_dirichlet_alpha=0.6,
+            root_dirichlet_epsilon=0.35,
         ),
         model=ModelGroup(
             num_actions_controller=24,
@@ -1138,44 +1257,47 @@ def main() -> None:
             root_player="adversary",
             iterations=1000,
             feature_version=1,
+            sample_from_mcts_policy=False,
+            selfplay_policy_temperature=0,
         ),
     )
 
 
     # TODO: Remove useless feilds and move the config class to eval_utils
     evaluator_cfg = EvaluatorConfig(
-        num_random_games=8,
-        max_history_depth=100,
+        num_random_games=10,
+        max_history_depth=10,  # no history for now (can add later if you want to test it in the arena)
         random_seed_base=12345,
         adv_iterations_per_root=4000,
-        cont_iterations_per_root=4000,
-        arena_num_processes=8,
+        cont_iterations_per_root=10000,
+        arena_num_processes=10,
         # arena_iters_adversary=2000,
         # arena_iters_controller=2000,
         arena_max_adversary_moves=1,
-        arena_max_controller_cleanup_steps=24,
+        arena_max_controller_cleanup_steps=128,
         arena_max_total_turns=512,
         arena_win_threshold=0.52,
         tie_points=0.5,
         debug_sample_games=5,
         debug_flush_every=1,
+        arena_per_gen=1,
     )
 
 
 
     ## MODEL TRAINING PARMS FOR SELF-IMPROVEMENT LOOP:
-    num_selfPlay_workers = 8
+    num_selfPlay_workers = 10
     num_generations = 200
     history_nontrivial_hops = [0, 5 , 10 , 15 , 20, 25, 30, 35]  # per worker
-    roots_per_generation = 400
+    roots_per_generation = 500
     adv_iterations_per_root = 4000
-    cont_iterations_per_root = 8000
-    train_steps_per_generation = 100  
+    cont_iterations_per_root = 12000
+    train_steps_per_generation = 75 
     max_batch_size = 256
     train_log_csv = Path("simulator_output/mcts_dnn_logs/train_metrics.csv")
     ckpt_dir = Path("simulator_output/mcts_dnn_checkpoints")
     use_virtual_env = True
-    replay_capacity_samples = 12000
+    replay_capacity_samples = 4000
     replay_max_cached_shards = 1024
     replay_seed = 2026
 

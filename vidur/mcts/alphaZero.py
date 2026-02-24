@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import csv
 import math
+import os
 import random
 import re
 import time
@@ -29,6 +30,12 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
+
+# Keep CPU thread pools at 1 per process to avoid oversubscription.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 import torch
 
@@ -461,6 +468,12 @@ def configure_simulation(sim_args: Iterable[str]) -> SimulationConfig:
 # -----------------------------
 
 def main() -> None:
+    # Keep PyTorch CPU execution single-threaded for predictable per-process scaling.
+    try:
+        torch.set_num_threads(1)
+        torch.set_num_interop_threads(1)
+    except Exception:
+        pass
 
     use_virtual_env = True
 
@@ -518,7 +531,7 @@ def main() -> None:
             root_id=0,
             root_depth=0,
             root_player="adversary",
-            iterations=8000,
+            iterations=10000,
             feature_version=1,
         ),
     )
@@ -646,15 +659,28 @@ def main() -> None:
 
     try:
 
-        runner.run_single_root(
-            SingleRootRun(
-                game_id=cfg.run.game_id,
-                root_id=cfg.run.root_id,
-                root_depth=cfg.run.root_depth,
-                root_player=cfg.run.root_player,
-                iterations=cfg.run.iterations,
-                feature_version=cfg.run.feature_version,
-            )
+        # runner.run_single_root(
+        #     SingleRootRun(
+        #         game_id=cfg.run.game_id,
+        #         root_id=cfg.run.root_id,
+        #         root_depth=cfg.run.root_depth,
+        #         root_player=cfg.run.root_player,
+        #         iterations=cfg.run.iterations,
+        #         feature_version=cfg.run.feature_version,
+        #     )
+        # )
+
+
+        runner.run_n_roots(
+            game_id=cfg.run.game_id,
+            num_roots=1,
+            adv_iterations_per_root=10000,
+            cont_iterations_per_root=10000,
+            start_root_id=cfg.run.root_id,
+            start_root_depth=0,
+            start_player="adversary",
+            history_nontrivial_hops=100, 
+            feature_version=cfg.run.feature_version,
         )
 
 
@@ -681,5 +707,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 

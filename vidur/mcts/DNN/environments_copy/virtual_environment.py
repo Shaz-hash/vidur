@@ -24,6 +24,7 @@ from .virtual_simulator import VirtualSimulator
 from vidur.entities.execution_time_predictor_request import ExecutionTimePredictorRequest
 
 
+
 class VirtualVidurMCTSEnvironment:
     """
     Drop-in, speed-focused environment that preserves the same external API
@@ -382,8 +383,6 @@ class VirtualVidurMCTSEnvironment:
 
 
 
-
-
     def apply_adversary_action_only(
         self, state: VidurMCTSState, action: AdversaryAction, *, inplace: bool = False
     ) -> VidurMCTSState:
@@ -396,29 +395,29 @@ class VirtualVidurMCTSEnvironment:
         self, state: VidurMCTSState, action: ControllerAction, *, inplace: bool = False
     ) -> VidurMCTSState:
 
-        # t_all = time.perf_counter()
-        # self._perf["apply_ctrl_calls"] += 1
+        t_all = time.perf_counter()
+        self._perf["apply_ctrl_calls"] += 1
 
         new_state = state if inplace else state.fork()
         self._drain_arrivals(new_state.simulator)
 
-        # t = time.perf_counter()
+        t = time.perf_counter()
         req_map = self._req_map(new_state.simulator)
         active_ids = new_state.stats.active_request_ids
 
         if __debug__:
             missing = [rid for rid in active_ids if rid not in req_map]
             assert not missing, f"active_request_ids not in req_map: {missing[:8]}"
-        # self._perf["lookup"] += time.perf_counter() - t
+        self._perf["lookup"] += time.perf_counter() - t
 
         if not active_ids:
-            # t = time.perf_counter()
+            t = time.perf_counter()
             self._update_requests_and_stats(new_state, batch_exec=None)
-            # self._perf["stats"] += time.perf_counter() - t
-            # self._perf["apply_ctrl_total"] += time.perf_counter() - t_all
+            self._perf["stats"] += time.perf_counter() - t
+            self._perf["apply_ctrl_total"] += time.perf_counter() - t_all
             return new_state
 
-        # t = time.perf_counter()
+        t = time.perf_counter()
         (
             prefill_alloc,
             decode_alloc,
@@ -432,18 +431,18 @@ class VirtualVidurMCTSEnvironment:
             req_map=req_map,
             active_ids=active_ids,
         )
-        # self._perf["alloc_norm"] += time.perf_counter() - t
+        self._perf["alloc_norm"] += time.perf_counter() - t     
 
         batch_exec = None
 
         if pred_reqs:
             start_time = float(new_state.simulator._time)
 
-            # t = time.perf_counter()
+            t = time.perf_counter()
             execution_time = new_state.simulator._execution_time_predictor.get_execution_time(
                 pred_reqs, 0
             )
-            # self._perf["predictor"] += time.perf_counter() - t
+            self._perf["predictor"] += time.perf_counter() - t
 
             end_time = start_time + float(execution_time.total_time)
             new_state.simulator._set_time(end_time)
@@ -459,15 +458,15 @@ class VirtualVidurMCTSEnvironment:
             }
 
         if not prefill_alloc:
-            # t = time.perf_counter()
+            t = time.perf_counter()
             self._maybe_fast_forward_decode_only_to_next_adv_second(new_state)
-            # self._perf["ff_decode"] += time.perf_counter() - t
+            self._perf["ff_decode"] += time.perf_counter() - t
 
-        # t = time.perf_counter()
+        t = time.perf_counter()
         self._update_requests_and_stats(new_state, batch_exec=batch_exec)
-        # self._perf["stats"] += time.perf_counter() - t
+        self._perf["stats"] += time.perf_counter() - t
 
-        # self._perf["apply_ctrl_total"] += time.perf_counter() - t_all
+        self._perf["apply_ctrl_total"] += time.perf_counter() - t_all
         return new_state
 
 
@@ -884,10 +883,10 @@ class VirtualVidurMCTSEnvironment:
         sim_time = float(sim._time)
         req_map = self._req_map(sim)
 
-        # t_all = time.perf_counter()
-        # self._perf["stats_calls"] += 1
+        t_all = time.perf_counter()
+        self._perf["stats_calls"] += 1
 
-        # t = time.perf_counter()
+        t = time.perf_counter()
         if batch_exec is not None:
             batch_tokens_by_id: Dict[int, int] = {
                 int(rid): int(tok)
@@ -900,36 +899,36 @@ class VirtualVidurMCTSEnvironment:
         else:
             batch_tokens_by_id = {}
             st = et = stage_total = stage_model = 0.0
-        # self._perf["stats_batch_unpack"] += time.perf_counter() - t
+        self._perf["stats_batch_unpack"] += time.perf_counter() - t
 
-        # t = time.perf_counter()
+        t = time.perf_counter()
         ids = set(stats.active_request_ids)
         ids.update(batch_tokens_by_id.keys())
-        # self._perf["stats_ids_union"] += time.perf_counter() - t
+        self._perf["stats_ids_union"] += time.perf_counter() - t
 
         for rid in ids:
             rid = int(rid)
 
-            # t = time.perf_counter()
+            t = time.perf_counter()
             request = req_map.get(rid)
-            # self._perf["stats_req_get"] += time.perf_counter() - t
+            self._perf["stats_req_get"] += time.perf_counter() - t
 
             if request is None:
-                # t = time.perf_counter()
+                t = time.perf_counter()
                 stats.active_request_ids.discard(rid)
-                # self._perf["stats_complete"] += time.perf_counter() - t
+                self._perf["stats_complete"] += time.perf_counter() - t
                 continue
 
             tok = batch_tokens_by_id.get(rid)
             if tok is not None:
-                # t = time.perf_counter()
+                t = time.perf_counter()
                 request.on_batch_schedule(st)
                 request.on_batch_stage_schedule(st)
                 request.on_batch_stage_end(et, stage_total, stage_model)
                 request.on_batch_end(et, int(tok))
-                # self._perf["stats_hooks"] += time.perf_counter() - t
+                self._perf["stats_hooks"] += time.perf_counter() - t
 
-            # t = time.perf_counter()
+            t = time.perf_counter()
             if rid not in stats.prefill_lateness_finalized:
                 prefill_slo = getattr(request, "_prefill_slo_time", None)
                 if prefill_slo is not None:
@@ -951,9 +950,9 @@ class VirtualVidurMCTSEnvironment:
 
                     if is_prefill_complete:
                         stats.prefill_lateness_finalized.add(rid)
-            # self._perf["stats_prefill"] += time.perf_counter() - t
+            self._perf["stats_prefill"] += time.perf_counter() - t
 
-            # t = time.perf_counter()
+            t = time.perf_counter()
             decode_slo = getattr(request, "_decode_slo_time", None)
             has_decode_tokens = int(getattr(request, "_num_decode_tokens", request.num_decode_tokens)) > 0
             is_prefill_complete = bool(getattr(request, "_is_prefill_complete", request.is_prefill_complete))
@@ -983,18 +982,18 @@ class VirtualVidurMCTSEnvironment:
                     stats.slo_lateness_sum += float(token_late)
                     stats.decode_tokens_counted[rid] = done
                     stats.decode_next_deadline_by_id[rid] = sim_time + float(decode_slo)
-            # self._perf["stats_decode"] += time.perf_counter() - t
+            self._perf["stats_decode"] += time.perf_counter() - t
 
-            # t = time.perf_counter()
+            t = time.perf_counter()
             total_lateness = float(stats.per_request_prefill_lateness.get(rid, 0.0)) + float(
                 stats.per_request_decode_lateness.get(rid, 0.0)
             )
             if total_lateness > 0.0 and rid not in stats.violated_request_ids:
                 stats.violated_request_ids.add(rid)
                 stats.slo_violations += 1
-            # self._perf["stats_violation"] += time.perf_counter() - t
+            self._perf["stats_violation"] += time.perf_counter() - t
 
-            # t = time.perf_counter()
+            t = time.perf_counter()
             if request.completed:
                 if rid not in stats.completed_request_ids:
                     stats.requests_completed += 1
@@ -1004,9 +1003,9 @@ class VirtualVidurMCTSEnvironment:
                 stats.active_request_ids.add(rid)
             else:
                 stats.active_request_ids.discard(rid)
-            # self._perf["stats_complete"] += time.perf_counter() - t
+            self._perf["stats_complete"] += time.perf_counter() - t
 
-        # self._perf["stats_total_internal"] += time.perf_counter() - t_all
+        self._perf["stats_total_internal"] += time.perf_counter() - t_all
 
 
 

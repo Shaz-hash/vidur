@@ -244,7 +244,7 @@ class EvaluatorConfig:
     arena_max_adversary_total_turns: int = 256  # safety cap including no-op adversary turns
     arena_require_request_generating_adversary: bool = True
     arena_log_model_prior_on_forced_adv_noop: bool = True
-    arena_max_controller_cleanup_steps: int = 24
+    arena_max_controller_cleanup_steps: int = 64
     arena_max_total_turns: int = 512
 
     arena_win_threshold: float = 0.55
@@ -252,6 +252,7 @@ class EvaluatorConfig:
 
     debug_sample_games: int = 5
     debug_flush_every: int = 1
+    arena_per_gen: int = 1
 
 
 @dataclass(frozen=True)

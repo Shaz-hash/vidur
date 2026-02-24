@@ -239,3 +239,15 @@ scp -r <your_username>@<remote_host>:/home/shazer/Desktop/Research/Vidur/vidur/s
 scp -r "shazer@shaz.csres.utexas.edu:/home/shazer/Desktop/Research/Vidur/vidur/simulator_output/Parrallel_Launch/analysis/P*/process_iteration_visits.svg" \
 /Users/shazer/Desktop/FallResearch
 
+
+
+commands to kill :
+pkill -9 -f "/home/shazer/Desktop/Research/Vidur/vidur/.venv/bin/python3 -c from multiprocessing.spawn import spawn_main"
+pkill -9 -f "/home/shazer/Desktop/Research/Vidur/vidur/.venv/bin/python3 -c from multiprocessing.resource_tracker import main"
+pkill -9 -f "vidur\.mcts\.alphaZeroParrallel"
+
+
+
+veriy :
+ps -eo pid,ppid,stat,etime,cmd | rg "multiprocessing\.spawn|resource_tracker|vidur\.mcts\.alphaZeroParrallel"
+free -h

@@ -25,7 +25,7 @@ from .models import AlphaZeroModel
 
 @dataclass
 class TrainerConfig:
-    lr: float = 1e-3
+    lr: float = 1e-4
     weight_decay: float = 1e-4
     policy_weight: float = 1.0
     value_weight: float = 1.0

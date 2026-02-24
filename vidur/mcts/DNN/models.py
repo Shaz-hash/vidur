@@ -24,6 +24,7 @@ from typing import Callable, Optional, Protocol, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import time
 
 # NOTE: models.py is inside vidur/vidur/mcts/DNN/, so environment is one level up.
 from ..environment import VidurMCTSState
@@ -55,9 +56,8 @@ D_TRUNK: int = 32
 # Value support (real units, controller perspective)
 V_MIN: float = -50.0
 V_MAX: float = 0.0
-NUM_BINS: int = 101  # NOTE: step=4.0 => 101 bins from -400..0 inclusive
-V_STEP: float = (V_MAX - V_MIN) / (NUM_BINS - 1)  # = 4.0
-
+NUM_BINS: int = 401  # NOTE: step=4.0 => 401 bins from -50..0 inclusive
+V_STEP: float = (V_MAX - V_MIN) / (NUM_BINS - 1)  # = 0.125
 
 
 # MuZero-style value support (optional, but you already started it) * Note : Penalty and Max SLO cost in real units in seconds
@@ -294,6 +294,12 @@ class AlphaZeroModel(nn.Module):
         self.num_actions_controller = int(num_actions_controller)
         self.num_actions_adversary = int(num_actions_adversary)
 
+        ## for the Value from logits 
+        support = (torch.arange(NUM_BINS, dtype=torch.float32) * V_STEP) + V_MIN
+        self.register_buffer("_value_support", support, persistent=False)
+
+
+
         self.norm_req = nn.Identity()
         self.norm_global = nn.Identity()
 
@@ -309,6 +315,13 @@ class AlphaZeroModel(nn.Module):
 
         # Value head (categorical support in SCALED units)
         self.value_head = nn.Linear(D_TRUNK, NUM_BINS)  # 32 -> 101
+
+
+        self._infer_perf_enabled = True
+        self._infer_perf_sync_cuda = True   # accurate GPU timing; adds overhead
+        self._infer_perf_every = 10000
+        self.reset_infer_perf()
+
 
 
     def forward(
@@ -367,7 +380,45 @@ class AlphaZeroModel(nn.Module):
     # Inference helpers (bridge to MCTS)
     # -------------------------------------------------------------------------
 
-    @torch.no_grad()
+    # @torch.no_grad()
+    @torch.inference_mode()
+    # def infer_from_inputs(
+    #     self,
+    #     inputs: ModelInputs,
+    #     player: Player,
+    #     *,
+    #     device: Optional[torch.device] = None,
+    # ) -> Tuple[float, list[float]]:
+    #     """
+    #     Returns:
+    #       value_controller: float
+    #       priors: list[float] aligned with deterministic action indexing for that player
+    #               (i.e., priors[i] = π(a_i | s) for action index i)
+    #     """
+    #     dev = device or next(self.parameters()).device
+
+    #     req_features = inputs.req_features.to(dev)
+    #     global_features = inputs.global_features.to(dev)
+    #     req_mask = inputs.req_mask.to(dev) if inputs.req_mask is not None else None
+    #     action_mask = inputs.action_mask.to(dev) if inputs.action_mask is not None else None
+
+    #     policy_logits, value_logits = self.forward(
+    #         req_features=req_features,
+    #         global_features=global_features,
+    #         player=player,
+    #         req_mask=req_mask,
+    #         action_mask=action_mask,
+    #     )
+
+    #     # Convert value support logits -> scalar in real units (controller perspective)
+    #     value = self.value_scalar_from_logits(value_logits).squeeze(0).item()
+
+    #     # Convert logits -> normalized priors (softmax over valid actions)
+    #     priors = F.softmax(policy_logits, dim=-1).squeeze(0).to("cpu").tolist()
+    #     return value, priors
+
+
+    @torch.inference_mode()
     def infer_from_inputs(
         self,
         inputs: ModelInputs,
@@ -375,18 +426,33 @@ class AlphaZeroModel(nn.Module):
         *,
         device: Optional[torch.device] = None,
     ) -> Tuple[float, list[float]]:
-        """
-        Returns:
-          value_controller: float
-          priors: list[float] aligned with deterministic action indexing for that player
-                  (i.e., priors[i] = π(a_i | s) for action index i)
-        """
         dev = device or next(self.parameters()).device
+
+        profile = bool(getattr(self, "_infer_perf_enabled", False))
+        sync_cuda = bool(getattr(self, "_infer_perf_sync_cuda", True)) and (dev.type == "cuda")
+
+        def _sync():
+            if sync_cuda:
+                torch.cuda.synchronize(dev)
+
+        if profile:
+            _sync()
+            t_all = time.perf_counter()
+
+            _sync()
+            t = time.perf_counter()
 
         req_features = inputs.req_features.to(dev)
         global_features = inputs.global_features.to(dev)
         req_mask = inputs.req_mask.to(dev) if inputs.req_mask is not None else None
         action_mask = inputs.action_mask.to(dev) if inputs.action_mask is not None else None
+
+        if profile:
+            _sync()
+            self._infer_perf["to_device"] += time.perf_counter() - t
+
+            _sync()
+            t = time.perf_counter()
 
         policy_logits, value_logits = self.forward(
             req_features=req_features,
@@ -396,12 +462,49 @@ class AlphaZeroModel(nn.Module):
             action_mask=action_mask,
         )
 
-        # Convert value support logits -> scalar in real units (controller perspective)
+        if profile:
+            _sync()
+            self._infer_perf["forward"] += time.perf_counter() - t
+
+            _sync()
+            t = time.perf_counter()
+
         value = self.value_scalar_from_logits(value_logits).squeeze(0).item()
 
-        # Convert logits -> normalized priors (softmax over valid actions)
-        priors = F.softmax(policy_logits, dim=-1).squeeze(0).to("cpu").tolist()
+        if profile:
+            _sync()
+            self._infer_perf["value_from_logits"] += time.perf_counter() - t
+
+            _sync()
+            t = time.perf_counter()
+
+        priors_t = F.softmax(policy_logits, dim=-1).squeeze(0)
+
+        if profile:
+            _sync()
+            self._infer_perf["softmax"] += time.perf_counter() - t
+
+            _sync()
+            t = time.perf_counter()
+
+        priors = priors_t.to("cpu").tolist()
+
+        if profile:
+            _sync()
+            self._infer_perf["to_cpu_list"] += time.perf_counter() - t
+
+            _sync()
+            self._infer_perf["total"] += time.perf_counter() - t_all
+            self._infer_perf["calls"] += 1
+
+            # every = int(getattr(self, "_infer_perf_every", 10000))
+            # if every > 0 and (self._infer_perf["calls"] % every == 0):
+            #     self._print_infer_perf(prefix=f"[INFER_PERF player={player}]")
+
         return value, priors
+
+
+
 
     # TODO: I dont think this is needed even in MCTS so remove it afterwards 
     @torch.no_grad()
@@ -464,12 +567,45 @@ class AlphaZeroModel(nn.Module):
         return scalar_to_support(value_real)
 
     def value_scalar_from_logits(self, value_logits: torch.Tensor) -> torch.Tensor:
-        return support_to_scalar(value_logits)
+        # return support_to_scalar(value_logits)
+        probs = F.softmax(value_logits, dim=-1)
+        support = self._value_support
+        if support.dtype != probs.dtype:
+            support = support.to(dtype=probs.dtype)
+        return (probs * support).sum(dim=-1)
 
 
 
 
+    def reset_infer_perf(self) -> None:
+        self._infer_perf = {
+            "calls": 0,
+            "total": 0.0,
+            "to_device": 0.0,
+            "forward": 0.0,
+            "value_from_logits": 0.0,
+            "softmax": 0.0,
+            "to_cpu_list": 0.0,
+        }
 
+    def _print_infer_perf(self, prefix: str = "[INFER_PERF]") -> None:
+        p = self._infer_perf
+        c = max(1, int(p["calls"]))
+        tot = max(1e-12, float(p["total"]))
+
+        def pct(x: float) -> float:
+            return 100.0 * float(x) / tot
+
+        # print(
+        #     f"{prefix}\n"
+        #     f"  calls={c}\n"
+        #     f"  total={p['total']:.3f}s total_per_call={p['total']/c:.6f}s\n"
+        #     f"  to_device={p['to_device']:.3f}s ({pct(p['to_device']):.1f}%)\n"
+        #     f"  forward={p['forward']:.3f}s ({pct(p['forward']):.1f}%)\n"
+        #     f"  value_from_logits={p['value_from_logits']:.3f}s ({pct(p['value_from_logits']):.1f}%)\n"
+        #     f"  softmax={p['softmax']:.3f}s ({pct(p['softmax']):.1f}%)\n"
+        #     f"  to_cpu_list={p['to_cpu_list']:.3f}s ({pct(p['to_cpu_list']):.1f}%)"
+        # )
 
 
 

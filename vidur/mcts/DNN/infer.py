@@ -211,12 +211,13 @@ def build_action_mask(
         raise ValueError(f"action_mask_fn returned shape {tuple(mask.shape)}, expected {(1, n)}")
     return mask
 
-
+# NOTE to Shazer: This function can't be batched across multiple processes , this func is used in the MCTS search mainly --> therefore in the  mcts search + arena
 def build_model_inputs(
     state: VidurMCTSState,
     player: str,
     device: torch.device,
     *,
+    build_action_mask_flag : bool = False,  
     action_mask_fn: Optional[Callable[[VidurMCTSState, str, int, torch.device], torch.Tensor]] = None,
     max_prefill_tokens: int = 3072,
     prefill_slowdown: float = 3.0,
@@ -240,6 +241,9 @@ def build_model_inputs(
 
     Returns single-batch tensors (B=1) since MCTS calls per-node inference.
     """
+
+    # Forcefully making device to CPU 
+    feat_device = torch.device("cpu")
 
     sim = state.simulator
     sim_time = _safe_float(getattr(sim, "_time", 0.0), 0.0)
@@ -265,8 +269,8 @@ def build_model_inputs(
     prefill_reqs.sort(key=urgency_key)
 
     # Build per-request matrix
-    req_feat = torch.zeros((1, N_REQ, D_REQ), dtype=torch.float32, device=device)
-    req_mask = torch.zeros((1, N_REQ), dtype=torch.bool, device=device)
+    req_feat = torch.zeros((1, N_REQ, D_REQ), dtype=torch.float32, device=feat_device)
+    req_mask = torch.zeros((1, N_REQ), dtype=torch.bool, device=feat_device)
 
     eps = 1e-9
     max_prefill_tokens_f = float(max(1, int(max_prefill_tokens)))
@@ -441,12 +445,15 @@ def build_model_inputs(
             remaining_prefill_norm,
         ]],
         dtype=torch.float32,
-        device=device,
+        device=feat_device,
     )
 
 
-    action_mask = build_action_mask(state, player, device, action_mask_fn=action_mask_fn)
-
+    # action_mask = build_action_mask(state, player, device, action_mask_fn=action_mask_fn)
+    if build_action_mask_flag:
+        action_mask = build_action_mask(state, player, device, action_mask_fn=action_mask_fn)
+    else :
+        action_mask = None
 
     # if debug:
     #     _infer_debug_dump(
