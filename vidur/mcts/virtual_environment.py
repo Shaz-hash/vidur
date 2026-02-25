@@ -23,6 +23,11 @@ from .prefill_calibrator import PrefillProfile
 from .virtual_simulator import VirtualSimulator
 from vidur.entities.execution_time_predictor_request import ExecutionTimePredictorRequest
 
+try:
+    from . import mcts_native as _mcts_native
+except Exception:  # pragma: no cover - optional native runtime
+    _mcts_native = None
+
 
 class VirtualVidurMCTSEnvironment:
     """
@@ -36,6 +41,8 @@ class VirtualVidurMCTSEnvironment:
         base_simulator: VirtualSimulator,
         constraints: MCTSConstraintConfig,
         explore_cfg: MCTSExploreConfig,
+        native_enabled: bool = False,
+        native_strict_compat: bool = True,
     ) -> None:
         self._base = base_simulator
         self._constraints = constraints
@@ -70,6 +77,13 @@ class VirtualVidurMCTSEnvironment:
             self._constraints.max_request_tokens = self._prefill_profile.max_tokens
 
         self._controller_budgets_cache: Dict[int, Tuple[int, ...]] = {}
+        self._native_enabled = bool(native_enabled)
+        self._native_strict_compat = bool(native_strict_compat)
+        if self._native_enabled and _mcts_native is None and self._native_strict_compat:
+            raise RuntimeError(
+                "native_enabled=True but vidur.mcts.mcts_native is not importable. "
+                "Build the native module or set native_strict_compat=False."
+            )
         self._perf = {
             "apply_ctrl_calls": 0.0,
             "apply_ctrl_total": 0.0,
@@ -230,13 +244,128 @@ class VirtualVidurMCTSEnvironment:
         max_samples: int,
         use_state_cache: bool = True,
     ) -> Tuple[List[Optional[ControllerAction]], List[bool]]:
+        if self._native_enabled and _mcts_native is not None:
+            try:
+                return self._sample_controller_actions_native(
+                    state,
+                    max_samples=max_samples,
+                    use_state_cache=use_state_cache,
+                )
+            except Exception:
+                if self._native_strict_compat:
+                    raise
+        return self._sample_controller_actions_python(
+            state,
+            max_samples=max_samples,
+            use_state_cache=use_state_cache,
+        )
+
+    def _sample_controller_actions_native(
+        self,
+        state: VidurMCTSState,
+        max_samples: int,
+        use_state_cache: bool = True,
+    ) -> Tuple[List[Optional[ControllerAction]], List[bool]]:
         del max_samples, use_state_cache
 
         self._drain_arrivals(state.simulator)
         sim_time = float(state.simulator._time)
         step = int(self._constraints.interval_request_size or 512)
 
-        # Cache budgets per step (avoids rebuilding every call)
+        budget_cache = self._controller_budgets_cache
+        budgets = budget_cache.get(step)
+        if budgets is None:
+            budgets = tuple(step * i for i in range(1, 7))
+            budget_cache[step] = budgets
+
+        num_heur = 4
+        num_actions = num_heur * len(budgets)
+        actions_by_index: List[Optional[ControllerAction]] = [None] * num_actions
+        mask: List[bool] = [False] * num_actions
+
+        req_map = self._req_map(state.simulator)
+        active_ids = state.stats.active_request_ids
+        if not active_ids:
+            actions_by_index[0] = ControllerAction(token_budget=0, selected_request_ids=None)
+            mask[0] = True
+            return actions_by_index, mask
+
+        if not hasattr(self, "_cpp_profile_tokens") or not hasattr(self, "_cpp_profile_times"):
+            entries = dict(getattr(self._prefill_profile, "entries", {}) or {})
+            self._cpp_profile_tokens = sorted(int(k) for k in entries.keys())
+            self._cpp_profile_times = [float(entries[k]) for k in self._cpp_profile_tokens]
+
+        self._perf.setdefault("ctrl_sample_total", 0.0)
+        self._perf.setdefault("ctrl_sample_pack", 0.0)
+        self._perf.setdefault("ctrl_sample_cpp", 0.0)
+        self._perf.setdefault("ctrl_sample_unpack", 0.0)
+        self._perf.setdefault("ctrl_sample_calls", 0.0)
+        self._perf["ctrl_sample_calls"] += 1.0
+
+        t_all = time.perf_counter()
+
+        t_pack = time.perf_counter()
+        req_states = []
+        for rid0 in active_ids:
+            rid = int(rid0)
+            req = req_map.get(rid)
+            if req is None:
+                continue
+            rs = _mcts_native.ControllerRequestStateNative()
+            rs.request_id = rid
+            rs.prefill_done = bool(getattr(req, "_is_prefill_complete", req.is_prefill_complete))
+            rs.remaining_prefill = int(self._remaining_prefill(req))
+            rs.remaining_decode = int(self._remaining_decode(req))
+            rs.arrived_at = float(getattr(req, "arrived_at", 0.0))
+            rs.prefill_slo = float(getattr(req, "prefill_slo_time", 0.0))
+            req_states.append(rs)
+        self._perf["ctrl_sample_pack"] += time.perf_counter() - t_pack
+
+        t_cpp = time.perf_counter()
+        out_actions, out_mask = _mcts_native.sample_controller_actions_pyready(
+            req_states,
+            sim_time,
+            [int(b) for b in budgets],
+            self._cpp_profile_tokens,
+            self._cpp_profile_times,
+            int(num_actions),
+        )
+        self._perf["ctrl_sample_cpp"] += time.perf_counter() - t_cpp
+
+        t_unpack = time.perf_counter()
+        actions = list(out_actions)
+        if len(actions) < num_actions:
+            actions.extend([None] * (num_actions - len(actions)))
+        elif len(actions) > num_actions:
+            actions = actions[:num_actions]
+
+        mask = [bool(x) for x in out_mask]
+        if len(mask) < num_actions:
+            mask.extend([False] * (num_actions - len(mask)))
+        elif len(mask) > num_actions:
+            mask = mask[:num_actions]
+
+        actions_by_index = [a for a in actions]
+        if not any(mask):
+            actions_by_index[0] = ControllerAction(token_budget=0, selected_request_ids=None)
+            mask[0] = True
+
+        self._perf["ctrl_sample_unpack"] += time.perf_counter() - t_unpack
+        self._perf["ctrl_sample_total"] += time.perf_counter() - t_all
+        return actions_by_index, mask
+
+    def _sample_controller_actions_python(
+        self,
+        state: VidurMCTSState,
+        max_samples: int,
+        use_state_cache: bool = True,
+    ) -> Tuple[List[Optional[ControllerAction]], List[bool]]:
+        del max_samples, use_state_cache
+
+        self._drain_arrivals(state.simulator)
+        sim_time = float(state.simulator._time)
+        step = int(self._constraints.interval_request_size or 512)
+
         budget_cache = self._controller_budgets_cache
         budgets = budget_cache.get(step)
         if budgets is None:
@@ -244,7 +373,7 @@ class VirtualVidurMCTSEnvironment:
             budget_cache[step] = budgets
 
         req_map = self._req_map(state.simulator)
-        active_ids = state.stats.active_request_ids  # already a set
+        active_ids = state.stats.active_request_ids
 
         num_heur = 4
         num_budgets = len(budgets)
@@ -257,7 +386,6 @@ class VirtualVidurMCTSEnvironment:
             mask[0] = True
             return actions_by_index, mask
 
-        # One pass over active ids
         prefill_ids: List[int] = []
         rem_pref_by_id: Dict[int, int] = {}
         edf_key_by_id: Dict[int, float] = {}
@@ -266,15 +394,13 @@ class VirtualVidurMCTSEnvironment:
         decode_candidates: List[int] = []
         decode_base_template: Dict[int, int] = {}
 
-
         for rid0 in active_ids:
             rid = int(rid0)
             req = req_map.get(rid)
             if req is None:
-                continue  # stale active id safety
+                continue
 
             prefill_done = bool(getattr(req, "_is_prefill_complete", req.is_prefill_complete))
-
             if not prefill_done:
                 rem_pref = self._remaining_prefill(req)
                 if rem_pref > 0:
@@ -294,13 +420,9 @@ class VirtualVidurMCTSEnvironment:
                     decode_candidates.append(rid)
                     decode_base_template[rid] = 1
 
-     
-        # decode_candidates.sort()
-
         if total_remaining_prefill == 0:
             decode_base = dict(decode_base_template)
             token_alloc = dict(decode_base)
-            selected = decode_candidates if decode_candidates else None
             a = ControllerAction(
                 token_budget=len(decode_base),
                 selected_request_ids=list(token_alloc.keys()) if token_alloc else None,
@@ -314,20 +436,16 @@ class VirtualVidurMCTSEnvironment:
             mask[0] = True
             return actions_by_index, mask
 
-        # Precompute sorted orders once
         ordered_sjf = sorted(prefill_ids, key=rem_pref_by_id.__getitem__)
         ordered_edf = sorted(prefill_ids, key=edf_key_by_id.__getitem__)
         ordered_lst = sorted(prefill_ids, key=lst_key_by_id.__getitem__)
         ordered_ljf = list(reversed(ordered_sjf))
-
         heuristics = [
             ("SJF", ordered_sjf),
             ("EDF", ordered_edf),
             ("LST", ordered_lst),
             ("LJF", ordered_ljf),
         ]
-
-        # decode_base_template = {rid: 1 for rid in decode_candidates}
         decode_budget = len(decode_candidates)
 
         def build_action(ordered_prefill: List[int], prefill_budget: int, heur_name: str) -> ControllerAction:
@@ -346,11 +464,9 @@ class VirtualVidurMCTSEnvironment:
                 remaining_budget -= alloc
                 used_prefill += alloc
 
-            decode_alloc = dict(decode_base_template)  # avoid shared dicts across actions
+            decode_alloc = dict(decode_base_template)
             token_alloc = dict(decode_alloc)
             token_alloc.update(pre)
-
-            # selected = sorted(token_alloc.keys()) if token_alloc else None
             selected = list(token_alloc.keys()) if token_alloc else None
             return ControllerAction(
                 token_budget=decode_budget + used_prefill,
@@ -376,7 +492,6 @@ class VirtualVidurMCTSEnvironment:
         if not any(mask):
             actions_by_index[0] = ControllerAction(token_budget=0, selected_request_ids=None)
             mask[0] = True
-
         return actions_by_index, mask
 
 

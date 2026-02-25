@@ -270,7 +270,7 @@ class HistoryRootGenerator:
         root_id_for_logs: int,
         seed: Optional[int] = None,
         log_history: bool = True,
-        max_total_steps: int = 200000,
+        max_total_steps: int = 20000,
         log_node_id_start: int,
         log_parent_id_start: int | None = None,
 
@@ -306,14 +306,18 @@ class HistoryRootGenerator:
                 depth,
                 game_id=game_id,
                 root_id=root_id_for_logs,
-                max_hops=min(10000, int(max_total_steps)),
+                max_hops=min(2000, int(max_total_steps)),
                 log_node_id=log_node_id,
                 log_parent_id=log_parent_id,
                 log_steps=log_history,
             )
             steps += 1
             if steps >= int(max_total_steps):
-                raise RuntimeError("history generator hit max_total_steps")
+                print(
+                    "[HistoryRootGenerator] max_total_steps reached; "
+                    "returning current state without additional nontrivial hops"
+                )
+                return state, player, int(depth), int(log_node_id), log_parent_id
 
             # 2) branching / terminal check
             actions_by_index, valid, _mask = self._actions_valid(state, player)
@@ -363,7 +367,7 @@ class HistoryRootGenerator:
             depth,
             game_id=game_id,
             root_id=root_id_for_logs,
-            max_hops=min(10000, int(max_total_steps)),
+            max_hops=min(2000, int(max_total_steps)),
             log_node_id=log_node_id,
             log_parent_id=log_parent_id,
             log_steps=log_history,

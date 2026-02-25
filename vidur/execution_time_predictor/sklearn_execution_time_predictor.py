@@ -835,6 +835,7 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
             predictions = pickle.load(open(cache_file, "rb"))
             return predictions
 
+
     def _get_model_prediction(
         self, model_name: str, model: BaseEstimator, X: pd.DataFrame
     ) -> Dict[Tuple, float]:

@@ -32,7 +32,10 @@ import random
 import re
 import time
 import sys
-from dataclasses import dataclass
+import traceback
+import queue
+import faulthandler
+from dataclasses import dataclass, field as dc_field
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
@@ -67,6 +70,25 @@ from .DNN.eval_utils import (
     NoopReplayWriter,
     write_arena_cycle_end_csv,
 )
+
+try:
+    from .native.python.infer_client import (
+        TorchScriptInferClient,
+        TorchScriptModelPaths,
+        TorchScriptServiceModelAdapter,
+        NativeTorchScriptModelAdapter,
+        build_native_torchscript_runtime,
+        build_native_infer_service_runtime,
+        start_torchscript_infer_service,
+    )
+except Exception:  # pragma: no cover - optional runtime dependency path
+    TorchScriptInferClient = None
+    TorchScriptModelPaths = None
+    TorchScriptServiceModelAdapter = None
+    NativeTorchScriptModelAdapter = None
+    build_native_torchscript_runtime = None
+    build_native_infer_service_runtime = None
+    start_torchscript_infer_service = None
 
 
 
@@ -163,6 +185,17 @@ def _build_constraints_and_explore(cfg: "AlphaZeroConfig") -> tuple[MCTSConstrai
         "root_dirichlet_epsilon",
         float(cfg.explore.root_dirichlet_epsilon),
     )
+    setattr(
+        explore_cfg,
+        "native_mcts_enabled",
+        bool(getattr(getattr(cfg, "native", None), "enabled", False))
+        and str(getattr(getattr(cfg, "native", None), "backend", "python")) == "cpp_virtual",
+    )
+    setattr(
+        explore_cfg,
+        "torchscript_full_native_search",
+        bool(getattr(getattr(cfg, "native", None), "torchscript_full_native_search", False)),
+    )
 
     return constraints, explore_cfg
 
@@ -182,6 +215,8 @@ def _build_env_and_simulator(
             base_simulator=simulator,
             constraints=constraints,
             explore_cfg=explore_cfg,
+            native_enabled=_use_cpp_virtual_backend(cfg),
+            native_strict_compat=bool(getattr(getattr(cfg, "native", None), "strict_compat", True)),
         )
     else:
         simulator = Simulator(sim_cfg, register_atexit=False)
@@ -257,6 +292,68 @@ def _infer_best_generation_from_train_log(path: Path) -> int:
 
 def _csv_bool(v: object) -> bool:
     return str(v).strip().lower() in {"true", "1", "yes"}
+
+
+def _use_cpp_virtual_backend(cfg: "AlphaZeroConfig") -> bool:
+    ncfg = getattr(cfg, "native", None)
+    if ncfg is None:
+        return False
+    return bool(getattr(ncfg, "enabled", False)) and str(getattr(ncfg, "backend", "python")) == "cpp_virtual"
+
+
+def _infer_service_enabled(cfg: "AlphaZeroConfig") -> bool:
+    ncfg = getattr(cfg, "native", None)
+    if ncfg is None:
+        return False
+    return bool(getattr(ncfg, "enabled", False)) and str(getattr(ncfg, "infer_mode", "python")) == "torchscript_service"
+
+
+def _infer_cpp_runtime_enabled(cfg: "AlphaZeroConfig") -> bool:
+    ncfg = getattr(cfg, "native", None)
+    if ncfg is None:
+        return False
+    return bool(getattr(ncfg, "enabled", False)) and str(getattr(ncfg, "infer_mode", "python")) == "torchscript_cpp"
+
+
+def _wait_for_infer_service(addr: str, *, timeout_s: float = 30.0) -> None:
+    if TorchScriptInferClient is None:
+        raise RuntimeError("TorchScriptInferClient is unavailable; cannot use infer_mode=torchscript_service")
+
+    deadline = time.time() + float(timeout_s)
+    last_err: Optional[Exception] = None
+    while time.time() < deadline:
+        try:
+            c = TorchScriptInferClient(addr=str(addr))
+            if c.ping():
+                c.close()
+                return
+            c.close()
+        except Exception as exc:  # pragma: no cover - startup retry path
+            last_err = exc
+        time.sleep(0.2)
+    raise RuntimeError(f"inference service did not become ready at {addr}: {last_err!r}")
+
+
+def _export_torchscript_artifacts_for_checkpoint(
+    *,
+    checkpoint_path: Path,
+    out_dir: Path,
+    model_version: int,
+    device: str = "cpu",
+    num_actions_controller: int,
+    num_actions_adversary: int,
+) -> tuple[Path, Path, Path]:
+    from .DNN.export_torchscript import export_torchscript_artifacts
+
+    out = export_torchscript_artifacts(
+        checkpoint_path=checkpoint_path,
+        out_dir=out_dir,
+        model_version=int(model_version),
+        device=str(device),
+        num_actions_controller=int(num_actions_controller),
+        num_actions_adversary=int(num_actions_adversary),
+    )
+    return out.controller_path, out.adversary_path, out.meta_path
 
 def _bootstrap_replay_from_train_log(
     *,
@@ -361,18 +458,20 @@ def _selfplay_worker_main(
     # history_nontrivial_hops: int,
     default_history_nontrivial_hops: int,
     use_virtual_env: bool,
+    total_workers: int = 1,
 ) -> None:
-    # Important: avoid CPU oversubscription when you run many processes
-    # try:
-    #     os.environ["OMP_NUM_THREADS"] = "1"
-    #     os.environ["MKL_NUM_THREADS"] = "1"
-    #     os.environ["OPENBLAS_NUM_THREADS"] = "1"
-    #     os.environ["NUMEXPR_NUM_THREADS"] = "1"
-    #     import torch
-    #     torch.set_num_threads(1)
-    #     torch.set_num_interop_threads(1)
-    # except Exception:
-    #     pass
+    # Important: avoid CPU oversubscription when many workers are active.
+    # Native TorchScript on CPU can otherwise spawn many threads per worker.
+    try:
+        os.environ["OMP_NUM_THREADS"] = "1"
+        os.environ["MKL_NUM_THREADS"] = "1"
+        os.environ["OPENBLAS_NUM_THREADS"] = "1"
+        os.environ["NUMEXPR_NUM_THREADS"] = "1"
+        torch.set_num_threads(1)
+        torch.set_num_interop_threads(1)
+        print(f"[worker {worker_id}] torch threads set to intra=1 interop=1", flush=True)
+    except Exception as e:
+        print(f"[worker {worker_id}] thread-limit setup failed: {e}", flush=True)
     # Pin each worker to a dedicated logical CPU from current allowed set (Linux)
     try:
         avail_cpus = sorted(os.sched_getaffinity(0))
@@ -383,10 +482,58 @@ def _selfplay_worker_main(
     except Exception as e:
         print(f"[worker {worker_id}] affinity pin failed: {e}")
 
+    try:
+        fault_log = Path(cfg.logging.mcts_iter_log).parent / f"worker_{int(worker_id):02d}_faulthandler.log"
+        fault_log.parent.mkdir(parents=True, exist_ok=True)
+        _fault_fh = open(fault_log, "a", buffering=1)
+        faulthandler.enable(file=_fault_fh, all_threads=True)
+    except Exception as e:
+        print(f"[worker {worker_id}] faulthandler setup failed: {e}")
+
+    # Native C++ tracing controls (used by mcts_native via env vars)
+    try:
+        ncfg = getattr(cfg, "native", None)
+        if bool(getattr(ncfg, "native_trace", False)):
+            os.environ["VIDUR_NATIVE_TRACE"] = "1"
+            os.environ["VIDUR_NATIVE_TRACE_EVERY"] = str(int(getattr(ncfg, "native_trace_every", 500)))
+            trace_dir = str(getattr(ncfg, "native_trace_dir", "")).strip()
+            if trace_dir:
+                os.environ["VIDUR_NATIVE_TRACE_DIR"] = trace_dir
+            print(
+                f"[worker {worker_id}] native trace enabled "
+                f"(every={os.environ.get('VIDUR_NATIVE_TRACE_EVERY')}, "
+                f"dir={os.environ.get('VIDUR_NATIVE_TRACE_DIR', '/tmp')})",
+                flush=True,
+            )
+        else:
+            os.environ.pop("VIDUR_NATIVE_TRACE", None)
+            os.environ.pop("VIDUR_NATIVE_TRACE_EVERY", None)
+            os.environ.pop("VIDUR_NATIVE_TRACE_DIR", None)
+    except Exception as e:
+        print(f"[worker {worker_id}] native trace env setup failed: {e}")
+
 
 
     # Build simulator/env ONCE per process (big speed win vs rebuilding every gen)
     _, env, _, explore_cfg = _build_env_and_simulator(cfg, use_virtual_env=use_virtual_env)
+    multiprocess_safety_mode = bool(getattr(getattr(cfg, "native", None), "multiprocess_safety_mode", True))
+    safe_multi = multiprocess_safety_mode and int(total_workers) > 1
+    if safe_multi:
+        if bool(getattr(explore_cfg, "native_mcts_enabled", False)):
+            setattr(explore_cfg, "native_mcts_enabled", False)
+            print(
+                f"[worker {worker_id}] safety: disabled native_mcts_enabled for multiprocess stability",
+                flush=True,
+            )
+        if hasattr(env, "_native_enabled") and bool(getattr(env, "_native_enabled", False)):
+            try:
+                setattr(env, "_native_enabled", False)
+                print(
+                    f"[worker {worker_id}] safety: disabled native controller sampler for multiprocess stability",
+                    flush=True,
+                )
+            except Exception:
+                pass
 
     # Build model once per process; reload weights each generation
     model = AlphaZeroModel(
@@ -394,6 +541,48 @@ def _selfplay_worker_main(
         num_actions_adversary=cfg.model.num_actions_adversary,
     ).to(torch.device("cpu"))
     model.eval()
+
+    use_service_infer = _infer_service_enabled(cfg)
+    use_cpp_runtime_infer = _infer_cpp_runtime_enabled(cfg)
+    infer_client = None
+    native_ts_runtime = None
+    native_service_runtime = None
+    runtime_device = str(cfg.native.infer_service_device)
+    if use_service_infer:
+        if TorchScriptInferClient is None:
+            raise RuntimeError("infer_mode=torchscript_service requested but infer client is unavailable")
+        infer_client = TorchScriptInferClient(addr=str(cfg.native.infer_service_addr))
+    if use_cpp_runtime_infer:
+        if build_native_torchscript_runtime is None:
+            raise RuntimeError("infer_mode=torchscript_cpp requested but native runtime builder is unavailable")
+        if runtime_device.startswith("cuda") and (not torch.cuda.is_available()):
+            raise RuntimeError(
+                f"torchscript_cpp requested device={runtime_device} but CUDA is unavailable "
+                "(torch.cuda.is_available() is False). Fix CUDA/runtime setup or switch infer_mode."
+            )
+        native_ts_runtime = build_native_torchscript_runtime(
+            device=runtime_device,
+        )
+        print(
+            f"[worker {worker_id}] torchscript_cpp runtime device={runtime_device}",
+            flush=True,
+        )
+    if use_service_infer and build_native_infer_service_runtime is not None:
+        try:
+            native_service_runtime = build_native_infer_service_runtime(
+                addr=str(cfg.native.infer_service_addr),
+            )
+            if native_service_runtime.ping():
+                print(
+                    f"[worker {worker_id}] native infer-service runtime connected addr={cfg.native.infer_service_addr}",
+                    flush=True,
+                )
+        except Exception as e:
+            native_service_runtime = None
+            print(
+                f"[worker {worker_id}] native infer-service runtime unavailable: {e}",
+                flush=True,
+            )
 
 
     arena_candidate_model = AlphaZeroModel(
@@ -410,6 +599,7 @@ def _selfplay_worker_main(
 
     _loaded_candidate_sig: Optional[tuple[Path, int, int]] = None
     _loaded_best_sig: Optional[tuple[Path, int, int]] = None
+    _warned_service_callback_bridge = False
 
     def _weights_sig(path: Path) -> tuple[Path, int, int]:
         # Path alone is not enough (best.pt path stays constant while contents change).
@@ -424,198 +614,440 @@ def _selfplay_worker_main(
 
     while True:
 
-
-
-
         task = task_q.get()
         if task is None:
             break
 
         task_kind = str(task.get("task_kind", "selfplay"))
-        if task_kind == "selfplay":
-            # Unpack task
-            gen = int(task["gen"])
-            round_idx = int(task.get("round_idx", 0)) 
-            out_dir = Path(task["out_dir"])
-            weights_path = Path(task["weights_path"])
-            game_id = int(task["game_id"])
-            start_root_id = int(task["start_root_id"])
-            history_seed = int(task["history_seed"])
-            roots = int(task["num_roots"])
-            sample_from_policy = bool(task.get("sample_from_mcts_policy", False))
-            policy_temp = float(task.get("selfplay_policy_temperature", 1.0))
-            action_seed_base = int(task.get("action_seed_base", task.get("history_seed", 0)))
+        try:
+            if task_kind == "selfplay":
+                # Unpack task
+                gen = int(task["gen"])
+                round_idx = int(task.get("round_idx", 0))
+                out_dir = Path(task["out_dir"])
+                weights_path = Path(task["weights_path"])
+                game_id = int(task["game_id"])
+                start_root_id = int(task["start_root_id"])
+                history_seed = int(task["history_seed"])
+                roots = int(task["num_roots"])
+                sample_from_policy = bool(task.get("sample_from_mcts_policy", False))
+                policy_temp = float(task.get("selfplay_policy_temperature", 1.0))
+                action_seed_base = int(task.get("action_seed_base", task.get("history_seed", 0)))
 
-            # Load frozen weights for this generation
-            ckpt = torch.load(weights_path, map_location="cpu")
-            model.load_state_dict(ckpt["model_state"])
-            model.eval()
+                run_model = model
 
-            # Per-worker writer
-            writer = ReplayWriter(ReplayWriterConfig(out_dir=out_dir, shard_size=cfg.dataset.shard_size))
+                # Load frozen weights for this generation
+                ckpt = torch.load(weights_path, map_location="cpu")
+                model.load_state_dict(ckpt["model_state"])
+                model.eval()
 
-            # Put per-worker logs in the global logs dir (not inside dataset dir)
-            logs_base = Path(cfg.logging.mcts_iter_log).parent  # simulator_output/mcts_dnn_logs
-            logs_dir = logs_base / f"gen_{gen:06d}"
-            logs_dir.mkdir(parents=True, exist_ok=True)
+                infer_mode = str(task.get("infer_mode", "python"))
+                if safe_multi and infer_mode == "torchscript_cpp":
+                    infer_mode = "python"
+                native_mcts_on = bool(getattr(explore_cfg, "native_mcts_enabled", False))
+                if (
+                    infer_mode == "torchscript_service"
+                    and native_mcts_on
+                    and native_service_runtime is not None
+                    and NativeTorchScriptModelAdapter is not None
+                ):
+                    ts_controller_raw = str(task.get("ts_controller_path", "")).strip()
+                    ts_adversary_raw = str(task.get("ts_adversary_path", "")).strip()
+                    if not ts_controller_raw or not ts_adversary_raw:
+                        raise RuntimeError("torchscript_service task missing ts_controller_path/ts_adversary_path")
+                    model_version = int(task["model_version"])
+                    native_service_runtime.load_models(
+                        int(model_version),
+                        str(ts_controller_raw),
+                        str(ts_adversary_raw),
+                    )
+                    run_model = NativeTorchScriptModelAdapter(
+                        runtime=native_service_runtime,
+                        model_version=int(model_version),
+                        fallback_model=model,
+                        fallback_to_python=bool(task.get("fallback_to_python_infer", True)),
+                    )
+                elif (
+                    infer_mode == "torchscript_service"
+                    and infer_client is not None
+                    and TorchScriptModelPaths is not None
+                    and TorchScriptServiceModelAdapter is not None
+                ):
+                    ts_controller_raw = str(task.get("ts_controller_path", "")).strip()
+                    ts_adversary_raw = str(task.get("ts_adversary_path", "")).strip()
+                    if not ts_controller_raw or not ts_adversary_raw:
+                        raise RuntimeError("torchscript_service task missing ts_controller_path/ts_adversary_path")
+                    ts_controller = Path(ts_controller_raw)
+                    ts_adversary = Path(ts_adversary_raw)
+                    model_version = int(task["model_version"])
+                    infer_client.ensure_models_loaded(
+                        TorchScriptModelPaths(
+                            controller_path=str(ts_controller),
+                            adversary_path=str(ts_adversary),
+                            model_version=int(model_version),
+                        )
+                    )
+                    run_model = TorchScriptServiceModelAdapter(
+                        client=infer_client,
+                        model_version=int(model_version),
+                        fallback_model=model,
+                        fallback_to_python=bool(task.get("fallback_to_python_infer", True)),
+                    )
+                    if native_mcts_on and not _warned_service_callback_bridge:
+                        print(
+                            f"[worker {worker_id}] torchscript_service fallback path uses "
+                            "C++->Python callback per simulation (high overhead).",
+                            flush=True,
+                        )
+                        _warned_service_callback_bridge = True
+                elif (
+                    infer_mode == "torchscript_cpp"
+                    and native_ts_runtime is not None
+                    and NativeTorchScriptModelAdapter is not None
+                ):
+                    ts_controller_raw = str(task.get("ts_controller_path", "")).strip()
+                    ts_adversary_raw = str(task.get("ts_adversary_path", "")).strip()
+                    if not ts_controller_raw or not ts_adversary_raw:
+                        raise RuntimeError("torchscript_cpp task missing ts_controller_path/ts_adversary_path")
+                    model_version = int(task["model_version"])
+                    native_ts_runtime.load_models(
+                        int(model_version),
+                        str(ts_controller_raw),
+                        str(ts_adversary_raw),
+                    )
+                    run_model = NativeTorchScriptModelAdapter(
+                        runtime=native_ts_runtime,
+                        model_version=int(model_version),
+                        fallback_model=model,
+                        fallback_to_python=bool(task.get("fallback_to_python_infer", True)),
+                    )
 
-            iter_log = logs_dir / f"mcts_iter_p{worker_id:02d}.csv"
-            root_log = logs_dir / f"mcts_root_p{worker_id:02d}_gen{round_idx:02d}.csv"
+                # Per-worker writer
+                writer = ReplayWriter(ReplayWriterConfig(out_dir=out_dir, shard_size=cfg.dataset.shard_size))
 
+                # Put per-worker logs in the global logs dir (not inside dataset dir)
+                logs_base = Path(cfg.logging.mcts_iter_log).parent  # simulator_output/mcts_dnn_logs
+                logs_dir = logs_base / f"gen_{gen:06d}"
+                logs_dir.mkdir(parents=True, exist_ok=True)
 
-
-            mcts = VidurMCTS(env=env, explore_cfg=explore_cfg, log_path=iter_log, tree_log_path=root_log, logger_flush_every=cfg.logging.flush_every)
-            runner = SelfPlayRunner(env=env, mcts=mcts, model=model, writer=writer, device_for_features=torch.device("cpu"))
-
-            # Make history different per worker/gen by changing game_id and/or seed.
-            # Right now run_n_roots only takes history_nontrivial_hops, so “seed” comes from game_id/root_id_for_logs.
-            # If you want explicit control, add a `history_seed` arg to run_n_roots and forward it to HistoryRootGenerator.
-            hops_for_task = int(task.get("history_nontrivial_hops", default_history_nontrivial_hops))
-            runner.run_n_roots(
-                game_id=game_id,
-                num_roots=roots,
-                adv_iterations_per_root=adv_iterations_per_root,
-                cont_iterations_per_root=cont_iterations_per_root,
-                max_batch_size=max_batch_size,
-                start_root_id=start_root_id,
-                start_root_depth=0,
-                start_player="adversary",
-                history_nontrivial_hops=hops_for_task,
-                feature_version=cfg.run.feature_version,
-                history_seed=history_seed,
-                sample_from_mcts_policy=sample_from_policy,
-                selfplay_policy_temperature=policy_temp,
-                action_seed_base=action_seed_base,
-            )
-
-            writer.close()
-            mcts.close()
-
-            result_q.put(
-                {
-                    "worker_id": worker_id,
-                    "gen": gen,
-                    "out_dir": str(out_dir),
-                }
-            )
-            continue
-
-        if task_kind == "arena":
-            gen = int(task["gen"])
-            arena_roots = list(task["arena_roots"])
-            arena_games_dir = Path(task["arena_games_dir"])
-
-            candidate_weights_path = Path(task["candidate_weights_path"])
-            best_weights_path = Path(task["best_weights_path"])
-
-            candidate_sig = _weights_sig(candidate_weights_path)
-            if _loaded_candidate_sig != candidate_sig:
-                ckpt_c = torch.load(candidate_weights_path, map_location="cpu")
-                arena_candidate_model.load_state_dict(extract_model_state(ckpt_c), strict=True)
-                arena_candidate_model.eval()
-                _loaded_candidate_sig = candidate_sig
-
-            best_sig = _weights_sig(best_weights_path)
-            if _loaded_best_sig != best_sig:
-                ckpt_b = torch.load(best_weights_path, map_location="cpu")
-                arena_best_model.load_state_dict(extract_model_state(ckpt_b), strict=True)
-                arena_best_model.eval()
-                _loaded_best_sig = best_sig
-
-            adv_iters = int(task["adv_iterations_per_root"])
-            cont_iters = int(task["cont_iterations_per_root"])
-            max_adv_moves = int(task["arena_max_adversary_moves"])
-            max_cleanup = int(task["arena_max_controller_cleanup_steps"])
-            max_turns = int(task["arena_max_total_turns"])
-            feature_version = int(task["feature_version"])
-            tie_points = float(task["tie_points"])
-
-            noop_writer = NoopReplayWriter()
-
-            for entry in arena_roots:
-                game_id = int(entry["game_id"])
-                history_hops = int(entry["history_hops"])
-                start_player = str(entry.get("player_to_act", "adversary"))
-                start_depth = int(entry.get("depth", 0))
-                history_root_id = int(entry.get("root_id", 0))
-
-                # debug full log (single file with both cycles)
-                debug_root_log = arena_games_dir / f"game_{game_id}.csv"
+                iter_log = logs_dir / f"mcts_iter_p{worker_id:02d}.csv"
+                root_log = logs_dir / f"mcts_root_p{worker_id:02d}_gen{round_idx:02d}.csv"
 
                 mcts = VidurMCTS(
                     env=env,
                     explore_cfg=explore_cfg,
-                    log_path=None,
-                    tree_log_path=debug_root_log,
+                    log_path=iter_log,
+                    tree_log_path=root_log,
                     logger_flush_every=cfg.logging.flush_every,
                 )
                 runner = SelfPlayRunner(
                     env=env,
                     mcts=mcts,
-                    model=arena_candidate_model,
-                    writer=noop_writer,
+                    model=run_model,
+                    writer=writer,
                     device_for_features=torch.device("cpu"),
                 )
 
-                try:
-                    out = runner.run_arena_game(
-                        game_id=game_id,
-                        candidate_model=arena_candidate_model,
-                        best_model=arena_best_model,
-                        history_nontrivial_hops=history_hops,
-                        adv_iterations_per_root=adv_iters,
-                        cont_iterations_per_root=cont_iters,
-                        arena_max_adversary_moves=max_adv_moves,
-                        arena_max_controller_cleanup_steps=max_cleanup,
-                        arena_max_total_turns=max_turns,
-                        feature_version=feature_version,
-                        tie_points=tie_points,
-                        start_player=start_player,
-                        start_root_depth=start_depth,
-                        history_root_id_for_logs=history_root_id,
+                hops_for_task = int(task.get("history_nontrivial_hops", default_history_nontrivial_hops))
+                runner.run_n_roots(
+                    game_id=game_id,
+                    num_roots=roots,
+                    adv_iterations_per_root=adv_iterations_per_root,
+                    cont_iterations_per_root=cont_iterations_per_root,
+                    max_batch_size=max_batch_size,
+                    start_root_id=start_root_id,
+                    start_root_depth=0,
+                    start_player="adversary",
+                    history_nontrivial_hops=hops_for_task,
+                    feature_version=cfg.run.feature_version,
+                    history_seed=history_seed,
+                    sample_from_mcts_policy=sample_from_policy,
+                    selfplay_policy_temperature=policy_temp,
+                    action_seed_base=action_seed_base,
+                    max_forced_hops_per_root=int(task.get("max_forced_hops_per_root", 1024)),
+                    history_max_total_steps=int(task.get("history_max_total_steps", 20000)),
+                )
+
+                writer.close()
+                mcts.close()
+
+                result_q.put(
+                    {
+                        "ok": True,
+                        "task_kind": "selfplay",
+                        "worker_id": worker_id,
+                        "gen": gen,
+                        "round_idx": round_idx,
+                        "out_dir": str(out_dir),
+                    }
+                )
+                continue
+
+            if task_kind == "arena":
+                gen = int(task["gen"])
+                arena_roots = list(task["arena_roots"])
+                arena_games_dir = Path(task["arena_games_dir"])
+
+                candidate_weights_path = Path(task["candidate_weights_path"])
+                best_weights_path = Path(task["best_weights_path"])
+
+                candidate_sig = _weights_sig(candidate_weights_path)
+                if _loaded_candidate_sig != candidate_sig:
+                    ckpt_c = torch.load(candidate_weights_path, map_location="cpu")
+                    arena_candidate_model.load_state_dict(extract_model_state(ckpt_c), strict=True)
+                    arena_candidate_model.eval()
+                    _loaded_candidate_sig = candidate_sig
+
+                best_sig = _weights_sig(best_weights_path)
+                if _loaded_best_sig != best_sig:
+                    ckpt_b = torch.load(best_weights_path, map_location="cpu")
+                    arena_best_model.load_state_dict(extract_model_state(ckpt_b), strict=True)
+                    arena_best_model.eval()
+                    _loaded_best_sig = best_sig
+
+                candidate_model_for_arena = arena_candidate_model
+                best_model_for_arena = arena_best_model
+
+                infer_mode = str(task.get("infer_mode", "python"))
+                if safe_multi and infer_mode == "torchscript_cpp":
+                    infer_mode = "python"
+                native_mcts_on = bool(getattr(explore_cfg, "native_mcts_enabled", False))
+                if (
+                    infer_mode == "torchscript_service"
+                    and native_mcts_on
+                    and native_service_runtime is not None
+                    and NativeTorchScriptModelAdapter is not None
+                ):
+                    required_keys = [
+                        "candidate_ts_controller_path",
+                        "candidate_ts_adversary_path",
+                        "best_ts_controller_path",
+                        "best_ts_adversary_path",
+                    ]
+                    missing = [k for k in required_keys if not str(task.get(k, "")).strip()]
+                    if missing:
+                        raise RuntimeError(f"torchscript_service arena task missing fields: {missing}")
+                    candidate_model_version = int(task["candidate_model_version"])
+                    best_model_version = int(task["best_model_version"])
+                    native_service_runtime.load_models(
+                        candidate_model_version,
+                        str(task["candidate_ts_controller_path"]),
+                        str(task["candidate_ts_adversary_path"]),
                     )
-                finally:
-                    mcts.close()
+                    native_service_runtime.load_models(
+                        best_model_version,
+                        str(task["best_ts_controller_path"]),
+                        str(task["best_ts_adversary_path"]),
+                    )
 
-                cycle_a = dict(out["cycle_a"])
-                cycle_b = dict(out["cycle_b"])
+                    fallback_to_python = bool(task.get("fallback_to_python_infer", True))
+                    candidate_model_for_arena = NativeTorchScriptModelAdapter(
+                        runtime=native_service_runtime,
+                        model_version=candidate_model_version,
+                        fallback_model=arena_candidate_model,
+                        fallback_to_python=fallback_to_python,
+                    )
+                    best_model_for_arena = NativeTorchScriptModelAdapter(
+                        runtime=native_service_runtime,
+                        model_version=best_model_version,
+                        fallback_model=arena_best_model,
+                        fallback_to_python=fallback_to_python,
+                    )
+                elif (
+                    infer_mode == "torchscript_service"
+                    and infer_client is not None
+                    and TorchScriptModelPaths is not None
+                    and TorchScriptServiceModelAdapter is not None
+                ):
+                    required_keys = [
+                        "candidate_ts_controller_path",
+                        "candidate_ts_adversary_path",
+                        "best_ts_controller_path",
+                        "best_ts_adversary_path",
+                    ]
+                    missing = [k for k in required_keys if not str(task.get(k, "")).strip()]
+                    if missing:
+                        raise RuntimeError(f"torchscript_service arena task missing fields: {missing}")
+                    cand_paths = TorchScriptModelPaths(
+                        controller_path=str(task["candidate_ts_controller_path"]),
+                        adversary_path=str(task["candidate_ts_adversary_path"]),
+                        model_version=int(task["candidate_model_version"]),
+                    )
+                    best_paths = TorchScriptModelPaths(
+                        controller_path=str(task["best_ts_controller_path"]),
+                        adversary_path=str(task["best_ts_adversary_path"]),
+                        model_version=int(task["best_model_version"]),
+                    )
+                    infer_client.ensure_models_loaded(cand_paths)
+                    infer_client.ensure_models_loaded(best_paths)
 
-                write_arena_cycle_end_csv(
-                    arena_games_dir / f"game_{game_id}_adv_candidate_ctrl_best.csv",
-                    game_id=game_id,
-                    cycle_label="candidate_as_adversary",
-                    total_cost=float(out["candidate_as_adv_cost"]),
-                    slo_violations=int(cycle_a.get("slo_violations", 0)),
-                    total_lateness=float(cycle_a.get("total_lateness", 0.0)),
+                    fallback_to_python = bool(task.get("fallback_to_python_infer", True))
+                    candidate_model_for_arena = TorchScriptServiceModelAdapter(
+                        client=infer_client,
+                        model_version=int(cand_paths.model_version),
+                        fallback_model=arena_candidate_model,
+                        fallback_to_python=fallback_to_python,
+                    )
+                    best_model_for_arena = TorchScriptServiceModelAdapter(
+                        client=infer_client,
+                        model_version=int(best_paths.model_version),
+                        fallback_model=arena_best_model,
+                        fallback_to_python=fallback_to_python,
+                    )
+                    if native_mcts_on and not _warned_service_callback_bridge:
+                        print(
+                            f"[worker {worker_id}] torchscript_service fallback path uses "
+                            "C++->Python callback per simulation (high overhead).",
+                            flush=True,
+                        )
+                        _warned_service_callback_bridge = True
+                elif (
+                    infer_mode == "torchscript_cpp"
+                    and native_ts_runtime is not None
+                    and NativeTorchScriptModelAdapter is not None
+                ):
+                    required_keys = [
+                        "candidate_ts_controller_path",
+                        "candidate_ts_adversary_path",
+                        "best_ts_controller_path",
+                        "best_ts_adversary_path",
+                    ]
+                    missing = [k for k in required_keys if not str(task.get(k, "")).strip()]
+                    if missing:
+                        raise RuntimeError(f"torchscript_cpp arena task missing fields: {missing}")
+
+                    candidate_model_version = int(task["candidate_model_version"])
+                    best_model_version = int(task["best_model_version"])
+
+                    native_ts_runtime.load_models(
+                        candidate_model_version,
+                        str(task["candidate_ts_controller_path"]),
+                        str(task["candidate_ts_adversary_path"]),
+                    )
+                    native_ts_runtime.load_models(
+                        best_model_version,
+                        str(task["best_ts_controller_path"]),
+                        str(task["best_ts_adversary_path"]),
+                    )
+
+                    fallback_to_python = bool(task.get("fallback_to_python_infer", True))
+                    candidate_model_for_arena = NativeTorchScriptModelAdapter(
+                        runtime=native_ts_runtime,
+                        model_version=candidate_model_version,
+                        fallback_model=arena_candidate_model,
+                        fallback_to_python=fallback_to_python,
+                    )
+                    best_model_for_arena = NativeTorchScriptModelAdapter(
+                        runtime=native_ts_runtime,
+                        model_version=best_model_version,
+                        fallback_model=arena_best_model,
+                        fallback_to_python=fallback_to_python,
+                    )
+
+                adv_iters = int(task["adv_iterations_per_root"])
+                cont_iters = int(task["cont_iterations_per_root"])
+                max_adv_moves = int(task["arena_max_adversary_moves"])
+                max_cleanup = int(task["arena_max_controller_cleanup_steps"])
+                max_turns = int(task["arena_max_total_turns"])
+                feature_version = int(task["feature_version"])
+                tie_points = float(task["tie_points"])
+
+                noop_writer = NoopReplayWriter()
+
+                for entry in arena_roots:
+                    game_id = int(entry["game_id"])
+                    history_hops = int(entry["history_hops"])
+                    start_player = str(entry.get("player_to_act", "adversary"))
+                    start_depth = int(entry.get("depth", 0))
+                    history_root_id = int(entry.get("root_id", 0))
+
+                    # debug full log (single file with both cycles)
+                    debug_root_log = arena_games_dir / f"game_{game_id}.csv"
+
+                    mcts = VidurMCTS(
+                        env=env,
+                        explore_cfg=explore_cfg,
+                        log_path=None,
+                        tree_log_path=debug_root_log,
+                        logger_flush_every=cfg.logging.flush_every,
+                    )
+                    runner = SelfPlayRunner(
+                        env=env,
+                        mcts=mcts,
+                        model=candidate_model_for_arena,
+                        writer=noop_writer,
+                        device_for_features=torch.device("cpu"),
+                    )
+
+                    try:
+                        out = runner.run_arena_game(
+                            game_id=game_id,
+                            candidate_model=candidate_model_for_arena,
+                            best_model=best_model_for_arena,
+                            history_nontrivial_hops=history_hops,
+                            adv_iterations_per_root=adv_iters,
+                            cont_iterations_per_root=cont_iters,
+                            arena_max_adversary_moves=max_adv_moves,
+                            arena_max_controller_cleanup_steps=max_cleanup,
+                            arena_max_total_turns=max_turns,
+                            feature_version=feature_version,
+                            tie_points=tie_points,
+                            start_player=start_player,
+                            start_root_depth=start_depth,
+                            history_root_id_for_logs=history_root_id,
+                        )
+                    finally:
+                        mcts.close()
+
+                    cycle_a = dict(out["cycle_a"])
+                    cycle_b = dict(out["cycle_b"])
+
+                    write_arena_cycle_end_csv(
+                        arena_games_dir / f"game_{game_id}_adv_candidate_ctrl_best.csv",
+                        game_id=game_id,
+                        cycle_label="candidate_as_adversary",
+                        total_cost=float(out["candidate_as_adv_cost"]),
+                        slo_violations=int(cycle_a.get("slo_violations", 0)),
+                        total_lateness=float(cycle_a.get("total_lateness", 0.0)),
+                    )
+                    write_arena_cycle_end_csv(
+                        arena_games_dir / f"game_{game_id}_adv_best_ctrl_candidate.csv",
+                        game_id=game_id,
+                        cycle_label="best_as_adversary",
+                        total_cost=float(out["best_as_adv_cost"]),
+                        slo_violations=int(cycle_b.get("slo_violations", 0)),
+                        total_lateness=float(cycle_b.get("total_lateness", 0.0)),
+                    )
+
+                result_q.put(
+                    {
+                        "ok": True,
+                        "task_kind": "arena",
+                        "worker_id": worker_id,
+                        "gen": gen,
+                        "num_games": len(arena_roots),
+                    }
                 )
-                write_arena_cycle_end_csv(
-                    arena_games_dir / f"game_{game_id}_adv_best_ctrl_candidate.csv",
-                    game_id=game_id,
-                    cycle_label="best_as_adversary",
-                    total_cost=float(out["best_as_adv_cost"]),
-                    slo_violations=int(cycle_b.get("slo_violations", 0)),
-                    total_lateness=float(cycle_b.get("total_lateness", 0.0)),
-                )
+                continue
 
             result_q.put(
                 {
-                    "ok": True,
-                    "task_kind": "arena",
+                    "ok": False,
+                    "task_kind": str(task_kind),
                     "worker_id": worker_id,
-                    "gen": gen,
-                    "num_games": len(arena_roots),
+                    "error": f"unknown task_kind={task_kind}",
                 }
             )
-            continue
-
-        result_q.put(
-            {
-                "ok": False,
-                "task_kind": str(task_kind),
-                "worker_id": worker_id,
-                "error": f"unknown task_kind={task_kind}",
-            }
-        )
+        except Exception as exc:
+            result_q.put(
+                {
+                    "ok": False,
+                    "task_kind": str(task_kind),
+                    "worker_id": worker_id,
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                }
+            )
 
 def selfImprovementPolicy(
     *,
@@ -729,7 +1161,28 @@ def selfImprovementPolicy(
     os.environ.setdefault("MKL_NUM_THREADS", "1")
     os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
     os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
-        
+
+    infer_service_proc = None
+    infer_mode = str(getattr(cfg.native, "infer_mode", "python"))
+    using_infer_service = _infer_service_enabled(cfg)
+    using_cpp_runtime_infer = _infer_cpp_runtime_enabled(cfg)
+    export_ts_artifacts = (
+        bool(getattr(cfg.native, "export_torchscript", False))
+        or using_infer_service
+        or using_cpp_runtime_infer
+    )
+
+    if using_infer_service:
+        if start_torchscript_infer_service is None:
+            raise RuntimeError("infer_mode=torchscript_service requested but infer service entrypoint is unavailable")
+        infer_service_proc = start_torchscript_infer_service(
+            addr=str(cfg.native.infer_service_addr),
+            device=str(cfg.native.infer_service_device),
+            max_batch=int(cfg.native.infer_max_batch),
+            max_wait_us=int(cfg.native.infer_max_wait_us),
+            impl=str(getattr(cfg.native, "infer_service_impl", "cpp")),
+        )
+        _wait_for_infer_service(str(cfg.native.infer_service_addr), timeout_s=45.0)
 
 
     ctx = mp.get_context("spawn")
@@ -774,10 +1227,57 @@ def selfImprovementPolicy(
                 max_batch_size,
                 _hops_for_worker(wid),
                 use_virtual_env,
+                int(num_selfPlay_workers),
             ),
         )
         p.start()
         workers.append(p)
+
+    def _collect_results(
+        *,
+        expected: int,
+        task_kind: str,
+        gen: int,
+        round_idx: int | None = None,
+        poll_timeout_s: float = 30.0,
+    ) -> list[dict]:
+        msgs: list[dict] = []
+        wait_loops = 0
+        while len(msgs) < int(expected):
+            try:
+                msg = result_q.get(timeout=float(poll_timeout_s))
+            except queue.Empty:
+                dead = [p for p in workers if p.exitcode not in (None, 0)]
+                if dead:
+                    details = ", ".join(f"pid={p.pid} exitcode={p.exitcode}" for p in dead)
+                    raise RuntimeError(
+                        f"{task_kind} wait failed: worker process died while waiting for results: {details}"
+                    )
+                wait_loops += 1
+                if (wait_loops % 2) == 0:
+                    alive = sum(1 for p in workers if p.is_alive())
+                    ridx = f", round={round_idx}" if round_idx is not None else ""
+                    print(
+                        f"[main] waiting for {task_kind} results gen={gen}{ridx}: "
+                        f"received={len(msgs)}/{expected}, alive_workers={alive}",
+                        flush=True,
+                    )
+                continue
+
+            msg_kind = str(msg.get("task_kind", ""))
+            if msg_kind != str(task_kind):
+                raise RuntimeError(
+                    f"received unexpected task result kind='{msg_kind}' while waiting for '{task_kind}': {msg}"
+                )
+            if not bool(msg.get("ok", False)):
+                tb = str(msg.get("traceback", "")).strip()
+                err = str(msg.get("error", "unknown error"))
+                wid = msg.get("worker_id", "?")
+                if tb:
+                    raise RuntimeError(f"{task_kind} worker {wid} failed: {err}\n{tb}")
+                raise RuntimeError(f"{task_kind} worker {wid} failed: {err}")
+            msgs.append(msg)
+        return msgs
 
 
     dataset_base = Path(cfg.dataset.out_dir)
@@ -801,6 +1301,21 @@ def selfImprovementPolicy(
         weights_path = ckpt_dir / f"selfplay_weights_gen_{gen:06d}.pt"
         state = {k: v.detach().cpu() for k, v in trainer.model.state_dict().items()}
         torch.save({"model_state": state}, weights_path)
+
+        selfplay_model_version = int(gen) * 100 + 1
+        selfplay_ts_controller_path = None
+        selfplay_ts_adversary_path = None
+        if export_ts_artifacts:
+            ts_controller, ts_adversary, _ = _export_torchscript_artifacts_for_checkpoint(
+                checkpoint_path=weights_path,
+                out_dir=ckpt_dir,
+                model_version=selfplay_model_version,
+                device="cpu",
+                num_actions_controller=int(cfg.model.num_actions_controller),
+                num_actions_adversary=int(cfg.model.num_actions_adversary),
+            )
+            selfplay_ts_controller_path = ts_controller
+            selfplay_ts_adversary_path = ts_adversary
 
 
         # split roots across workers
@@ -869,12 +1384,26 @@ def selfImprovementPolicy(
                         "sample_from_mcts_policy": bool(getattr(cfg.run, "sample_from_mcts_policy", False)),
                         "selfplay_policy_temperature": float(getattr(cfg.run, "selfplay_policy_temperature", 1.0)),
                         "action_seed_base":(gen * 1_000_000 + round_idx * 1_000 + wid) ,
+                        "max_forced_hops_per_root": int(getattr(cfg.run, "max_forced_hops_per_root", 1024)),
+                        "history_max_total_steps": int(getattr(cfg.run, "history_max_total_steps", 20000)),
+                        "infer_mode": str(infer_mode),
+                        "fallback_to_python_infer": bool(getattr(cfg.native, "fallback_to_python_infer", True)),
+                        "model_version": int(selfplay_model_version),
+                        "ts_controller_path": str(selfplay_ts_controller_path) if selfplay_ts_controller_path else "",
+                        "ts_adversary_path": str(selfplay_ts_adversary_path) if selfplay_ts_adversary_path else "",
                     }
                 )
                 tasks_sent += 1
 
-            for _ in range(tasks_sent):
-                all_results.append(result_q.get())
+            if tasks_sent > 0:
+                all_results.extend(
+                    _collect_results(
+                        expected=tasks_sent,
+                        task_kind="selfplay",
+                        gen=int(gen),
+                        round_idx=int(round_idx),
+                    )
+                )
 
         # # 2) wait for all worker results
         # results = []
@@ -980,6 +1509,34 @@ def selfImprovementPolicy(
         ckpt_path = ckpt_dir / f"ckpt_gen_{gen:06d}_step_{trainer.step:06d}.pt"
         trainer.save_checkpoint(ckpt_path)
 
+        arena_candidate_version = int(gen) * 100 + 2
+        arena_best_version = int(gen) * 100 + 3
+        candidate_ts_controller_path = None
+        candidate_ts_adversary_path = None
+        best_ts_controller_path = None
+        best_ts_adversary_path = None
+        if export_ts_artifacts:
+            c_ctrl, c_adv, _ = _export_torchscript_artifacts_for_checkpoint(
+                checkpoint_path=ckpt_path,
+                out_dir=ckpt_dir,
+                model_version=arena_candidate_version,
+                device="cpu",
+                num_actions_controller=int(cfg.model.num_actions_controller),
+                num_actions_adversary=int(cfg.model.num_actions_adversary),
+            )
+            b_ctrl, b_adv, _ = _export_torchscript_artifacts_for_checkpoint(
+                checkpoint_path=best_path,
+                out_dir=ckpt_dir,
+                model_version=arena_best_version,
+                device="cpu",
+                num_actions_controller=int(cfg.model.num_actions_controller),
+                num_actions_adversary=int(cfg.model.num_actions_adversary),
+            )
+            candidate_ts_controller_path = c_ctrl
+            candidate_ts_adversary_path = c_adv
+            best_ts_controller_path = b_ctrl
+            best_ts_adversary_path = b_adv
+
         # 5) arena evaluation against current best 
    
         arena_root_entries = _build_arena_root_entries(gen, evaluator_cfg, cfg)
@@ -1013,14 +1570,24 @@ def selfImprovementPolicy(
                     "arena_max_total_turns": int(evaluator_cfg.arena_max_total_turns),
                     "feature_version": int(cfg.run.feature_version),
                     "tie_points": float(evaluator_cfg.tie_points),
+                    "infer_mode": str(infer_mode),
+                    "fallback_to_python_infer": bool(getattr(cfg.native, "fallback_to_python_infer", True)),
+                    "candidate_model_version": int(arena_candidate_version),
+                    "best_model_version": int(arena_best_version),
+                    "candidate_ts_controller_path": str(candidate_ts_controller_path) if candidate_ts_controller_path else "",
+                    "candidate_ts_adversary_path": str(candidate_ts_adversary_path) if candidate_ts_adversary_path else "",
+                    "best_ts_controller_path": str(best_ts_controller_path) if best_ts_controller_path else "",
+                    "best_ts_adversary_path": str(best_ts_adversary_path) if best_ts_adversary_path else "",
                 }
             )
             arena_tasks_sent += 1
 
-        arena_msgs = [result_q.get() for _ in range(arena_tasks_sent)]
-        for msg in arena_msgs:
-            if not bool(msg.get("ok", False)):
-                raise RuntimeError(f"arena worker failed: {msg.get('error', 'unknown error')}")
+        arena_msgs = _collect_results(
+            expected=arena_tasks_sent,
+            task_kind="arena",
+            gen=int(gen),
+            round_idx=None,
+        )
 
         arena_metrics = grade_arena_from_game_logs(
             game_log_dir=arena_games_dir,
@@ -1068,6 +1635,17 @@ def selfImprovementPolicy(
         p.join()
         if p.exitcode != 0:
             raise RuntimeError(f"selfplay worker died: pid={p.pid} exitcode={p.exitcode}")
+
+    if infer_service_proc is not None:
+        if TorchScriptInferClient is not None:
+            try:
+                c = TorchScriptInferClient(addr=str(cfg.native.infer_service_addr))
+                c.shutdown()
+                c.close()
+            except Exception:
+                pass
+        infer_service_proc.terminate()
+        infer_service_proc.join(timeout=5.0)
 
 
 
@@ -1134,6 +1712,26 @@ class ModelGroup:
 
 
 @dataclass(frozen=True)
+class NativeRuntimeGroup:
+    enabled: bool = False
+    backend: str = "python"  # python | cpp_virtual
+    strict_compat: bool = True
+    multiprocess_safety_mode: bool = False
+    native_trace: bool = False
+    native_trace_every: int = 500
+    native_trace_dir: str = "simulator_output/mcts_dnn_logs"
+    infer_mode: str = "python"  # python | torchscript_service | torchscript_cpp
+    infer_service_impl: str = "cpp"  # cpp | python
+    torchscript_full_native_search: bool = False
+    infer_service_addr: str = "127.0.0.1:50201"
+    infer_service_device: str = "cuda:0"
+    infer_max_batch: int = 256
+    infer_max_wait_us: int = 2000
+    export_torchscript: bool = False
+    fallback_to_python_infer: bool = True
+
+
+@dataclass(frozen=True)
 class LoggingGroup:
     mcts_iter_log: str = "simulator_output/mcts_dnn_logs/mcts_iter.csv"
     mcts_root_log: str = "simulator_output/mcts_dnn_logs/mcts_root.csv"
@@ -1156,6 +1754,8 @@ class RunGroup:
     feature_version: int = 1
     sample_from_mcts_policy: bool = False
     selfplay_policy_temperature: float = 1.0
+    max_forced_hops_per_root: int = 1024
+    history_max_total_steps: int = 20000
 
 
 @dataclass(frozen=True)
@@ -1167,6 +1767,7 @@ class AlphaZeroConfig:
     logging: LoggingGroup
     dataset: DatasetGroup
     run: RunGroup
+    native: NativeRuntimeGroup = dc_field(default_factory=NativeRuntimeGroup)
 
 
 # -----------------------------
@@ -1241,6 +1842,24 @@ def main() -> None:
             num_actions_adversary=6,
             device="cuda" if torch.cuda.is_available() else "cpu",
         ),
+        native=NativeRuntimeGroup(
+            enabled=True,
+            backend="cpp_virtual",  # python | cpp_virtual
+            strict_compat=True,
+            multiprocess_safety_mode=False,
+            native_trace=False,
+            native_trace_every=250,
+            native_trace_dir="simulator_output/mcts_dnn_logs",
+            infer_mode="torchscript_service",
+            infer_service_impl="cpp",
+            torchscript_full_native_search=True,
+            infer_service_addr="127.0.0.1:50201",
+            infer_service_device="cuda:0",
+            infer_max_batch=256,
+            infer_max_wait_us=2000,
+            export_torchscript=False,
+            fallback_to_python_infer=False,
+        ),
         logging=LoggingGroup(
             mcts_iter_log="simulator_output/mcts_dnn_logs/mcts_iter.csv",
             mcts_root_log="simulator_output/mcts_dnn_logs/mcts_root.csv",
@@ -1259,6 +1878,8 @@ def main() -> None:
             feature_version=1,
             sample_from_mcts_policy=False,
             selfplay_policy_temperature=0,
+            max_forced_hops_per_root=512,
+            history_max_total_steps=12000,
         ),
     )
 

@@ -157,7 +157,7 @@ class SelfPlayRunner:
         player: str,
         depth: int,
         *,
-        max_hops: int = 10000,
+        max_hops: int = 1024,
     ) -> tuple[VidurMCTSState, str, int]:
         """
         Advance the real self-play state through forced moves until the current player
@@ -165,7 +165,8 @@ class SelfPlayRunner:
 
         Returns: (state, player_to_act, updated_depth)
         """
-        for _ in range(int(max_hops)):
+        max_hops_i = max(1, int(max_hops))
+        for _ in range(max_hops_i):
            
             if player == "controller":
                 actions_by_index, mask = self.env.sample_controller_actions(state, self.mcts._cfg.max_branching)
@@ -203,6 +204,10 @@ class SelfPlayRunner:
             player = "controller"
             depth += 1
 
+        print(
+            f"[SelfPlayRunner] advance cap reached: max_hops={max_hops_i} "
+            f"depth={depth} player={player}; proceeding without guaranteed branching"
+        )
         return state, player, depth
 
 
@@ -303,6 +308,8 @@ class SelfPlayRunner:
         sample_from_mcts_policy: bool = False,
         selfplay_policy_temperature: float = 0.0,
         action_seed_base: int = 0,
+        max_forced_hops_per_root: int = 1024,
+        history_max_total_steps: int = 20000,
     ) -> VidurMCTSState:
         # state = initial_state or self.env.initial_state()
         # player = start_player
@@ -326,9 +333,12 @@ class SelfPlayRunner:
                 log_node_id_start=next_log_node_id,
                 log_parent_id_start=last_log_node_id,
                 seed=history_seed,
+                max_total_steps=int(history_max_total_steps),
             )
             # IMPORTANT: prevent MCTS from reusing history node ids
             self.mcts._node_counter = int(next_log_node_id)
+
+        warned_overflow_soft = False
 
         for k in range(int(num_roots)):
             root_node_id_override = int(last_log_node_id) if (k == 0 and last_log_node_id is not None) else None
@@ -336,17 +346,23 @@ class SelfPlayRunner:
             # root_depth = start_root_depth + k
 
             # force-advance until branching before running MCTS
-            state, player, depth = self._advance_to_branching_root(state, player, depth)
+            state, player, depth = self._advance_to_branching_root(
+                state,
+                player,
+                depth,
+                max_hops=int(max_forced_hops_per_root),
+            )
 
-            ## TODO : This terminal condition needs to be later avoided. NOT NEEDED ANYMORE, AVOID IT 
-            # NEW: terminal cutoff for dataset collection
             requests_in_system = int(self.env.describe_state(state).get("requests_in_system", 0))
             if requests_in_system > int(max_batch_size):
-                print(
-                    f"[SelfPlayRunner] stop: requests_in_system={requests_in_system} "
-                    f"> max_batch_size={max_batch_size}"
-                )
-                return state
+                if not warned_overflow_soft:
+                    print(
+                        f"[SelfPlayRunner] soft_overflow: requests_in_system={requests_in_system} "
+                        f"> max_batch_size={max_batch_size}; continuing search "
+                        f"(game_id={game_id}, root_id={root_id})",
+                        flush=True,
+                    )
+                    warned_overflow_soft = True
 
             # Determine iterations per root based on player to act
             iters = int(adv_iterations_per_root if player == "adversary" else cont_iterations_per_root)

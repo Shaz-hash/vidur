@@ -17,6 +17,10 @@ from .DNN.misc import dump_tree_snapshot_csv
 # Imports for excuting DNN model during MCTS
 import torch 
 from .DNN import infer as dnn_infer
+try:
+    from . import mcts_native as _mcts_native
+except Exception:  # pragma: no cover - optional native runtime
+    _mcts_native = None
 
 # Logger Imports
 from .logger.mctsDNN_logger import DNNMCTSIterationLogger, DNNMCTSRootSummaryLogger
@@ -1110,6 +1114,244 @@ class VidurMCTS:
 
 
 
+    def _native_mcts_enabled(self) -> bool:
+        return bool(getattr(self._cfg, "native_mcts_enabled", False)) and _mcts_native is not None
+
+
+    def _native_infer_callback(self, dnn_model: Any):
+        def _cb(state: VidurMCTSState, player: str, mask_list: List[bool]):
+            action_mask = torch.tensor(
+                [bool(x) for x in mask_list],
+                dtype=torch.bool,
+            ).unsqueeze(0)
+            value, priors = self._nn_value_and_priors(
+                dnn_model,
+                state,
+                str(player),
+                action_mask=action_mask,
+            )
+            return float(value), [float(x) for x in priors]
+
+        return _cb
+
+
+    def _apply_native_search_result(
+        self,
+        *,
+        native_result: dict,
+        root_node_id: int,
+        root_depth: int,
+        root_player: str,
+    ) -> None:
+        root = self._root
+        if root is None:
+            raise RuntimeError("Root must be initialized before applying native result")
+
+        root.player = str(root_player)
+        root.node_id = int(root_node_id)
+        root.depth = int(root_depth)
+        root.parent = None
+        root.parent_action = None
+        root.parent_action_index = None
+
+        root.visits = int(native_result.get("root_visits", 0))
+        root.value_sum = float(native_result.get("root_value_sum", 0.0))
+        root.state_cost = float(native_result.get("root_state_cost", 0.0))
+        root.sim_time = float(native_result.get("root_sim_time", 0.0))
+        root.num_valid_actions = int(native_result.get("root_num_valid_actions", 0))
+
+        nn_v = native_result.get("root_nn_value_controller", None)
+        root.nn_value_controller = (None if nn_v is None else float(nn_v))
+        nn_priors = native_result.get("root_nn_priors", None)
+        root.nn_priors = (None if nn_priors is None else [float(x) for x in nn_priors])
+        nn_priors_thr = native_result.get("root_nn_priors_after_threshold", None)
+        root.nn_priors_after_threshold = (
+            None if nn_priors_thr is None else [float(x) for x in nn_priors_thr]
+        )
+        nn_mask = native_result.get("root_nn_valid_mask", None)
+        root.nn_valid_mask = (None if nn_mask is None else [bool(x) for x in nn_mask])
+
+        root.action_alias_to_canonical = {
+            int(k): int(v)
+            for k, v in dict(native_result.get("action_alias_to_canonical", {})).items()
+        }
+        root.canonical_to_action_aliases = {
+            int(k): [int(x) for x in list(v)]
+            for k, v in dict(native_result.get("canonical_to_action_aliases", {})).items()
+        }
+
+        root.children.clear()
+        max_seen_node_id = int(root.node_id)
+        for row in list(native_result.get("children", [])):
+            idx = int(row.get("index"))
+            child_node_id = int(row.get("node_id", idx))
+            max_seen_node_id = max(max_seen_node_id, child_node_id)
+            child = MCTSNode(
+                player=str(row.get("player", "controller" if root.player == "adversary" else "adversary")),
+                node_id=child_node_id,
+                depth=int(row.get("depth", root.depth + 1)),
+                parent=root,
+                parent_action=row.get("parent_action", None),
+                parent_action_index=idx,
+                prior=float(row.get("prior", 0.0)),
+                reward=float(row.get("reward", 0.0)),
+                visits=int(row.get("visits", 0)),
+                value_sum=float(row.get("value_sum", 0.0)),
+                sim_time=float(row.get("sim_time", 0.0)),
+                state_cost=float(row.get("state_cost", 0.0)),
+                num_valid_actions=int(row.get("num_valid_actions", 0)),
+            )
+            root.children[idx] = child
+
+        self._node_counter = max(self._node_counter, max_seen_node_id + 1)
+
+
+    def _search_dnn_native(
+        self,
+        *,
+        dnn_model: Any,
+        rootState: VidurMCTSState,
+        root_player: str,
+        iterations: int,
+        root_node_id: int,
+        root_depth: int,
+    ) -> None:
+        if _mcts_native is None:
+            raise RuntimeError("native_mcts_enabled=True but vidur.mcts.mcts_native is unavailable")
+        if not hasattr(_mcts_native, "search_mcts_dnn"):
+            raise RuntimeError("mcts_native.search_mcts_dnn is missing; rebuild native module")
+
+        reward_knee = float(getattr(self._cfg, "reward_knee", 25.0))
+        reward_max_penalty = float(getattr(self._cfg, "reward_max_penalty", 40.0))
+        headroom = max(reward_max_penalty - reward_knee, 1e-9)
+        reward_tail_alpha = float(getattr(self._cfg, "reward_tail_alpha", 1.0 / headroom))
+
+        common_kwargs = dict(
+            env=self._env,
+            root_state=rootState,
+            root_player=str(root_player),
+            iterations=int(iterations),
+            max_branching=int(getattr(self._cfg, "max_branching", 10)),
+            controller_min_prior_threshold=float(
+                getattr(self._cfg, "controller_min_prior_threshold", 0.0) or 0.0
+            ),
+            adversary_min_prior_threshold=float(
+                getattr(self._cfg, "adversary_min_prior_threshold", 0.0) or 0.0
+            ),
+            root_dirichlet_noise_enabled=bool(
+                getattr(self._cfg, "root_dirichlet_noise_enabled", False)
+            ),
+            root_dirichlet_alpha=float(getattr(self._cfg, "root_dirichlet_alpha", 0.3) or 0.3),
+            root_dirichlet_epsilon=float(
+                getattr(self._cfg, "root_dirichlet_epsilon", 0.25) or 0.25
+            ),
+            pb_c_base=float(getattr(self._cfg, "pb_c_base", 5000)),
+            pb_c_init=float(getattr(self._cfg, "pb_c_init", 0.75)),
+            discount_factor=float(getattr(self._cfg, "discount_factor", 0.98)),
+            prefill_step_time=float(getattr(self, "_prefill_step_time", 0.0388862329)),
+            reward_knee=reward_knee,
+            reward_max_penalty=reward_max_penalty,
+            reward_tail_alpha=reward_tail_alpha,
+            seed=int(self._rng.randint(0, 2**31 - 1)),
+            root_node_id=int(root_node_id),
+            root_depth=int(root_depth),
+        )
+
+        native_ts_runtime = getattr(dnn_model, "_native_ts_runtime", None)
+        native_ts_model_version = getattr(dnn_model, "_native_ts_model_version", None)
+        # If a native TorchScript runtime is present, prefer full-native search.
+        # This avoids the mixed callback bridge (C++ -> Python infer callback),
+        # which has been unstable under multiprocess load.
+        use_full_native_ts = bool(getattr(self._cfg, "torchscript_full_native_search", False))
+        if (
+            not use_full_native_ts
+            and native_ts_runtime is not None
+            and native_ts_model_version is not None
+            and hasattr(_mcts_native, "search_mcts_dnn_torchscript")
+        ):
+            use_full_native_ts = True
+            if not bool(getattr(self, "_auto_native_ts_full_search_logged", False)):
+                print(
+                    "[VidurMCTS] auto-enabled full native torchscript search "
+                    "(avoids unstable callback bridge path)",
+                    flush=True,
+                )
+                self._auto_native_ts_full_search_logged = True
+        if (
+            use_full_native_ts
+            and
+            native_ts_runtime is not None
+            and native_ts_model_version is not None
+            and hasattr(_mcts_native, "search_mcts_dnn_torchscript")
+        ):
+            native_search_fn = _mcts_native.search_mcts_dnn_torchscript
+            try:
+                if (
+                    hasattr(_mcts_native, "NativeInferServiceRuntime")
+                    and hasattr(_mcts_native, "search_mcts_dnn_torchscript_service")
+                    and isinstance(native_ts_runtime, _mcts_native.NativeInferServiceRuntime)
+                ):
+                    native_search_fn = _mcts_native.search_mcts_dnn_torchscript_service
+            except Exception:
+                pass
+
+            native_result = native_search_fn(
+                infer_runtime=native_ts_runtime,
+                model_version=int(native_ts_model_version),
+                **common_kwargs,
+            )
+        else:
+            native_result = _mcts_native.search_mcts_dnn(
+                infer_cb=self._native_infer_callback(dnn_model),
+                **common_kwargs,
+            )
+        if not isinstance(native_result, dict):
+            raise RuntimeError("native search returned invalid payload")
+
+        perf = native_result.get("perf")
+        if isinstance(perf, dict) and bool(getattr(self._cfg, "native_profile", True)):
+            try:
+                print(
+                    "[NATIVE_SEARCH_PERF] "
+                    f"root_node_id={int(root_node_id)} player={str(root_player)} iters={int(iterations)} "
+                    f"total={float(perf.get('total_sec', 0.0)):.3f}s "
+                    f"state={float(perf.get('state_build_sec', 0.0)):.3f}s "
+                    f"predictor={float(perf.get('predictor_load_sec', 0.0)):.3f}s "
+                    f"root_expand={float(perf.get('root_expand_sec', 0.0)):.3f}s "
+                    f"selection={float(perf.get('selection_sec', 0.0)):.3f}s "
+                    f"restore={float(perf.get('restore_sec', 0.0)):.3f}s "
+                    f"forced={float(perf.get('forced_chain_sec', 0.0)):.3f}s "
+                    f"forced_mask={float(perf.get('forced_actions_mask_sec', 0.0)):.3f}s "
+                    f"forced_apply={float(perf.get('forced_apply_sec', 0.0)):.3f}s "
+                    f"leaf_expand={float(perf.get('leaf_expand_sec', 0.0)):.3f}s "
+                    f"backprop={float(perf.get('backprop_sec', 0.0)):.3f}s "
+                    f"actions_mask_total={float(perf.get('actions_mask_total_sec', 0.0)):.3f}s "
+                    f"infer_total={float(perf.get('infer_total_sec', 0.0)):.3f}s "
+                    f"infer_build={float(perf.get('infer_build_sec', 0.0)):.3f}s "
+                    f"infer_forward={float(perf.get('infer_forward_sec', 0.0)):.3f}s "
+                    f"expand_threshold={float(perf.get('expand_threshold_sec', 0.0)):.3f}s "
+                    f"expand_dedup={float(perf.get('expand_dedup_sec', 0.0)):.3f}s "
+                    f"expand_child_create={float(perf.get('expand_child_create_sec', 0.0)):.3f}s "
+                    f"infer_calls={int(perf.get('infer_calls', 0))} "
+                    f"expand_calls={int(perf.get('expand_calls', 0))} "
+                    f"selection_steps={int(perf.get('selection_steps', 0))} "
+                    f"forced_steps={int(perf.get('forced_steps', 0))} "
+                    f"restore_missing={int(perf.get('restore_missing_nodes_total', 0))} "
+                    f"nodes_capacity_grows={int(perf.get('nodes_capacity_grows', 0))} "
+                    f"expand_ctrl_actions={int(perf.get('expand_controller_actions_total', 0))} "
+                    f"expand_ctrl_alloc_pairs={int(perf.get('expand_controller_alloc_pairs_total', 0))}",
+                    flush=True,
+                )
+            except Exception:
+                pass
+
+        self._apply_native_search_result(
+            native_result=native_result,
+            root_node_id=int(root_node_id),
+            root_depth=int(root_depth),
+            root_player=str(root_player),
+        )
+
 
 
     def search_dnn(self, dnn_model: Any, rootState: VidurMCTSState, root_player: str, iterations: int , * , game_id: int , root_id: int, root_node_id_override: int | None , root_depth: int , root_phase: str = "train_root", cycle_label: str = "",) -> Tuple[str, List[Union[AdversaryAction, ControllerAction]]]:
@@ -1174,51 +1416,58 @@ class VidurMCTS:
         #     for k in self._env._perf:
         #         self._env._perf[k] = 0.0
 
-
-
-        # --- Root evaluation (NOT counted as a simulation) ---
-        # This seeds priors / nn cache so PUCT is defined, but we do NOT let it bias MCTS value.
-        root_work = self._scratch_restore(self._root.cached_sim_snapshot, self._root.cached_stats)
-        _ignored_value, _ignored_called, _ignored_num_valid = self._expand_node(self._root, root_work, dnn_model)
-
-        self._maybe_add_root_dirichlet_noise(
-            self._root,
-            nn_called=bool(_ignored_called),
-            num_valid_actions=int(_ignored_num_valid),
-        )
-
-
-
-        for sim_iteration in range(int(iterations)):
-            # print(f"[INFO] Starting MCTS simulation iteration {sim_iteration} / {iterations}_______")
-            # t1 = time.perf_counter()
-            self.run_one_simulation(
-                self._root,
-                dnn_model,
-                min_max_stats,
-                game_id=game_id,
-                root_id=root_id,
-                sim_iteration=sim_iteration,
+        if self._native_mcts_enabled():
+            self._search_dnn_native(
+                dnn_model=dnn_model,
+                rootState=rootState,
+                root_player=root_player,
+                iterations=int(iterations),
+                root_node_id=int(root_node_id),
+                root_depth=int(root_depth),
             )
-            # t2 = time.perf_counter()
-            # print(f"[PERF] MCTS simulation {sim_iteration} time: {(t2 - t1)} seconds ======= \n\n")
+        else:
+            # --- Root evaluation (NOT counted as a simulation) ---
+            # This seeds priors / nn cache so PUCT is defined, but we do NOT let it bias MCTS value.
+            root_work = self._scratch_restore(self._root.cached_sim_snapshot, self._root.cached_stats)
+            _ignored_value, _ignored_called, _ignored_num_valid = self._expand_node(self._root, root_work, dnn_model)
+
+            self._maybe_add_root_dirichlet_noise(
+                self._root,
+                nn_called=bool(_ignored_called),
+                num_valid_actions=int(_ignored_num_valid),
+            )
+
+            for sim_iteration in range(int(iterations)):
+                self.run_one_simulation(
+                    self._root,
+                    dnn_model,
+                    min_max_stats,
+                    game_id=game_id,
+                    root_id=root_id,
+                    sim_iteration=sim_iteration,
+                )
 
         next_player = "controller" if self._root.player == "adversary" else "adversary"
         action_space = [child.parent_action for child in self._root.children.values()]
 
+        ## Filling Logging details for root node after MCTS Search is done :
+        # Always log a root row. For forced/terminal roots (no NN call), use a
+        # safe fallback payload so native/Python paths still emit CSV output.
         if (
             self._root.nn_value_controller is None
             or self._root.nn_priors is None
             or self._root.nn_valid_mask is None
         ):
-            return next_player, action_space
-
-        ## Filling Logging details for root node after MCTS Search is done :
-
-        # model_v, model_prior, mask, mcts_prior, best_idx = self._compute_root_log_payload_from_cache(
-        #     root=self._root,
-        # )
-        model_v, model_prior, normalized_prior, mask, mcts_prior, best_idx = self._compute_root_log_payload_from_cache(root=self._root)
+            model_v, model_prior, normalized_prior, mask, mcts_prior, best_idx = (
+                self._compute_root_log_payload_without_nn(
+                    root=self._root,
+                    root_state=rootState,
+                )
+            )
+        else:
+            model_v, model_prior, normalized_prior, mask, mcts_prior, best_idx = (
+                self._compute_root_log_payload_from_cache(root=self._root)
+            )
 
        
         ### DEBUGGING LOG ###
@@ -1394,7 +1643,7 @@ class VidurMCTS:
     def _compute_root_log_payload_from_cache(
         self,
         root: MCTSNode,
-    ) -> tuple[float, list[float], list[bool], list[float], int]:
+    ) -> tuple[float, list[float], list[float], list[bool], list[float], Optional[int]]:
         if root.nn_value_controller is None or root.nn_priors is None or root.nn_valid_mask is None:
             raise RuntimeError("Root NN eval missing; evaluate+cache root before logging")
 
@@ -1444,6 +1693,67 @@ class VidurMCTS:
             best_idx = next((i for i, ok in enumerate(mask) if ok), 0)
 
         
+        return model_v, model_prior, normalized_prior, mask, mcts_prior, best_idx
+
+    def _compute_root_log_payload_without_nn(
+        self,
+        *,
+        root: MCTSNode,
+        root_state: VidurMCTSState,
+    ) -> tuple[float, list[float], list[float], list[bool], list[float], Optional[int]]:
+        if root.player == "controller":
+            _, mask_raw = self._env.sample_controller_actions(root_state, self._cfg.max_branching)
+        else:
+            _, mask_raw = self._env.sample_adversary_actions(root_state, self._cfg.max_branching)
+
+        if isinstance(mask_raw, torch.Tensor):
+            mask = [bool(x) for x in mask_raw.to(dtype=torch.bool).tolist()]
+        else:
+            mask = [bool(x) for x in mask_raw]
+
+        num_actions = len(mask)
+        model_v = 0.0
+        model_prior = [0.0] * num_actions
+        normalized_prior = [0.0] * num_actions
+
+        visit_mass = [0.0] * num_actions
+        if root.canonical_to_action_aliases:
+            for canon, aliases in root.canonical_to_action_aliases.items():
+                child = root.children.get(int(canon))
+                visits = float(child.visits) if child is not None else 0.0
+                alias_ids = [int(aidx) for aidx in aliases if 0 <= int(aidx) < num_actions]
+                if not alias_ids:
+                    continue
+                share = visits / float(len(alias_ids))
+                for aidx in alias_ids:
+                    visit_mass[aidx] = share
+        else:
+            for action_index, child in root.children.items():
+                idx = int(action_index)
+                if 0 <= idx < num_actions:
+                    visit_mass[idx] = float(child.visits)
+
+        total = sum(visit_mass[i] for i in range(num_actions) if mask[i])
+        if total > 0:
+            mcts_prior = [(visit_mass[i] / total) if mask[i] else 0.0 for i in range(num_actions)]
+        else:
+            valid_idx = [i for i, ok in enumerate(mask) if ok]
+            mcts_prior = [0.0] * num_actions
+            if valid_idx:
+                p = 1.0 / float(len(valid_idx))
+                for i in valid_idx:
+                    mcts_prior[i] = p
+
+        valid_canons = [
+            int(i)
+            for i in root.children.keys()
+            if 0 <= int(i) < num_actions and mask[int(i)]
+        ]
+        if valid_canons:
+            best_idx: Optional[int] = max(valid_canons, key=lambda i: int(root.children[i].visits))
+        else:
+            best_idx = next((i for i, ok in enumerate(mask) if ok), None)
+
         return model_v, model_prior, normalized_prior, mask, mcts_prior, best_idx
 
     def _adversary_prefill_deadlines_by_id_json(
