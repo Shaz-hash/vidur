@@ -13,6 +13,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <numeric>
 #include <random>
@@ -33,6 +34,7 @@
 #include <sys/stat.h>
 #include <time.h>
 
+#include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -2336,8 +2338,7 @@ static py::dict search_mcts_dnn(
             auto& parent = nodes[(size_t)node.parent];
             const bool parent_is_branching =
                 (parent.num_valid_actions > 1) || (parent.children.size() > 1);
-            const double disc =
-                parent_is_branching ? time_discount(cfg, node.sim_time, parent.sim_time) : 1.0;
+            const double disc = time_discount(cfg, node.sim_time, parent.sim_time);
             const double reward_used = parent_is_branching ? node.reward : 0.0;
 
             if (parent_is_branching && node.visits > 0) {
@@ -2512,6 +2513,359 @@ static bool py_get_b(const py::object& obj, const char* name, bool dflt) {
     } catch (...) {
     }
     return dflt;
+}
+
+static py::object py_predictor_from_env(const py::object& env) {
+    try {
+        py::object base = env.attr("_base");
+        if (!py::hasattr(base, "_execution_time_predictor")) return py::none();
+        py::object pred = base.attr("_execution_time_predictor");
+        if (pred.is_none()) return py::none();
+        return pred;
+    } catch (...) {
+        return py::none();
+    }
+}
+
+static std::string native_component_kind_for_name(const std::string& name) {
+    if (name == "attn_decode") return "decode";
+    if (name == "attn_prefill") return "prefill";
+    if (
+        name == "schedule" ||
+        name == "sampler_e2e" ||
+        name == "prepare_inputs_e2e" ||
+        name == "process_model_outputs" ||
+        name == "ray_comm_time"
+    ) {
+        return "batch_size";
+    }
+    if (
+        name == "attn_pre_proj" ||
+        name == "attn_post_proj" ||
+        name == "mlp_up_proj" ||
+        name == "mlp_down_proj" ||
+        name == "mlp_act" ||
+        name == "attn_rope" ||
+        name == "attn_kv_cache_save" ||
+        name == "input_layernorm" ||
+        name == "post_attention_layernorm" ||
+        name == "add" ||
+        name == "all_reduce" ||
+        name == "send_recv"
+    ) {
+        return "num_tokens";
+    }
+    return std::string();
+}
+
+static bool native_dense_shape_for_kind(
+    const std::string& kind,
+    int max_tokens,
+    int max_batch_size,
+    int kv_gran,
+    int prefill_gran,
+    int max_prefill_chunk,
+    std::vector<int>* shape_out
+) {
+    if (shape_out == nullptr) return false;
+    shape_out->clear();
+    if (kind == "num_tokens") {
+        if (max_tokens <= 0) return false;
+        shape_out->push_back(max_tokens);
+        return true;
+    }
+    if (kind == "batch_size") {
+        if (max_batch_size <= 0) return false;
+        shape_out->push_back(max_batch_size);
+        return true;
+    }
+    if (kind == "decode") {
+        if (max_batch_size <= 0 || kv_gran <= 0 || max_tokens < 0) return false;
+        shape_out->push_back(max_batch_size);
+        shape_out->push_back((max_tokens / kv_gran) + 1);
+        return true;
+    }
+    if (kind == "prefill") {
+        if (kv_gran <= 0 || prefill_gran <= 0 || max_tokens < 0 || max_prefill_chunk <= 0) return false;
+        shape_out->push_back((max_tokens / kv_gran) + 1);
+        shape_out->push_back(max_prefill_chunk / prefill_gran);
+        return shape_out->size() == 2 && (*shape_out)[1] > 0;
+    }
+    return false;
+}
+
+static bool native_predictor_set_table_from_array(
+    NativePredictor& predictor,
+    const std::string& name,
+    const std::string& kind,
+    int max_tokens,
+    int max_batch_size,
+    int kv_gran,
+    int prefill_gran,
+    const py::object& array_obj
+) {
+    try {
+        py::array_t<double, py::array::c_style | py::array::forcecast> arr = py::array_t<double, py::array::c_style | py::array::forcecast>::ensure(array_obj);
+        if (!arr) return false;
+        py::buffer_info info = arr.request();
+        if (info.ndim < 1 || info.ndim > 2) return false;
+        std::vector<int> shape;
+        shape.reserve((size_t)info.ndim);
+        size_t count = 1;
+        for (ssize_t i = 0; i < info.ndim; ++i) {
+            shape.push_back((int)info.shape[(size_t)i]);
+            count *= (size_t)info.shape[(size_t)i];
+        }
+        const double* ptr = static_cast<const double*>(info.ptr);
+        std::vector<double> values(ptr, ptr + count);
+        predictor.set_component_table(
+            name,
+            kind,
+            max_tokens,
+            max_batch_size,
+            kv_gran,
+            prefill_gran,
+            std::move(shape),
+            std::move(values)
+        );
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+static bool native_predictor_set_table_from_mapping(
+    NativePredictor& predictor,
+    const std::string& name,
+    const std::string& kind,
+    int max_tokens,
+    int max_batch_size,
+    int kv_gran,
+    int prefill_gran,
+    int max_prefill_chunk,
+    const py::object& mapping_obj
+) {
+    std::vector<int> shape;
+    if (!native_dense_shape_for_kind(
+            kind,
+            max_tokens,
+            max_batch_size,
+            kv_gran,
+            prefill_gran,
+            max_prefill_chunk,
+            &shape)) {
+        return false;
+    }
+    size_t total = 1;
+    for (int dim : shape) total *= (size_t)std::max(0, dim);
+    if (total == 0) return false;
+
+    std::vector<double> values(total, 0.0);
+    try {
+        py::dict d = mapping_obj.cast<py::dict>();
+        for (const auto& kv : d) {
+            py::tuple key = py::reinterpret_borrow<py::tuple>(kv.first);
+            const double value = py::cast<double>(kv.second);
+            size_t idx = 0;
+            if (kind == "num_tokens") {
+                if (py::len(key) != 1) continue;
+                const int t = py::cast<int>(key[0]);
+                if (t < 1 || t > shape[0]) continue;
+                idx = (size_t)(t - 1);
+            } else if (kind == "batch_size") {
+                if (py::len(key) != 1) continue;
+                const int b = py::cast<int>(key[0]);
+                if (b < 1 || b > shape[0]) continue;
+                idx = (size_t)(b - 1);
+            } else if (kind == "decode") {
+                if (py::len(key) != 2 || kv_gran <= 0) continue;
+                const int b = py::cast<int>(key[0]);
+                const int cache = py::cast<int>(key[1]);
+                const int row = b - 1;
+                const int col = cache / kv_gran;
+                if (row < 0 || row >= shape[0] || col < 0 || col >= shape[1]) continue;
+                idx = (size_t)row * (size_t)shape[1] + (size_t)col;
+            } else if (kind == "prefill") {
+                if (py::len(key) != 2 || kv_gran <= 0 || prefill_gran <= 0) continue;
+                const int cache = py::cast<int>(key[0]);
+                const int chunk = py::cast<int>(key[1]);
+                const int row = cache / kv_gran;
+                const int col = (chunk / prefill_gran) - 1;
+                if (row < 0 || row >= shape[0] || col < 0 || col >= shape[1]) continue;
+                idx = (size_t)row * (size_t)shape[1] + (size_t)col;
+            } else {
+                continue;
+            }
+            if (idx < values.size()) values[idx] = value;
+        }
+    } catch (...) {
+        return false;
+    }
+
+    predictor.set_component_table(
+        name,
+        kind,
+        max_tokens,
+        max_batch_size,
+        kv_gran,
+        prefill_gran,
+        std::move(shape),
+        std::move(values)
+    );
+    return true;
+}
+
+static bool populate_native_predictor_from_python(
+    const py::object& env,
+    NativePredictor& predictor,
+    std::string* source_out
+) {
+    py::object py_predictor = py_predictor_from_env(env);
+    if (py_predictor.is_none()) return false;
+
+    try {
+        py::object pred_cfg = py_predictor.attr("_config");
+        py::object replica_cfg = py_predictor.attr("_replica_config");
+        py::object model_cfg = py_predictor.attr("_model_config");
+
+        const int max_tokens = py_get_i(pred_cfg, "prediction_max_tokens_per_request", py_get_i(py_predictor, "_max_tokens", 0));
+        const int max_batch_size = py_get_i(pred_cfg, "prediction_max_batch_size", 0);
+        const int kv_gran = py_get_i(pred_cfg, "kv_cache_prediction_granularity", 64);
+        const int prefill_gran = py_get_i(pred_cfg, "prefill_chunk_size_prediction_granularity", 32);
+        const int max_prefill_chunk = py_get_i(pred_cfg, "prediction_max_prefill_chunk_size", 0);
+
+        NativePredictorRuntimeConfig native_cfg;
+        native_cfg.num_layers_per_pipeline_stage = py_get_i(py_predictor, "_num_layers_per_pipeline_stage", 1);
+        native_cfg.tensor_parallel_size = py_get_i(replica_cfg, "tensor_parallel_size", 1);
+        native_cfg.num_pipeline_stages = py_get_i(replica_cfg, "num_pipeline_stages", 1);
+        native_cfg.post_attn_norm = py_get_b(model_cfg, "post_attn_norm", true);
+        native_cfg.skip_cpu_overhead_modeling = py_get_b(pred_cfg, "skip_cpu_overhead_modeling", false);
+        native_cfg.attention_prefill_batching_overhead_fraction =
+            py_get_f(py_predictor, "_attention_prefill_batching_overhead_fraction", 0.0);
+        native_cfg.attention_decode_batching_overhead_fraction =
+            py_get_f(py_predictor, "_attention_decode_batching_overhead_fraction", 0.0);
+        native_cfg.nccl_cpu_launch_overhead_ms = py_get_f(pred_cfg, "nccl_cpu_launch_overhead_ms", 0.0);
+        native_cfg.nccl_cpu_skew_overhead_per_device_ms =
+            py_get_f(pred_cfg, "nccl_cpu_skew_overhead_per_device_ms", 0.0);
+
+        predictor.clear_component_tables();
+        predictor.set_runtime_config(native_cfg);
+
+        py::dict predictions = py_predictor.attr("_predictions").cast<py::dict>();
+        int loaded_tables = 0;
+        for (const auto& kv : predictions) {
+            const std::string name = py::cast<std::string>(kv.first);
+            const std::string kind = native_component_kind_for_name(name);
+            if (kind.empty()) continue;
+            py::object table_obj = py::reinterpret_borrow<py::object>(kv.second);
+            bool loaded = false;
+            if (py::hasattr(table_obj, "mmap")) {
+                loaded = native_predictor_set_table_from_array(
+                    predictor,
+                    name,
+                    kind,
+                    max_tokens,
+                    max_batch_size,
+                    kv_gran,
+                    prefill_gran,
+                    table_obj.attr("mmap")
+                );
+            } else {
+                loaded = native_predictor_set_table_from_mapping(
+                    predictor,
+                    name,
+                    kind,
+                    max_tokens,
+                    max_batch_size,
+                    kv_gran,
+                    prefill_gran,
+                    max_prefill_chunk,
+                    table_obj
+                );
+            }
+            if (loaded) loaded_tables += 1;
+        }
+
+        if (loaded_tables <= 0) return false;
+        if (source_out != nullptr) {
+            *source_out = py::cast<std::string>(pred_cfg.attr("cache_dir"));
+        }
+        return predictor.has_component_tables();
+    } catch (...) {
+        return false;
+    }
+}
+
+static std::shared_ptr<NativePredictor> get_cached_native_predictor(
+    const py::object& env,
+    std::string* mode_out,
+    std::string* source_out
+) {
+    static std::mutex cache_mu;
+    static std::unordered_map<std::uintptr_t, std::shared_ptr<NativePredictor>> py_cache;
+    static std::unordered_map<std::string, std::shared_ptr<NativePredictor>> csv_cache;
+
+    py::object py_predictor = py_predictor_from_env(env);
+    if (!py_predictor.is_none()) {
+        const std::uintptr_t key = reinterpret_cast<std::uintptr_t>(py_predictor.ptr());
+        {
+            std::lock_guard<std::mutex> lock(cache_mu);
+            auto it = py_cache.find(key);
+            if (it != py_cache.end()) {
+                if (mode_out != nullptr) *mode_out = "python_cache";
+                if (source_out != nullptr) {
+                    try {
+                        *source_out = py::cast<std::string>(py_predictor.attr("_config").attr("cache_dir"));
+                    } catch (...) {
+                        source_out->clear();
+                    }
+                }
+                return it->second;
+            }
+        }
+
+        auto predictor = std::make_shared<NativePredictor>();
+        std::string source;
+        if (populate_native_predictor_from_python(env, *predictor, &source)) {
+            std::lock_guard<std::mutex> lock(cache_mu);
+            auto [it, inserted] = py_cache.emplace(key, predictor);
+            if (!inserted) predictor = it->second;
+            if (mode_out != nullptr) *mode_out = "python_cache";
+            if (source_out != nullptr) *source_out = source;
+            return predictor;
+        }
+    }
+
+    std::string predictor_csv_path;
+    try {
+        predictor_csv_path = py::cast<std::string>(env.attr("_native_predictor_table_path"));
+    } catch (...) {
+    }
+    if (predictor_csv_path.empty()) {
+        const char* p = std::getenv("VIDUR_NATIVE_BATCH_TIME_TABLE");
+        if (p != nullptr) predictor_csv_path = p;
+    }
+
+    if (!predictor_csv_path.empty()) {
+        std::lock_guard<std::mutex> lock(cache_mu);
+        auto it = csv_cache.find(predictor_csv_path);
+        if (it != csv_cache.end()) {
+            if (mode_out != nullptr) *mode_out = "csv_table";
+            if (source_out != nullptr) *source_out = predictor_csv_path;
+            return it->second;
+        }
+        auto predictor = std::make_shared<NativePredictor>();
+        if (predictor->load_csv(predictor_csv_path)) {
+            csv_cache[predictor_csv_path] = predictor;
+            if (mode_out != nullptr) *mode_out = "csv_table";
+            if (source_out != nullptr) *source_out = predictor_csv_path;
+            return predictor;
+        }
+    }
+
+    if (mode_out != nullptr) *mode_out = "heuristic_fallback";
+    if (source_out != nullptr) source_out->clear();
+    return std::make_shared<NativePredictor>();
 }
 
 static NativeRuntimeConfig runtime_cfg_from_env(const py::object& env) {
@@ -3234,25 +3588,21 @@ static py::dict search_mcts_dnn_torchscript_impl(
     }
 
     const double t_pred0 = now_sec();
-    NativePredictor predictor;
-    std::string predictor_csv_path;
-    try {
-        predictor_csv_path = py::cast<std::string>(env.attr("_native_predictor_table_path"));
-    } catch (...) {
-    }
-    if (predictor_csv_path.empty()) {
-        const char* p = std::getenv("VIDUR_NATIVE_BATCH_TIME_TABLE");
-        if (p != nullptr) predictor_csv_path = p;
-    }
-    if (!predictor_csv_path.empty()) {
-        predictor.load_csv(predictor_csv_path);
-    }
+    std::string predictor_mode;
+    std::string predictor_source;
+    std::shared_ptr<NativePredictor> predictor_owner = get_cached_native_predictor(
+        env,
+        &predictor_mode,
+        &predictor_source
+    );
+    NativePredictor& predictor = *predictor_owner;
     perf.predictor_load_sec += (now_sec() - t_pred0);
     if (native_trace_should_log(search_call)) {
         std::ostringstream oss;
         oss
             << "search_ts predictor call=" << search_call
-            << " table=" << (predictor_csv_path.empty() ? std::string("<none>") : predictor_csv_path);
+            << " mode=" << predictor_mode
+            << " source=" << (predictor_source.empty() ? std::string("<none>") : predictor_source);
         native_trace(oss.str());
     }
 
@@ -3504,8 +3854,7 @@ static py::dict search_mcts_dnn_torchscript_impl(
             auto& parent = nodes[(size_t)node.parent];
             const bool parent_is_branching =
                 (parent.num_valid_actions > 1) || (parent.children.size() > 1);
-            const double disc =
-                parent_is_branching ? time_discount(cfg, node.sim_time, parent.sim_time) : 1.0;
+            const double disc = time_discount(cfg, node.sim_time, parent.sim_time);
             const double reward_used = parent_is_branching ? node.reward : 0.0;
 
             if (parent_is_branching && node.visits > 0) {

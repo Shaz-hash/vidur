@@ -115,15 +115,20 @@ static void update_requests_and_stats(
             }
             const int done = req->num_processed_decode_tokens;
             const int counted = stats.decode_tokens_counted.count(rid) ? stats.decode_tokens_counted[rid] : 0;
-            int new_tokens = done - counted;
-            while (new_tokens > 0) {
+            const int new_tokens = done - counted;
+            if (new_tokens != 0) {
+                if (new_tokens != 1) {
+                    throw std::runtime_error(
+                        "Expected 1 new decode token for req " + std::to_string(rid) +
+                        ", got " + std::to_string(new_tokens)
+                    );
+                }
                 const double deadline = stats.decode_next_deadline_by_id[rid];
                 const double token_late = std::max(0.0, sim_time - deadline);
                 stats.per_request_decode_lateness[rid] += token_late;
                 stats.slo_lateness_sum += token_late;
-                stats.decode_tokens_counted[rid] = stats.decode_tokens_counted[rid] + 1;
-                stats.decode_next_deadline_by_id[rid] = deadline + req->decode_slo;
-                new_tokens -= 1;
+                stats.decode_tokens_counted[rid] = done;
+                stats.decode_next_deadline_by_id[rid] = sim_time + req->decode_slo;
             }
         }
 

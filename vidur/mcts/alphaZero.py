@@ -724,7 +724,7 @@ def main() -> None:
             root_id=0,
             root_depth=0,
             root_player="adversary",
-            iterations=1000,
+            iterations=20000,
             feature_version=1,
         ),
         native=NativeRuntimeGroup(
@@ -890,8 +890,8 @@ def main() -> None:
         log_path=cfg.logging.mcts_iter_log,
         tree_log_path=cfg.logging.mcts_root_log,
         logger_flush_every=cfg.logging.flush_every,
-        verbose=True,
-        complete_log=True,
+        verbose=False,
+        complete_log=False,
     )
 
 
