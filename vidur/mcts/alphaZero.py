@@ -674,8 +674,8 @@ def main() -> None:
         runner.run_n_roots(
             game_id=cfg.run.game_id,
             num_roots=1,
-            adv_iterations_per_root=10000,
-            cont_iterations_per_root=10000,
+            adv_iterations_per_root=1000,
+            cont_iterations_per_root=1000,
             start_root_id=cfg.run.root_id,
             start_root_depth=0,
             start_player="adversary",

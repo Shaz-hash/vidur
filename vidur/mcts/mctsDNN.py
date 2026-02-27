@@ -88,6 +88,10 @@ class MCTSNode:
     cached_sim_snapshot: Any | None = None
     cached_stats: Any | None = None
 
+    # Debug related feilds for the PUCT :
+    last_expand_children_created: List[list] = field(default_factory=list)
+    last_expand_dedup: List[list] = field(default_factory=list)
+
 
     def expanded(self) -> bool:
         return len(self.children) > 0
@@ -131,9 +135,9 @@ class VidurMCTS:
 
         self._use_fast_sim_snapshot = True
 
-        # self._iter_logger = DNNMCTSIterationLogger(log_path, flush_every=logger_flush_every)
+        self._iter_logger = DNNMCTSIterationLogger(log_path, flush_every=logger_flush_every)
         # Disable per-simulation iteration logging (mcts_iter.csv)
-        self._iter_logger = DNNMCTSIterationLogger(None, flush_every=logger_flush_every)
+        # self._iter_logger = DNNMCTSIterationLogger(None, flush_every=logger_flush_every)
 
         self._root_logger = DNNMCTSRootSummaryLogger(tree_log_path, flush_every=logger_flush_every)
 
@@ -171,6 +175,12 @@ class VidurMCTS:
     def _state_cost(self, state: VidurMCTSState) -> float:
         violations, avg_lateness = self._env.evaluate_objective(state)
         return float(violations) + float(avg_lateness)
+
+
+    def _seed_node_runtime_from_state(self, node: MCTSNode, state: VidurMCTSState) -> None:
+        node.state_cost = float(self._state_cost(state))
+        node.sim_time = float(getattr(state.simulator, "_time", 0.0))
+
 
     # TODO: pass this via the config and experiment with different reward shaping functions
     def _transition_reward(self, parent_cost: float, child_cost: float) -> float:
@@ -712,6 +722,11 @@ class VidurMCTS:
 
         # Create children ONLY for canonical indices
         # t = time.perf_counter()
+
+        node.last_expand_children_created = []
+        node.last_expand_dedup = []
+
+
         for idx in canonical_indices:
             action = actions_by_index[idx]
             if action is None:
@@ -732,9 +747,53 @@ class VidurMCTS:
                 value_sum=0.0,
                 sim_time=state.simulator._time,
             )
+            if self._iter_logger is not None:    
+                node.last_expand_children_created.append([int(node.children[idx].node_id), float(node.children[idx].prior), int(idx)])
         # self._perf["expand_child_create"] += time.perf_counter() - t
 
+        if self._iter_logger is not None and node.player == "controller":
+            for canon_idx, aliases in node.canonical_to_action_aliases.items():
+                child = node.children.get(canon_idx)
+                if child is None:
+                    continue
+                node.last_expand_dedup.append([
+                    int(child.node_id),                     # canonical child id
+                    float(canonical_prior.get(canon_idx, 0.0)),
+                    [int(a) for a in aliases],
+                ])
+
         return value_used_for_backup, True, num_valid_actions
+
+
+    ## Function for DEBUGGING ONLY TODO : optimise it later or make it modular if needed. This function is same as UCB SCORE :
+    def _ucb_components(self, parent: MCTSNode, child: MCTSNode, min_max_stats: MinMaxStats) -> Dict[str, float]:
+        pb_c_base = getattr(self._cfg, "pb_c_base", 5000)
+        pb_c_init = getattr(self._cfg, "pb_c_init", 0.75)
+        parent_is_branching = (getattr(parent, "num_valid_actions", 0) > 1) or (len(parent.children) > 1)
+
+        pb_c = math.log((parent.visits + pb_c_base + 1.0) / pb_c_base) + pb_c_init
+        pb_c *= math.sqrt(parent.visits + 1.0) / (child.visits + 1.0)
+
+        prior_score = pb_c * float(child.prior)
+        if child.visits > 0:
+            disc = self._time_discount(float(child.sim_time), float(parent.sim_time)) if parent_is_branching else 1.0
+            q_controller = float(child.reward) + disc * float(child.mean_value())
+            q_norm = min_max_stats.normalize(q_controller)
+            value_score = q_norm if parent.player == "controller" else -q_norm
+        else:
+            q_controller = 0.0
+            q_norm = 0.0
+            value_score = 0.0
+
+        ucb = float(prior_score) + float(value_score)
+        return {
+            "pb_c": float(pb_c),
+            "prior_score": float(prior_score),
+            "value_score": float(value_score),
+            "q_controller": float(q_controller),
+            "q_norm": float(q_norm),
+            "ucb": float(ucb),
+        }
 
 
 
@@ -765,6 +824,7 @@ class VidurMCTS:
 
 
     def select_child(self, node: MCTSNode, min_max_stats: MinMaxStats) -> Tuple[int, MCTSNode]:
+
         assert node.children, "select_child called on unexpanded node"
 
         if len(node.children) == 1:
@@ -774,9 +834,48 @@ class VidurMCTS:
         max_ucb = max(self.ucb_score(node, child, min_max_stats) for child in node.children.values())
         best = [idx for idx, child in node.children.items() if self.ucb_score(node, child, min_max_stats) == max_ucb]
         action_index = self._rng.choice(best)
+
         return int(action_index), node.children[action_index]
 
+    # TODO : These functions are for the PUCT cases for the selection :
     
+    def _build_selection_candidates(self, node: MCTSNode, min_max_stats: MinMaxStats) -> List[Dict[str, Any]]:
+        cands: List[Dict[str, Any]] = []
+        for idx, child in node.children.items():
+            comp = self._ucb_components(node, child, min_max_stats)
+            cands.append({
+                "action_index": int(idx),
+                "child_node_id": int(child.node_id),
+                **comp,  # pb_c, prior_score, value_score, q_controller, q_norm, ucb
+            })
+        cands.sort(key=lambda x: x["action_index"])
+        return cands
+
+    def _select_child_with_trace(
+        self,
+        node: MCTSNode,
+        min_max_stats: MinMaxStats,
+        *,
+        enable_trace: bool,
+    ) -> Tuple[int, MCTSNode, Optional[Dict[str, Any]]]:
+        trace = None
+        candidates = self._build_selection_candidates(node, min_max_stats) if enable_trace else None
+
+        action_index, child = self.select_child(node, min_max_stats)  # unchanged select_child
+
+        if enable_trace:
+            trace = {
+                "parent_node_id": int(node.node_id),
+                "parent_player": str(node.player),
+                "parent_visits": int(node.visits),
+                "candidates": candidates,
+                "chosen_action_index": int(action_index),
+                "chosen_child_node_id": int(child.node_id),
+            }
+        return int(action_index), child, trace
+
+
+
     def _advance_through_single_child_chain(
         self,
         node: MCTSNode,
@@ -908,6 +1007,21 @@ class VidurMCTS:
             node = child
             hops += 1
 
+    # Helper for debugging : TODO : move it later to somewhere :
+    def _ancestor_chain(self, node: MCTSNode) -> List[Dict[str, Any]]:
+        out = []
+        cur = node
+        while cur is not None:
+            out.append({
+                "node_id": int(cur.node_id),
+                "parent_node_id": None if cur.parent is None else int(cur.parent.node_id),
+                "value_sum": float(cur.value_sum),
+                "visits": int(cur.visits),
+                "mean_value": float(cur.mean_value()),
+            })
+            cur = cur.parent
+        return out
+
 
 
     def backpropagate(self, search_path: List[MCTSNode], value: float, min_max_stats: MinMaxStats) -> None:
@@ -950,9 +1064,26 @@ class VidurMCTS:
         node = root
         search_path: List[MCTSNode] = [node]
         # t_phase = time.perf_counter()
+        # TODO : we are chanigng this with unnecessary code for PUCT logging with selection trace and trace sink, make it modular and neat later
+        selection_trace = []
+        iter_logging = getattr(self._iter_logger, "_path", None) is not None
         while node.expanded():
-            _, node = self.select_child(node, min_max_stats)
-            search_path.append(node)
+
+            if self._iter_logger is None:
+                _, node = self.select_child(node, min_max_stats)
+                search_path.append(node)
+            else :
+                action_index, child, hop = self._select_child_with_trace(
+                    node,
+                    min_max_stats,
+                    enable_trace=iter_logging,
+                )
+                if hop is not None:
+                    selection_trace.append(hop)
+                node = child
+                search_path.append(node)
+
+          
         # self._perf["selection"] += time.perf_counter() - t_phase
         # 2) Restore scratch sim straight to the selected node state (or materialize it once)
      
@@ -961,7 +1092,6 @@ class VidurMCTS:
         # self._perf["restore"] += time.perf_counter() - t_phase
        
 
-        iter_logging = getattr(self._iter_logger, "_path", None) is not None
         forced_logs = [] if iter_logging else None
 
         # 3) Skip forced single-child chains so we end on branching/terminal
@@ -1092,21 +1222,27 @@ class VidurMCTS:
         # t_phase = time.perf_counter()
         self.backpropagate(search_path, float(leaf_value), min_max_stats)
         # self._perf["backprop"] += time.perf_counter() - t_phase
-        # self._perf["sim_count"] += 1
+        # self._perf["sim_count"] += 1  
 
-        # # LOGGING MCTS:
-        # DUMP_EVERY = 1  # or 50/100 to reduce overhead
-        # if sim_iteration is not None and (sim_iteration % DUMP_EVERY == 0):
-        #     dump_tree_snapshot_csv(
-        #         out_path=f"simulator_output/mcts_dnn_logs/tree_snap_iter_{sim_iteration}.csv",
-        #         game_id=int(game_id),
-        #         root_id=int(root_id),
-        #         sim_iteration=int(sim_iteration),
-        #         root_node=root,
-        #         minmax_min=min_max_stats.minimum,
-        #         minmax_max=min_max_stats.maximum,
-        #         max_nodes=None,   # or set a cap while debugging
-        #     )
+        if self._iter_logger is not None:
+            self._iter_logger.puct_log_expand(
+                game_id=int(game_id),
+                root_id=int(root_id),
+                sim_iteration=int(sim_iteration),
+                root_node_id=int(root.node_id),
+                parent_node_id=(leaf_node.parent.node_id if leaf_node.parent else None),
+                node_id=int(leaf_node.node_id),
+                player_acted_to_create_this_node=(leaf_node.parent.player if leaf_node.parent else "root_no_parent"),
+                reward=float(getattr(leaf_node, "reward", 0.0)),
+                node_dnn_value=(None if leaf_node.nn_value_controller is None else float(leaf_node.nn_value_controller)),
+                children_created=list(getattr(leaf_node, "last_expand_children_created", [])),
+                dedup_children=list(getattr(leaf_node, "last_expand_dedup", [])),
+                ancestor_chain=self._ancestor_chain(leaf_node),
+                selection_trace=selection_trace,
+                minmax_min=float(min_max_stats.minimum),
+                minmax_max=float(min_max_stats.maximum),
+            )
+
 
 
 
@@ -1134,6 +1270,9 @@ class VidurMCTS:
         else:
             self._root.cached_sim_snapshot = sim.snapshot_state()
         self._root.cached_stats = rootState.stats.clone()
+
+        # IMPORTANT: root reward/discount baseline must come from actual root state
+        self._seed_node_runtime_from_state(self._root, rootState)
 
         # One scratch simulator per search_dnn
         self._scratch_state = None  # forces _scratch_restore to create it once
@@ -1299,87 +1438,6 @@ class VidurMCTS:
             total_cost=float(total_cost),
         )
 
-
-        # p = getattr(self, "_perf", None)
-        # if p is not None:
-        #     total_core = p["restore"] + p["forced_chain"] + p["expand"] + p["backprop"]
-        #     print(
-        #         "[MCTS_PERF] "
-        #         f"root_id={root_id} iters={iterations} \n"
-        #         f"total_core={total_core:.3f}s \n"
-        #         f"restore={p['restore']:.3f}s \n selection={p['selection']:.3f}s \n forced_chain={p['forced_chain']:.3f}s \n "
-        #         f"expand={p['expand']:.3f}s \n backprop={p['backprop']:.3f}s \n"
-        #         f"sim_count={p.get('sim_count', 0)}\n"
-        #     )
-
-        #PRINTING PROFILING :
-        # p = getattr(self, "_perf", None)
-        # if p is not None:
-        #     n = max(1, int(p.get("sim_count", 0)))
-        #     total_core = p["restore"] + p["forced_chain"] + p["expand"] + p["backprop"]
-        #     print(
-        #         "[MCTS_PERF] "
-        #         f"root_id={root_id} iters={iterations} "
-        #         f"restore={p['restore']:.3f}s forced_chain={p['forced_chain']:.3f}s "
-        #         f"expand={p['expand']:.3f}s backprop={p['backprop']:.3f}s "
-        #         f"nn_build={p['nn_build_inputs']:.3f}s nn_infer={p['nn_infer']:.3f}s \n"
-        #         f"core_total={total_core:.3f}s core_per_sim={total_core/n:.6f}s \n"
-        #         f"adv_apply_actions={p['adv_apply_actions']:.3f}s ctrl_apply_actions={p['ctrl_apply_actions']:.3f}s\n"
-        #         f"cost_&_node_snap={p['cost_&_node_snap']:.3f}s recursive_restore={p['recursive_restore']:.3f}s \n"
-        #     )
-
-        #     ex_total = max(float(p.get("expand", 0.0)), 1e-12)
-
-        #     def pct(v: float, tot: float) -> float:
-        #         return (100.0 * v / tot) if tot > 1e-12 else 0.0
-
-        #     print(
-        #         "[EXPAND_PERF]\n"
-        #         f"  root_id={root_id} iters={n}\n"
-        #         f"  expand_total={ex_total:.3f}s  expand_per_sim={ex_total/n:.6f}s\n"
-        #         f"  actions_mask={p['expand_actions_mask']:.3f}s ({pct(p['expand_actions_mask'], ex_total):.1f}%)\n"
-        #         f"  valid_scan={p['expand_valid_scan']:.3f}s ({pct(p['expand_valid_scan'], ex_total):.1f}%)\n"
-        #         f"  nn_total={p['expand_nn_total']:.3f}s ({pct(p['expand_nn_total'], ex_total):.1f}%)\n"
-        #         f"  threshold={p['expand_threshold']:.3f}s ({pct(p['expand_threshold'], ex_total):.1f}%)\n"
-        #         f"  dedup={p['expand_dedup']:.3f}s ({pct(p['expand_dedup'], ex_total):.1f}%)\n"
-        #         f"  child_create={p['expand_child_create']:.3f}s ({pct(p['expand_child_create'], ex_total):.1f}%)\n"
-        #         f"  single_path={p['expand_single_path']:.3f}s ({pct(p['expand_single_path'], ex_total):.1f}%)\n"
-        #         f"  counts(term/single/multi)="
-        #         f"({int(p['expand_terminal_count'])}/{int(p['expand_single_count'])}/{int(p['expand_multi_count'])})"
-        #     )
-
-        #     ep = getattr(self._env, "_perf", None)
-        #     if ep is not None:
-        #         print(
-        #             "[ENV_PERF] "
-        #             f"ctrl_calls={int(ep.get('apply_ctrl_calls', 0))} "
-        #             f"ctrl_total={ep.get('apply_ctrl_total', 0.0):.3f}s "
-        #             f"lookup={ep.get('lookup', 0.0):.3f}s "
-        #             f"alloc_norm={ep.get('alloc_norm', 0.0):.3f}s "
-        #             f"predictor={ep.get('predictor', 0.0):.3f}s "
-        #             f"stats={ep.get('stats', 0.0):.3f}s "
-        #             f"rebuild={ep.get('rebuild', 0.0):.3f}s "
-        #             f"ff_decode={ep.get('ff_decode', 0.0):.3f}s"
-        #         )
-
-        #     stats_total = ep.get("stats_total_internal", 0.0)
-        #     stats_calls = max(1, int(ep.get("stats_calls", 0)))
-        #     if stats_total > 0.0:
-        #         def _pct(x: float) -> float:
-        #             return (100.0 * x / stats_total) if stats_total > 1e-12 else 0.0
-
-        #         print(
-        #             "[ENV_STATS_PERF] "
-        #             f"calls={stats_calls} total={stats_total:.3f}s per_call={stats_total/stats_calls:.6f}s "
-        #             f"batch_unpack={ep.get('stats_batch_unpack',0.0):.3f}s({_pct(ep.get('stats_batch_unpack',0.0)):.1f}%) "
-        #             f"ids_union={ep.get('stats_ids_union',0.0):.3f}s({_pct(ep.get('stats_ids_union',0.0)):.1f}%) "
-        #             f"req_get={ep.get('stats_req_get',0.0):.3f}s({_pct(ep.get('stats_req_get',0.0)):.1f}%) "
-        #             f"hooks={ep.get('stats_hooks',0.0):.3f}s({_pct(ep.get('stats_hooks',0.0)):.1f}%) "
-        #             f"prefill={ep.get('stats_prefill',0.0):.3f}s({_pct(ep.get('stats_prefill',0.0)):.1f}%) "
-        #             f"decode={ep.get('stats_decode',0.0):.3f}s({_pct(ep.get('stats_decode',0.0)):.1f}%) "
-        #             f"violation={ep.get('stats_violation',0.0):.3f}s({_pct(ep.get('stats_violation',0.0)):.1f}%) "
-        #             f"complete={ep.get('stats_complete',0.0):.3f}s({_pct(ep.get('stats_complete',0.0)):.1f}%)"
-        #         )
 
 
         return next_player, action_space
