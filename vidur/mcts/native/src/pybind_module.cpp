@@ -9,6 +9,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -50,6 +51,7 @@ using namespace mcts_native;
 
 struct NativeActionSpace {};
 struct NativeTreeNode;
+struct NativeSearchCfg;
 
 #ifdef _WIN32
 #include <process.h>
@@ -1199,6 +1201,235 @@ struct NativeSearchPerf {
     long long nodes_capacity_grows = 0;
 };
 
+static inline std::string f64(double v) {
+    std::ostringstream oss;
+    oss << std::setprecision(17) << v;
+    return oss.str();
+}
+
+static std::string csv_escape(const std::string& s) {
+    bool needs_quotes = false;
+    for (char c : s) {
+        if (c == ',' || c == '"' || c == '\n' || c == '\r') {
+            needs_quotes = true;
+            break;
+        }
+    }
+    if (!needs_quotes) return s;
+    std::string out;
+    out.reserve(s.size() + 8);
+    out.push_back('"');
+    for (char c : s) {
+        if (c == '"') out.push_back('"');
+        out.push_back(c);
+    }
+    out.push_back('"');
+    return out;
+}
+
+class NativeIterCsvLogger {
+public:
+    explicit NativeIterCsvLogger(const std::string& path) {
+        enabled_ = !path.empty();
+        if (!enabled_) return;
+        try {
+            const std::filesystem::path p(path);
+            std::error_code ec;
+            const auto parent = p.parent_path();
+            if (!parent.empty()) {
+                std::filesystem::create_directories(parent, ec);
+            }
+            bool write_header = true;
+            if (std::filesystem::exists(p, ec)) {
+                write_header = std::filesystem::file_size(p, ec) == 0;
+            }
+            out_.open(path, std::ios::app);
+            if (!out_) {
+                enabled_ = false;
+                return;
+            }
+            if (write_header) {
+                out_ << "game_id,root_id,sim_iteration,root_depth,root_node_id,root_player,phase,node_depth,parent_node_id,node_id,player_acted_to_create_this_node,player_to_act_in_this_node,action_index,action_repr,prior,model_prior_json,normalized_prior_json,reward,nn_called,num_valid_actions,unique_actions,nn_value_controller,objective_cost,sim_time,requests_in_system,requests_generated,requests_completed,slo_violations,avg_lateness,state_waiting_ids,state_completed_request_ids,adversary_requests,adversary_prefill_slos,adversary_prefill_deadlines_by_id,adversary_decode_slos,controller_token_budget,controller_selected_ids,controller_allocations,controller_prefill_allocations,controller_decode_allocations,controller_prefill_total,controller_decode_total,controller_heuristic,controller_strategy\n";
+            }
+        } catch (...) {
+            enabled_ = false;
+        }
+    }
+
+    bool enabled() const { return enabled_; }
+
+    void write_row(const std::vector<std::string>& cols) {
+        if (!enabled_) return;
+        for (size_t i = 0; i < cols.size(); ++i) {
+            if (i) out_ << ',';
+            out_ << csv_escape(cols[i]);
+        }
+        out_ << '\n';
+    }
+
+private:
+    bool enabled_ = false;
+    std::ofstream out_;
+};
+
+static std::string json_int_list(const std::vector<int>& v) {
+    std::ostringstream oss;
+    oss << '[';
+    for (size_t i = 0; i < v.size(); ++i) {
+        if (i) oss << ", ";
+        oss << v[i];
+    }
+    oss << ']';
+    return oss.str();
+}
+
+static std::string json_float_list(const std::vector<double>& v) {
+    std::ostringstream oss;
+    oss << '[';
+    for (size_t i = 0; i < v.size(); ++i) {
+        if (i) oss << ", ";
+        oss << f64(v[i]);
+    }
+    oss << ']';
+    return oss.str();
+}
+
+static std::string json_float_list_from_f32(const std::vector<float>& v) {
+    std::vector<double> tmp;
+    tmp.reserve(v.size());
+    for (float x : v) tmp.push_back((double)x);
+    return json_float_list(tmp);
+}
+
+static std::string py_map_repr_alloc(const std::vector<AllocationEntry>& v) {
+    std::ostringstream oss;
+    oss << '{';
+    bool first = true;
+    for (const auto& e : v) {
+        if (!first) oss << ", ";
+        first = false;
+        oss << e.request_id << ": " << e.tokens;
+    }
+    oss << '}';
+    return oss.str();
+}
+
+static std::string json_alloc_map(const std::vector<AllocationEntry>& v) {
+    std::ostringstream oss;
+    oss << '{';
+    bool first = true;
+    for (const auto& e : v) {
+        if (!first) oss << ", ";
+        first = false;
+        oss << '"' << e.request_id << '"' << ": " << e.tokens;
+    }
+    oss << '}';
+    return oss.str();
+}
+
+static std::string controller_action_repr_native(const ControllerActionSpecNative& a) {
+    std::ostringstream oss;
+    oss << "ControllerAction(token_budget=" << a.token_budget
+        << ", selected_request_ids=" << json_int_list(a.selected_request_ids)
+        << ", token_allocations=" << py_map_repr_alloc(a.token_allocations)
+        << ", prefill_allocations=" << py_map_repr_alloc(a.prefill_allocations)
+        << ", decode_allocations=" << py_map_repr_alloc(a.decode_allocations)
+        << ", heuristic=";
+    if (a.heuristic.empty()) oss << "None";
+    else oss << '\'' << a.heuristic << '\'';
+    oss << ", strategy=";
+    if (a.strategy.empty()) oss << "None";
+    else oss << '\'' << a.strategy << '\'';
+    oss << ", mapping=None)";
+    return oss.str();
+}
+
+static std::string adversary_action_repr_native(const AdversaryActionSpecNative& a) {
+    std::ostringstream oss;
+    oss << "AdversaryAction(requests=[";
+    for (size_t i = 0; i < a.requests.size(); ++i) {
+        if (i) oss << ", ";
+        const auto& r = a.requests[i];
+        oss << "AdversaryRequestSpec(prefill_tokens=" << r.prefill_tokens
+            << ", decode_tokens=" << r.decode_tokens
+            << ", prefill_slo=" << f64(r.prefill_slo)
+            << ", decode_slo=" << f64(r.decode_slo)
+            << ")";
+    }
+    oss << "], stop_decode_ids=" << json_int_list(a.stop_decode_ids) << ")";
+    return oss.str();
+}
+
+static std::vector<int> sorted_ids(const std::unordered_set<int>& s) {
+    std::vector<int> v;
+    v.reserve(s.size());
+    for (int x : s) v.push_back(x);
+    std::sort(v.begin(), v.end());
+    return v;
+}
+
+static std::string adversary_prefill_deadlines_json(
+    const NativeSimState& state,
+    const AdversaryActionSpecNative& a
+) {
+    if (a.requests.empty()) return "{}";
+    std::vector<int> ids;
+    ids.reserve(state.requests.size());
+    for (const auto& r : state.requests) ids.push_back(r.request_id);
+    if (ids.empty()) return "{}";
+    std::sort(ids.begin(), ids.end());
+    int k = (int)a.requests.size();
+    if (k <= 0) return "{}";
+    if (k > (int)ids.size()) k = (int)ids.size();
+    const int start = (int)ids.size() - k;
+
+    std::ostringstream oss;
+    oss << '{';
+    bool first = true;
+    for (int i = start; i < (int)ids.size(); ++i) {
+        const int rid = ids[(size_t)i];
+        for (const auto& req : state.requests) {
+            if (req.request_id != rid) continue;
+            if (!first) oss << ", ";
+            first = false;
+            oss << '"' << rid << '"' << ": " << f64(req.queued_at + req.prefill_slo);
+            break;
+        }
+    }
+    oss << '}';
+    return oss.str();
+}
+
+static inline void ensure_node_index(
+    const std::vector<NativeTreeNode>& nodes,
+    int idx,
+    const char* where
+);
+
+static std::string iter_phase_label(bool parent_multi, int num_valid_actions) {
+    if (num_valid_actions <= 0) return "terminal";
+    if (num_valid_actions == 1) {
+        return parent_multi ? "single-child" : "trivial-single-child";
+    }
+    return parent_multi ? "multiple-child" : "trivial-multiple-child";
+}
+
+static void write_native_iter_row(
+    NativeIterCsvLogger& iter_logger,
+    const std::vector<NativeTreeNode>& nodes,
+    int node_idx,
+    const NativeSimState& state,
+    int game_id,
+    int root_id,
+    int sim_iteration,
+    const NativeSearchCfg& cfg,
+    const std::string& root_player,
+    const std::string& phase,
+    bool nn_called,
+    int num_valid_actions,
+    int unique_actions
+);
+
 static inline void ensure_node_capacity(
     std::vector<NativeTreeNode>& nodes,
     size_t additional_nodes,
@@ -1288,6 +1519,164 @@ static inline void ensure_node_index(
             << " node_count=" << nodes.size();
         throw std::runtime_error(oss.str());
     }
+}
+
+static void write_native_iter_row(
+    NativeIterCsvLogger& iter_logger,
+    const std::vector<NativeTreeNode>& nodes,
+    int node_idx,
+    const NativeSimState& state,
+    int game_id,
+    int root_id,
+    int sim_iteration,
+    const NativeSearchCfg& cfg,
+    const std::string& root_player,
+    const std::string& phase,
+    bool nn_called,
+    int num_valid_actions,
+    int unique_actions
+) {
+    if (!iter_logger.enabled()) return;
+    ensure_node_index(nodes, node_idx, "write_native_iter_row.node");
+    const auto& node = nodes[(size_t)node_idx];
+    const int parent_idx = node.parent;
+
+    std::string parent_node_id_s;
+    std::string action_index_s;
+    std::string player_acted_to_create = "root_no_parent";
+    std::string action_repr;
+    std::string adversary_requests = "[]";
+    std::string adversary_prefill_slos = "[]";
+    std::string adversary_prefill_deadlines_by_id = "{}";
+    std::string adversary_decode_slos = "[]";
+    std::string controller_token_budget;
+    std::string controller_selected_ids = "[]";
+    std::string controller_allocations = "{}";
+    std::string controller_prefill_allocations = "{}";
+    std::string controller_decode_allocations = "{}";
+    std::string controller_prefill_total = "0";
+    std::string controller_decode_total = "0";
+    std::string controller_heuristic;
+    std::string controller_strategy;
+
+    if (parent_idx >= 0) {
+        ensure_node_index(nodes, parent_idx, "write_native_iter_row.parent");
+        const auto& parent = nodes[(size_t)parent_idx];
+        parent_node_id_s = std::to_string(parent.node_id);
+        action_index_s = std::to_string(node.parent_action_index);
+        player_acted_to_create = parent.player;
+
+        if (node.parent_action_is_controller) {
+            const auto& a = node.parent_controller_action;
+            action_repr = controller_action_repr_native(a);
+            controller_token_budget = std::to_string(a.token_budget);
+            controller_selected_ids = json_int_list(a.selected_request_ids);
+            controller_allocations = json_alloc_map(a.token_allocations);
+            controller_prefill_allocations = json_alloc_map(a.prefill_allocations);
+            controller_decode_allocations = json_alloc_map(a.decode_allocations);
+            int prefill_total = 0;
+            int decode_total = 0;
+            for (const auto& e : a.prefill_allocations) prefill_total += e.tokens;
+            for (const auto& e : a.decode_allocations) decode_total += e.tokens;
+            controller_prefill_total = std::to_string(prefill_total);
+            controller_decode_total = std::to_string(decode_total);
+            controller_heuristic = a.heuristic;
+            controller_strategy = a.strategy;
+        } else {
+            const auto& a = node.parent_adversary_action;
+            action_repr = adversary_action_repr_native(a);
+            {
+                std::ostringstream reqs, pre_slos, dec_slos;
+                reqs << '[';
+                pre_slos << '[';
+                dec_slos << '[';
+                for (size_t i = 0; i < a.requests.size(); ++i) {
+                    if (i) {
+                        reqs << ", ";
+                        pre_slos << ", ";
+                        dec_slos << ", ";
+                    }
+                    const auto& r = a.requests[i];
+                    reqs << "{\"prefill_tokens\":" << r.prefill_tokens
+                         << ",\"decode_tokens\":" << r.decode_tokens
+                         << ",\"prefill_slo\":" << f64(r.prefill_slo)
+                         << ",\"decode_slo\":" << f64(r.decode_slo) << "}";
+                    pre_slos << f64(r.prefill_slo);
+                    dec_slos << f64(r.decode_slo);
+                }
+                reqs << ']';
+                pre_slos << ']';
+                dec_slos << ']';
+                adversary_requests = reqs.str();
+                adversary_prefill_slos = pre_slos.str();
+                adversary_decode_slos = dec_slos.str();
+            }
+            adversary_prefill_deadlines_by_id = adversary_prefill_deadlines_json(state, a);
+        }
+    }
+
+    std::string model_prior_json = "[]";
+    std::string normalized_prior_json = "[]";
+    std::string nn_value_controller_s;
+    if (nn_called) {
+        model_prior_json = json_float_list(node.nn_priors);
+        normalized_prior_json = json_float_list(node.nn_priors_after_threshold);
+        if (node.has_nn_value) {
+            nn_value_controller_s = f64(node.nn_value_controller);
+        }
+    }
+
+    const std::vector<int> waiting_ids = sorted_ids(state.stats.active_request_ids);
+    const std::vector<int> completed_ids = sorted_ids(state.stats.completed_request_ids);
+
+    std::vector<std::string> row;
+    row.reserve(44);
+    row.push_back(std::to_string(game_id));
+    row.push_back(std::to_string(root_id));
+    row.push_back(std::to_string(sim_iteration));
+    row.push_back(std::to_string(cfg.root_depth));
+    row.push_back(std::to_string(cfg.root_node_id));
+    row.push_back(root_player);
+    row.push_back(phase);
+    row.push_back(std::to_string(node.depth));
+    row.push_back(parent_node_id_s);
+    row.push_back(std::to_string(node.node_id));
+    row.push_back(player_acted_to_create);
+    row.push_back(node.player);
+    row.push_back(action_index_s);
+    row.push_back(action_repr);
+    row.push_back(f64(node.prior));
+    row.push_back(model_prior_json);
+    row.push_back(normalized_prior_json);
+    row.push_back(f64(node.reward));
+    row.push_back(nn_called ? "True" : "False");
+    row.push_back(std::to_string(num_valid_actions));
+    row.push_back(std::to_string(unique_actions));
+    row.push_back(nn_value_controller_s);
+    row.push_back(f64(node.state_cost));
+    row.push_back(f64(state.sim_time));
+    row.push_back(std::to_string((int)state.stats.active_request_ids.size()));
+    row.push_back(std::to_string(state.stats.requests_generated));
+    row.push_back(std::to_string(state.stats.requests_completed));
+    row.push_back(std::to_string(state.stats.slo_violations));
+    row.push_back(f64(state.stats.slo_lateness_sum));
+    row.push_back(json_int_list(waiting_ids));
+    row.push_back(json_int_list(completed_ids));
+    row.push_back(adversary_requests);
+    row.push_back(adversary_prefill_slos);
+    row.push_back(adversary_prefill_deadlines_by_id);
+    row.push_back(adversary_decode_slos);
+    row.push_back(controller_token_budget);
+    row.push_back(controller_selected_ids);
+    row.push_back(controller_allocations);
+    row.push_back(controller_prefill_allocations);
+    row.push_back(controller_decode_allocations);
+    row.push_back(controller_prefill_total);
+    row.push_back(controller_decode_total);
+    row.push_back(controller_heuristic);
+    row.push_back(controller_strategy);
+
+    iter_logger.write_row(row);
 }
 
 static std::string next_player(const std::string& player) {
@@ -1823,8 +2212,16 @@ static py::dict search_mcts_dnn(
     double reward_tail_alpha,
     int seed,
     int root_node_id,
-    int root_depth
+    int root_depth,
+    int game_id,
+    int root_id,
+    std::string iter_log_path,
+    bool iter_complete_log
 ) {
+    (void)game_id;
+    (void)root_id;
+    (void)iter_log_path;
+    (void)iter_complete_log;
     NativeSearchCfg cfg;
     cfg.max_branching = max_branching;
     cfg.controller_min_prior_threshold = controller_min_prior_threshold;
@@ -2783,7 +3180,11 @@ static py::dict search_mcts_dnn_torchscript_impl(
     double reward_tail_alpha,
     int seed,
     int root_node_id,
-    int root_depth
+    int root_depth,
+    int game_id,
+    int root_id,
+    std::string iter_log_path,
+    bool iter_complete_log
 ) {
     const long long search_call = ++g_native_ts_search_calls;
     const double t_search0 = now_sec();
@@ -2902,6 +3303,8 @@ static py::dict search_mcts_dnn_torchscript_impl(
         cfg,
         rng
     );
+    NativeIterCsvLogger iter_logger(iter_log_path);
+    const bool iter_log_enabled = iter_logger.enabled();
     if (native_trace_should_log(search_call)) {
         std::ostringstream oss;
         oss
@@ -2972,6 +3375,27 @@ static py::dict search_mcts_dnn_torchscript_impl(
             nodes[(size_t)current].num_valid_actions = (int)am.valid.size();
             nodes[(size_t)current].nn_valid_mask = am.mask;
             if (am.valid.size() != 1) break;
+
+            if (iter_log_enabled && iter_complete_log) {
+                const int parent_idx = nodes[(size_t)current].parent;
+                const bool parent_multi =
+                    (parent_idx < 0) || (nodes[(size_t)parent_idx].children.size() > 1);
+                write_native_iter_row(
+                    iter_logger,
+                    nodes,
+                    current,
+                    state,
+                    game_id,
+                    root_id,
+                    it,
+                    cfg,
+                    root_player,
+                    std::string("forced_step:") + iter_phase_label(parent_multi, 1),
+                    false,
+                    1,
+                    (int)nodes[(size_t)current].children.size()
+                );
+            }
 
             const int only_idx = am.valid[0];
             auto it_child = nodes[(size_t)current].children.find(only_idx);
@@ -3045,6 +3469,29 @@ static py::dict search_mcts_dnn_torchscript_impl(
         );
         perf.leaf_expand_sec += (now_sec() - t_leaf_expand0);
         double value = std::get<0>(leaf_expand);
+
+        if (iter_log_enabled) {
+            ensure_node_index(nodes, current, "iter_logger.leaf");
+            const auto& leaf = nodes[(size_t)current];
+            const int parent_idx = leaf.parent;
+            const bool parent_multi =
+                (parent_idx < 0) || (nodes[(size_t)parent_idx].children.size() > 1);
+            write_native_iter_row(
+                iter_logger,
+                nodes,
+                current,
+                state,
+                game_id,
+                root_id,
+                it,
+                cfg,
+                root_player,
+                iter_phase_label(parent_multi, leaf.num_valid_actions),
+                (leaf.num_valid_actions > 1),
+                leaf.num_valid_actions,
+                (int)leaf.children.size()
+            );
+        }
 
         const double t_backprop0 = now_sec();
         for (int i = (int)search_path.size() - 1; i >= 0; --i) {
@@ -3184,7 +3631,11 @@ static py::dict search_mcts_dnn_torchscript(
     double reward_tail_alpha,
     int seed,
     int root_node_id,
-    int root_depth
+    int root_depth,
+    int game_id,
+    int root_id,
+    std::string iter_log_path,
+    bool iter_complete_log
 ) {
     return search_mcts_dnn_torchscript_impl(
         std::move(env),
@@ -3208,7 +3659,11 @@ static py::dict search_mcts_dnn_torchscript(
         reward_tail_alpha,
         seed,
         root_node_id,
-        root_depth
+        root_depth,
+        game_id,
+        root_id,
+        std::move(iter_log_path),
+        iter_complete_log
     );
 }
 
@@ -3234,7 +3689,11 @@ static py::dict search_mcts_dnn_torchscript_service(
     double reward_tail_alpha,
     int seed,
     int root_node_id,
-    int root_depth
+    int root_depth,
+    int game_id,
+    int root_id,
+    std::string iter_log_path,
+    bool iter_complete_log
 ) {
     return search_mcts_dnn_torchscript_impl(
         std::move(env),
@@ -3258,7 +3717,11 @@ static py::dict search_mcts_dnn_torchscript_service(
         reward_tail_alpha,
         seed,
         root_node_id,
-        root_depth
+        root_depth,
+        game_id,
+        root_id,
+        std::move(iter_log_path),
+        iter_complete_log
     );
 }
 
@@ -3509,7 +3972,11 @@ PYBIND11_MODULE(mcts_native, m) {
       py::arg("reward_tail_alpha"),
       py::arg("seed"),
       py::arg("root_node_id"),
-      py::arg("root_depth"));
+      py::arg("root_depth"),
+      py::arg("game_id") = 0,
+      py::arg("root_id") = 0,
+      py::arg("iter_log_path") = "",
+      py::arg("iter_complete_log") = false);
     m.def(
       "search_mcts_dnn_torchscript",
       &search_mcts_dnn_torchscript,
@@ -3534,7 +4001,11 @@ PYBIND11_MODULE(mcts_native, m) {
       py::arg("reward_tail_alpha"),
       py::arg("seed"),
       py::arg("root_node_id"),
-      py::arg("root_depth"));
+      py::arg("root_depth"),
+      py::arg("game_id") = 0,
+      py::arg("root_id") = 0,
+      py::arg("iter_log_path") = "",
+      py::arg("iter_complete_log") = false);
     m.def(
       "search_mcts_dnn_torchscript_service",
       &search_mcts_dnn_torchscript_service,
@@ -3559,5 +4030,9 @@ PYBIND11_MODULE(mcts_native, m) {
       py::arg("reward_tail_alpha"),
       py::arg("seed"),
       py::arg("root_node_id"),
-      py::arg("root_depth"));
+      py::arg("root_depth"),
+      py::arg("game_id") = 0,
+      py::arg("root_id") = 0,
+      py::arg("iter_log_path") = "",
+      py::arg("iter_complete_log") = false);
 }

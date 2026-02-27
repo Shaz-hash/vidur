@@ -5,9 +5,6 @@ alphaZero.py
 run command :
 python3 -m vidur.mcts.alphaZero
 
-For native :
-PYTHONPATH=/home/shazer/Desktop/Research/Vidur/vidur /home/shazer/Desktop/Research/Vidur/vidur/.venv/bin/python3 -m vidur.mcts.alphaZero
-
 Single entrypoint that owns configuration for:
 - Vidur simulator config (CLI args passed to SimulationConfig)
 - MCTS constraints + explore cfg
@@ -30,7 +27,7 @@ import random
 import re
 import time
 import sys
-from dataclasses import dataclass, field as dc_field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
@@ -60,25 +57,6 @@ from .DNN.trainer import Trainer, TrainerConfig
 
 from .virtual_environment import VirtualVidurMCTSEnvironment
 from .virtual_simulator import VirtualSimulator
-
-try:
-    from .native.python.infer_client import (
-        TorchScriptInferClient,
-        TorchScriptModelPaths,
-        TorchScriptServiceModelAdapter,
-        NativeTorchScriptModelAdapter,
-        build_native_torchscript_runtime,
-        build_native_infer_service_runtime,
-        start_torchscript_infer_service,
-    )
-except Exception:  # pragma: no cover - optional runtime dependency path
-    TorchScriptInferClient = None
-    TorchScriptModelPaths = None
-    TorchScriptServiceModelAdapter = None
-    NativeTorchScriptModelAdapter = None
-    build_native_torchscript_runtime = None
-    build_native_infer_service_runtime = None
-    start_torchscript_infer_service = None
 
 
 
@@ -379,154 +357,6 @@ def _append_metrics_csv(path: Path, row: dict) -> None:
         w.writerow(row)
 
 
-def _build_constraints_and_explore(cfg: "AlphaZeroConfig") -> tuple[MCTSConstraintConfig, MCTSExploreConfig]:
-    slo_options = RequestSLOOptions(
-        prefill_slos=tuple(cfg.constraints.prefill_slos),
-        decode_slos=tuple(cfg.constraints.decode_slos),
-    )
-    constraints = MCTSConstraintConfig(
-        maximum_qps=cfg.constraints.maximum_qps,
-        min_request_tokens=cfg.constraints.min_request_tokens,
-        max_request_tokens=cfg.constraints.max_request_tokens,
-        interval_request_size=cfg.constraints.interval_request_size,
-        request_slo_options=slo_options,
-        prefill_slowdown=cfg.constraints.prefill_slowdown,
-        prefill_profile_path=cfg.constraints.prefill_profile_path,
-    )
-    explore_cfg = MCTSExploreConfig(
-        simulation_depth=cfg.explore.simulation_depth,
-        simulation_random_tries=cfg.explore.simulation_random_tries,
-        exploration_constant=cfg.explore.exploration_constant,
-        max_branching=cfg.explore.max_branching,
-        controller_budget_combs=cfg.explore.controller_budget_combs,
-    )
-    setattr(
-        explore_cfg,
-        "controller_min_prior_threshold",
-        float(cfg.explore.controller_min_prior_threshold),
-    )
-    setattr(
-        explore_cfg,
-        "adversary_min_prior_threshold",
-        float(cfg.explore.adversary_min_prior_threshold),
-    )
-    setattr(
-        explore_cfg,
-        "root_dirichlet_noise_enabled",
-        bool(cfg.explore.root_dirichlet_noise_enabled),
-    )
-    setattr(
-        explore_cfg,
-        "root_dirichlet_alpha",
-        float(cfg.explore.root_dirichlet_alpha),
-    )
-    setattr(
-        explore_cfg,
-        "root_dirichlet_epsilon",
-        float(cfg.explore.root_dirichlet_epsilon),
-    )
-    setattr(
-        explore_cfg,
-        "native_mcts_enabled",
-        bool(getattr(getattr(cfg, "native", None), "enabled", False))
-        and str(getattr(getattr(cfg, "native", None), "backend", "python")) == "cpp_virtual",
-    )
-    setattr(
-        explore_cfg,
-        "torchscript_full_native_search",
-        bool(getattr(getattr(cfg, "native", None), "torchscript_full_native_search", False)),
-    )
-    return constraints, explore_cfg
-
-
-def _build_env_and_simulator(
-    cfg: "AlphaZeroConfig",
-    *,
-    use_virtual_env: bool,
-) -> tuple[object, object, MCTSConstraintConfig, MCTSExploreConfig]:
-    sim_cfg = configure_simulation(cfg.sim.cli_args)
-    setattr(sim_cfg.cluster_config.cache_config, "assume_infinite_kv", True)
-    constraints, explore_cfg = _build_constraints_and_explore(cfg)
-    if use_virtual_env:
-        simulator = VirtualSimulator(sim_cfg, register_atexit=False)
-        env = VirtualVidurMCTSEnvironment(
-            base_simulator=simulator,
-            constraints=constraints,
-            explore_cfg=explore_cfg,
-            native_enabled=_use_cpp_virtual_backend(cfg),
-            native_strict_compat=bool(getattr(getattr(cfg, "native", None), "strict_compat", True)),
-        )
-    else:
-        simulator = Simulator(sim_cfg, register_atexit=False)
-        env = VidurMCTSEnvironment(
-            base_simulator=simulator,
-            constraints=constraints,
-            explore_cfg=explore_cfg,
-        )
-    return simulator, env, constraints, explore_cfg
-
-
-def _use_cpp_virtual_backend(cfg: "AlphaZeroConfig") -> bool:
-    ncfg = getattr(cfg, "native", None)
-    if ncfg is None:
-        return False
-    return bool(getattr(ncfg, "enabled", False)) and str(getattr(ncfg, "backend", "python")) == "cpp_virtual"
-
-
-def _infer_service_enabled(cfg: "AlphaZeroConfig") -> bool:
-    ncfg = getattr(cfg, "native", None)
-    if ncfg is None:
-        return False
-    return bool(getattr(ncfg, "enabled", False)) and str(getattr(ncfg, "infer_mode", "python")) == "torchscript_service"
-
-
-def _infer_cpp_runtime_enabled(cfg: "AlphaZeroConfig") -> bool:
-    ncfg = getattr(cfg, "native", None)
-    if ncfg is None:
-        return False
-    return bool(getattr(ncfg, "enabled", False)) and str(getattr(ncfg, "infer_mode", "python")) == "torchscript_cpp"
-
-
-def _wait_for_infer_service(addr: str, *, timeout_s: float = 30.0) -> None:
-    if TorchScriptInferClient is None:
-        raise RuntimeError("TorchScriptInferClient is unavailable; cannot use infer_mode=torchscript_service")
-    deadline = time.time() + float(timeout_s)
-    last_err: Optional[Exception] = None
-    while time.time() < deadline:
-        try:
-            c = TorchScriptInferClient(addr=str(addr))
-            if c.ping():
-                c.close()
-                return
-            c.close()
-        except Exception as exc:
-            last_err = exc
-        time.sleep(0.2)
-    raise RuntimeError(f"inference service did not become ready at {addr}: {last_err!r}")
-
-
-def _export_torchscript_artifacts_for_checkpoint(
-    *,
-    checkpoint_path: Path,
-    out_dir: Path,
-    model_version: int,
-    device: str = "cpu",
-    num_actions_controller: int,
-    num_actions_adversary: int,
-) -> tuple[Path, Path, Path]:
-    from .DNN.export_torchscript import export_torchscript_artifacts
-
-    out = export_torchscript_artifacts(
-        checkpoint_path=checkpoint_path,
-        out_dir=out_dir,
-        model_version=int(model_version),
-        device=str(device),
-        num_actions_controller=int(num_actions_controller),
-        num_actions_adversary=int(num_actions_adversary),
-    )
-    return out.controller_path, out.adversary_path, out.meta_path
-
-
 
 # -----------------------------
 # Config groups
@@ -564,9 +394,6 @@ class MCTSExploreGroup:
     controller_budget_combs: int = 10
     controller_min_prior_threshold : float = 0.01
     adversary_min_prior_threshold : float = 0.1
-    root_dirichlet_noise_enabled: bool = False
-    root_dirichlet_alpha: float = 0.6
-    root_dirichlet_epsilon: float = 0.25
 
 
 
@@ -576,22 +403,6 @@ class ModelGroup:
     num_actions_controller: int = 24
     num_actions_adversary: int = 6
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-
-
-@dataclass(frozen=True)
-class NativeRuntimeGroup:
-    enabled: bool = False
-    backend: str = "python"  # python | cpp_virtual
-    strict_compat: bool = True
-    infer_mode: str = "python"  # python | torchscript_service | torchscript_cpp
-    infer_service_impl: str = "cpp"  # cpp | python
-    torchscript_full_native_search: bool = False
-    infer_service_addr: str = "127.0.0.1:50201"
-    infer_service_device: str = "cuda:0"
-    infer_max_batch: int = 256
-    infer_max_wait_us: int = 2000
-    export_torchscript: bool = False
-    fallback_to_python_infer: bool = True
 
 
 @dataclass(frozen=True)
@@ -626,7 +437,6 @@ class AlphaZeroConfig:
     logging: LoggingGroup
     dataset: DatasetGroup
     run: RunGroup
-    native: NativeRuntimeGroup = dc_field(default_factory=NativeRuntimeGroup)
 
 
 # -----------------------------
@@ -701,9 +511,6 @@ def main() -> None:
             controller_budget_combs=10,
             controller_min_prior_threshold=0.01,
             adversary_min_prior_threshold=0.1,
-            root_dirichlet_noise_enabled=False,
-            root_dirichlet_alpha=0.6,
-            root_dirichlet_epsilon=0.25,
         ),
         model=ModelGroup(
             num_actions_controller=24,
@@ -724,22 +531,8 @@ def main() -> None:
             root_id=0,
             root_depth=0,
             root_player="adversary",
-            iterations=1000,
+            iterations=10000,
             feature_version=1,
-        ),
-        native=NativeRuntimeGroup(
-            enabled=True,
-            backend="cpp_virtual",
-            strict_compat=True,
-            infer_mode="torchscript_cpp",
-            infer_service_impl="cpp",
-            torchscript_full_native_search=True,
-            infer_service_addr="127.0.0.1:50201",
-            infer_service_device="cuda:0",
-            infer_max_batch=256,
-            infer_max_wait_us=500,
-            export_torchscript=False,
-            fallback_to_python_infer=True,
         ),
     )
 
@@ -757,132 +550,67 @@ def main() -> None:
 
 
     # ---- Build simulator/env/mcts/model/writer ----
-    simulator, env, _, explore_cfg = _build_env_and_simulator(cfg, use_virtual_env=use_virtual_env)
+    sim_cfg = configure_simulation(cfg.sim.cli_args)
+    setattr(sim_cfg.cluster_config.cache_config, "assume_infinite_kv", True)
+    # simulator = Simulator(sim_cfg, register_atexit=False)
+    # print("Simulator initialized.")
+    # print(simulator._execution_time_predictor.to_dict())
+
+    if use_virtual_env:
+        simulator = VirtualSimulator(sim_cfg, register_atexit=False)
+    else:
+        simulator = Simulator(sim_cfg, register_atexit=False)
+
+
+    slo_options = RequestSLOOptions(
+        prefill_slos=tuple(cfg.constraints.prefill_slos),
+        decode_slos=tuple(cfg.constraints.decode_slos),
+    )
+
+    constraints = MCTSConstraintConfig(
+        maximum_qps=cfg.constraints.maximum_qps,
+        min_request_tokens=cfg.constraints.min_request_tokens,
+        max_request_tokens=cfg.constraints.max_request_tokens,
+        interval_request_size=cfg.constraints.interval_request_size,
+        request_slo_options=slo_options,
+        prefill_slowdown=cfg.constraints.prefill_slowdown,
+        prefill_profile_path=cfg.constraints.prefill_profile_path,
+    )
+
+    explore_cfg = MCTSExploreConfig(
+        simulation_depth=cfg.explore.simulation_depth,
+        simulation_random_tries=cfg.explore.simulation_random_tries,
+        exploration_constant=cfg.explore.exploration_constant,
+        max_branching=cfg.explore.max_branching,
+        controller_budget_combs=cfg.explore.controller_budget_combs,
+    )
+
+    setattr(explore_cfg, "controller_min_prior_threshold", float(cfg.explore.controller_min_prior_threshold))
+    setattr(explore_cfg, "adversary_min_prior_threshold", float(cfg.explore.adversary_min_prior_threshold))
+
+
+    if use_virtual_env:
+        env = VirtualVidurMCTSEnvironment(
+            base_simulator=simulator,
+            constraints=constraints,
+            explore_cfg=explore_cfg,
+        )
+    else:
+        env = VidurMCTSEnvironment(
+            base_simulator=simulator,
+            constraints=constraints,
+            explore_cfg=explore_cfg,
+        )
 
     model = AlphaZeroModel(
         num_actions_controller=cfg.model.num_actions_controller,
         num_actions_adversary=cfg.model.num_actions_adversary,
     ).to(torch.device(cfg.model.device))
     model.eval()
-    run_model = model
-
-    infer_service_proc = None
-    infer_client = None
-    native_ts_runtime = None
-    native_service_runtime = None
-
-    use_service_infer = _infer_service_enabled(cfg)
-    use_cpp_infer = _infer_cpp_runtime_enabled(cfg)
-
-    if use_service_infer:
-        if start_torchscript_infer_service is None:
-            raise RuntimeError(
-                "infer_mode=torchscript_service requested but infer service entrypoint is unavailable"
-            )
-        infer_service_proc = start_torchscript_infer_service(
-            addr=str(cfg.native.infer_service_addr),
-            device=str(cfg.native.infer_service_device),
-            max_batch=int(cfg.native.infer_max_batch),
-            max_wait_us=int(cfg.native.infer_max_wait_us),
-            impl=str(getattr(cfg.native, "infer_service_impl", "cpp")),
-        )
-        _wait_for_infer_service(str(cfg.native.infer_service_addr), timeout_s=45.0)
-        if build_native_infer_service_runtime is not None:
-            try:
-                native_service_runtime = build_native_infer_service_runtime(
-                    addr=str(cfg.native.infer_service_addr),
-                )
-            except Exception:
-                native_service_runtime = None
-        if infer_client is None and TorchScriptInferClient is not None:
-            infer_client = TorchScriptInferClient(addr=str(cfg.native.infer_service_addr))
-    elif use_cpp_infer:
-        if build_native_torchscript_runtime is None:
-            raise RuntimeError("infer_mode=torchscript_cpp requested but native runtime builder is unavailable")
-        runtime_device = str(cfg.native.infer_service_device)
-        if runtime_device.startswith("cuda") and not torch.cuda.is_available():
-            raise RuntimeError(
-                f"torchscript_cpp requested device={runtime_device} but CUDA is unavailable "
-                "(torch.cuda.is_available() is False)."
-            )
-        native_ts_runtime = build_native_torchscript_runtime(
-            device=runtime_device,
-        )
-
-    if use_service_infer or use_cpp_infer:
-        # Native pybind API expects a 32-bit C++ int model_version.
-        model_version = int(time.time()) % 2_000_000_000
-        ckpt_dir.mkdir(parents=True, exist_ok=True)
-        ts_out_dir = ckpt_dir / "torchscript_singleproc"
-        ts_out_dir.mkdir(parents=True, exist_ok=True)
-        ckpt_path = ts_out_dir / f"singleproc_model_{model_version}.pt"
-        torch.save(
-            {"model_state": {k: v.detach().cpu() for k, v in model.state_dict().items()}},
-            ckpt_path,
-        )
-        ts_ctrl, ts_adv, _ = _export_torchscript_artifacts_for_checkpoint(
-            checkpoint_path=ckpt_path,
-            out_dir=ts_out_dir,
-            model_version=model_version,
-            device="cpu",
-            num_actions_controller=cfg.model.num_actions_controller,
-            num_actions_adversary=cfg.model.num_actions_adversary,
-        )
-        if (
-            use_service_infer
-            and native_service_runtime is not None
-            and NativeTorchScriptModelAdapter is not None
-        ):
-            native_service_runtime.load_models(model_version, str(ts_ctrl), str(ts_adv))
-            run_model = NativeTorchScriptModelAdapter(
-                runtime=native_service_runtime,
-                model_version=model_version,
-                fallback_model=model,
-                fallback_to_python=bool(cfg.native.fallback_to_python_infer),
-            )
-        elif (
-            use_service_infer
-            and infer_client is not None
-            and TorchScriptModelPaths is not None
-            and TorchScriptServiceModelAdapter is not None
-        ):
-            infer_client.ensure_models_loaded(
-                TorchScriptModelPaths(
-                    controller_path=str(ts_ctrl),
-                    adversary_path=str(ts_adv),
-                    model_version=model_version,
-                )
-            )
-            run_model = TorchScriptServiceModelAdapter(
-                client=infer_client,
-                model_version=model_version,
-                fallback_model=model,
-                fallback_to_python=bool(cfg.native.fallback_to_python_infer),
-            )
-        elif (
-            use_cpp_infer
-            and native_ts_runtime is not None
-            and NativeTorchScriptModelAdapter is not None
-        ):
-            native_ts_runtime.load_models(model_version, str(ts_ctrl), str(ts_adv))
-            run_model = NativeTorchScriptModelAdapter(
-                runtime=native_ts_runtime,
-                model_version=model_version,
-                fallback_model=model,
-                fallback_to_python=bool(cfg.native.fallback_to_python_infer),
-            )
 
     writer = ReplayWriter(
         ReplayWriterConfig(out_dir=Path(cfg.dataset.out_dir), shard_size=cfg.dataset.shard_size)
     )
-
-    # mcts = VidurMCTS(
-    #     env=env,
-    #     explore_cfg=explore_cfg,
-    #     log_path=cfg.logging.mcts_iter_log,
-    #     tree_log_path=cfg.logging.mcts_root_log,
-    #     logger_flush_every=cfg.logging.flush_every,
-    # )
 
     mcts = VidurMCTS(
         env=env,
@@ -890,15 +618,12 @@ def main() -> None:
         log_path=cfg.logging.mcts_iter_log,
         tree_log_path=cfg.logging.mcts_root_log,
         logger_flush_every=cfg.logging.flush_every,
-        verbose=True,
-        complete_log=True,
     )
-
 
     runner = SelfPlayRunner(
         env=env,
         mcts=mcts,
-        model=run_model,
+        model=model,
         writer=writer,
         device_for_features=torch.device("cpu"),
     )
@@ -949,12 +674,12 @@ def main() -> None:
         runner.run_n_roots(
             game_id=cfg.run.game_id,
             num_roots=1,
-            adv_iterations_per_root=int(cfg.run.iterations),
-            cont_iterations_per_root=int(cfg.run.iterations),
+            adv_iterations_per_root=10000,
+            cont_iterations_per_root=10000,
             start_root_id=cfg.run.root_id,
-            start_root_depth=int(cfg.run.root_depth),
-            start_player=str(cfg.run.root_player),
-            history_nontrivial_hops=int(history_nontrivial_hops),
+            start_root_depth=0,
+            start_player="adversary",
+            history_nontrivial_hops=100, 
             feature_version=cfg.run.feature_version,
         )
 
@@ -977,22 +702,9 @@ def main() -> None:
         # )
     finally:
         mcts.close()
-        if infer_client is not None:
-            try:
-                infer_client.close()
-            except Exception:
-                pass
-        if infer_service_proc is not None:
-            try:
-                infer_service_proc.terminate()
-            except Exception:
-                pass
-            try:
-                infer_service_proc.join(timeout=3.0)
-            except Exception:
-                pass
 
 
 
 if __name__ == "__main__":
     main()
+

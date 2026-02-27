@@ -2,6 +2,20 @@
 
 """
 alphaZeroParrallel.py
+
+build the native if needed using the following command :
+
+cd /home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/native
+PY=/home/shazer/Desktop/Research/Vidur/vidur/.venv/bin/python3
+
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -Dpybind11_DIR="$($PY -m pybind11 --cmakedir)"
+
+cmake --build build -j
+cp build/mcts_native*.so ../
+
+
 run command :
 python3 -m vidur.mcts.alphaZeroParrallel
 
@@ -1856,7 +1870,7 @@ def main() -> None:
             infer_service_addr="127.0.0.1:50201",
             infer_service_device="cuda:0",
             infer_max_batch=256,
-            infer_max_wait_us=2000,
+            infer_max_wait_us=500,
             export_torchscript=False,
             fallback_to_python_infer=False,
         ),
@@ -1907,7 +1921,7 @@ def main() -> None:
 
 
     ## MODEL TRAINING PARMS FOR SELF-IMPROVEMENT LOOP:
-    num_selfPlay_workers = 10
+    num_selfPlay_workers = 15
     num_generations = 200
     history_nontrivial_hops = [0, 5 , 10 , 15 , 20, 25, 30, 35]  # per worker
     roots_per_generation = 500

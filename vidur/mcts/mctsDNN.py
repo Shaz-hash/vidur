@@ -117,7 +117,8 @@ class VidurMCTS:
         tree_log_path: Optional[Union[str, Path]] = None,   # NEW
         *,
         logger_flush_every: int = 1,
-        verbose: bool = False,
+        verbose: bool = True,
+        complete_log: bool = False,
         ## A flag to enable logs for normalised version of the inputs given to the model at root inference
         _did_root_infer_debug = False
         # history_depth: int = 0,          # NEW
@@ -135,9 +136,15 @@ class VidurMCTS:
 
         self._use_fast_sim_snapshot = True
 
-        # self._iter_logger = DNNMCTSIterationLogger(log_path, flush_every=logger_flush_every)
-        # Disable per-simulation iteration logging (mcts_iter.csv)
-        self._iter_logger = DNNMCTSIterationLogger(None, flush_every=logger_flush_every)
+        # Iteration-level logging is intentionally opt-in via existing `verbose` flag.
+        # This keeps native/Python search hot paths unaffected unless explicitly enabled.
+        self._iter_log_enabled = bool(verbose)
+        self._iter_complete_log = bool(complete_log)
+        self._iter_logger = (
+            DNNMCTSIterationLogger(log_path, flush_every=logger_flush_every)
+            if (self._iter_log_enabled and log_path is not None)
+            else None
+        )
 
         self._root_logger = DNNMCTSRootSummaryLogger(tree_log_path, flush_every=logger_flush_every)
 
@@ -1215,6 +1222,8 @@ class VidurMCTS:
         iterations: int,
         root_node_id: int,
         root_depth: int,
+        game_id: int = 0,
+        root_id: int = 0,
     ) -> None:
         if _mcts_native is None:
             raise RuntimeError("native_mcts_enabled=True but vidur.mcts.mcts_native is unavailable")
@@ -1225,6 +1234,12 @@ class VidurMCTS:
         reward_max_penalty = float(getattr(self._cfg, "reward_max_penalty", 40.0))
         headroom = max(reward_max_penalty - reward_knee, 1e-9)
         reward_tail_alpha = float(getattr(self._cfg, "reward_tail_alpha", 1.0 / headroom))
+
+        iter_log_path = ""
+        if bool(getattr(self, "_iter_log_enabled", False)):
+            p = getattr(getattr(self, "_iter_logger", None), "_path", None)
+            if p is not None:
+                iter_log_path = str(p)
 
         common_kwargs = dict(
             env=self._env,
@@ -1255,6 +1270,10 @@ class VidurMCTS:
             seed=int(self._rng.randint(0, 2**31 - 1)),
             root_node_id=int(root_node_id),
             root_depth=int(root_depth),
+            game_id=int(game_id),
+            root_id=int(root_id),
+            iter_log_path=str(iter_log_path),
+            iter_complete_log=bool(getattr(self, "_iter_complete_log", True)),
         )
 
         native_ts_runtime = getattr(dnn_model, "_native_ts_runtime", None)
@@ -1424,6 +1443,8 @@ class VidurMCTS:
                 iterations=int(iterations),
                 root_node_id=int(root_node_id),
                 root_depth=int(root_depth),
+                game_id=int(game_id),
+                root_id=int(root_id),
             )
         else:
             # --- Root evaluation (NOT counted as a simulation) ---
