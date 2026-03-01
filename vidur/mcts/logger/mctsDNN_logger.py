@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
 
@@ -123,18 +124,42 @@ class DNNMCTSIterationLogger:
         "controller_strategy",
     ]
 
+    PUCT_FIELDS = [
+        "game_id",
+        "root_id",
+        "sim_iteration",
+        "root_node_id",
+        "parent_node_id",
+        "node_id",
+        "player_acted_to_create_this_node",
+        "reward",
+        "node_dnn_value",
+        "children_created_json",
+        "dedup_children_json",
+        "ancestor_chain_json",
+        "selection_trace_json",
+        "minmax_min",
+        "minmax_max",
+    ]
+
     def __init__(self, path: Optional[Union[str, Path]], *, flush_every: int = 1) -> None:
         self._path = Path(path) if path else None
         self._flush_every = max(1, int(flush_every))
         self._file = None
         self._writer: Optional[csv.DictWriter] = None
         self._rows = 0
+        self._puct_file = None
+        self._puct_writer: Optional[csv.DictWriter] = None
 
     def close(self) -> None:
         if self._file is not None:
             self._file.close()
+        if self._puct_file is not None:
+            self._puct_file.close()
         self._file = None
         self._writer = None
+        self._puct_file = None
+        self._puct_writer = None
 
     def _ensure(self) -> None:
         if not self._path:
@@ -145,6 +170,17 @@ class DNNMCTSIterationLogger:
         self._file = self._path.open("w", newline="")
         self._writer = csv.DictWriter(self._file, fieldnames=self.FIELDS)
         self._writer.writeheader()
+
+    def _ensure_puct(self) -> None:
+        if not self._path:
+            return
+        if self._puct_writer is not None:
+            return
+        p = self._path.with_name(self._path.stem + "_puct.csv")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        self._puct_file = p.open("w", newline="")
+        self._puct_writer = csv.DictWriter(self._puct_file, fieldnames=self.PUCT_FIELDS)
+        self._puct_writer.writeheader()
 
     def log_expand(
         self,
@@ -267,6 +303,51 @@ class DNNMCTSIterationLogger:
         self._rows += 1
         if self._rows % self._flush_every == 0:
             self._file.flush()  # type: ignore[union-attr]
+
+    def puct_log_expand(
+        self,
+        *,
+        game_id: int,
+        root_id: int,
+        sim_iteration: int,
+        root_node_id: int,
+        parent_node_id: Optional[int],
+        node_id: int,
+        player_acted_to_create_this_node: str,
+        reward: float,
+        node_dnn_value: Optional[float],
+        children_created: list,
+        dedup_children: list,
+        ancestor_chain: list,
+        selection_trace: list,
+        minmax_min: float,
+        minmax_max: float,
+    ) -> None:
+        if not self._path:
+            return
+        self._ensure_puct()
+        assert self._puct_writer is not None
+        row = {
+            "game_id": int(game_id),
+            "root_id": int(root_id),
+            "sim_iteration": int(sim_iteration),
+            "root_node_id": int(root_node_id),
+            "parent_node_id": "" if parent_node_id is None else int(parent_node_id),
+            "node_id": int(node_id),
+            "player_acted_to_create_this_node": str(player_acted_to_create_this_node),
+            "reward": _safe_float(reward),
+            "node_dnn_value": "" if node_dnn_value is None else _safe_float(node_dnn_value),
+            "children_created_json": _j(children_created),
+            "dedup_children_json": _j(dedup_children),
+            "ancestor_chain_json": _j(ancestor_chain),
+            "selection_trace_json": _j(selection_trace),
+            "minmax_min": "" if math.isinf(minmax_min) else float(minmax_min),
+            "minmax_max": "" if math.isinf(minmax_max) else float(minmax_max),
+        }
+        self._puct_writer.writerow(row)
+        self._rows += 1
+        if self._rows % self._flush_every == 0:
+            self._puct_file.flush()  # type: ignore[union-attr]
 
 
 class DNNMCTSRootSummaryLogger:

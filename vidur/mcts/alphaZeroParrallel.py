@@ -210,6 +210,11 @@ def _build_constraints_and_explore(cfg: "AlphaZeroConfig") -> tuple[MCTSConstrai
         "torchscript_full_native_search",
         bool(getattr(getattr(cfg, "native", None), "torchscript_full_native_search", False)),
     )
+    setattr(
+        explore_cfg,
+        "prior_value_mode",
+        str(getattr(cfg.explore, "prior_value_mode", "model")),
+    )
 
     return constraints, explore_cfg
 
@@ -327,6 +332,36 @@ def _infer_cpp_runtime_enabled(cfg: "AlphaZeroConfig") -> bool:
     if ncfg is None:
         return False
     return bool(getattr(ncfg, "enabled", False)) and str(getattr(ncfg, "infer_mode", "python")) == "torchscript_cpp"
+
+
+def _infer_service_count(cfg: "AlphaZeroConfig") -> int:
+    ncfg = getattr(cfg, "native", None)
+    if ncfg is None:
+        return 1
+    try:
+        return max(1, int(getattr(ncfg, "infer_service_count", 1)))
+    except Exception:
+        return 1
+
+
+def _infer_service_addrs(cfg: "AlphaZeroConfig") -> list[str]:
+    base_addr = str(getattr(cfg.native, "infer_service_addr", "127.0.0.1:50201"))
+    count = _infer_service_count(cfg)
+    if count <= 1:
+        return [base_addr]
+    try:
+        host, port_raw = base_addr.rsplit(":", 1)
+        base_port = int(port_raw)
+    except Exception as exc:
+        raise ValueError(
+            f"infer_service_addr must be host:port when infer_service_count>1, got {base_addr!r}"
+        ) from exc
+    return [f"{host}:{base_port + idx}" for idx in range(count)]
+
+
+def _worker_infer_service_addr(cfg: "AlphaZeroConfig", worker_id: int) -> str:
+    addrs = _infer_service_addrs(cfg)
+    return str(addrs[int(worker_id) % len(addrs)])
 
 
 def _wait_for_infer_service(addr: str, *, timeout_s: float = 30.0) -> None:
@@ -562,10 +597,11 @@ def _selfplay_worker_main(
     native_ts_runtime = None
     native_service_runtime = None
     runtime_device = str(cfg.native.infer_service_device)
+    assigned_service_addr = _worker_infer_service_addr(cfg, worker_id) if use_service_infer else None
     if use_service_infer:
         if TorchScriptInferClient is None:
             raise RuntimeError("infer_mode=torchscript_service requested but infer client is unavailable")
-        infer_client = TorchScriptInferClient(addr=str(cfg.native.infer_service_addr))
+        infer_client = TorchScriptInferClient(addr=str(assigned_service_addr))
     if use_cpp_runtime_infer:
         if build_native_torchscript_runtime is None:
             raise RuntimeError("infer_mode=torchscript_cpp requested but native runtime builder is unavailable")
@@ -584,11 +620,11 @@ def _selfplay_worker_main(
     if use_service_infer and build_native_infer_service_runtime is not None:
         try:
             native_service_runtime = build_native_infer_service_runtime(
-                addr=str(cfg.native.infer_service_addr),
+                addr=str(assigned_service_addr),
             )
             if native_service_runtime.ping():
                 print(
-                    f"[worker {worker_id}] native infer-service runtime connected addr={cfg.native.infer_service_addr}",
+                    f"[worker {worker_id}] native infer-service runtime connected addr={assigned_service_addr}",
                     flush=True,
                 )
         except Exception as e:
@@ -753,6 +789,8 @@ def _selfplay_worker_main(
                     log_path=iter_log,
                     tree_log_path=root_log,
                     logger_flush_every=cfg.logging.flush_every,
+                    verbose=False,
+                    complete_log=False,
                 )
                 runner = SelfPlayRunner(
                     env=env,
@@ -984,6 +1022,8 @@ def _selfplay_worker_main(
                         log_path=None,
                         tree_log_path=debug_root_log,
                         logger_flush_every=cfg.logging.flush_every,
+                        verbose=False,
+                        complete_log=False,
                     )
                     runner = SelfPlayRunner(
                         env=env,
@@ -1176,7 +1216,8 @@ def selfImprovementPolicy(
     os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
     os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
-    infer_service_proc = None
+    infer_service_procs: list[object] = []
+    infer_service_addrs: list[str] = []
     infer_mode = str(getattr(cfg.native, "infer_mode", "python"))
     using_infer_service = _infer_service_enabled(cfg)
     using_cpp_runtime_infer = _infer_cpp_runtime_enabled(cfg)
@@ -1189,14 +1230,24 @@ def selfImprovementPolicy(
     if using_infer_service:
         if start_torchscript_infer_service is None:
             raise RuntimeError("infer_mode=torchscript_service requested but infer service entrypoint is unavailable")
-        infer_service_proc = start_torchscript_infer_service(
-            addr=str(cfg.native.infer_service_addr),
-            device=str(cfg.native.infer_service_device),
-            max_batch=int(cfg.native.infer_max_batch),
-            max_wait_us=int(cfg.native.infer_max_wait_us),
-            impl=str(getattr(cfg.native, "infer_service_impl", "cpp")),
-        )
-        _wait_for_infer_service(str(cfg.native.infer_service_addr), timeout_s=45.0)
+        infer_service_addrs = _infer_service_addrs(cfg)
+        for addr in infer_service_addrs:
+            infer_service_procs.append(
+                start_torchscript_infer_service(
+                    addr=str(addr),
+                    device=str(cfg.native.infer_service_device),
+                    max_batch=int(cfg.native.infer_max_batch),
+                    max_wait_us=int(cfg.native.infer_max_wait_us),
+                    impl=str(getattr(cfg.native, "infer_service_impl", "cpp")),
+                )
+            )
+        for addr in infer_service_addrs:
+            _wait_for_infer_service(str(addr), timeout_s=45.0)
+        if len(infer_service_addrs) > 1:
+            print(
+                f"[main] started {len(infer_service_addrs)} native infer services: {', '.join(infer_service_addrs)}",
+                flush=True,
+            )
 
 
     ctx = mp.get_context("spawn")
@@ -1650,16 +1701,22 @@ def selfImprovementPolicy(
         if p.exitcode != 0:
             raise RuntimeError(f"selfplay worker died: pid={p.pid} exitcode={p.exitcode}")
 
-    if infer_service_proc is not None:
+    for addr, infer_service_proc in zip(infer_service_addrs, infer_service_procs):
         if TorchScriptInferClient is not None:
             try:
-                c = TorchScriptInferClient(addr=str(cfg.native.infer_service_addr))
+                c = TorchScriptInferClient(addr=str(addr))
                 c.shutdown()
                 c.close()
             except Exception:
                 pass
-        infer_service_proc.terminate()
-        infer_service_proc.join(timeout=5.0)
+        try:
+            infer_service_proc.terminate()
+        except Exception:
+            pass
+        try:
+            infer_service_proc.join(timeout=5.0)
+        except Exception:
+            pass
 
 
 
@@ -1716,6 +1773,7 @@ class MCTSExploreGroup:
     root_dirichlet_noise_enabled: bool = False
     root_dirichlet_alpha: float = 0.6
     root_dirichlet_epsilon: float = 0.25
+    prior_value_mode: str = "model"  # model | uniform
 
 
 @dataclass(frozen=True)
@@ -1738,6 +1796,7 @@ class NativeRuntimeGroup:
     infer_service_impl: str = "cpp"  # cpp | python
     torchscript_full_native_search: bool = False
     infer_service_addr: str = "127.0.0.1:50201"
+    infer_service_count: int = 1
     infer_service_device: str = "cuda:0"
     infer_max_batch: int = 256
     infer_max_wait_us: int = 2000
@@ -1865,6 +1924,7 @@ def main() -> None:
             native_trace_every=250,
             native_trace_dir="simulator_output/mcts_dnn_logs",
             infer_mode="torchscript_service",
+            infer_service_count=1,
             infer_service_impl="cpp",
             torchscript_full_native_search=True,
             infer_service_addr="127.0.0.1:50201",

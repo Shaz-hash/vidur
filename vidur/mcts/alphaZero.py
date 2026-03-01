@@ -436,6 +436,11 @@ def _build_constraints_and_explore(cfg: "AlphaZeroConfig") -> tuple[MCTSConstrai
         "torchscript_full_native_search",
         bool(getattr(getattr(cfg, "native", None), "torchscript_full_native_search", False)),
     )
+    setattr(
+        explore_cfg,
+        "prior_value_mode",
+        str(getattr(cfg.explore, "prior_value_mode", "model")),
+    )
     return constraints, explore_cfg
 
 
@@ -567,6 +572,7 @@ class MCTSExploreGroup:
     root_dirichlet_noise_enabled: bool = False
     root_dirichlet_alpha: float = 0.6
     root_dirichlet_epsilon: float = 0.25
+    prior_value_mode: str = "model"  # model | uniform
 
 
 
@@ -724,7 +730,7 @@ def main() -> None:
             root_id=0,
             root_depth=0,
             root_player="adversary",
-            iterations=20000,
+            iterations=1000,
             feature_version=1,
         ),
         native=NativeRuntimeGroup(
@@ -746,7 +752,7 @@ def main() -> None:
 
     ## MODEL TRAINING PARMS FOR SELF-IMPROVEMENT LOOP:
     num_generations = 1
-    history_nontrivial_hops = 0
+    history_nontrivial_hops = 10
     roots_per_generation = 1
     adv_iterations_per_root = 8000
     cont_iterations_per_root = 8000
@@ -890,8 +896,8 @@ def main() -> None:
         log_path=cfg.logging.mcts_iter_log,
         tree_log_path=cfg.logging.mcts_root_log,
         logger_flush_every=cfg.logging.flush_every,
-        verbose=False,
-        complete_log=False,
+        verbose=True,
+        complete_log=True,
     )
 
 

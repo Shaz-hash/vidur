@@ -1250,8 +1250,21 @@ public:
                 enabled_ = false;
                 return;
             }
+            const auto puct_path = p.parent_path() / (p.stem().string() + "_puct" + p.extension().string());
+            bool write_puct_header = true;
+            if (std::filesystem::exists(puct_path, ec)) {
+                write_puct_header = std::filesystem::file_size(puct_path, ec) == 0;
+            }
+            puct_out_.open(puct_path, std::ios::app);
+            if (!puct_out_) {
+                enabled_ = false;
+                return;
+            }
             if (write_header) {
                 out_ << "game_id,root_id,sim_iteration,root_depth,root_node_id,root_player,phase,node_depth,parent_node_id,node_id,player_acted_to_create_this_node,player_to_act_in_this_node,action_index,action_repr,prior,model_prior_json,normalized_prior_json,reward,nn_called,num_valid_actions,unique_actions,nn_value_controller,objective_cost,sim_time,requests_in_system,requests_generated,requests_completed,slo_violations,avg_lateness,state_waiting_ids,state_completed_request_ids,adversary_requests,adversary_prefill_slos,adversary_prefill_deadlines_by_id,adversary_decode_slos,controller_token_budget,controller_selected_ids,controller_allocations,controller_prefill_allocations,controller_decode_allocations,controller_prefill_total,controller_decode_total,controller_heuristic,controller_strategy\n";
+            }
+            if (write_puct_header) {
+                puct_out_ << "game_id,root_id,sim_iteration,root_node_id,parent_node_id,node_id,player_acted_to_create_this_node,reward,node_dnn_value,children_created_json,dedup_children_json,ancestor_chain_json,selection_trace_json,minmax_min,minmax_max\n";
             }
         } catch (...) {
             enabled_ = false;
@@ -1259,6 +1272,7 @@ public:
     }
 
     bool enabled() const { return enabled_; }
+    bool puct_enabled() const { return enabled_; }
 
     void write_row(const std::vector<std::string>& cols) {
         if (!enabled_) return;
@@ -1269,9 +1283,19 @@ public:
         out_ << '\n';
     }
 
+    void write_puct_row(const std::vector<std::string>& cols) {
+        if (!enabled_) return;
+        for (size_t i = 0; i < cols.size(); ++i) {
+            if (i) puct_out_ << ',';
+            puct_out_ << csv_escape(cols[i]);
+        }
+        puct_out_ << '\n';
+    }
+
 private:
     bool enabled_ = false;
     std::ofstream out_;
+    std::ofstream puct_out_;
 };
 
 static std::string json_int_list(const std::vector<int>& v) {
@@ -1432,6 +1456,57 @@ static void write_native_iter_row(
     int unique_actions
 );
 
+struct NativePuctCandidate {
+    int action_index = -1;
+    int child_node_id = -1;
+    double pb_c = 0.0;
+    double prior_score = 0.0;
+    double value_score = 0.0;
+    double q_controller = 0.0;
+    double q_norm = 0.0;
+    double ucb = 0.0;
+};
+
+struct NativePuctHop {
+    int parent_node_id = -1;
+    std::string parent_player;
+    int parent_visits = 0;
+    std::vector<NativePuctCandidate> candidates;
+    int chosen_action_index = -1;
+    int chosen_child_node_id = -1;
+};
+
+static std::string json_selection_trace(const std::vector<NativePuctHop>& trace) {
+    std::ostringstream oss;
+    oss << '[';
+    for (size_t i = 0; i < trace.size(); ++i) {
+        if (i) oss << ", ";
+        const auto& hop = trace[i];
+        oss << "{\"parent_node_id\": " << hop.parent_node_id
+            << ", \"parent_player\": \"" << hop.parent_player << '"'
+            << ", \"parent_visits\": " << hop.parent_visits
+            << ", \"candidates\": [";
+        for (size_t j = 0; j < hop.candidates.size(); ++j) {
+            if (j) oss << ", ";
+            const auto& c = hop.candidates[j];
+            oss << "{\"action_index\": " << c.action_index
+                << ", \"child_node_id\": " << c.child_node_id
+                << ", \"pb_c\": " << f64(c.pb_c)
+                << ", \"prior_score\": " << f64(c.prior_score)
+                << ", \"value_score\": " << f64(c.value_score)
+                << ", \"q_controller\": " << f64(c.q_controller)
+                << ", \"q_norm\": " << f64(c.q_norm)
+                << ", \"ucb\": " << f64(c.ucb)
+                << '}';
+        }
+        oss << "], \"chosen_action_index\": " << hop.chosen_action_index
+            << ", \"chosen_child_node_id\": " << hop.chosen_child_node_id
+            << '}';
+    }
+    oss << ']';
+    return oss.str();
+}
+
 static inline void ensure_node_capacity(
     std::vector<NativeTreeNode>& nodes,
     size_t additional_nodes,
@@ -1453,6 +1528,7 @@ static inline void ensure_node_capacity(
 
 struct NativeSearchCfg {
     int max_branching = 10;
+    bool uniform_prior_value = false;
     double controller_min_prior_threshold = 0.0;
     double adversary_min_prior_threshold = 0.0;
     bool root_dirichlet_noise_enabled = false;
@@ -1503,10 +1579,66 @@ struct NativeTreeNode {
     std::map<int, int> children;  // action index -> node index
     std::map<int, int> action_alias_to_canonical;
     std::map<int, std::vector<int>> canonical_to_action_aliases;
+    std::vector<std::tuple<int, double, int>> last_expand_children_created;
+    std::vector<std::tuple<int, double, std::vector<int>>> last_expand_dedup;
 
     bool has_state_snapshot = false;
     NativeSimState state_snapshot;
 };
+
+static std::string json_expand_children_created(const NativeTreeNode& node) {
+    std::ostringstream oss;
+    oss << '[';
+    for (size_t i = 0; i < node.last_expand_children_created.size(); ++i) {
+        if (i) oss << ", ";
+        const auto& item = node.last_expand_children_created[i];
+        oss << '['
+            << std::get<0>(item) << ", "
+            << f64(std::get<1>(item)) << ", "
+            << std::get<2>(item) << ']';
+    }
+    oss << ']';
+    return oss.str();
+}
+
+static std::string json_expand_dedup(const NativeTreeNode& node) {
+    std::ostringstream oss;
+    oss << '[';
+    for (size_t i = 0; i < node.last_expand_dedup.size(); ++i) {
+        if (i) oss << ", ";
+        const auto& item = node.last_expand_dedup[i];
+        oss << '['
+            << std::get<0>(item) << ", "
+            << f64(std::get<1>(item)) << ", "
+            << json_int_list(std::get<2>(item)) << ']';
+    }
+    oss << ']';
+    return oss.str();
+}
+
+static std::string json_ancestor_chain(const std::vector<NativeTreeNode>& nodes, int node_idx) {
+    std::ostringstream oss;
+    oss << '[';
+    bool first = true;
+    int cur = node_idx;
+    while (cur >= 0) {
+        ensure_node_index(nodes, cur, "json_ancestor_chain");
+        const auto& node = nodes[(size_t)cur];
+        if (!first) oss << ", ";
+        first = false;
+        oss << "{\"node_id\": " << node.node_id
+            << ", \"parent_node_id\": ";
+        if (node.parent < 0) oss << "null";
+        else oss << nodes[(size_t)node.parent].node_id;
+        oss << ", \"value_sum\": " << f64(node.value_sum)
+            << ", \"visits\": " << node.visits
+            << ", \"mean_value\": " << f64(node.visits > 0 ? (node.value_sum / (double)node.visits) : 0.0)
+            << '}';
+        cur = node.parent;
+    }
+    oss << ']';
+    return oss.str();
+}
 
 static inline void ensure_node_index(
     const std::vector<NativeTreeNode>& nodes,
@@ -1940,6 +2072,51 @@ static int select_child(
     return best_children[(size_t)dist(rng)];
 }
 
+static std::vector<NativePuctCandidate> build_selection_candidates(
+    const std::vector<NativeTreeNode>& nodes,
+    int node_idx,
+    const NativeSearchCfg& cfg,
+    const NativeMinMaxStats& minmax
+) {
+    ensure_node_index(nodes, node_idx, "build_selection_candidates(node)");
+    const auto& node = nodes[(size_t)node_idx];
+    const bool parent_is_branching = (node.num_valid_actions > 1) || (node.children.size() > 1);
+    std::vector<NativePuctCandidate> out;
+    out.reserve(node.children.size());
+    for (const auto& kv : node.children) {
+        const int action_idx = kv.first;
+        const int child_idx = kv.second;
+        if (child_idx < 0 || (size_t)child_idx >= nodes.size()) {
+            continue;
+        }
+        const auto& child = nodes[(size_t)child_idx];
+        NativePuctCandidate c;
+        c.action_index = action_idx;
+        c.child_node_id = child.node_id;
+        c.pb_c = std::log((node.visits + cfg.pb_c_base + 1.0) / cfg.pb_c_base) + cfg.pb_c_init;
+        c.pb_c *= std::sqrt((double)node.visits + 1.0) / ((double)child.visits + 1.0);
+        c.prior_score = c.pb_c * child.prior;
+        if (child.visits > 0) {
+            const double disc = parent_is_branching ? time_discount(cfg, child.sim_time, node.sim_time) : 1.0;
+            c.q_controller = child.reward + disc * (child.value_sum / (double)child.visits);
+            c.q_norm = minmax.normalize(c.q_controller);
+            c.value_score = (node.player == "controller") ? c.q_norm : -c.q_norm;
+        }
+        c.ucb = c.prior_score + c.value_score;
+        out.push_back(c);
+    }
+    return out;
+}
+
+static int action_index_for_child(const NativeTreeNode& node, int child_idx) {
+    for (const auto& kv : node.children) {
+        if (kv.second == child_idx) {
+            return kv.first;
+        }
+    }
+    return -1;
+}
+
 static int create_child(
     std::vector<NativeTreeNode>& nodes,
     int parent_idx,
@@ -1989,6 +2166,22 @@ static void apply_edge_transition(
     child.sim_time = py::cast<double>(state.attr("simulator").attr("_time"));
 }
 
+static std::pair<double, std::vector<double>> uniform_value_and_priors(
+    const std::vector<int>& valid,
+    size_t action_count
+) {
+    std::vector<double> priors(action_count, 0.0);
+    if (!valid.empty()) {
+        const double p = 1.0 / (double)valid.size();
+        for (int idx : valid) {
+            if (idx >= 0 && (size_t)idx < action_count) {
+                priors[(size_t)idx] = p;
+            }
+        }
+    }
+    return std::make_pair(0.0, std::move(priors));
+}
+
 static std::tuple<double, bool, int> expand_node(
     std::vector<NativeTreeNode>& nodes,
     int node_idx,
@@ -1997,11 +2190,16 @@ static std::tuple<double, bool, int> expand_node(
     const py::function& infer_cb,
     const NativeSearchCfg& cfg,
     std::mt19937& rng,
-    int& next_node_id
+    int& next_node_id,
+    bool record_expand_debug = false
 ) {
     auto am = actions_and_mask(env, state, nodes[(size_t)node_idx].player, cfg.max_branching);
     nodes[(size_t)node_idx].num_valid_actions = (int)am.valid.size();
     nodes[(size_t)node_idx].nn_valid_mask = am.mask;
+    if (record_expand_debug) {
+        nodes[(size_t)node_idx].last_expand_children_created.clear();
+        nodes[(size_t)node_idx].last_expand_dedup.clear();
+    }
 
     if (am.valid.empty()) {
         return std::make_tuple(0.0, false, 0);
@@ -2022,15 +2220,25 @@ static std::tuple<double, bool, int> expand_node(
         return std::make_tuple(0.0, false, 1);
     }
 
-    py::tuple infer_out = infer_cb(
-        state,
-        py::str(nodes[(size_t)node_idx].player),
-        to_pybool_list(am.mask)
-    ).cast<py::tuple>();
-    const double model_value = py::cast<double>(infer_out[0]);
-    std::vector<double> priors = infer_out[1].cast<std::vector<double>>();
     const size_t a = (size_t)py::len(am.actions);
-    if (priors.size() < a) priors.resize(a, 0.0);
+    double model_value = 0.0;
+    std::vector<double> priors;
+    bool used_model = false;
+    if (cfg.uniform_prior_value) {
+        auto uniform_out = uniform_value_and_priors(am.valid, a);
+        model_value = uniform_out.first;
+        priors = std::move(uniform_out.second);
+    } else {
+        py::tuple infer_out = infer_cb(
+            state,
+            py::str(nodes[(size_t)node_idx].player),
+            to_pybool_list(am.mask)
+        ).cast<py::tuple>();
+        model_value = py::cast<double>(infer_out[0]);
+        priors = infer_out[1].cast<std::vector<double>>();
+        if (priors.size() < a) priors.resize(a, 0.0);
+        used_model = true;
+    }
 
     nodes[(size_t)node_idx].has_nn_value = true;
     nodes[(size_t)node_idx].nn_value_controller = model_value;
@@ -2111,7 +2319,7 @@ static std::tuple<double, bool, int> expand_node(
         );
     }
 
-    return std::make_tuple(model_value, true, (int)am.valid.size());
+    return std::make_tuple(model_value, used_model, (int)am.valid.size());
 }
 
 static void maybe_add_root_dirichlet_noise(
@@ -2199,6 +2407,7 @@ static py::dict search_mcts_dnn(
     std::string root_player,
     int iterations,
     py::function infer_cb,
+    bool uniform_prior_value,
     int max_branching,
     double controller_min_prior_threshold,
     double adversary_min_prior_threshold,
@@ -2226,6 +2435,7 @@ static py::dict search_mcts_dnn(
     (void)iter_complete_log;
     NativeSearchCfg cfg;
     cfg.max_branching = max_branching;
+    cfg.uniform_prior_value = uniform_prior_value;
     cfg.controller_min_prior_threshold = controller_min_prior_threshold;
     cfg.adversary_min_prior_threshold = adversary_min_prior_threshold;
     cfg.root_dirichlet_noise_enabled = root_dirichlet_noise_enabled;
@@ -3339,7 +3549,8 @@ static std::tuple<double, bool, int> expand_node_full_native(
     NativePredictor& predictor,
     std::mt19937& rng,
     int& next_node_id,
-    NativeSearchPerf* perf = nullptr
+    NativeSearchPerf* perf = nullptr,
+    bool record_expand_debug = false
 ) {
     ensure_node_index(nodes, node_idx, "expand_node_full_native(node)");
     (void)predictor;
@@ -3351,6 +3562,10 @@ static std::tuple<double, bool, int> expand_node_full_native(
     if (perf != nullptr) perf->actions_mask_total_sec += (t_am1 - t_am0);
     nodes[(size_t)node_idx].num_valid_actions = (int)am.valid.size();
     nodes[(size_t)node_idx].nn_valid_mask = am.mask;
+    if (record_expand_debug) {
+        nodes[(size_t)node_idx].last_expand_children_created.clear();
+        nodes[(size_t)node_idx].last_expand_dedup.clear();
+    }
 
     if (am.valid.empty()) {
         return std::make_tuple(0.0, false, 0);
@@ -3384,28 +3599,38 @@ static std::tuple<double, bool, int> expand_node_full_native(
         return std::make_tuple(0.0, false, 1);
     }
 
-    double infer_build_sec = 0.0;
-    double infer_forward_sec = 0.0;
-    auto infer_out = infer_from_native_state_torchscript(
-        state,
-        nodes[(size_t)node_idx].player,
-        am.mask,
-        runtime_cfg,
-        infer_runtime,
-        model_version,
-        &infer_build_sec,
-        &infer_forward_sec
-    );
-    if (perf != nullptr) {
-        perf->infer_calls += 1;
-        perf->infer_build_sec += infer_build_sec;
-        perf->infer_forward_sec += infer_forward_sec;
-        perf->infer_total_sec += (infer_build_sec + infer_forward_sec);
-    }
-    const double model_value = std::get<0>(infer_out);
-    std::vector<double> priors = std::get<1>(std::move(infer_out));
     const size_t a = am.mask.size();
-    if (priors.size() < a) priors.resize(a, 0.0);
+    double model_value = 0.0;
+    std::vector<double> priors;
+    bool used_model = false;
+    if (cfg.uniform_prior_value) {
+        auto uniform_out = uniform_value_and_priors(am.valid, a);
+        model_value = uniform_out.first;
+        priors = std::move(uniform_out.second);
+    } else {
+        double infer_build_sec = 0.0;
+        double infer_forward_sec = 0.0;
+        auto infer_out = infer_from_native_state_torchscript(
+            state,
+            nodes[(size_t)node_idx].player,
+            am.mask,
+            runtime_cfg,
+            infer_runtime,
+            model_version,
+            &infer_build_sec,
+            &infer_forward_sec
+        );
+        if (perf != nullptr) {
+            perf->infer_calls += 1;
+            perf->infer_build_sec += infer_build_sec;
+            perf->infer_forward_sec += infer_forward_sec;
+            perf->infer_total_sec += (infer_build_sec + infer_forward_sec);
+        }
+        model_value = std::get<0>(infer_out);
+        priors = std::get<1>(std::move(infer_out));
+        if (priors.size() < a) priors.resize(a, 0.0);
+        used_model = true;
+    }
 
     nodes[(size_t)node_idx].has_nn_value = true;
     nodes[(size_t)node_idx].nn_value_controller = model_value;
@@ -3482,9 +3707,10 @@ static std::tuple<double, bool, int> expand_node_full_native(
     const double t_child0 = now_sec();
     for (int idx : canonical_indices) {
         if (nodes[(size_t)node_idx].children.find(idx) != nodes[(size_t)node_idx].children.end()) continue;
+        int child_idx = -1;
         if (is_controller_player) {
             if ((size_t)idx >= am.controller_actions.size()) continue;
-            create_child_native(
+            child_idx = create_child_native(
                 nodes,
                 node_idx,
                 idx,
@@ -3495,7 +3721,7 @@ static std::tuple<double, bool, int> expand_node_full_native(
             );
         } else {
             if ((size_t)idx >= am.adversary_actions.size()) continue;
-            create_child_native(
+            child_idx = create_child_native(
                 nodes,
                 node_idx,
                 idx,
@@ -3505,10 +3731,30 @@ static std::tuple<double, bool, int> expand_node_full_native(
                 next_node_id
             );
         }
+        if (record_expand_debug && child_idx >= 0) {
+            const auto& child = nodes[(size_t)child_idx];
+            nodes[(size_t)node_idx].last_expand_children_created.push_back(
+                std::make_tuple(child.node_id, child.prior, idx)
+            );
+        }
     }
     if (perf != nullptr) perf->expand_child_create_sec += (now_sec() - t_child0);
 
-    return std::make_tuple(model_value, true, (int)am.valid.size());
+    if (record_expand_debug && is_controller_player) {
+        for (const auto& kv : nodes[(size_t)node_idx].canonical_to_action_aliases) {
+            const int canon_idx = kv.first;
+            auto it_child = nodes[(size_t)node_idx].children.find(canon_idx);
+            if (it_child == nodes[(size_t)node_idx].children.end()) {
+                continue;
+            }
+            const auto& child = nodes[(size_t)it_child->second];
+            nodes[(size_t)node_idx].last_expand_dedup.push_back(
+                std::make_tuple(child.node_id, canonical_prior[canon_idx], kv.second)
+            );
+        }
+    }
+
+    return std::make_tuple(model_value, used_model, (int)am.valid.size());
 }
 
 template <typename InferRuntimeT>
@@ -3519,6 +3765,7 @@ static py::dict search_mcts_dnn_torchscript_impl(
     int iterations,
     InferRuntimeT& infer_runtime,
     int model_version,
+    bool uniform_prior_value,
     int max_branching,
     double controller_min_prior_threshold,
     double adversary_min_prior_threshold,
@@ -3557,6 +3804,7 @@ static py::dict search_mcts_dnn_torchscript_impl(
 
     NativeSearchCfg cfg;
     cfg.max_branching = max_branching;
+    cfg.uniform_prior_value = uniform_prior_value;
     cfg.controller_min_prior_threshold = controller_min_prior_threshold;
     cfg.adversary_min_prior_threshold = adversary_min_prior_threshold;
     cfg.root_dirichlet_noise_enabled = root_dirichlet_noise_enabled;
@@ -3628,6 +3876,10 @@ static py::dict search_mcts_dnn_torchscript_impl(
     root.state_snapshot = root_native_state;
     nodes.push_back(std::move(root));
 
+    NativeIterCsvLogger iter_logger(iter_log_path);
+    const bool iter_log_enabled = iter_logger.enabled();
+    const bool puct_log_enabled = iter_logger.puct_enabled();
+
     int next_node_id = cfg.root_node_id + 1;
     NativeSimState root_work = root_native_state;
     const double t_root_expand0 = now_sec();
@@ -3642,7 +3894,8 @@ static py::dict search_mcts_dnn_torchscript_impl(
         predictor,
         rng,
         next_node_id,
-        &perf
+        &perf,
+        puct_log_enabled
     );
     perf.root_expand_sec += (now_sec() - t_root_expand0);
     maybe_add_root_dirichlet_noise(
@@ -3653,8 +3906,6 @@ static py::dict search_mcts_dnn_torchscript_impl(
         cfg,
         rng
     );
-    NativeIterCsvLogger iter_logger(iter_log_path);
-    const bool iter_log_enabled = iter_logger.enabled();
     if (native_trace_should_log(search_call)) {
         std::ostringstream oss;
         oss
@@ -3678,14 +3929,36 @@ static py::dict search_mcts_dnn_torchscript_impl(
         std::vector<int> search_path;
         search_path.reserve(32);
         search_path.push_back(current);
+        std::vector<NativePuctHop> selection_trace;
+        if (puct_log_enabled) {
+            selection_trace.reserve(32);
+        }
 
         const double t_select0 = now_sec();
         while (!nodes[(size_t)current].children.empty()) {
             ensure_node_index(nodes, current, "search_loop.select.current");
-            int child_idx = select_child(nodes, current, cfg, minmax, rng);
-            if (child_idx < 0) break;
-            ensure_node_index(nodes, child_idx, "search_loop.select.child");
-            current = child_idx;
+            if (puct_log_enabled) {
+                NativePuctHop hop;
+                const auto& parent = nodes[(size_t)current];
+                hop.parent_node_id = parent.node_id;
+                hop.parent_player = parent.player;
+                hop.parent_visits = parent.visits;
+                hop.candidates = build_selection_candidates(nodes, current, cfg, minmax);
+                const int chosen_child_idx = select_child(nodes, current, cfg, minmax, rng);
+                if (chosen_child_idx < 0) {
+                    break;
+                }
+                ensure_node_index(nodes, chosen_child_idx, "search_loop.select.child");
+                hop.chosen_child_node_id = nodes[(size_t)chosen_child_idx].node_id;
+                hop.chosen_action_index = action_index_for_child(parent, chosen_child_idx);
+                selection_trace.push_back(std::move(hop));
+                current = chosen_child_idx;
+            } else {
+                int child_idx = select_child(nodes, current, cfg, minmax, rng);
+                if (child_idx < 0) break;
+                ensure_node_index(nodes, child_idx, "search_loop.select.child");
+                current = child_idx;
+            }
             search_path.push_back(current);
             perf.selection_steps += 1;
         }
@@ -3815,7 +4088,8 @@ static py::dict search_mcts_dnn_torchscript_impl(
             predictor,
             rng,
             next_node_id,
-            &perf
+            &perf,
+            puct_log_enabled
         );
         perf.leaf_expand_sec += (now_sec() - t_leaf_expand0);
         double value = std::get<0>(leaf_expand);
@@ -3864,6 +4138,29 @@ static py::dict search_mcts_dnn_torchscript_impl(
             value = reward_used + disc * value;
         }
         perf.backprop_sec += (now_sec() - t_backprop0);
+
+        if (puct_log_enabled) {
+            ensure_node_index(nodes, current, "puct_logger.leaf");
+            const auto& leaf = nodes[(size_t)current];
+            std::vector<std::string> cols;
+            cols.reserve(15);
+            cols.push_back(std::to_string(game_id));
+            cols.push_back(std::to_string(root_id));
+            cols.push_back(std::to_string(it));
+            cols.push_back(std::to_string(nodes[0].node_id));
+            cols.push_back(leaf.parent < 0 ? std::string() : std::to_string(nodes[(size_t)leaf.parent].node_id));
+            cols.push_back(std::to_string(leaf.node_id));
+            cols.push_back(leaf.parent < 0 ? std::string("root_no_parent") : nodes[(size_t)leaf.parent].player);
+            cols.push_back(f64(leaf.reward));
+            cols.push_back(leaf.has_nn_value ? f64(leaf.nn_value_controller) : std::string());
+            cols.push_back(json_expand_children_created(leaf));
+            cols.push_back(json_expand_dedup(leaf));
+            cols.push_back(json_ancestor_chain(nodes, current));
+            cols.push_back(json_selection_trace(selection_trace));
+            cols.push_back(std::isinf(minmax.minimum) ? std::string() : f64(minmax.minimum));
+            cols.push_back(std::isinf(minmax.maximum) ? std::string() : f64(minmax.maximum));
+            iter_logger.write_puct_row(cols);
+        }
     }
 
     perf.total_sec = (now_sec() - t_search0);
@@ -3965,6 +4262,7 @@ static py::dict search_mcts_dnn_torchscript(
     int iterations,
     NativeTorchScriptInferRuntime& infer_runtime,
     int model_version,
+    bool uniform_prior_value,
     int max_branching,
     double controller_min_prior_threshold,
     double adversary_min_prior_threshold,
@@ -3993,6 +4291,7 @@ static py::dict search_mcts_dnn_torchscript(
         iterations,
         infer_runtime,
         model_version,
+        uniform_prior_value,
         max_branching,
         controller_min_prior_threshold,
         adversary_min_prior_threshold,
@@ -4023,6 +4322,7 @@ static py::dict search_mcts_dnn_torchscript_service(
     int iterations,
     NativeInferServiceRuntime& infer_runtime,
     int model_version,
+    bool uniform_prior_value,
     int max_branching,
     double controller_min_prior_threshold,
     double adversary_min_prior_threshold,
@@ -4051,6 +4351,7 @@ static py::dict search_mcts_dnn_torchscript_service(
         iterations,
         infer_runtime,
         model_version,
+        uniform_prior_value,
         max_branching,
         controller_min_prior_threshold,
         adversary_min_prior_threshold,
@@ -4306,6 +4607,7 @@ PYBIND11_MODULE(mcts_native, m) {
       py::arg("root_player"),
       py::arg("iterations"),
       py::arg("infer_cb"),
+      py::arg("uniform_prior_value") = false,
       py::arg("max_branching"),
       py::arg("controller_min_prior_threshold"),
       py::arg("adversary_min_prior_threshold"),
@@ -4335,6 +4637,7 @@ PYBIND11_MODULE(mcts_native, m) {
       py::arg("iterations"),
       py::arg("infer_runtime"),
       py::arg("model_version"),
+      py::arg("uniform_prior_value") = false,
       py::arg("max_branching"),
       py::arg("controller_min_prior_threshold"),
       py::arg("adversary_min_prior_threshold"),
@@ -4364,6 +4667,7 @@ PYBIND11_MODULE(mcts_native, m) {
       py::arg("iterations"),
       py::arg("infer_runtime"),
       py::arg("model_version"),
+      py::arg("uniform_prior_value") = false,
       py::arg("max_branching"),
       py::arg("controller_min_prior_threshold"),
       py::arg("adversary_min_prior_threshold"),

@@ -92,6 +92,10 @@ class MCTSNode:
     cached_sim_snapshot: Any | None = None
     cached_stats: Any | None = None
 
+    # Debug fields for PUCT trace logging
+    last_expand_children_created: List[list] = field(default_factory=list)
+    last_expand_dedup: List[list] = field(default_factory=list)
+
 
     def expanded(self) -> bool:
         return len(self.children) > 0
@@ -117,7 +121,7 @@ class VidurMCTS:
         tree_log_path: Optional[Union[str, Path]] = None,   # NEW
         *,
         logger_flush_every: int = 1,
-        verbose: bool = True,
+        verbose: bool = False,
         complete_log: bool = False,
         ## A flag to enable logs for normalised version of the inputs given to the model at root inference
         _did_root_infer_debug = False
@@ -182,6 +186,56 @@ class VidurMCTS:
     def _state_cost(self, state: VidurMCTSState) -> float:
         violations, avg_lateness = self._env.evaluate_objective(state)
         return float(violations) + float(avg_lateness)
+
+    def _seed_node_runtime_from_state(self, node: MCTSNode, state: VidurMCTSState) -> None:
+        node.state_cost = float(self._state_cost(state))
+        node.sim_time = float(getattr(state.simulator, "_time", 0.0))
+
+    def _prior_value_mode(self) -> str:
+        """
+        Mode switch for expansion priors/value:
+        - "model": normal NN inference
+        - "uniform": uniform priors over valid actions, bootstrap value = 0
+        """
+        mode = str(
+            getattr(
+                self._cfg,
+                "prior_value_mode",
+                getattr(self._cfg, "prior_mode", "model"),
+            )
+            or "model"
+        ).strip().lower()
+        if mode not in ("model", "uniform"):
+            raise ValueError(f"Unsupported prior/value mode: {mode!r}")
+        return mode
+
+    def _get_prior_value_mode(self) -> str:
+        return self._prior_value_mode()
+
+    def _uniform_value_and_priors(
+        self,
+        actions_by_index: List[Optional[object]],
+        mask: torch.Tensor,
+    ) -> Tuple[float, List[float]]:
+        """
+        Uniform policy on valid actions, value=0 (controller perspective).
+        """
+        mask_list = (
+            mask.to(dtype=torch.bool).tolist()
+            if isinstance(mask, torch.Tensor)
+            else [bool(x) for x in mask]
+        )
+        priors = [0.0] * len(actions_by_index)
+        valid = [
+            i
+            for i, ok in enumerate(mask_list)
+            if ok and i < len(actions_by_index) and actions_by_index[i] is not None
+        ]
+        if valid:
+            p = 1.0 / float(len(valid))
+            for i in valid:
+                priors[i] = p
+        return 0.0, priors
 
     # TODO: pass this via the config and experiment with different reward shaping functions
     def _transition_reward(self, parent_cost: float, child_cost: float) -> float:
@@ -318,8 +372,7 @@ class VidurMCTS:
         # t = time.perf_counter()
         child_cost = float(self._state_cost(state))
         node.reward = float(self._transition_reward(parent_cost, child_cost))
-        node.state_cost = float(child_cost)
-        node.sim_time = float(getattr(state.simulator, "_time", 0.0))
+        self._seed_node_runtime_from_state(node, state)
 
         # Snapshot this node so future rollouts can jump here
         self._store_node_snapshot(node, state)
@@ -622,9 +675,15 @@ class VidurMCTS:
         # ------------------------
         # Always call NN to get PRIORS for multi-child nodes
         # t = time.perf_counter()
-        model_value, priors = self._nn_value_and_priors(
-            dnn_model, state, node.player, action_mask=mask.unsqueeze(0)
-        )
+        mode = self._prior_value_mode()
+        if mode == "uniform":
+            model_value, priors = self._uniform_value_and_priors(actions_by_index, mask)
+            used_model = False
+        else:
+            model_value, priors = self._nn_value_and_priors(
+                dnn_model, state, node.player, action_mask=mask.unsqueeze(0)
+            )
+            used_model = True
         # self._perf["expand_nn_total"] += time.perf_counter() - t
         node.nn_value_controller = float(model_value)
         node.nn_priors = list(priors)
@@ -723,6 +782,10 @@ class VidurMCTS:
 
         # Create children ONLY for canonical indices
         # t = time.perf_counter()
+        record_puct = getattr(self._iter_logger, "_path", None) is not None
+        if record_puct:
+            node.last_expand_children_created = []
+            node.last_expand_dedup = []
         for idx in canonical_indices:
             action = actions_by_index[idx]
             if action is None:
@@ -743,9 +806,26 @@ class VidurMCTS:
                 value_sum=0.0,
                 sim_time=state.simulator._time,
             )
+            if record_puct:
+                node.last_expand_children_created.append(
+                    [int(node.children[idx].node_id), float(node.children[idx].prior), int(idx)]
+                )
+
+        if record_puct and node.player == "controller":
+            for canon_idx, aliases in node.canonical_to_action_aliases.items():
+                child = node.children.get(canon_idx)
+                if child is None:
+                    continue
+                node.last_expand_dedup.append(
+                    [
+                        int(child.node_id),
+                        float(canonical_prior.get(canon_idx, 0.0)),
+                        [int(a) for a in aliases],
+                    ]
+                )
         # self._perf["expand_child_create"] += time.perf_counter() - t
 
-        return value_used_for_backup, True, num_valid_actions
+        return value_used_for_backup, bool(used_model), num_valid_actions
 
 
 
@@ -786,6 +866,74 @@ class VidurMCTS:
         best = [idx for idx, child in node.children.items() if self.ucb_score(node, child, min_max_stats) == max_ucb]
         action_index = self._rng.choice(best)
         return int(action_index), node.children[action_index]
+
+    def _ucb_components(self, parent: MCTSNode, child: MCTSNode, min_max_stats: MinMaxStats) -> Dict[str, float]:
+        pb_c_base = getattr(self._cfg, "pb_c_base", 5000)
+        pb_c_init = getattr(self._cfg, "pb_c_init", 0.75)
+        parent_is_branching = (getattr(parent, "num_valid_actions", 0) > 1) or (len(parent.children) > 1)
+
+        pb_c = math.log((parent.visits + pb_c_base + 1.0) / pb_c_base) + pb_c_init
+        pb_c *= math.sqrt(parent.visits + 1.0) / (child.visits + 1.0)
+
+        prior_score = pb_c * float(child.prior)
+        if child.visits > 0:
+            disc = self._time_discount(float(child.sim_time), float(parent.sim_time)) if parent_is_branching else 1.0
+            q_controller = float(child.reward) + disc * float(child.mean_value())
+            q_norm = min_max_stats.normalize(q_controller)
+            value_score = q_norm if parent.player == "controller" else -q_norm
+        else:
+            q_controller = 0.0
+            q_norm = 0.0
+            value_score = 0.0
+
+        ucb = float(prior_score) + float(value_score)
+        return {
+            "pb_c": float(pb_c),
+            "prior_score": float(prior_score),
+            "value_score": float(value_score),
+            "q_controller": float(q_controller),
+            "q_norm": float(q_norm),
+            "ucb": float(ucb),
+        }
+
+    def _build_selection_candidates(
+        self,
+        node: MCTSNode,
+        min_max_stats: MinMaxStats,
+    ) -> List[Dict[str, Any]]:
+        candidates: List[Dict[str, Any]] = []
+        for idx, child in node.children.items():
+            comp = self._ucb_components(node, child, min_max_stats)
+            candidates.append(
+                {
+                    "action_index": int(idx),
+                    "child_node_id": int(child.node_id),
+                    **comp,
+                }
+            )
+        candidates.sort(key=lambda x: x["action_index"])
+        return candidates
+
+    def _select_child_with_trace(
+        self,
+        node: MCTSNode,
+        min_max_stats: MinMaxStats,
+        *,
+        enable_trace: bool,
+    ) -> Tuple[int, MCTSNode, Optional[Dict[str, Any]]]:
+        trace = None
+        candidates = self._build_selection_candidates(node, min_max_stats) if enable_trace else None
+        action_index, child = self.select_child(node, min_max_stats)
+        if enable_trace:
+            trace = {
+                "parent_node_id": int(node.node_id),
+                "parent_player": str(node.player),
+                "parent_visits": int(node.visits),
+                "candidates": candidates,
+                "chosen_action_index": int(action_index),
+                "chosen_child_node_id": int(child.node_id),
+            }
+        return int(action_index), child, trace
 
     
     def _advance_through_single_child_chain(
@@ -910,14 +1058,29 @@ class VidurMCTS:
             step_reward = self._transition_reward(parent_cost, child_cost)
 
             child.reward = float(step_reward)
-            child.state_cost = float(child_cost)
-            child.sim_time = state.simulator._time
+            self._seed_node_runtime_from_state(child, state)
             # branching anchor doesn't change inside a forced chain
             # child.branch_anchor_time = node.branch_anchor_time
 
             search_path.append(child)
             node = child
             hops += 1
+
+    def _ancestor_chain(self, node: MCTSNode) -> List[Dict[str, Any]]:
+        out = []
+        cur = node
+        while cur is not None:
+            out.append(
+                {
+                    "node_id": int(cur.node_id),
+                    "parent_node_id": None if cur.parent is None else int(cur.parent.node_id),
+                    "value_sum": float(cur.value_sum),
+                    "visits": int(cur.visits),
+                    "mean_value": float(cur.mean_value()),
+                }
+            )
+            cur = cur.parent
+        return out
 
 
 
@@ -960,9 +1123,21 @@ class VidurMCTS:
         # 1) Selection (TREE ONLY)
         node = root
         search_path: List[MCTSNode] = [node]
+        selection_trace: List[Dict[str, Any]] = []
+        iter_logging = getattr(self._iter_logger, "_path", None) is not None
         # t_phase = time.perf_counter()
         while node.expanded():
-            _, node = self.select_child(node, min_max_stats)
+            if iter_logging:
+                _, child, hop = self._select_child_with_trace(
+                    node,
+                    min_max_stats,
+                    enable_trace=True,
+                )
+                if hop is not None:
+                    selection_trace.append(hop)
+                node = child
+            else:
+                _, node = self.select_child(node, min_max_stats)
             search_path.append(node)
         # self._perf["selection"] += time.perf_counter() - t_phase
         # 2) Restore scratch sim straight to the selected node state (or materialize it once)
@@ -972,7 +1147,6 @@ class VidurMCTS:
         # self._perf["restore"] += time.perf_counter() - t_phase
        
 
-        iter_logging = getattr(self._iter_logger, "_path", None) is not None
         forced_logs = [] if iter_logging else None
 
         # 3) Skip forced single-child chains so we end on branching/terminal
@@ -1105,6 +1279,27 @@ class VidurMCTS:
         # self._perf["backprop"] += time.perf_counter() - t_phase
         # self._perf["sim_count"] += 1
 
+        if self._iter_logger is not None:
+            self._iter_logger.puct_log_expand(
+                game_id=int(game_id),
+                root_id=int(root_id),
+                sim_iteration=int(sim_iteration),
+                root_node_id=int(root.node_id),
+                parent_node_id=(leaf_node.parent.node_id if leaf_node.parent else None),
+                node_id=int(leaf_node.node_id),
+                player_acted_to_create_this_node=(leaf_node.parent.player if leaf_node.parent else "root_no_parent"),
+                reward=float(getattr(leaf_node, "reward", 0.0)),
+                node_dnn_value=(
+                    None if leaf_node.nn_value_controller is None else float(leaf_node.nn_value_controller)
+                ),
+                children_created=list(getattr(leaf_node, "last_expand_children_created", [])),
+                dedup_children=list(getattr(leaf_node, "last_expand_dedup", [])),
+                ancestor_chain=self._ancestor_chain(leaf_node),
+                selection_trace=selection_trace,
+                minmax_min=float(min_max_stats.minimum),
+                minmax_max=float(min_max_stats.maximum),
+            )
+
         # # LOGGING MCTS:
         # DUMP_EVERY = 1  # or 50/100 to reduce overhead
         # if sim_iteration is not None and (sim_iteration % DUMP_EVERY == 0):
@@ -1127,6 +1322,10 @@ class VidurMCTS:
 
     def _native_infer_callback(self, dnn_model: Any):
         def _cb(state: VidurMCTSState, player: str, mask_list: List[bool]):
+            if self._prior_value_mode() == "uniform":
+                actions_by_index, mask = self._actions_and_mask(state, str(player))
+                value, priors = self._uniform_value_and_priors(actions_by_index, mask)
+                return float(value), [float(x) for x in priors]
             action_mask = torch.tensor(
                 [bool(x) for x in mask_list],
                 dtype=torch.bool,
@@ -1246,6 +1445,7 @@ class VidurMCTS:
             root_state=rootState,
             root_player=str(root_player),
             iterations=int(iterations),
+            uniform_prior_value=bool(self._prior_value_mode() == "uniform"),
             max_branching=int(getattr(self._cfg, "max_branching", 10)),
             controller_min_prior_threshold=float(
                 getattr(self._cfg, "controller_min_prior_threshold", 0.0) or 0.0
@@ -1395,6 +1595,8 @@ class VidurMCTS:
         else:
             self._root.cached_sim_snapshot = sim.snapshot_state()
         self._root.cached_stats = rootState.stats.clone()
+        # IMPORTANT: root reward/discount baseline must come from actual root state
+        self._seed_node_runtime_from_state(self._root, rootState)
 
         # One scratch simulator per search_dnn
         self._scratch_state = None  # forces _scratch_restore to create it once
