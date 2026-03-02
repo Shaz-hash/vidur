@@ -12,6 +12,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstdint>
@@ -43,6 +44,35 @@ constexpr uint8_t CMD_PING = 1;
 constexpr uint8_t CMD_SHUTDOWN = 2;
 constexpr uint8_t CMD_LOAD_MODELS = 3;
 constexpr uint8_t CMD_INFER = 4;
+
+constexpr float kValueRealMin = -50.0f;
+constexpr float kValueRealMax = 0.0f;
+constexpr float kValueLinearRealMin = -48.0f;
+constexpr float kValueNormMin = -1.0f;
+constexpr float kValueNormMax = 0.0f;
+constexpr float kValueLinearNormMin = -0.98f;
+constexpr float kValueTailPower = 2.0f;
+
+torch::Tensor denormalize_value_model(torch::Tensor value_norm) {
+    value_norm = torch::clamp(value_norm, kValueNormMin, kValueNormMax);
+
+    const float linear_scale = std::abs(kValueLinearNormMin) / std::abs(kValueLinearRealMin);
+    torch::Tensor x_linear = value_norm / linear_scale;
+
+    const float tail_real_span = kValueLinearRealMin - kValueRealMin;  // 2.0
+    const float tail_norm_span = kValueLinearNormMin - kValueNormMin;  // 0.02
+    torch::Tensor t = torch::clamp((kValueLinearNormMin - value_norm) / tail_norm_span, 0.0f, 1.0f);
+    torch::Tensor x_tail = kValueLinearRealMin
+        - tail_real_span * torch::pow(t, 1.0f / kValueTailPower);
+
+    torch::Tensor x = torch::where(value_norm >= kValueLinearNormMin, x_linear, x_tail);
+    return torch::clamp(x, kValueRealMin, kValueRealMax);
+}
+
+torch::Tensor value_real_from_output(torch::Tensor value_raw) {
+    torch::Tensor value_norm = -torch::sigmoid(value_raw);
+    return denormalize_value_model(value_norm);
+}
 
 struct Args {
     std::string addr = "127.0.0.1:50201";
@@ -152,20 +182,36 @@ public:
 
         pthread_mutex_lock(&reg_->mu);
         while (reg_->ready_count == 0 && reg_->shutdown == 0) {
-            timespec ts{};
-            ::clock_gettime(CLOCK_REALTIME, &ts);
-            long ns = ts.tv_nsec + static_cast<long>(max_wait_us) * 1000L;
-            ts.tv_sec += ns / 1000000000L;
-            ts.tv_nsec = ns % 1000000000L;
-            const int rc = pthread_cond_timedwait(&reg_->cv_ready, &reg_->mu, &ts);
-            if (rc != 0 && rc != ETIMEDOUT) break;
-            if (rc == ETIMEDOUT) break;
+            const int rc = pthread_cond_wait(&reg_->cv_ready, &reg_->mu);
+            if (rc != 0) break;
         }
 
         if (reg_->ready_count == 0) {
             const bool keep_running = (reg_->shutdown == 0);
             pthread_mutex_unlock(&reg_->mu);
             return keep_running;
+        }
+
+        // Once at least one request is available, keep the service hot for a
+        // bounded window so more workers can join the same batch. We actively
+        // poll here (yielding, not sleeping) to reduce launch latency while
+        // still respecting the configured maximum batching delay.
+        if (max_wait_us > 0 && max_batch > 1) {
+            const auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::microseconds(max_wait_us);
+            const uint32_t target = std::min<uint32_t>(
+                static_cast<uint32_t>(std::max(1, max_batch)),
+                infer_shared::kSlots
+            );
+            while (
+                reg_->shutdown == 0 &&
+                reg_->ready_count < target &&
+                std::chrono::steady_clock::now() < deadline
+            ) {
+                pthread_mutex_unlock(&reg_->mu);
+                std::this_thread::yield();
+                pthread_mutex_lock(&reg_->mu);
+            }
         }
 
         const int take = std::min<int>(max_batch, static_cast<int>(reg_->ready_count));
@@ -702,16 +748,10 @@ private:
             auto out_iv = mod.forward(in);
             auto out_t = out_iv.toTuple();
             torch::Tensor policy_logits = out_t->elements()[0].toTensor();
-            torch::Tensor value_logits = out_t->elements()[1].toTensor();
+            torch::Tensor value_raw = out_t->elements()[1].toTensor();
 
             torch::Tensor priors_t = torch::softmax(policy_logits, -1).to(torch::kCPU).contiguous();
-            const int64_t bins = value_logits.size(-1);
-            torch::Tensor support = torch::arange(
-                0,
-                bins,
-                torch::TensorOptions().dtype(torch::kFloat32).device(value_logits.device())
-            ) * 0.125f + (-50.0f);
-            torch::Tensor values_t = (torch::softmax(value_logits, -1) * support).sum(-1).to(torch::kCPU).contiguous();
+            torch::Tensor values_t = value_real_from_output(value_raw).reshape({B}).to(torch::kCPU).contiguous();
 
             const auto* pri_ptr = priors_t.data_ptr<float>();
             const auto* val_ptr = values_t.data_ptr<float>();
@@ -777,16 +817,10 @@ private:
             auto out_iv = mod.forward(in);
             auto out_t = out_iv.toTuple();
             torch::Tensor policy_logits = out_t->elements()[0].toTensor();
-            torch::Tensor value_logits = out_t->elements()[1].toTensor();
+            torch::Tensor value_raw = out_t->elements()[1].toTensor();
 
             torch::Tensor priors_t = torch::softmax(policy_logits, -1).to(torch::kCPU).contiguous();
-            const int64_t bins = value_logits.size(-1);
-            torch::Tensor support = torch::arange(
-                0,
-                bins,
-                torch::TensorOptions().dtype(torch::kFloat32).device(value_logits.device())
-            ) * 0.125f + (-50.0f);
-            torch::Tensor values_t = (torch::softmax(value_logits, -1) * support).sum(-1).to(torch::kCPU).contiguous();
+            torch::Tensor values_t = value_real_from_output(value_raw).reshape({B}).to(torch::kCPU).contiguous();
 
             const auto* pri_ptr = priors_t.data_ptr<float>();
             const auto* val_ptr = values_t.data_ptr<float>();

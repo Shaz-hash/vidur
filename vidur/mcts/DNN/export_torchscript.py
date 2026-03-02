@@ -9,7 +9,16 @@ import torch
 import torch.nn as nn
 
 from .infer import D_GLOBAL, D_REQ, N_REQ
-from .models import AlphaZeroModel, NUM_BINS, V_MAX, V_MIN, V_STEP
+from .models import (
+    AlphaZeroModel,
+    V_LINEAR_MIN,
+    V_LINEAR_NORM_MIN,
+    V_MAX,
+    V_MIN,
+    V_NORM_MAX,
+    V_NORM_MIN,
+    V_TAIL_COMPRESS_POWER,
+)
 
 
 @dataclass(frozen=True)
@@ -129,10 +138,14 @@ def export_torchscript_artifacts(
         "num_actions_controller": int(num_actions_controller),
         "num_actions_adversary": int(num_actions_adversary),
         "value": {
-            "num_bins": int(NUM_BINS),
-            "v_min": float(V_MIN),
-            "v_max": float(V_MAX),
-            "v_step": float(V_STEP),
+            "type": "scalar",
+            "real_min": float(V_MIN),
+            "real_max": float(V_MAX),
+            "linear_real_min": float(V_LINEAR_MIN),
+            "normalized_min": float(V_NORM_MIN),
+            "normalized_max": float(V_NORM_MAX),
+            "linear_normalized_min": float(V_LINEAR_NORM_MIN),
+            "tail_power": float(V_TAIL_COMPRESS_POWER),
         },
     }
     meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
@@ -143,4 +156,3 @@ def export_torchscript_artifacts(
         meta_path=meta_path,
         model_version=model_version_i,
     )
-

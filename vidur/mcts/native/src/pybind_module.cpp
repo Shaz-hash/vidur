@@ -51,6 +51,37 @@
 namespace py = pybind11;
 using namespace mcts_native;
 
+namespace {
+constexpr float kValueRealMin = -50.0f;
+constexpr float kValueRealMax = 0.0f;
+constexpr float kValueLinearRealMin = -48.0f;
+constexpr float kValueNormMin = -1.0f;
+constexpr float kValueNormMax = 0.0f;
+constexpr float kValueLinearNormMin = -0.98f;
+constexpr float kValueTailPower = 2.0f;
+
+torch::Tensor native_denormalize_value_model(torch::Tensor value_norm) {
+    value_norm = torch::clamp(value_norm, kValueNormMin, kValueNormMax);
+
+    const float linear_scale = std::abs(kValueLinearNormMin) / std::abs(kValueLinearRealMin);
+    torch::Tensor x_linear = value_norm / linear_scale;
+
+    const float tail_real_span = kValueLinearRealMin - kValueRealMin;  // 2.0
+    const float tail_norm_span = kValueLinearNormMin - kValueNormMin;  // 0.02
+    torch::Tensor t = torch::clamp((kValueLinearNormMin - value_norm) / tail_norm_span, 0.0f, 1.0f);
+    torch::Tensor x_tail = kValueLinearRealMin
+        - tail_real_span * torch::pow(t, 1.0f / kValueTailPower);
+
+    torch::Tensor x = torch::where(value_norm >= kValueLinearNormMin, x_linear, x_tail);
+    return torch::clamp(x, kValueRealMin, kValueRealMax);
+}
+
+torch::Tensor native_value_real_from_output(torch::Tensor value_raw) {
+    torch::Tensor value_norm = -torch::sigmoid(value_raw);
+    return native_denormalize_value_model(value_norm);
+}
+}  // namespace
+
 struct NativeActionSpace {};
 struct NativeTreeNode;
 struct NativeSearchCfg;
@@ -466,7 +497,10 @@ public:
         double v_min = -50.0,
         double v_step = 0.125
     )
-        : device_(parse_device(device)), v_min_(v_min), v_step_(v_step) {}
+        : device_(parse_device(device)) {
+        (void)v_min;
+        (void)v_step;
+    }
 
     void load_models(int model_version, const std::string& controller_path, const std::string& adversary_path) {
         if (models_.find(model_version) != models_.end()) return;
@@ -556,7 +590,7 @@ public:
         auto out_iv = mod.forward(in);
         auto out_t = out_iv.toTuple();
         torch::Tensor policy_logits = out_t->elements()[0].toTensor();
-        torch::Tensor value_logits = out_t->elements()[1].toTensor();
+        torch::Tensor value_raw = out_t->elements()[1].toTensor();
 
         torch::Tensor priors_t = torch::softmax(policy_logits, -1)
             .squeeze(0)
@@ -568,14 +602,10 @@ public:
             for (size_t i = 0; i < priors.size(); ++i) priors[i] = p_acc[i];
         }
 
-        const int64_t bins = value_logits.size(-1);
-        torch::Tensor support = torch::arange(
-            0,
-            bins,
-            torch::TensorOptions().dtype(torch::kFloat32).device(value_logits.device())
-        ) * (float)v_step_ + (float)v_min_;
-        torch::Tensor probs = torch::softmax(value_logits, -1);
-        torch::Tensor value_t = (probs * support).sum(-1).squeeze(0).to(torch::kCPU);
+        torch::Tensor value_t = native_value_real_from_output(value_raw)
+            .reshape({-1})
+            .squeeze(0)
+            .to(torch::kCPU);
         const double value = value_t.item<double>();
         if (native_trace_should_log(infer_call)) {
             std::ostringstream oss;
@@ -610,8 +640,6 @@ private:
 
     std::unordered_map<int, NativeTsModelPair> models_;
     torch::Device device_;
-    double v_min_ = -50.0;
-    double v_step_ = 0.125;
     size_t max_cached_model_versions_ = 3;
 };
 
@@ -632,10 +660,10 @@ public:
         int request_timeout_ms = 30000
     )
         : addr_(addr),
-          v_min_(v_min),
-          v_step_(v_step),
           connect_timeout_ms_(std::max(100, connect_timeout_ms)),
           request_timeout_ms_(std::max(1000, request_timeout_ms)) {
+        (void)v_min;
+        (void)v_step;
         parse_addr(addr_, host_, port_);
     }
 
@@ -1147,8 +1175,6 @@ private:
     std::string shm_name_;
     std::string host_;
     int port_ = 0;
-    double v_min_ = -50.0;
-    double v_step_ = 0.125;
     int connect_timeout_ms_ = 2000;
     int request_timeout_ms_ = 30000;
     int sock_fd_ = -1;

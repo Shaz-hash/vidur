@@ -53,11 +53,22 @@ D_REQ_EMB: int = 16
 D_GLOBAL_EMB: int = 16
 D_TRUNK: int = 32
 
-# Value support (real units, controller perspective)
+# Value range (real units, controller perspective)
 V_MIN: float = -50.0
 V_MAX: float = 0.0
-NUM_BINS: int = 401  # NOTE: step=4.0 => 401 bins from -50..0 inclusive
-V_STEP: float = (V_MAX - V_MIN) / (NUM_BINS - 1)  # = 0.125
+
+# Legacy support constants kept for compatibility with older helpers/imports.
+NUM_BINS: int = 401
+V_STEP: float = (V_MAX - V_MIN) / (NUM_BINS - 1)
+
+# Scalar-head normalization:
+#   [-48, 0]   -> [-0.98, 0.0] linearly
+#   [-50, -48] -> [-1.0, -0.98] with compressed quadratic tail
+V_LINEAR_MIN: float = -48.0
+V_NORM_MIN: float = -1.0
+V_NORM_MAX: float = 0.0
+V_LINEAR_NORM_MIN: float = -0.98
+V_TAIL_COMPRESS_POWER: float = 2.0
 
 
 # MuZero-style value support (optional, but you already started it) * Note : Penalty and Max SLO cost in real units in seconds
@@ -153,7 +164,7 @@ def masked_min(x, mask, dim):
 
 
 #------------------------------
-# Support Helpers for AlphaZeroModel
+# Value Normalization Helpers for AlphaZeroModel
 #------------------------------
 
 # def scalar_to_support(x: torch.Tensor, support_size: int) -> torch.Tensor:
@@ -234,37 +245,42 @@ def masked_min(x, mask, dim):
 #     return x
 
 
-def scalar_to_support(x: torch.Tensor) -> torch.Tensor:
+def normalize_value_real(x: torch.Tensor) -> torch.Tensor:
     """
-    x: [B] or [B, 1] or [B, T]  (real units in [V_MIN, V_MAX])
-    returns: [..., NUM_BINS]  2-hot distribution over bins
-    """
-    if x.dim() == 1:
-        x = x.unsqueeze(-1)
+    Maps real value in [V_MIN, V_MAX] into model space [-1, 0].
 
+    For controller values:
+      - [-48, 0] is nearly all of the dynamic range and stays linear
+      - [-50, -48] is compressed into a small tail near -1
+    """
     x = torch.clamp(x, V_MIN, V_MAX)
+    linear_scale = abs(V_LINEAR_NORM_MIN) / abs(V_LINEAR_MIN)
 
-    pos = (x - V_MIN) / V_STEP  # in [0, NUM_BINS-1]
-    idx0 = torch.floor(pos).to(torch.long)                      # [..., 1]
-    frac = (pos - idx0.to(dtype=pos.dtype)).clamp(0.0, 1.0)     # [..., 1]
-    idx1 = (idx0 + 1).clamp(0, NUM_BINS - 1)
+    y_linear = x * linear_scale
 
-    out_shape = list(x.shape[:-1]) + [NUM_BINS]
-    dist = torch.zeros(out_shape, device=x.device, dtype=x.dtype)
+    tail_real_span = V_LINEAR_MIN - V_MIN  # 2.0
+    tail_norm_span = V_NORM_MIN - V_LINEAR_NORM_MIN  # -0.02
+    t = ((V_LINEAR_MIN - x) / tail_real_span).clamp(0.0, 1.0)
+    y_tail = V_LINEAR_NORM_MIN + tail_norm_span * torch.pow(t, V_TAIL_COMPRESS_POWER)
 
-    dist.scatter_add_(-1, idx0, (1.0 - frac))
-    dist.scatter_add_(-1, idx1, frac)
-    return dist
+    return torch.where(x >= V_LINEAR_MIN, y_linear, y_tail).clamp(V_NORM_MIN, V_NORM_MAX)
 
 
-def support_to_scalar(logits: torch.Tensor) -> torch.Tensor:
+def denormalize_value_model(y: torch.Tensor) -> torch.Tensor:
     """
-    logits: [..., NUM_BINS]
-    returns: [...] scalar in [V_MIN, V_MAX] (expectation under softmax)
+    Inverse of normalize_value_real().
     """
-    probs = F.softmax(logits, dim=-1)
-    support = (torch.arange(NUM_BINS, device=logits.device, dtype=probs.dtype) * V_STEP) + V_MIN
-    return (probs * support).sum(dim=-1)
+    y = torch.clamp(y, V_NORM_MIN, V_NORM_MAX)
+    linear_scale = abs(V_LINEAR_NORM_MIN) / abs(V_LINEAR_MIN)
+
+    x_linear = y / linear_scale
+
+    tail_real_span = V_LINEAR_MIN - V_MIN  # 2.0
+    tail_norm_span = V_LINEAR_NORM_MIN - V_NORM_MIN  # 0.02
+    t = ((V_LINEAR_NORM_MIN - y) / tail_norm_span).clamp(0.0, 1.0)
+    x_tail = V_LINEAR_MIN - tail_real_span * torch.pow(t, 1.0 / V_TAIL_COMPRESS_POWER)
+
+    return torch.where(y >= V_LINEAR_NORM_MIN, x_linear, x_tail).clamp(V_MIN, V_MAX)
 
 
 
@@ -276,11 +292,11 @@ class AlphaZeroModel(nn.Module):
     Policy/value network with:
       - shared trunk
       - separate policy heads per player
-      - value head using categorical support
+      - single scalar value head in normalized space
 
     Forward returns:
       policy_logits: [B, num_actions(player)]
-      value_logits:  [B, 2*SUPPORT_SIZE+1]   (in SCALED units; convert to scalar via value_scalar_from_logits)
+      value_raw:     [B, 1] raw scalar head output (convert via value_scalar_from_logits)
     """
 
     def __init__(
@@ -293,12 +309,6 @@ class AlphaZeroModel(nn.Module):
 
         self.num_actions_controller = int(num_actions_controller)
         self.num_actions_adversary = int(num_actions_adversary)
-
-        ## for the Value from logits 
-        support = (torch.arange(NUM_BINS, dtype=torch.float32) * V_STEP) + V_MIN
-        self.register_buffer("_value_support", support, persistent=False)
-
-
 
         self.norm_req = nn.Identity()
         self.norm_global = nn.Identity()
@@ -313,8 +323,8 @@ class AlphaZeroModel(nn.Module):
         self.policy_head_controller = nn.Linear(D_TRUNK, self.num_actions_controller)  # 32 -> 24
         self.policy_head_adversary = nn.Linear(D_TRUNK, self.num_actions_adversary)    # 32 -> 6
 
-        # Value head (categorical support in SCALED units)
-        self.value_head = nn.Linear(D_TRUNK, NUM_BINS)  # 32 -> 101
+        # Value head (single bounded scalar)
+        self.value_head = nn.Linear(D_TRUNK, 1)
 
 
         self._infer_perf_enabled = True
@@ -371,8 +381,8 @@ class AlphaZeroModel(nn.Module):
                 raise ValueError(f"action_mask shape {tuple(action_mask.shape)} != logits shape {tuple(policy_logits.shape)}")
             policy_logits = policy_logits.masked_fill(~action_mask, float("-inf"))
 
-        value_logits = self.value_head(h)  # [B, 2*SUPPORT_SIZE+1]
-        return policy_logits, value_logits
+        value_raw = self.value_head(h)  # [B, 1]
+        return policy_logits, value_raw
 
 
 
@@ -454,7 +464,7 @@ class AlphaZeroModel(nn.Module):
             _sync()
             t = time.perf_counter()
 
-        policy_logits, value_logits = self.forward(
+        policy_logits, value_raw = self.forward(
             req_features=req_features,
             global_features=global_features,
             player=player,
@@ -469,11 +479,11 @@ class AlphaZeroModel(nn.Module):
             _sync()
             t = time.perf_counter()
 
-        value = self.value_scalar_from_logits(value_logits).squeeze(0).item()
+        value = self.value_scalar_from_logits(value_raw).squeeze(0).item()
 
         if profile:
             _sync()
-            self._infer_perf["value_from_logits"] += time.perf_counter() - t
+            self._infer_perf["value_decode"] += time.perf_counter() - t
 
             _sync()
             t = time.perf_counter()
@@ -531,21 +541,21 @@ class AlphaZeroModel(nn.Module):
 
 
     ##==============================    
-    # HELPERS FOR TRAINING & INFERENCE with SUPPORT/SCALAR conversions
+    # HELPERS FOR TRAINING & INFERENCE with scalar normalization conversions
     ##==============================
 
 
     def scale_value(self, value_real: torch.Tensor) -> torch.Tensor:
         """
-        Converts real value  to scaled value
+        Converts real value to normalized model value.
         """
-        return value_real / VALUE_SCALE
+        return normalize_value_real(value_real)
 
     def unscale_value(self, value_scaled: torch.Tensor) -> torch.Tensor:
         """
-        Converts scaled value to real value
+        Converts normalized model value to real value.
         """
-        return value_scaled * VALUE_SCALE
+        return denormalize_value_model(value_scaled)
 
     # def value_target_to_support(self, value_real: torch.Tensor) -> torch.Tensor:
     #     """
@@ -563,16 +573,20 @@ class AlphaZeroModel(nn.Module):
     #     value_scaled = support_to_scalar(value_logits, SUPPORT_SIZE)
     #     return self.unscale_value(value_scaled)
 
+    def value_target_to_model(self, value_real: torch.Tensor) -> torch.Tensor:
+        return normalize_value_real(value_real)
+
+    # Backward-compatible alias used by older trainer code paths.
     def value_target_to_support(self, value_real: torch.Tensor) -> torch.Tensor:
-        return scalar_to_support(value_real)
+        return self.value_target_to_model(value_real)
+
+    def value_normalized_from_raw(self, value_raw: torch.Tensor) -> torch.Tensor:
+        return -torch.sigmoid(value_raw).squeeze(-1)
 
     def value_scalar_from_logits(self, value_logits: torch.Tensor) -> torch.Tensor:
-        # return support_to_scalar(value_logits)
-        probs = F.softmax(value_logits, dim=-1)
-        support = self._value_support
-        if support.dtype != probs.dtype:
-            support = support.to(dtype=probs.dtype)
-        return (probs * support).sum(dim=-1)
+        # Backward-compatible name; value_logits is now the raw scalar-head output.
+        value_norm = self.value_normalized_from_raw(value_logits)
+        return denormalize_value_model(value_norm)
 
 
 
@@ -583,7 +597,7 @@ class AlphaZeroModel(nn.Module):
             "total": 0.0,
             "to_device": 0.0,
             "forward": 0.0,
-            "value_from_logits": 0.0,
+            "value_decode": 0.0,
             "softmax": 0.0,
             "to_cpu_list": 0.0,
         }
@@ -602,12 +616,10 @@ class AlphaZeroModel(nn.Module):
         #     f"  total={p['total']:.3f}s total_per_call={p['total']/c:.6f}s\n"
         #     f"  to_device={p['to_device']:.3f}s ({pct(p['to_device']):.1f}%)\n"
         #     f"  forward={p['forward']:.3f}s ({pct(p['forward']):.1f}%)\n"
-        #     f"  value_from_logits={p['value_from_logits']:.3f}s ({pct(p['value_from_logits']):.1f}%)\n"
+        #     f"  value_decode={p['value_decode']:.3f}s ({pct(p['value_decode']):.1f}%)\n"
         #     f"  softmax={p['softmax']:.3f}s ({pct(p['softmax']):.1f}%)\n"
         #     f"  to_cpu_list={p['to_cpu_list']:.3f}s ({pct(p['to_cpu_list']):.1f}%)"
         # )
-
-
 
 
 

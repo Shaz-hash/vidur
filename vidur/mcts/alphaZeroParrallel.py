@@ -17,7 +17,8 @@ cp build/mcts_native*.so ../
 
 
 run command :
-python3 -m vidur.mcts.alphaZeroParrallel
+python3 -m vidur.mcts.alphaZeroParrallel or 
+PYTHONPATH=/home/shazer/Desktop/Research/Vidur/vidur /home/shazer/Desktop/Research/Vidur/vidur/.venv/bin/python3 -m vidur.mcts.alphaZeroParrallel
 
 Single entrypoint that owns configuration for:
 - Vidur simulator config (CLI args passed to SimulationConfig)
@@ -500,6 +501,7 @@ def _selfplay_worker_main(
     worker_id: int,
     task_q: "mp.Queue",
     result_q: "mp.Queue",
+    ready_q: "mp.Queue",
     cfg: "AlphaZeroConfig",
     adv_iterations_per_root: int,
     cont_iterations_per_root: int,
@@ -650,6 +652,8 @@ def _selfplay_worker_main(
     _loaded_candidate_sig: Optional[tuple[Path, int, int]] = None
     _loaded_best_sig: Optional[tuple[Path, int, int]] = None
     _warned_service_callback_bridge = False
+
+    ready_q.put({"worker_id": int(worker_id), "ready": True})
 
     def _weights_sig(path: Path) -> tuple[Path, int, int]:
         # Path alone is not enough (best.pt path stays constant while contents change).
@@ -1253,6 +1257,7 @@ def selfImprovementPolicy(
     ctx = mp.get_context("spawn")
     task_q = ctx.Queue()
     result_q = ctx.Queue()
+    ready_q = ctx.Queue()
 
     # def _hops_for_worker(wid: int) -> int:
     #     if isinstance(history_nontrivial_hops, int):
@@ -1278,7 +1283,26 @@ def selfImprovementPolicy(
         return int(hops_list[wid % len(hops_list)])
 
 
+    def _wait_for_workers_ready(expected: int, *, poll_timeout_s: float = 30.0) -> None:
+        ready = 0
+        while ready < int(expected):
+            try:
+                msg = ready_q.get(timeout=float(poll_timeout_s))
+            except queue.Empty:
+                dead = [p for p in workers if p.exitcode not in (None, 0)]
+                if dead:
+                    details = ", ".join(f"pid={p.pid} exitcode={p.exitcode}" for p in dead)
+                    raise RuntimeError(f"worker startup failed: {details}")
+                raise RuntimeError(
+                    f"worker startup timed out while waiting for ready messages "
+                    f"({ready}/{expected} received)"
+                )
+            if bool(msg.get("ready", False)):
+                ready += 1
+
     workers = []
+    worker_start_wave = 5
+    pending_ready = 0
     for wid in range(int(num_selfPlay_workers)):
         p = ctx.Process(
             target=_selfplay_worker_main,
@@ -1286,6 +1310,7 @@ def selfImprovementPolicy(
                 wid,
                 task_q,
                 result_q,
+                ready_q,
                 cfg,
                 adv_iterations_per_root,
                 cont_iterations_per_root,
@@ -1297,6 +1322,12 @@ def selfImprovementPolicy(
         )
         p.start()
         workers.append(p)
+        pending_ready += 1
+        wave_complete = ((wid + 1) % worker_start_wave) == 0
+        last_worker = (wid + 1) == int(num_selfPlay_workers)
+        if wave_complete or last_worker:
+            _wait_for_workers_ready(pending_ready)
+            pending_ready = 0
 
     def _collect_results(
         *,
@@ -1930,7 +1961,7 @@ def main() -> None:
             infer_service_addr="127.0.0.1:50201",
             infer_service_device="cuda:0",
             infer_max_batch=256,
-            infer_max_wait_us=500,
+            infer_max_wait_us=250,
             export_torchscript=False,
             fallback_to_python_infer=False,
         ),
@@ -1960,18 +1991,16 @@ def main() -> None:
 
     # TODO: Remove useless feilds and move the config class to eval_utils
     evaluator_cfg = EvaluatorConfig(
-        num_random_games=10,
-        max_history_depth=10,  # no history for now (can add later if you want to test it in the arena)
+        num_random_games=20,
+        max_history_depth=75,  # no history for now (can add later if you want to test it in the arena)
         random_seed_base=12345,
         adv_iterations_per_root=4000,
-        cont_iterations_per_root=10000,
-        arena_num_processes=10,
-        # arena_iters_adversary=2000,
-        # arena_iters_controller=2000,
+        cont_iterations_per_root=20000,
+        arena_num_processes=20,
         arena_max_adversary_moves=1,
         arena_max_controller_cleanup_steps=128,
         arena_max_total_turns=512,
-        arena_win_threshold=0.52,
+        arena_win_threshold=0.60,
         tie_points=0.5,
         debug_sample_games=5,
         debug_flush_every=1,
@@ -1981,12 +2010,12 @@ def main() -> None:
 
 
     ## MODEL TRAINING PARMS FOR SELF-IMPROVEMENT LOOP:
-    num_selfPlay_workers = 15
+    num_selfPlay_workers = 25
     num_generations = 200
     history_nontrivial_hops = [0, 5 , 10 , 15 , 20, 25, 30, 35]  # per worker
-    roots_per_generation = 500
+    roots_per_generation = 1250
     adv_iterations_per_root = 4000
-    cont_iterations_per_root = 12000
+    cont_iterations_per_root = 30000
     train_steps_per_generation = 75 
     max_batch_size = 256
     train_log_csv = Path("simulator_output/mcts_dnn_logs/train_metrics.csv")

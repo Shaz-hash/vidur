@@ -73,14 +73,12 @@ class Trainer:
 
     def _value_loss(
         self,
-        value_logits: torch.Tensor,      # [B, support]
+        value_raw: torch.Tensor,         # [B, 1]
         target_value: torch.Tensor,      # [B]
     ) -> torch.Tensor:
-        # pred_value = self.model.value_scalar_from_logits(value_logits).view(-1)
-            # return F.mse_loss(pred_value, target_value.view(-1))
-        target_dist = self.model.value_target_to_support(target_value)      # [B, NUM_BINS]
-        log_probs = F.log_softmax(value_logits, dim=-1)                     # [B, NUM_BINS]
-        return -(target_dist * log_probs).sum(dim=-1).mean()
+        pred_value = self.model.value_normalized_from_raw(value_raw).view(-1)
+        target_norm = self.model.value_target_to_model(target_value).view(-1)
+        return F.smooth_l1_loss(pred_value, target_norm)
 
 
     def train_step(self, batch_by_player: Dict[str, Optional[Dict[str, Any]]]) -> Dict[str, float]:
@@ -113,7 +111,7 @@ class Trainer:
             total_count += bsz
 
             # IMPORTANT: pass action_mask=None so model doesn't inject -inf; we mask ourselves.
-            policy_logits, value_logits = self.model.forward(
+            policy_logits, value_raw = self.model.forward(
                 req_features=req_features,
                 global_features=global_features,
                 player=player,
@@ -122,7 +120,7 @@ class Trainer:
             )
 
             p_loss = self._policy_loss(policy_logits, target_policy, action_mask)
-            v_loss = self._value_loss(value_logits, target_value)
+            v_loss = self._value_loss(value_raw, target_value)
 
             player_stats[player]["policy_loss"] = float(p_loss.detach().cpu())
             player_stats[player]["value_loss"] = float(v_loss.detach().cpu())
@@ -187,7 +185,7 @@ class Trainer:
             bsz = int(req_features.shape[0])
             total_count += bsz
 
-            policy_logits, value_logits = self.model.forward(
+            policy_logits, value_raw = self.model.forward(
                 req_features=req_features,
                 global_features=global_features,
                 player=player,
@@ -196,7 +194,7 @@ class Trainer:
             )
 
             p_loss = self._policy_loss(policy_logits, target_policy, action_mask).item()
-            v_loss = self._value_loss(value_logits, target_value).item()
+            v_loss = self._value_loss(value_raw, target_value).item()
 
             player_stats[player]["policy_loss"] = float(p_loss)
             player_stats[player]["value_loss"] = float(v_loss)
