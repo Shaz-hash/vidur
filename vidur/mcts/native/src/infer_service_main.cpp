@@ -119,7 +119,11 @@ struct ModelPair {
 
 class SharedInferRegion {
 public:
+    ~SharedInferRegion() { close(); }
+
     bool init_server(const std::string& addr) {
+        // Re-init safe: release any prior mapping/fd first.
+        close();
         name_ = infer_shared::shm_name_from_addr(addr);
         ::shm_unlink(name_.c_str());
 
@@ -128,8 +132,10 @@ public:
             std::cerr << "shm_open failed: " << std::strerror(errno) << "\n";
             return false;
         }
+        creator_ = true;
         if (::ftruncate(fd_, static_cast<off_t>(sizeof(infer_shared::Region))) != 0) {
             std::cerr << "ftruncate failed: " << std::strerror(errno) << "\n";
+            close();
             return false;
         }
         void* p = ::mmap(
@@ -142,10 +148,10 @@ public:
         );
         if (p == MAP_FAILED) {
             std::cerr << "mmap failed: " << std::strerror(errno) << "\n";
+            close();
             return false;
         }
         reg_ = reinterpret_cast<infer_shared::Region*>(p);
-        creator_ = true;
         init_region_unsafe();
         return true;
     }
@@ -522,16 +528,28 @@ public:
         addr.sin_port = htons(static_cast<uint16_t>(port));
         if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
             std::cerr << "invalid host: " << host << "\n";
+            if (listen_fd_ >= 0) {
+                ::close(listen_fd_);
+                listen_fd_ = -1;
+            }
             shared_region_.close();
             return 2;
         }
         if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
             std::cerr << "bind failed\n";
+            if (listen_fd_ >= 0) {
+                ::close(listen_fd_);
+                listen_fd_ = -1;
+            }
             shared_region_.close();
             return 2;
         }
         if (::listen(listen_fd_, 256) != 0) {
             std::cerr << "listen failed\n";
+            if (listen_fd_ >= 0) {
+                ::close(listen_fd_);
+                listen_fd_ = -1;
+            }
             shared_region_.close();
             return 2;
         }
@@ -551,7 +569,18 @@ public:
                 continue;
             }
             std::lock_guard<std::mutex> lk(conn_mu_);
-            conn_threads_.emplace_back([this, cfd]() { this->handle_conn(cfd); });
+            cleanup_conn_threads_locked(false);
+            auto done = std::make_shared<std::atomic<bool>>(false);
+            conn_threads_.push_back(ConnThreadEntry{
+                std::thread([this, cfd, done]() {
+                    try {
+                        this->handle_conn(cfd);
+                    } catch (...) {
+                    }
+                    done->store(true, std::memory_order_release);
+                }),
+                std::move(done),
+            });
         }
 
         stopping_.store(true);
@@ -560,9 +589,7 @@ public:
 
         {
             std::lock_guard<std::mutex> lk(conn_mu_);
-            for (auto& t : conn_threads_) {
-                if (t.joinable()) t.join();
-            }
+            cleanup_conn_threads_locked(true);
         }
         if (listen_fd_ >= 0) {
             ::close(listen_fd_);
@@ -573,6 +600,29 @@ public:
     }
 
 private:
+    struct ConnThreadEntry {
+        std::thread th;
+        std::shared_ptr<std::atomic<bool>> done;
+    };
+
+    void cleanup_conn_threads_locked(bool join_all) {
+        size_t out_idx = 0;
+        for (size_t i = 0; i < conn_threads_.size(); ++i) {
+            auto& entry = conn_threads_[i];
+            const bool finished = join_all || (
+                entry.done != nullptr &&
+                entry.done->load(std::memory_order_acquire)
+            );
+            if (finished) {
+                if (entry.th.joinable()) entry.th.join();
+                continue;
+            }
+            if (out_idx != i) conn_threads_[out_idx] = std::move(entry);
+            out_idx += 1;
+        }
+        conn_threads_.resize(out_idx);
+    }
+
     void request_stop() {
         bool expected = false;
         if (!stopping_.compare_exchange_strong(expected, true)) return;
@@ -692,6 +742,15 @@ private:
         pair->controller.eval();
         pair->adversary.eval();
         models_[version] = std::move(pair);
+        model_version_order_.push_back(version);
+        while (model_version_order_.size() > max_cached_model_versions_) {
+            const int evict = model_version_order_.front();
+            model_version_order_.pop_front();
+            auto it = models_.find(evict);
+            if (it != models_.end()) {
+                models_.erase(it);
+            }
+        }
     }
 
     std::shared_ptr<ModelPair> get_model_pair(int version) {
@@ -875,9 +934,11 @@ private:
 
     std::mutex models_mu_;
     std::unordered_map<int, std::shared_ptr<ModelPair>> models_;
+    std::deque<int> model_version_order_;
+    size_t max_cached_model_versions_ = 3;
 
     std::mutex conn_mu_;
-    std::vector<std::thread> conn_threads_;
+    std::vector<ConnThreadEntry> conn_threads_;
     SharedInferRegion shared_region_;
 };
 

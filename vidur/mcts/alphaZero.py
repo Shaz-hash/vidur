@@ -401,18 +401,8 @@ def _build_constraints_and_explore(cfg: "AlphaZeroConfig") -> tuple[MCTSConstrai
         controller_budget_combs=cfg.explore.controller_budget_combs,
     )
     setattr(
-        explore_cfg,
-        "controller_min_prior_threshold",
-        float(cfg.explore.controller_min_prior_threshold),
-    )
-    setattr(
-        explore_cfg,
-        "adversary_min_prior_threshold",
-        float(cfg.explore.adversary_min_prior_threshold),
-    )
-    setattr(
-        explore_cfg,
-        "root_dirichlet_noise_enabled",
+    explore_cfg,
+    "root_dirichlet_noise_enabled",
         bool(cfg.explore.root_dirichlet_noise_enabled),
     )
     setattr(
@@ -567,8 +557,6 @@ class MCTSExploreGroup:
     exploration_constant: float = 1.7
     max_branching: int = 10
     controller_budget_combs: int = 10
-    controller_min_prior_threshold : float = 0.01
-    adversary_min_prior_threshold : float = 0.1
     root_dirichlet_noise_enabled: bool = False
     root_dirichlet_alpha: float = 0.6
     root_dirichlet_epsilon: float = 0.25
@@ -705,8 +693,6 @@ def main() -> None:
             exploration_constant=1.7,
             max_branching=10,
             controller_budget_combs=10,
-            controller_min_prior_threshold=0.01,
-            adversary_min_prior_threshold=0.1,
             root_dirichlet_noise_enabled=False,
             root_dirichlet_alpha=0.6,
             root_dirichlet_epsilon=0.25,

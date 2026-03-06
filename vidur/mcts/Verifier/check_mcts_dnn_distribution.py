@@ -14,13 +14,30 @@ python3 -m vidur.mcts.Verifier.check_mcts_dnn_distribution \
 cd /home/shazer/Desktop/Research/Vidur/vidur
 PYTHONPATH=/home/shazer/Desktop/Research/Vidur/vidur /home/shazer/Desktop/Research/Vidur/vidur/.venv/bin/python3 -m vidur.mcts.Verifier.check_mcts_distribution \
   --checkpoint simulator_output/mcts_dnn_checkpoints/best.pt \
-  --history-csv simulator_output/mcts_dnn_logs/sample_history.csv \
+  --history-csv simulator_output/mcts_dnn_logs/sample.csv \
   --prior-mode model \
   --discount-factor 0.98 \
-  --simulations 100000 \
+  --simulations 30000 \
   --game-id 0 \
   --root-id 0 \
   --root-depth 0 \
+  --out-csv simulator_output/mcts_dnn_logs/mcts_distribution_uniform_fresh.csv
+
+
+
+cd /home/shazer/Desktop/Research/Vidur/vidur
+PYTHONPATH=/home/shazer/Desktop/Research/Vidur/vidur \
+/home/shazer/Desktop/Research/Vidur/vidur/.venv/bin/python3 \
+-m vidur.mcts.Verifier.check_mcts_distribution \
+  --checkpoint simulator_output/mcts_dnn_checkpoints/best.pt \
+  --history-csv simulator_output/mcts_dnn_logs/sample.csv \
+  --prior-mode model \
+  --discount-factor 0.98 \
+  --simulations 30000 \
+  --align-branching-roots \
+  --validate-row-state \
+  --row-time-atol 1e-5 \
+  --row-float-atol 1e-5 \
   --out-csv simulator_output/mcts_dnn_logs/mcts_distribution_uniform_fresh.csv
 
 
@@ -71,6 +88,40 @@ class RootCSVRow:
     root_player: str
     phase: str
     best_action_json: str
+    sim_time: Optional[float] = None
+    slo_violations: Optional[int] = None
+    total_lateness: Optional[float] = None
+    total_cost: Optional[float] = None
+    requests_in_system: Optional[int] = None
+    num_requests_in_system: Optional[int] = None
+
+
+def _opt_int(v: Any) -> Optional[int]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    try:
+        return int(s)
+    except Exception:
+        return None
+
+
+def _opt_float(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def _isclose(a: float, b: float, atol: float) -> bool:
+    return abs(float(a) - float(b)) <= float(atol)
 
 
 def _mask_to_list(mask: Any) -> List[bool]:
@@ -145,6 +196,12 @@ def load_history_rows(path: Path) -> List[RootCSVRow]:
                     root_player=str(d.get("root_player", "") or "").strip(),
                     phase=str(d.get("phase", "") or "").strip(),
                     best_action_json=str(d.get("best_action_json", "") or "").strip(),
+                    sim_time=_opt_float(d.get("sim_time")),
+                    slo_violations=_opt_int(d.get("slo_violations")),
+                    total_lateness=_opt_float(d.get("total_lateness")),
+                    total_cost=_opt_float(d.get("total_cost")),
+                    requests_in_system=_opt_int(d.get("requests_in_system")),
+                    num_requests_in_system=_opt_int(d.get("num_requests_in_system")),
                 )
             )
     if not rows:
@@ -189,6 +246,64 @@ def advance_forced_until_branching(
     raise RuntimeError(f"Exceeded max_hops={max_hops} while advancing forced chain")
 
 
+def _expected_requests_count(row: RootCSVRow) -> Optional[int]:
+    if row.requests_in_system is not None:
+        return int(row.requests_in_system)
+    if row.num_requests_in_system is not None:
+        return int(row.num_requests_in_system)
+    return None
+
+
+def _validate_replay_state(
+    env: Any,
+    state: VidurMCTSState,
+    row: RootCSVRow,
+    *,
+    row_idx: int,
+    time_atol: float,
+    float_atol: float,
+) -> None:
+    desc = env.describe_state(state)
+
+    if row.sim_time is not None:
+        got_time = float(desc.get("sim_time", getattr(state.simulator, "_time", 0.0)))
+        if not _isclose(got_time, float(row.sim_time), atol=time_atol):
+            raise RuntimeError(
+                f"Replay mismatch row={row_idx}: sim_time row={row.sim_time:.9f} current={got_time:.9f}"
+            )
+
+    if row.slo_violations is not None:
+        got_viol = int(desc.get("slo_violations", 0))
+        if got_viol != int(row.slo_violations):
+            raise RuntimeError(
+                f"Replay mismatch row={row_idx}: slo_violations row={row.slo_violations} current={got_viol}"
+            )
+
+    if row.total_lateness is not None:
+        got_lateness = float(desc.get("total_lateness", 0.0))
+        if not _isclose(got_lateness, float(row.total_lateness), atol=float_atol):
+            raise RuntimeError(
+                f"Replay mismatch row={row_idx}: total_lateness row={row.total_lateness:.9f} current={got_lateness:.9f}"
+            )
+
+    if row.total_cost is not None:
+        got_viol = int(desc.get("slo_violations", 0))
+        got_lateness = float(desc.get("total_lateness", 0.0))
+        got_cost = float(got_viol) + float(got_lateness)
+        if not _isclose(got_cost, float(row.total_cost), atol=float_atol):
+            raise RuntimeError(
+                f"Replay mismatch row={row_idx}: total_cost row={row.total_cost:.9f} current={got_cost:.9f}"
+            )
+
+    expected_req_count = _expected_requests_count(row)
+    if expected_req_count is not None:
+        got_req_count = int(desc.get("requests_in_system", 0))
+        if got_req_count != int(expected_req_count):
+            raise RuntimeError(
+                f"Replay mismatch row={row_idx}: requests_in_system row={expected_req_count} current={got_req_count}"
+            )
+
+
 def replay_history_to_state_after_last_action(
     env: Any,
     rows: List[RootCSVRow],
@@ -196,6 +311,9 @@ def replay_history_to_state_after_last_action(
     align_branching_roots: bool,
     max_forced_hops: int,
     max_samples: int,
+    validate_row_state: bool,
+    row_time_atol: float,
+    row_float_atol: float,
 ) -> Tuple[VidurMCTSState, str, RootCSVRow]:
     state = env.initial_state()
     player = rows[0].root_player or "adversary"
@@ -206,15 +324,25 @@ def replay_history_to_state_after_last_action(
         raise RuntimeError("No actionable rows (best_action_json empty)")
 
     for i, row in enumerate(action_rows):
-        is_hist = _is_explicit_history_row(row)
-
-        if align_branching_roots and (not is_hist):
+        # First row is replayed directly from initial state. Between rows,
+        # advance forced single-action transitions to align with branching roots.
+        if i > 0 and align_branching_roots and (not _is_explicit_history_row(row)):
             state, player = advance_forced_until_branching(
                 env,
                 state,
                 player,
                 max_hops=max_forced_hops,
                 max_samples=max_samples,
+            )
+
+        if validate_row_state:
+            _validate_replay_state(
+                env,
+                state,
+                row,
+                row_idx=i,
+                time_atol=row_time_atol,
+                float_atol=row_float_atol,
             )
 
         if row.root_player and row.root_player != player:
@@ -234,16 +362,6 @@ def replay_history_to_state_after_last_action(
                 raise RuntimeError(f"Expected adversary action at row={i}, got {type(action).__name__}")
             state = env.apply_adversary_action_only(state, action, inplace=True)
             player = "controller"
-
-        # Move to next branching root between rows, but NOT after last row (user expectation)
-        if i < len(action_rows) - 1 and align_branching_roots and (not is_hist):
-            state, player = advance_forced_until_branching(
-                env,
-                state,
-                player,
-                max_hops=max_forced_hops,
-                max_samples=max_samples,
-            )
 
     return state, player, action_rows[-1]
 
@@ -293,8 +411,6 @@ def _build_default_cfg(simulations: int, prefill_profile_path: str) -> AlphaZero
             exploration_constant=1.7,
             max_branching=10,
             controller_budget_combs=10,
-            controller_min_prior_threshold=0.01,
-            adversary_min_prior_threshold=0.1,
             root_dirichlet_noise_enabled=False,
             root_dirichlet_alpha=0.6,
             root_dirichlet_epsilon=0.25,
@@ -394,7 +510,6 @@ def main() -> None:
     ap.add_argument("--checkpoint", type=str, default=None, help="Optional model checkpoint (.pt) for model mode")
     ap.add_argument("--prefill-profile", type=str, default="simulator_output/prefill_profile.csv")
     ap.add_argument("--use-virtual-env", action="store_true", default=True)
-    ap.add_argument("--align-branching-roots", action="store_true", default=True)
     ap.add_argument("--max-forced-hops", type=int, default=20000)
     ap.add_argument("--enum-max-samples", type=int, default=10000)
     ap.add_argument("--root-node-id-override", type=int, default=None)
@@ -404,6 +519,10 @@ def main() -> None:
     ap.add_argument("--only-visited", action="store_true", default=True)
     ap.add_argument("--out-csv", type=str, default="simulator_output/mcts_dnn_logs/mcts_distribution.csv")
     ap.add_argument("--print-stdout", action="store_true", default=False)
+    ap.add_argument("--align-branching-roots", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--validate-row-state", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--row-time-atol", type=float, default=1e-6)
+    ap.add_argument("--row-float-atol", type=float, default=1e-6)
     args = ap.parse_args()
 
     if not (0.0 <= float(args.discount_factor) <= 1.0):
@@ -428,6 +547,9 @@ def main() -> None:
         align_branching_roots=bool(args.align_branching_roots),
         max_forced_hops=int(args.max_forced_hops),
         max_samples=int(args.enum_max_samples),
+        validate_row_state=bool(args.validate_row_state),
+        row_time_atol=float(args.row_time_atol),
+        row_float_atol=float(args.row_float_atol),
     )
 
     device = torch.device("cpu")

@@ -124,6 +124,16 @@ static int native_trace_every() {
     return every;
 }
 
+static int native_env_int(const char* name, int dflt) {
+    const char* v = std::getenv(name);
+    if (v == nullptr) return dflt;
+    try {
+        return std::stoi(std::string(v));
+    } catch (...) {
+        return dflt;
+    }
+}
+
 static std::string native_trace_path() {
     const char* f = std::getenv("VIDUR_NATIVE_TRACE_FILE");
     if (f != nullptr && *f != '\0') return std::string(f);
@@ -350,15 +360,30 @@ ControllerSampleOutput sample_controller_actions_native(
 
     std::stable_sort(
         ordered_sjf.begin(), ordered_sjf.end(),
-        [&](int a, int b) { return prefill_records[a].rem_pref < prefill_records[b].rem_pref; }
+        [&](int a, int b) {
+            const auto& ra = prefill_records[a];
+            const auto& rb = prefill_records[b];
+            if (ra.rem_pref != rb.rem_pref) return ra.rem_pref < rb.rem_pref;
+            return ra.rid < rb.rid;
+        }
     );
     std::stable_sort(
         ordered_edf.begin(), ordered_edf.end(),
-        [&](int a, int b) { return prefill_records[a].edf_key < prefill_records[b].edf_key; }
+        [&](int a, int b) {
+            const auto& ra = prefill_records[a];
+            const auto& rb = prefill_records[b];
+            if (ra.edf_key != rb.edf_key) return ra.edf_key < rb.edf_key;
+            return ra.rid < rb.rid;
+        }
     );
     std::stable_sort(
         ordered_lst.begin(), ordered_lst.end(),
-        [&](int a, int b) { return prefill_records[a].lst_key < prefill_records[b].lst_key; }
+        [&](int a, int b) {
+            const auto& ra = prefill_records[a];
+            const auto& rb = prefill_records[b];
+            if (ra.lst_key != rb.lst_key) return ra.lst_key < rb.lst_key;
+            return ra.rid < rb.rid;
+        }
     );
 
     auto ordered_ljf = ordered_sjf;
@@ -1224,6 +1249,8 @@ struct NativeSearchPerf {
     long long selection_steps = 0;
     long long forced_steps = 0;
     long long restore_missing_nodes_total = 0;
+    long long snapshot_cache_writes = 0;
+    long long snapshot_cache_skips = 0;
     long long expand_controller_actions_total = 0;
     long long expand_controller_alloc_pairs_total = 0;
     long long nodes_capacity_grows = 0;
@@ -1490,6 +1517,7 @@ struct NativePuctCandidate {
     double value_score = 0.0;
     double q_controller = 0.0;
     double q_norm = 0.0;
+    double puct = 0.0;
     double ucb = 0.0;
 };
 
@@ -1522,6 +1550,7 @@ static std::string json_selection_trace(const std::vector<NativePuctHop>& trace)
                 << ", \"value_score\": " << f64(c.value_score)
                 << ", \"q_controller\": " << f64(c.q_controller)
                 << ", \"q_norm\": " << f64(c.q_norm)
+                << ", \"puct\": " << f64(c.puct)
                 << ", \"ucb\": " << f64(c.ucb)
                 << '}';
         }
@@ -1555,8 +1584,6 @@ static inline void ensure_node_capacity(
 struct NativeSearchCfg {
     int max_branching = 10;
     bool uniform_prior_value = false;
-    double controller_min_prior_threshold = 0.0;
-    double adversary_min_prior_threshold = 0.0;
     bool root_dirichlet_noise_enabled = false;
     double root_dirichlet_alpha = 0.3;
     double root_dirichlet_epsilon = 0.25;
@@ -1570,6 +1597,7 @@ struct NativeSearchCfg {
     int seed = 0;
     int root_node_id = 0;
     int root_depth = 0;
+    int max_cached_state_snapshots = 4096;
 };
 
 struct NativeActionMask {
@@ -1930,11 +1958,9 @@ static double time_discount(const NativeSearchCfg& cfg, double t_child, double t
     return std::pow(gamma, dt / denom);
 }
 
-static std::map<int, double> apply_min_prior_threshold(
+static std::map<int, double> normalize_prior_map(
     const std::map<int, double>& prior_by_idx,
-    double min_prior,
-    double eps = 1e-12,
-    int max_iters = 64
+    double eps = 1e-12
 ) {
     if (prior_by_idx.empty()) return {};
     std::vector<int> keys;
@@ -1942,89 +1968,19 @@ static std::map<int, double> apply_min_prior_threshold(
     for (const auto& kv : prior_by_idx) keys.push_back(kv.first);
     const int n = (int)keys.size();
 
-    const double mp = (min_prior > 0.0 ? min_prior : 0.0);
-    if (mp <= 0.0 || n <= 1) {
-        double s = 0.0;
-        for (int k : keys) s += std::max(0.0, prior_by_idx.at(k));
-        if (s <= eps) {
-            const double u = 1.0 / (double)n;
-            std::map<int, double> out;
-            for (int k : keys) out[k] = u;
-            return out;
-        }
-        std::map<int, double> out;
-        for (int k : keys) out[k] = std::max(0.0, prior_by_idx.at(k)) / s;
-        return out;
-    }
-
-    if (mp * (double)n >= 1.0 - eps) {
+    double s = 0.0;
+    for (int k : keys) s += std::max(0.0, prior_by_idx.at(k));
+    if (s <= eps) {
         const double u = 1.0 / (double)n;
         std::map<int, double> out;
         for (int k : keys) out[k] = u;
         return out;
     }
 
-    std::map<int, double> p0;
-    double s0 = 0.0;
-    for (int k : keys) {
-        const double v = std::max(0.0, prior_by_idx.at(k));
-        p0[k] = v;
-        s0 += v;
-    }
-    if (s0 <= eps) {
-        const double u = 1.0 / (double)n;
-        for (int k : keys) p0[k] = u;
-    } else {
-        for (int k : keys) p0[k] /= s0;
-    }
-
-    std::map<int, double> q;
-    for (int k : keys) q[k] = (p0[k] >= mp ? p0[k] : mp);
-
-    for (int it = 0; it < max_iters; ++it) {
-        double total = 0.0;
-        for (int k : keys) total += q[k];
-        const double over = total - 1.0;
-        if (std::fabs(over) <= 1e-10) break;
-
-        if (over > 0.0) {
-            std::vector<int> adjustable;
-            adjustable.reserve(keys.size());
-            for (int k : keys) {
-                if (q[k] > mp + eps) adjustable.push_back(k);
-            }
-            if (adjustable.empty()) {
-                const double u = 1.0 / (double)n;
-                std::map<int, double> out;
-                for (int k : keys) out[k] = u;
-                return out;
-            }
-            double wsum = 0.0;
-            for (int k : adjustable) wsum += p0[k];
-            if (wsum <= eps) {
-                const double u = 1.0 / (double)n;
-                std::map<int, double> out;
-                for (int k : keys) out[k] = u;
-                return out;
-            }
-            for (int k : adjustable) q[k] -= over * (p0[k] / wsum);
-            for (int k : keys) if (q[k] < mp) q[k] = mp;
-        } else {
-            const double under = -over;
-            double wsum = 0.0;
-            for (int k : keys) wsum += p0[k];
-            for (int k : keys) q[k] += under * (p0[k] / wsum);
-        }
-    }
-
-    double total = 0.0;
-    for (int k : keys) total += q[k];
-    if (std::fabs(total - 1.0) > 1e-8) {
-        int kmax = keys[0];
-        for (int k : keys) if (q[k] > q[kmax]) kmax = k;
-        q[kmax] = std::max(mp, q[kmax] + (1.0 - total));
-    }
-    return q;
+    const double inv_s = 1.0 / s;
+    std::map<int, double> out;
+    for (int k : keys) out[k] = std::max(0.0, prior_by_idx.at(k)) * inv_s;
+    return out;
 }
 
 static std::string controller_action_key(const py::object& action) {
@@ -2051,6 +2007,60 @@ static std::string controller_action_key(const py::object& action) {
     return out;
 }
 
+static bool try_child_q_controller(
+    const NativeTreeNode& parent,
+    const NativeTreeNode& child,
+    const NativeSearchCfg& cfg,
+    bool parent_is_branching,
+    double& q_controller_out
+) {
+    if (child.visits <= 0) {
+        return false;
+    }
+    const double disc = parent_is_branching ? time_discount(cfg, child.sim_time, parent.sim_time) : 1.0;
+    q_controller_out = child.reward + disc * (child.value_sum / (double)child.visits);
+    return true;
+}
+
+static bool compute_parent_local_q_bounds(
+    const std::vector<NativeTreeNode>& nodes,
+    const NativeTreeNode& parent,
+    const NativeSearchCfg& cfg,
+    bool parent_is_branching,
+    double& q_min_out,
+    double& q_max_out
+) {
+    bool has_q = false;
+    double q_min = std::numeric_limits<double>::infinity();
+    double q_max = -std::numeric_limits<double>::infinity();
+    for (const auto& kv : parent.children) {
+        const int child_idx = kv.second;
+        if (child_idx < 0 || (size_t)child_idx >= nodes.size()) {
+            continue;
+        }
+        double q_controller = 0.0;
+        if (!try_child_q_controller(parent, nodes[(size_t)child_idx], cfg, parent_is_branching, q_controller)) {
+            continue;
+        }
+        has_q = true;
+        q_min = std::min(q_min, q_controller);
+        q_max = std::max(q_max, q_controller);
+    }
+    if (!has_q) {
+        return false;
+    }
+    q_min_out = q_min;
+    q_max_out = q_max;
+    return true;
+}
+
+static double normalize_parent_local_q(double q_controller, bool has_bounds, double q_min, double q_max) {
+    if (has_bounds && q_max > q_min) {
+        return (q_controller - q_min) / (q_max - q_min);
+    }
+    return q_controller;
+}
+
 static int select_child(
     const std::vector<NativeTreeNode>& nodes,
     int node_idx,
@@ -2058,12 +2068,18 @@ static int select_child(
     const NativeMinMaxStats& minmax,
     std::mt19937& rng
 ) {
+    (void)minmax;
     ensure_node_index(nodes, node_idx, "select_child(node)");
     const auto& node = nodes[(size_t)node_idx];
     if (node.children.empty()) return -1;
     if (node.children.size() == 1) return node.children.begin()->second;
 
     const bool parent_is_branching = (node.num_valid_actions > 1) || (node.children.size() > 1);
+    double q_min = 0.0;
+    double q_max = 0.0;
+    const bool has_local_q_bounds =
+        compute_parent_local_q_bounds(nodes, node, cfg, parent_is_branching, q_min, q_max);
+
     double best = -std::numeric_limits<double>::infinity();
     std::vector<int> best_children;
 
@@ -2077,18 +2093,17 @@ static int select_child(
         double prior_score = pb_c * child.prior;
 
         double value_score = 0.0;
-        if (child.visits > 0) {
-            const double disc = parent_is_branching ? time_discount(cfg, child.sim_time, node.sim_time) : 1.0;
-            const double q_controller = child.reward + disc * (child.value_sum / (double)child.visits);
-            const double q_norm = minmax.normalize(q_controller);
+        double q_controller = 0.0;
+        if (try_child_q_controller(node, child, cfg, parent_is_branching, q_controller)) {
+            const double q_norm = normalize_parent_local_q(q_controller, has_local_q_bounds, q_min, q_max);
             value_score = (node.player == "controller") ? q_norm : -q_norm;
         }
-        const double u = prior_score + value_score;
-        if (u > best + 1e-15) {
-            best = u;
+        const double puct = prior_score + value_score;
+        if (puct > best + 1e-15) {
+            best = puct;
             best_children.clear();
             best_children.push_back(kv.second);
-        } else if (std::fabs(u - best) <= 1e-15) {
+        } else if (std::fabs(puct - best) <= 1e-15) {
             best_children.push_back(kv.second);
         }
     }
@@ -2104,9 +2119,14 @@ static std::vector<NativePuctCandidate> build_selection_candidates(
     const NativeSearchCfg& cfg,
     const NativeMinMaxStats& minmax
 ) {
+    (void)minmax;
     ensure_node_index(nodes, node_idx, "build_selection_candidates(node)");
     const auto& node = nodes[(size_t)node_idx];
     const bool parent_is_branching = (node.num_valid_actions > 1) || (node.children.size() > 1);
+    double q_min = 0.0;
+    double q_max = 0.0;
+    const bool has_local_q_bounds =
+        compute_parent_local_q_bounds(nodes, node, cfg, parent_is_branching, q_min, q_max);
     std::vector<NativePuctCandidate> out;
     out.reserve(node.children.size());
     for (const auto& kv : node.children) {
@@ -2122,13 +2142,13 @@ static std::vector<NativePuctCandidate> build_selection_candidates(
         c.pb_c = std::log((node.visits + cfg.pb_c_base + 1.0) / cfg.pb_c_base) + cfg.pb_c_init;
         c.pb_c *= std::sqrt((double)node.visits + 1.0) / ((double)child.visits + 1.0);
         c.prior_score = c.pb_c * child.prior;
-        if (child.visits > 0) {
-            const double disc = parent_is_branching ? time_discount(cfg, child.sim_time, node.sim_time) : 1.0;
-            c.q_controller = child.reward + disc * (child.value_sum / (double)child.visits);
-            c.q_norm = minmax.normalize(c.q_controller);
+        if (try_child_q_controller(node, child, cfg, parent_is_branching, c.q_controller)) {
+            c.q_norm = normalize_parent_local_q(c.q_controller, has_local_q_bounds, q_min, q_max);
             c.value_score = (node.player == "controller") ? c.q_norm : -c.q_norm;
         }
-        c.ucb = c.prior_score + c.value_score;
+        c.puct = c.prior_score + c.value_score;
+        // Keep ucb populated for compatibility with existing parsers/tests.
+        c.ucb = c.puct;
         out.push_back(c);
     }
     return out;
@@ -2271,16 +2291,13 @@ static std::tuple<double, bool, int> expand_node(
     nodes[(size_t)node_idx].nn_priors = priors;
 
     const bool is_controller_player = (nodes[(size_t)node_idx].player == "controller");
-    const double min_p = is_controller_player
-        ? cfg.controller_min_prior_threshold
-        : cfg.adversary_min_prior_threshold;
 
     const double t_thr0 = now_sec();
     std::map<int, double> valid_prior_by_idx;
     for (int i : am.valid) {
         valid_prior_by_idx[i] = (i >= 0 && (size_t)i < priors.size()) ? priors[(size_t)i] : 0.0;
     }
-    std::map<int, double> norm_prior = apply_min_prior_threshold(valid_prior_by_idx, min_p);
+    std::map<int, double> norm_prior = normalize_prior_map(valid_prior_by_idx);
 
     nodes[(size_t)node_idx].nn_priors_after_threshold.assign(priors.size(), 0.0);
     for (const auto& kv : norm_prior) {
@@ -2435,8 +2452,6 @@ static py::dict search_mcts_dnn(
     py::function infer_cb,
     bool uniform_prior_value,
     int max_branching,
-    double controller_min_prior_threshold,
-    double adversary_min_prior_threshold,
     bool root_dirichlet_noise_enabled,
     double root_dirichlet_alpha,
     double root_dirichlet_epsilon,
@@ -2462,8 +2477,6 @@ static py::dict search_mcts_dnn(
     NativeSearchCfg cfg;
     cfg.max_branching = max_branching;
     cfg.uniform_prior_value = uniform_prior_value;
-    cfg.controller_min_prior_threshold = controller_min_prior_threshold;
-    cfg.adversary_min_prior_threshold = adversary_min_prior_threshold;
     cfg.root_dirichlet_noise_enabled = root_dirichlet_noise_enabled;
     cfg.root_dirichlet_alpha = root_dirichlet_alpha;
     cfg.root_dirichlet_epsilon = root_dirichlet_epsilon;
@@ -2477,6 +2490,7 @@ static py::dict search_mcts_dnn(
     cfg.seed = seed;
     cfg.root_node_id = root_node_id;
     cfg.root_depth = root_depth;
+    cfg.max_cached_state_snapshots = native_env_int("VIDUR_NATIVE_MAX_CACHED_STATE_SNAPSHOTS", 4096);
 
     std::mt19937 rng((uint32_t)cfg.seed);
     NativeMinMaxStats minmax;
@@ -3040,6 +3054,35 @@ static std::shared_ptr<NativePredictor> get_cached_native_predictor(
     static std::mutex cache_mu;
     static std::unordered_map<std::uintptr_t, std::shared_ptr<NativePredictor>> py_cache;
     static std::unordered_map<std::string, std::shared_ptr<NativePredictor>> csv_cache;
+    static std::deque<std::uintptr_t> py_cache_lru;
+    static std::deque<std::string> csv_cache_lru;
+    constexpr size_t kMaxPyPredictorCacheEntries = 4;
+    constexpr size_t kMaxCsvPredictorCacheEntries = 2;
+
+    auto touch_py_key = [&](std::uintptr_t key) {
+        auto it = std::find(py_cache_lru.begin(), py_cache_lru.end(), key);
+        if (it != py_cache_lru.end()) py_cache_lru.erase(it);
+        py_cache_lru.push_back(key);
+    };
+    auto touch_csv_key = [&](const std::string& key) {
+        auto it = std::find(csv_cache_lru.begin(), csv_cache_lru.end(), key);
+        if (it != csv_cache_lru.end()) csv_cache_lru.erase(it);
+        csv_cache_lru.push_back(key);
+    };
+    auto prune_py_cache = [&]() {
+        while (py_cache.size() > kMaxPyPredictorCacheEntries && !py_cache_lru.empty()) {
+            const std::uintptr_t evict_key = py_cache_lru.front();
+            py_cache_lru.pop_front();
+            py_cache.erase(evict_key);
+        }
+    };
+    auto prune_csv_cache = [&]() {
+        while (csv_cache.size() > kMaxCsvPredictorCacheEntries && !csv_cache_lru.empty()) {
+            const std::string evict_key = csv_cache_lru.front();
+            csv_cache_lru.pop_front();
+            csv_cache.erase(evict_key);
+        }
+    };
 
     py::object py_predictor = py_predictor_from_env(env);
     if (!py_predictor.is_none()) {
@@ -3048,6 +3091,7 @@ static std::shared_ptr<NativePredictor> get_cached_native_predictor(
             std::lock_guard<std::mutex> lock(cache_mu);
             auto it = py_cache.find(key);
             if (it != py_cache.end()) {
+                touch_py_key(key);
                 if (mode_out != nullptr) *mode_out = "python_cache";
                 if (source_out != nullptr) {
                     try {
@@ -3066,6 +3110,8 @@ static std::shared_ptr<NativePredictor> get_cached_native_predictor(
             std::lock_guard<std::mutex> lock(cache_mu);
             auto [it, inserted] = py_cache.emplace(key, predictor);
             if (!inserted) predictor = it->second;
+            touch_py_key(key);
+            prune_py_cache();
             if (mode_out != nullptr) *mode_out = "python_cache";
             if (source_out != nullptr) *source_out = source;
             return predictor;
@@ -3086,6 +3132,7 @@ static std::shared_ptr<NativePredictor> get_cached_native_predictor(
         std::lock_guard<std::mutex> lock(cache_mu);
         auto it = csv_cache.find(predictor_csv_path);
         if (it != csv_cache.end()) {
+            touch_csv_key(predictor_csv_path);
             if (mode_out != nullptr) *mode_out = "csv_table";
             if (source_out != nullptr) *source_out = predictor_csv_path;
             return it->second;
@@ -3093,6 +3140,8 @@ static std::shared_ptr<NativePredictor> get_cached_native_predictor(
         auto predictor = std::make_shared<NativePredictor>();
         if (predictor->load_csv(predictor_csv_path)) {
             csv_cache[predictor_csv_path] = predictor;
+            touch_csv_key(predictor_csv_path);
+            prune_csv_cache();
             if (mode_out != nullptr) *mode_out = "csv_table";
             if (source_out != nullptr) *source_out = predictor_csv_path;
             return predictor;
@@ -3515,7 +3564,9 @@ static NativeSimState restore_state_for_node_native(
     const NativeSearchCfg& cfg,
     const NativeRuntimeConfig& runtime_cfg,
     NativePredictor& predictor,
-    int* out_missing_nodes = nullptr
+    int* out_missing_nodes = nullptr,
+    int* io_cached_snapshots = nullptr,
+    NativeSearchPerf* perf = nullptr
 ) {
     ensure_node_index(nodes, node_idx, "restore_state_for_node_native(target)");
 
@@ -3543,8 +3594,16 @@ static NativeSimState restore_state_for_node_native(
         auto& node = nodes[(size_t)idx];
 
         if (node.parent < 0) {
-            node.state_snapshot = state;
-            node.has_state_snapshot = true;
+            if (!node.has_state_snapshot) {
+                node.state_snapshot = state;
+                node.has_state_snapshot = true;
+                if (io_cached_snapshots != nullptr) {
+                    *io_cached_snapshots += 1;
+                }
+                if (perf != nullptr) {
+                    perf->snapshot_cache_writes += 1;
+                }
+            }
             node.state_cost = NativeSim::evaluate_objective_cost(state);
             node.sim_time = state.sim_time;
             continue;
@@ -3552,8 +3611,23 @@ static NativeSimState restore_state_for_node_native(
 
         ensure_node_index(nodes, node.parent, "restore_state_for_node_native(parent)");
         apply_edge_transition_native(nodes, node.parent, idx, state, cfg, runtime_cfg, predictor);
-        node.state_snapshot = state;
-        node.has_state_snapshot = true;
+        const bool likely_branching = (node.num_valid_actions != 1);
+        const bool under_budget =
+            (cfg.max_cached_state_snapshots <= 0) ||
+            (io_cached_snapshots == nullptr) ||
+            (*io_cached_snapshots < cfg.max_cached_state_snapshots);
+        if (!node.has_state_snapshot && likely_branching && under_budget) {
+            node.state_snapshot = state;
+            node.has_state_snapshot = true;
+            if (io_cached_snapshots != nullptr) {
+                *io_cached_snapshots += 1;
+            }
+            if (perf != nullptr) {
+                perf->snapshot_cache_writes += 1;
+            }
+        } else if (!node.has_state_snapshot && perf != nullptr) {
+            perf->snapshot_cache_skips += 1;
+        }
     }
 
     if (out_missing_nodes != nullptr) {
@@ -3663,16 +3737,13 @@ static std::tuple<double, bool, int> expand_node_full_native(
     nodes[(size_t)node_idx].nn_priors = priors;
 
     const bool is_controller_player = (nodes[(size_t)node_idx].player == "controller");
-    const double min_p = is_controller_player
-        ? cfg.controller_min_prior_threshold
-        : cfg.adversary_min_prior_threshold;
 
     const double t_thr0 = now_sec();
     std::map<int, double> valid_prior_by_idx;
     for (int i : am.valid) {
         valid_prior_by_idx[i] = (i >= 0 && (size_t)i < priors.size()) ? priors[(size_t)i] : 0.0;
     }
-    std::map<int, double> norm_prior = apply_min_prior_threshold(valid_prior_by_idx, min_p);
+    std::map<int, double> norm_prior = normalize_prior_map(valid_prior_by_idx);
 
     nodes[(size_t)node_idx].nn_priors_after_threshold.assign(priors.size(), 0.0);
     for (const auto& kv : norm_prior) {
@@ -3793,8 +3864,6 @@ static py::dict search_mcts_dnn_torchscript_impl(
     int model_version,
     bool uniform_prior_value,
     int max_branching,
-    double controller_min_prior_threshold,
-    double adversary_min_prior_threshold,
     bool root_dirichlet_noise_enabled,
     double root_dirichlet_alpha,
     double root_dirichlet_epsilon,
@@ -3831,8 +3900,6 @@ static py::dict search_mcts_dnn_torchscript_impl(
     NativeSearchCfg cfg;
     cfg.max_branching = max_branching;
     cfg.uniform_prior_value = uniform_prior_value;
-    cfg.controller_min_prior_threshold = controller_min_prior_threshold;
-    cfg.adversary_min_prior_threshold = adversary_min_prior_threshold;
     cfg.root_dirichlet_noise_enabled = root_dirichlet_noise_enabled;
     cfg.root_dirichlet_alpha = root_dirichlet_alpha;
     cfg.root_dirichlet_epsilon = root_dirichlet_epsilon;
@@ -3846,6 +3913,7 @@ static py::dict search_mcts_dnn_torchscript_impl(
     cfg.seed = seed;
     cfg.root_node_id = root_node_id;
     cfg.root_depth = root_depth;
+    cfg.max_cached_state_snapshots = native_env_int("VIDUR_NATIVE_MAX_CACHED_STATE_SNAPSHOTS", 4096);
 
     const double t_state0 = now_sec();
     NativeRuntimeConfig runtime_cfg = runtime_cfg_from_env(env);
@@ -3901,6 +3969,7 @@ static py::dict search_mcts_dnn_torchscript_impl(
     root.has_state_snapshot = true;
     root.state_snapshot = root_native_state;
     nodes.push_back(std::move(root));
+    int cached_snapshots = 1;
 
     NativeIterCsvLogger iter_logger(iter_log_path);
     const bool iter_log_enabled = iter_logger.enabled();
@@ -3999,7 +4068,9 @@ static py::dict search_mcts_dnn_torchscript_impl(
             cfg,
             runtime_cfg,
             predictor,
-            &restore_missing_nodes
+            &restore_missing_nodes,
+            &cached_snapshots,
+            &perf
         );
         perf.restore_sec += (now_sec() - t_restore0);
         perf.restore_missing_nodes_total += (long long)restore_missing_nodes;
@@ -4092,10 +4163,6 @@ static py::dict search_mcts_dnn_torchscript_impl(
             const double t_forced_apply0 = now_sec();
             apply_edge_transition_native(nodes, current, child_idx, state, cfg, runtime_cfg, predictor);
             perf.forced_apply_sec += (now_sec() - t_forced_apply0);
-            if (!nodes[(size_t)child_idx].has_state_snapshot) {
-                nodes[(size_t)child_idx].state_snapshot = state;
-                nodes[(size_t)child_idx].has_state_snapshot = true;
-            }
             current = child_idx;
             search_path.push_back(current);
             perf.forced_steps += 1;
@@ -4260,6 +4327,8 @@ static py::dict search_mcts_dnn_torchscript_impl(
     perf_out["selection_steps"] = py::int_(perf.selection_steps);
     perf_out["forced_steps"] = py::int_(perf.forced_steps);
     perf_out["restore_missing_nodes_total"] = py::int_(perf.restore_missing_nodes_total);
+    perf_out["snapshot_cache_writes"] = py::int_(perf.snapshot_cache_writes);
+    perf_out["snapshot_cache_skips"] = py::int_(perf.snapshot_cache_skips);
     perf_out["expand_controller_actions_total"] = py::int_(perf.expand_controller_actions_total);
     perf_out["expand_controller_alloc_pairs_total"] = py::int_(perf.expand_controller_alloc_pairs_total);
     perf_out["nodes_capacity_grows"] = py::int_(perf.nodes_capacity_grows);
@@ -4290,8 +4359,6 @@ static py::dict search_mcts_dnn_torchscript(
     int model_version,
     bool uniform_prior_value,
     int max_branching,
-    double controller_min_prior_threshold,
-    double adversary_min_prior_threshold,
     bool root_dirichlet_noise_enabled,
     double root_dirichlet_alpha,
     double root_dirichlet_epsilon,
@@ -4319,8 +4386,6 @@ static py::dict search_mcts_dnn_torchscript(
         model_version,
         uniform_prior_value,
         max_branching,
-        controller_min_prior_threshold,
-        adversary_min_prior_threshold,
         root_dirichlet_noise_enabled,
         root_dirichlet_alpha,
         root_dirichlet_epsilon,
@@ -4350,8 +4415,6 @@ static py::dict search_mcts_dnn_torchscript_service(
     int model_version,
     bool uniform_prior_value,
     int max_branching,
-    double controller_min_prior_threshold,
-    double adversary_min_prior_threshold,
     bool root_dirichlet_noise_enabled,
     double root_dirichlet_alpha,
     double root_dirichlet_epsilon,
@@ -4379,8 +4442,6 @@ static py::dict search_mcts_dnn_torchscript_service(
         model_version,
         uniform_prior_value,
         max_branching,
-        controller_min_prior_threshold,
-        adversary_min_prior_threshold,
         root_dirichlet_noise_enabled,
         root_dirichlet_alpha,
         root_dirichlet_epsilon,
@@ -4635,8 +4696,6 @@ PYBIND11_MODULE(mcts_native, m) {
       py::arg("infer_cb"),
       py::arg("uniform_prior_value") = false,
       py::arg("max_branching"),
-      py::arg("controller_min_prior_threshold"),
-      py::arg("adversary_min_prior_threshold"),
       py::arg("root_dirichlet_noise_enabled"),
       py::arg("root_dirichlet_alpha"),
       py::arg("root_dirichlet_epsilon"),
@@ -4665,8 +4724,6 @@ PYBIND11_MODULE(mcts_native, m) {
       py::arg("model_version"),
       py::arg("uniform_prior_value") = false,
       py::arg("max_branching"),
-      py::arg("controller_min_prior_threshold"),
-      py::arg("adversary_min_prior_threshold"),
       py::arg("root_dirichlet_noise_enabled"),
       py::arg("root_dirichlet_alpha"),
       py::arg("root_dirichlet_epsilon"),
@@ -4695,8 +4752,6 @@ PYBIND11_MODULE(mcts_native, m) {
       py::arg("model_version"),
       py::arg("uniform_prior_value") = false,
       py::arg("max_branching"),
-      py::arg("controller_min_prior_threshold"),
-      py::arg("adversary_min_prior_threshold"),
       py::arg("root_dirichlet_noise_enabled"),
       py::arg("root_dirichlet_alpha"),
       py::arg("root_dirichlet_epsilon"),

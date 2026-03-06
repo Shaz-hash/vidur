@@ -36,15 +36,10 @@ DECODE_SLO = 0.05  # 50ms
 BUDGET_STEP = 512  # controller interval
 MAX_REQUESTS_NORM = 200  # not used here, but kept for future
 
-## For threshold prior tests & verification 
-CONTROLLER_MIN_PRIOR_THRESHOLD = 0.01
-ADVERSARY_MIN_PRIOR_THRESHOLD = 0.1
-
 DECODE_TOL_BUCKET_SIZE = 10
 DECODE_TOL_PER_BUCKET_SEC = 50e-3  # 50 ms per 10 decode tokens (eval logs only)
 
 PRIOR_SUM_TOL = 1e-6
-PRIOR_FLOOR_TOL = 1e-6
 PRIOR_POS_EPS = 1e-12  # treat <= this as "zero / invalid"
 # -----------------------------
 
@@ -1124,7 +1119,7 @@ def test_objective_matches_log(ctx: TraceContext, row: Row, trace_id: str) -> No
         _fail("test_objective_matches_log", f"objective_cost mismatch: expected {exp_obj:.9f}, got {got_obj:.9f}", row, trace_id)
 
 
-def test_min_prior_threshold_and_sums(row: Row, trace_id: str) -> None:
+def test_normalized_prior_sums(row: Row, trace_id: str) -> None:
     # Ignore history rows
     if (row.phase or "").startswith("history-"):
         return
@@ -1142,7 +1137,7 @@ def test_min_prior_threshold_and_sums(row: Row, trace_id: str) -> None:
 
     if len(model_prior) != len(norm_prior):
         _fail(
-            "test_min_prior_threshold_and_sums",
+            "test_normalized_prior_sums",
             f"prior length mismatch: model={len(model_prior)} norm={len(norm_prior)}",
             row,
             trace_id,
@@ -1151,39 +1146,20 @@ def test_min_prior_threshold_and_sums(row: Row, trace_id: str) -> None:
     sm = float(sum(model_prior))
     sn = float(sum(norm_prior))
     if abs(sm - 1.0) > PRIOR_SUM_TOL:
-        _fail("test_min_prior_threshold_and_sums", f"model_prior sum={sm:.9f} != 1", row, trace_id)
+        _fail("test_normalized_prior_sums", f"model_prior sum={sm:.9f} != 1", row, trace_id)
     if abs(sn - 1.0) > PRIOR_SUM_TOL:
-        _fail("test_min_prior_threshold_and_sums", f"normalized_prior sum={sn:.9f} != 1", row, trace_id)
+        _fail("test_normalized_prior_sums", f"normalized_prior sum={sn:.9f} != 1", row, trace_id)
 
     for name, arr in (("model_prior_json", model_prior), ("normalized_prior_json", norm_prior)):
         if any((not math.isfinite(x)) for x in arr):
-            _fail("test_min_prior_threshold_and_sums", f"{name} contains non-finite values", row, trace_id)
+            _fail("test_normalized_prior_sums", f"{name} contains non-finite values", row, trace_id)
         if min(arr) < -PRIOR_POS_EPS:
-            _fail("test_min_prior_threshold_and_sums", f"{name} has negative prob min={min(arr):.9e}", row, trace_id)
-
-    if row.player_to_act == "controller":
-        mp = CONTROLLER_MIN_PRIOR_THRESHOLD
-    elif row.player_to_act == "adversary":
-        mp = ADVERSARY_MIN_PRIOR_THRESHOLD
-    else:
-        return
+            _fail("test_normalized_prior_sums", f"{name} has negative prob min={min(arr):.9e}", row, trace_id)
 
     # In your logging, normalized_prior_json is nonzero only on valid indices.
     positive = [p for p in norm_prior if p > PRIOR_POS_EPS]
     if not positive:
-        _fail("test_min_prior_threshold_and_sums", "normalized_prior has no positive entries", row, trace_id)
-
-    n_valid = len(positive)
-    # If infeasible (mp*n_valid >= 1), code falls back to uniform -> skip strict floor check
-    if mp * float(n_valid) < 1.0 - 1e-9:
-        min_pos = min(positive)
-        if min_pos < mp - PRIOR_FLOOR_TOL:
-            _fail(
-                "test_min_prior_threshold_and_sums",
-                f"min normalized_prior among valid is {min_pos:.6f} < floor {mp:.6f} (n_valid={n_valid})",
-                row,
-                trace_id,
-            )
+        _fail("test_normalized_prior_sums", "normalized_prior has no positive entries", row, trace_id)
 
 
 
@@ -1205,7 +1181,7 @@ def run_trace(trace_rows: List[Row], *, prefill_profile: Dict[int, float]) -> in
     for row in trace_rows:
         test_player_turn_consistency(ctx, row, trace_id)
 
-        test_min_prior_threshold_and_sums(row, trace_id)
+        test_normalized_prior_sums(row, trace_id)
 
 
         ids_seen = set(row.state_waiting_ids) | set(row.state_completed_ids)
@@ -1468,7 +1444,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 
 
 

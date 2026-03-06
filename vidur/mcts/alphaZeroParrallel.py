@@ -177,17 +177,7 @@ def _build_constraints_and_explore(cfg: "AlphaZeroConfig") -> tuple[MCTSConstrai
     )
     setattr(
         explore_cfg,
-        "controller_min_prior_threshold",
-        float(cfg.explore.controller_min_prior_threshold),
-    )
-    setattr(
-        explore_cfg,
-        "adversary_min_prior_threshold",
-        float(cfg.explore.adversary_min_prior_threshold),
-    )
-    setattr(
-    explore_cfg,
-    "root_dirichlet_noise_enabled",
+        "root_dirichlet_noise_enabled",
     bool(cfg.explore.root_dirichlet_noise_enabled),
     )
     setattr(
@@ -1219,6 +1209,7 @@ def selfImprovementPolicy(
     os.environ.setdefault("MKL_NUM_THREADS", "1")
     os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
     os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+    os.environ.setdefault("MALLOC_ARENA_MAX", "2")
 
     infer_service_procs: list[object] = []
     infer_service_addrs: list[str] = []
@@ -1799,9 +1790,7 @@ class MCTSExploreGroup:
     exploration_constant: float = 1.7
     max_branching: int = 10
     controller_budget_combs: int = 10
-    controller_min_prior_threshold : float = 0.01
-    adversary_min_prior_threshold : float = 0.1
-    root_dirichlet_noise_enabled: bool = False
+    root_dirichlet_noise_enabled: bool = True
     root_dirichlet_alpha: float = 0.6
     root_dirichlet_epsilon: float = 0.25
     prior_value_mode: str = "model"  # model | uniform
@@ -1935,11 +1924,9 @@ def main() -> None:
             exploration_constant=1.7,
             max_branching=10,
             controller_budget_combs=10,
-            controller_min_prior_threshold=0.01,
-            adversary_min_prior_threshold=0.1,
             root_dirichlet_noise_enabled=True,
             root_dirichlet_alpha=0.6,
-            root_dirichlet_epsilon=0.35,
+            root_dirichlet_epsilon=0.25,
         ),
         model=ModelGroup(
             num_actions_controller=24,
@@ -2010,7 +1997,7 @@ def main() -> None:
 
 
     ## MODEL TRAINING PARMS FOR SELF-IMPROVEMENT LOOP:
-    num_selfPlay_workers = 25
+    num_selfPlay_workers = 20
     num_generations = 200
     history_nontrivial_hops = [0, 5 , 10 , 15 , 20, 25, 30, 35]  # per worker
     roots_per_generation = 1250
@@ -2021,7 +2008,7 @@ def main() -> None:
     train_log_csv = Path("simulator_output/mcts_dnn_logs/train_metrics.csv")
     ckpt_dir = Path("simulator_output/mcts_dnn_checkpoints")
     use_virtual_env = True
-    replay_capacity_samples = 4000
+    replay_capacity_samples = 5000
     replay_max_cached_shards = 1024
     replay_seed = 2026
 

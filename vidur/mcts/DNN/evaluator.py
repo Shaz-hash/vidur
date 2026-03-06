@@ -1539,9 +1539,6 @@ class FixedEvalHarness:
             max_branching=int(getattr(explore_group, "max_branching")),
             controller_budget_combs=int(getattr(explore_group, "controller_budget_combs")),
         )
-        setattr(explore_cfg_eval, "controller_min_prior_threshold", float(getattr(explore_group, "controller_min_prior_threshold", 0.0)))
-        setattr(explore_cfg_eval, "adversary_min_prior_threshold", float(getattr(explore_group, "adversary_min_prior_threshold", 0.0)))
-
         env_eval = VidurMCTSEnvironment(
             base_simulator=simulator_eval,
             constraints=constraints_eval,

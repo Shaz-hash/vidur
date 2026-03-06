@@ -306,7 +306,7 @@ class VirtualVidurMCTSEnvironment:
 
         t_pack = time.perf_counter()
         req_states = []
-        for rid0 in active_ids:
+        for rid0 in sorted(active_ids):
             rid = int(rid0)
             req = req_map.get(rid)
             if req is None:
@@ -394,7 +394,7 @@ class VirtualVidurMCTSEnvironment:
         decode_candidates: List[int] = []
         decode_base_template: Dict[int, int] = {}
 
-        for rid0 in active_ids:
+        for rid0 in sorted(active_ids):
             rid = int(rid0)
             req = req_map.get(rid)
             if req is None:
@@ -425,7 +425,7 @@ class VirtualVidurMCTSEnvironment:
             token_alloc = dict(decode_base)
             a = ControllerAction(
                 token_budget=len(decode_base),
-                selected_request_ids=list(token_alloc.keys()) if token_alloc else None,
+                selected_request_ids=sorted(token_alloc.keys()) if token_alloc else None,
                 token_allocations=token_alloc,
                 prefill_allocations={},
                 decode_allocations=decode_base,
@@ -436,9 +436,9 @@ class VirtualVidurMCTSEnvironment:
             mask[0] = True
             return actions_by_index, mask
 
-        ordered_sjf = sorted(prefill_ids, key=rem_pref_by_id.__getitem__)
-        ordered_edf = sorted(prefill_ids, key=edf_key_by_id.__getitem__)
-        ordered_lst = sorted(prefill_ids, key=lst_key_by_id.__getitem__)
+        ordered_sjf = sorted(prefill_ids, key=lambda rid: (rem_pref_by_id[rid], rid))
+        ordered_edf = sorted(prefill_ids, key=lambda rid: (edf_key_by_id[rid], rid))
+        ordered_lst = sorted(prefill_ids, key=lambda rid: (lst_key_by_id[rid], rid))
         ordered_ljf = list(reversed(ordered_sjf))
         heuristics = [
             ("SJF", ordered_sjf),
@@ -467,7 +467,7 @@ class VirtualVidurMCTSEnvironment:
             decode_alloc = dict(decode_base_template)
             token_alloc = dict(decode_alloc)
             token_alloc.update(pre)
-            selected = list(token_alloc.keys()) if token_alloc else None
+            selected = sorted(token_alloc.keys()) if token_alloc else None
             return ControllerAction(
                 token_budget=decode_budget + used_prefill,
                 selected_request_ids=selected,

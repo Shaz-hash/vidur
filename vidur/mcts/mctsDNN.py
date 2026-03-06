@@ -80,7 +80,7 @@ class MCTSNode:
     sim_time: float = 0.0   # NEW: simulator time at this node after performing action
     nn_value_controller: float | None = None        # value from controller perspective
     nn_priors: list[float] | None = None            # length = full action space size
-    nn_priors_after_threshold: list[float] | None = None  # length = full action space size, nornalized after min_prior enforcement
+    nn_priors_after_threshold: list[float] | None = None  # length = full action space size, normalized priors actually used by search
     nn_valid_mask: list[bool] | None = None         # length = full action space size
     num_valid_actions: int = 0  # last computed valid-actions count at this node
 
@@ -509,95 +509,27 @@ class VidurMCTS:
 
 
 
-    def _apply_min_prior_threshold_dict(
+    def _normalize_prior_dict(
         self,
         prior_by_idx: Dict[int, float],
         *,
-        min_prior: float,
         eps: float = 1e-12,
-        max_iters: int = 64,
     ) -> Dict[int, float]:
         """
-        Enforce p_i >= min_prior for all keys in prior_by_idx, while keeping sum(p)=1.
-        If min_prior is infeasible (min_prior * N >= 1), fall back to uniform over keys.
-
-        Important: expects prior_by_idx to represent ONLY valid actions you want MCTS to consider
-        (e.g., canonical controller children, or adversary valid indices).
+        Normalize priors over the provided keys only, clipping negatives to zero.
+        If the total mass is effectively zero, fall back to uniform over keys.
         """
         if not prior_by_idx:
             return {}
 
         keys = list(prior_by_idx.keys())
         n = len(keys)
-
-        mp = float(min_prior or 0.0)
-        if mp <= 0.0 or n <= 1:
-            # just normalize and return
-            s = float(sum(max(0.0, float(prior_by_idx[k])) for k in keys))
-            if s <= eps:
-                u = 1.0 / float(n)
-                return {k: u for k in keys}
-            return {k: max(0.0, float(prior_by_idx[k])) / s for k in keys}
-
-        if mp * float(n) >= 1.0 - eps:
+        s = float(sum(max(0.0, float(prior_by_idx[k])) for k in keys))
+        if s <= eps:
             u = 1.0 / float(n)
             return {k: u for k in keys}
-
-        # normalize original (p0) -> used as proportional weights when subtracting mass
-        p0 = {k: max(0.0, float(prior_by_idx[k])) for k in keys}
-        s0 = float(sum(p0.values()))
-        if s0 <= eps:
-            u = 1.0 / float(n)
-            p0 = {k: u for k in keys}
-        else:
-            inv = 1.0 / s0
-            p0 = {k: v * inv for k, v in p0.items()}
-
-        # clamp low probs to min_prior
-        q = {k: (p0[k] if p0[k] >= mp else mp) for k in keys}
-
-        # if we increased some entries, we must remove the excess from entries above mp
-        for _ in range(max_iters):
-            total = float(sum(q.values()))
-            over = total - 1.0
-            if abs(over) <= 1e-10:
-                break
-
-            if over > 0.0:
-                adjustable = [k for k in keys if q[k] > mp + eps]
-                if not adjustable:
-                    u = 1.0 / float(n)
-                    return {k: u for k in keys}
-
-                wsum = float(sum(p0[k] for k in adjustable))
-                if wsum <= eps:
-                    u = 1.0 / float(n)
-                    return {k: u for k in keys}
-
-                # subtract overage proportional to original p0 mass (NN prior)
-                for k in adjustable:
-                    q[k] -= over * (p0[k] / wsum)
-
-                # re-clamp any that dropped below mp, then loop again if needed
-                for k in keys:
-                    if q[k] < mp:
-                        q[k] = mp
-
-            else:
-                # (rare) total < 1 due to numerical issues: add missing mass proportional to p0
-                under = -over
-                wsum = float(sum(p0.values()))
-                for k in keys:
-                    q[k] += under * (p0[k] / wsum)
-
-        # final tiny correction (keep sum=1 without breaking the floor)
-        total = float(sum(q.values()))
-        if abs(total - 1.0) > 1e-8:
-            # adjust the largest entry (must exist and should be >= mp)
-            kmax = max(keys, key=lambda k: q[k])
-            q[kmax] = max(mp, q[kmax] + (1.0 - total))
-
-        return q
+        inv_s = 1.0 / s
+        return {k: max(0.0, float(prior_by_idx[k])) * inv_s for k in keys}
 
 
 
@@ -690,32 +622,20 @@ class VidurMCTS:
         node.nn_valid_mask = [bool(x) for x in mask.tolist()]
 
 
-        # --- NEW: apply min-prior threshold on ALL valid indices (not canonical) ---
-        # t = time.perf_counter()
-        if node.player == "controller":
-            min_p = float(getattr(self._cfg, "controller_min_prior_threshold", 0.0) or 0.0)
-        else:
-            min_p = float(getattr(self._cfg, "adversary_min_prior_threshold", 0.0) or 0.0)
-
         valid_prior_by_idx = {
             int(i): (float(priors[i]) if 0 <= i < len(priors) else 0.0)
             for i in valid
         }
 
-        # This normalizes across valid indices and applies the floor.
-        # (If min_p==0 it still normalizes and cleans negatives.)
-        norm_prior_by_idx = self._apply_min_prior_threshold_dict(
-            valid_prior_by_idx,
-            min_prior=float(min_p),
-        )
+        # Normalize across valid indices only; no minimum-prior floor is applied.
+        norm_prior_by_idx = self._normalize_prior_dict(valid_prior_by_idx)
 
-        # store per-index thresholded prior vector for debugging/logging
+        # store per-index normalized prior vector for debugging/logging
         thr_vec = [0.0] * len(priors)
         for i, p in norm_prior_by_idx.items():
             if 0 <= int(i) < len(thr_vec):
                 thr_vec[int(i)] = float(p)
         node.nn_priors_after_threshold = thr_vec
-        # self._perf["expand_threshold"] += time.perf_counter() - t
 
         # But only USE the value for backup if parent had multiple children.
         # If parent had a single child -> "trivial-multiple-child": value passed upward is 0.0.
@@ -829,24 +749,49 @@ class VidurMCTS:
 
 
 
-    def ucb_score(self, parent: MCTSNode, child: MCTSNode, min_max_stats: MinMaxStats) -> float:
+    def _child_q_controller(self, parent: MCTSNode, child: MCTSNode) -> Optional[float]:
+        if child.visits <= 0:
+            return None
+        parent_is_branching = (getattr(parent, "num_valid_actions", 0) > 1) or (len(parent.children) > 1)
+        disc = self._time_discount(float(child.sim_time), float(parent.sim_time)) if parent_is_branching else 1.0
+        return float(child.reward) + disc * float(child.mean_value())
+
+    def _parent_child_q_bounds(self, parent: MCTSNode) -> Tuple[Optional[float], Optional[float]]:
+        q_values: List[float] = []
+        for child in parent.children.values():
+            q_controller = self._child_q_controller(parent, child)
+            if q_controller is not None:
+                q_values.append(float(q_controller))
+        if not q_values:
+            return None, None
+        return float(min(q_values)), float(max(q_values))
+
+    @staticmethod
+    def _normalize_local_q(q_controller: float, q_min: Optional[float], q_max: Optional[float]) -> float:
+        if q_min is not None and q_max is not None and q_max > q_min:
+            return (float(q_controller) - float(q_min)) / (float(q_max) - float(q_min))
+        return float(q_controller)
+
+    def puct_score(
+        self,
+        parent: MCTSNode,
+        child: MCTSNode,
+        min_max_stats: MinMaxStats,
+        *,
+        q_min: Optional[float] = None,
+        q_max: Optional[float] = None,
+    ) -> float:
         pb_c_base = getattr(self._cfg, "pb_c_base", 5000)
         pb_c_init = getattr(self._cfg, "pb_c_init", 0.75)
-
-        parent_is_branching = (getattr(parent, "num_valid_actions", 0) > 1) or (len(parent.children) > 1)
 
         pb_c = math.log((parent.visits + pb_c_base + 1.0) / pb_c_base) + pb_c_init
         pb_c *= math.sqrt(parent.visits + 1.0) / (child.visits + 1.0)
 
         prior_score = pb_c * float(child.prior)
 
-        if child.visits > 0:
-            # Time-based discount ONLY when parent is branching
-            disc = self._time_discount(float(child.sim_time), float(parent.sim_time)) if parent_is_branching else 1.0
-
-            q_controller = float(child.reward) + disc * float(child.mean_value())
-            q_norm = min_max_stats.normalize(q_controller)
-
+        q_controller = self._child_q_controller(parent, child)
+        if q_controller is not None:
+            q_norm = self._normalize_local_q(float(q_controller), q_min, q_max)
             # controller maximizes controller-Q; adversary minimizes it
             value_score = q_norm if parent.player == "controller" else -q_norm
         else:
@@ -854,6 +799,10 @@ class VidurMCTS:
 
         return float(prior_score) + float(value_score)
 
+    def ucb_score(self, parent: MCTSNode, child: MCTSNode, min_max_stats: MinMaxStats) -> float:
+        # Compatibility shim: code/tests that call ucb_score now get PUCT with local-q normalization.
+        q_min, q_max = self._parent_child_q_bounds(parent)
+        return self.puct_score(parent, child, min_max_stats, q_min=q_min, q_max=q_max)
 
     def select_child(self, node: MCTSNode, min_max_stats: MinMaxStats) -> Tuple[int, MCTSNode]:
         assert node.children, "select_child called on unexpanded node"
@@ -862,38 +811,52 @@ class VidurMCTS:
             idx, only_child = next(iter(node.children.items()))
             return int(idx), only_child
 
-        max_ucb = max(self.ucb_score(node, child, min_max_stats) for child in node.children.values())
-        best = [idx for idx, child in node.children.items() if self.ucb_score(node, child, min_max_stats) == max_ucb]
+        q_min, q_max = self._parent_child_q_bounds(node)
+        puct_by_action = {
+            int(idx): float(self.puct_score(node, child, min_max_stats, q_min=q_min, q_max=q_max))
+            for idx, child in node.children.items()
+        }
+        max_puct = max(puct_by_action.values())
+        best = [idx for idx, puct in puct_by_action.items() if puct == max_puct]
         action_index = self._rng.choice(best)
         return int(action_index), node.children[action_index]
 
-    def _ucb_components(self, parent: MCTSNode, child: MCTSNode, min_max_stats: MinMaxStats) -> Dict[str, float]:
+    def _puct_components(
+        self,
+        parent: MCTSNode,
+        child: MCTSNode,
+        min_max_stats: MinMaxStats,
+        *,
+        q_min: Optional[float],
+        q_max: Optional[float],
+    ) -> Dict[str, float]:
         pb_c_base = getattr(self._cfg, "pb_c_base", 5000)
         pb_c_init = getattr(self._cfg, "pb_c_init", 0.75)
-        parent_is_branching = (getattr(parent, "num_valid_actions", 0) > 1) or (len(parent.children) > 1)
 
         pb_c = math.log((parent.visits + pb_c_base + 1.0) / pb_c_base) + pb_c_init
         pb_c *= math.sqrt(parent.visits + 1.0) / (child.visits + 1.0)
 
         prior_score = pb_c * float(child.prior)
-        if child.visits > 0:
-            disc = self._time_discount(float(child.sim_time), float(parent.sim_time)) if parent_is_branching else 1.0
-            q_controller = float(child.reward) + disc * float(child.mean_value())
-            q_norm = min_max_stats.normalize(q_controller)
+        q_controller_opt = self._child_q_controller(parent, child)
+        if q_controller_opt is not None:
+            q_controller = float(q_controller_opt)
+            q_norm = self._normalize_local_q(q_controller, q_min, q_max)
             value_score = q_norm if parent.player == "controller" else -q_norm
         else:
             q_controller = 0.0
             q_norm = 0.0
             value_score = 0.0
 
-        ucb = float(prior_score) + float(value_score)
+        puct = float(prior_score) + float(value_score)
         return {
             "pb_c": float(pb_c),
             "prior_score": float(prior_score),
             "value_score": float(value_score),
             "q_controller": float(q_controller),
             "q_norm": float(q_norm),
-            "ucb": float(ucb),
+            "puct": float(puct),
+            # Keep ucb key for backward compatibility with existing tests/parsers.
+            "ucb": float(puct),
         }
 
     def _build_selection_candidates(
@@ -902,8 +865,9 @@ class VidurMCTS:
         min_max_stats: MinMaxStats,
     ) -> List[Dict[str, Any]]:
         candidates: List[Dict[str, Any]] = []
+        q_min, q_max = self._parent_child_q_bounds(node)
         for idx, child in node.children.items():
-            comp = self._ucb_components(node, child, min_max_stats)
+            comp = self._puct_components(node, child, min_max_stats, q_min=q_min, q_max=q_max)
             candidates.append(
                 {
                     "action_index": int(idx),
@@ -1447,12 +1411,6 @@ class VidurMCTS:
             iterations=int(iterations),
             uniform_prior_value=bool(self._prior_value_mode() == "uniform"),
             max_branching=int(getattr(self._cfg, "max_branching", 10)),
-            controller_min_prior_threshold=float(
-                getattr(self._cfg, "controller_min_prior_threshold", 0.0) or 0.0
-            ),
-            adversary_min_prior_threshold=float(
-                getattr(self._cfg, "adversary_min_prior_threshold", 0.0) or 0.0
-            ),
             root_dirichlet_noise_enabled=bool(
                 getattr(self._cfg, "root_dirichlet_noise_enabled", False)
             ),
@@ -1548,7 +1506,7 @@ class VidurMCTS:
                     f"infer_total={float(perf.get('infer_total_sec', 0.0)):.3f}s "
                     f"infer_build={float(perf.get('infer_build_sec', 0.0)):.3f}s "
                     f"infer_forward={float(perf.get('infer_forward_sec', 0.0)):.3f}s "
-                    f"expand_threshold={float(perf.get('expand_threshold_sec', 0.0)):.3f}s "
+                    f"expand_prior_norm={float(perf.get('expand_threshold_sec', 0.0)):.3f}s "
                     f"expand_dedup={float(perf.get('expand_dedup_sec', 0.0)):.3f}s "
                     f"expand_child_create={float(perf.get('expand_child_create_sec', 0.0)):.3f}s "
                     f"infer_calls={int(perf.get('infer_calls', 0))} "
