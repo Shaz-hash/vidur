@@ -1968,8 +1968,8 @@ def main() -> None:
             root_player="adversary",
             iterations=1000,
             feature_version=1,
-            sample_from_mcts_policy=False,
-            selfplay_policy_temperature=0,
+            sample_from_mcts_policy=True,
+            selfplay_policy_temperature=1.35,
             max_forced_hops_per_root=512,
             history_max_total_steps=12000,
         ),
@@ -1979,15 +1979,15 @@ def main() -> None:
     # TODO: Remove useless feilds and move the config class to eval_utils
     evaluator_cfg = EvaluatorConfig(
         num_random_games=20,
-        max_history_depth=75,  # no history for now (can add later if you want to test it in the arena)
+        max_history_depth=15,  # no history for now (can add later if you want to test it in the arena)
         random_seed_base=12345,
-        adv_iterations_per_root=4000,
-        cont_iterations_per_root=20000,
+        adv_iterations_per_root=2000,
+        cont_iterations_per_root=2000,
         arena_num_processes=20,
         arena_max_adversary_moves=1,
         arena_max_controller_cleanup_steps=128,
         arena_max_total_turns=512,
-        arena_win_threshold=0.60,
+        arena_win_threshold=0.65,
         tie_points=0.5,
         debug_sample_games=5,
         debug_flush_every=1,
@@ -1998,17 +1998,17 @@ def main() -> None:
 
     ## MODEL TRAINING PARMS FOR SELF-IMPROVEMENT LOOP:
     num_selfPlay_workers = 20
-    num_generations = 200
+    num_generations = 2000
     history_nontrivial_hops = [0, 5 , 10 , 15 , 20, 25, 30, 35]  # per worker
     roots_per_generation = 1250
-    adv_iterations_per_root = 4000
-    cont_iterations_per_root = 30000
-    train_steps_per_generation = 75 
+    adv_iterations_per_root = 1000
+    cont_iterations_per_root = 1000
+    train_steps_per_generation = 50 
     max_batch_size = 256
     train_log_csv = Path("simulator_output/mcts_dnn_logs/train_metrics.csv")
     ckpt_dir = Path("simulator_output/mcts_dnn_checkpoints")
     use_virtual_env = True
-    replay_capacity_samples = 5000
+    replay_capacity_samples = 15000
     replay_max_cached_shards = 1024
     replay_seed = 2026
 

@@ -16,12 +16,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional, Sequence, Tuple
+import json
 
 import torch
 import time  
 
 # from ..environment import VidurMCTSEnvironment, VidurMCTSState
-from ..environment import VidurMCTSEnvironment, VidurMCTSState, AdversaryAction
+from ..environment import VidurMCTSEnvironment, VidurMCTSState, AdversaryAction, ControllerAction
 
 from ..mctsDNN import VidurMCTS
 from .history_root import HistoryRootGenerator
@@ -113,6 +114,44 @@ def _compute_mcts_prior_from_root(root, mask: Sequence[bool]) -> Tuple[list[floa
                 prior[i] = p
 
     return prior, int(best_idx)
+
+
+def _action_to_json(action) -> str:
+    try:
+        if isinstance(action, ControllerAction):
+            return json.dumps(
+                {
+                    "type": "controller",
+                    "token_budget": int(action.token_budget),
+                    "selected_request_ids": [int(x) for x in (action.selected_request_ids or [])],
+                    "token_allocations": {str(int(k)): int(v) for k, v in (action.token_allocations or {}).items()},
+                    "prefill_allocations": {str(int(k)): int(v) for k, v in (action.prefill_allocations or {}).items()},
+                    "decode_allocations": {str(int(k)): int(v) for k, v in (action.decode_allocations or {}).items()},
+                    "heuristic": action.heuristic,
+                    "strategy": action.strategy,
+                },
+                ensure_ascii=False,
+            )
+        if isinstance(action, AdversaryAction):
+            return json.dumps(
+                {
+                    "type": "adversary",
+                    "requests": [
+                        {
+                            "prefill_tokens": int(r.prefill_tokens),
+                            "decode_tokens": int(r.decode_tokens),
+                            "prefill_slo": float(r.prefill_slo),
+                            "decode_slo": float(r.decode_slo),
+                        }
+                        for r in (action.requests or [])
+                    ],
+                    "stop_decode_ids": [int(x) for x in (action.stop_decode_ids or [])],
+                },
+                ensure_ascii=False,
+            )
+    except Exception:
+        return ""
+    return ""
 
 
 
@@ -415,6 +454,49 @@ class SelfPlayRunner:
             action = actions_by_index[best_idx]
             if action is None:
                 raise RuntimeError(f"actions_by_index[{best_idx}] is None even though mask is True")
+
+            # 2b) Log the actually executed action (after optional sampling).
+            # This is separate from mcts.search_dnn() root log, which records
+            # the best action from root visits before self-play sampling.
+            root_logger = getattr(self.mcts, "_root_logger", None)
+            if root_logger is not None and root is not None and hasattr(root_logger, "log_root"):
+                model_prior = list(getattr(root, "nn_priors", []) or [])
+                norm_prior = list(getattr(root, "nn_priors_after_threshold", []) or [])
+                if len(model_prior) < len(mask_list):
+                    model_prior = model_prior + [0.0] * (len(mask_list) - len(model_prior))
+                if len(norm_prior) < len(mask_list):
+                    norm_prior = norm_prior + [0.0] * (len(mask_list) - len(norm_prior))
+                model_prior = model_prior[: len(mask_list)]
+                norm_prior = norm_prior[: len(mask_list)]
+
+                nn_value = getattr(root, "nn_value_controller", None)
+                model_v = float(nn_value) if nn_value is not None else 0.0
+                viol, lateness = self.env.evaluate_objective(state)
+                sampled_flag = int(sample_from_mcts_policy and player == "controller")
+
+                root_logger.log_root(
+                    game_id=int(game_id),
+                    root_id=int(root_id),
+                    root_depth=int(depth),
+                    root_node_id=int(getattr(root, "node_id", -1)),
+                    root_player=str(player),
+                    num_simulations=int(iters),
+                    model_root_value_controller=float(model_v),
+                    model_root_prior=model_prior,
+                    normalized_root_prior=norm_prior,
+                    valid_action_mask=mask_list,
+                    mcts_root_value_controller=float(root.mean_value()),
+                    mcts_root_prior=mcts_prior,
+                    best_action_index=int(best_idx),
+                    best_action_repr=repr(action),
+                    best_action_json=_action_to_json(action),
+                    phase="train_root_applied",
+                    cycle_label=f"sampled={sampled_flag}",
+                    sim_time=float(state.simulator._time),
+                    slo_violations=int(viol),
+                    total_lateness=float(lateness),
+                    total_cost=float(float(viol) + float(lateness)),
+                )
 
             # 3) Advance simulator state in-place
             if player == "adversary":
