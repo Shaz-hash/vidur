@@ -1891,6 +1891,16 @@ def configure_simulation(sim_args: Iterable[str]) -> SimulationConfig:
 # Main
 # -----------------------------
 
+## EXP CONFIG PATHS (TODO: may need to be removed)
+
+EXP_TAG = "ablation_dirichlet_g121_eps010"
+EXP_BASE = Path(f"simulator_output/ablation/{EXP_TAG}")
+EXP_LOGS = EXP_BASE / "mcts_dnn_logs"
+EXP_DATA = EXP_BASE / "mcts_dnn_dataset" / "train"
+EXP_CKPT = EXP_BASE / "mcts_dnn_checkpoints"
+
+
+
 def main() -> None:
     # ---- Edit values here (single source of truth) ----
     cfg = AlphaZeroConfig(
@@ -1925,8 +1935,8 @@ def main() -> None:
             max_branching=10,
             controller_budget_combs=10,
             root_dirichlet_noise_enabled=True,
-            root_dirichlet_alpha=0.6,
-            root_dirichlet_epsilon=0.25,
+            root_dirichlet_alpha=0.65,
+            root_dirichlet_epsilon=0.05,
         ),
         model=ModelGroup(
             num_actions_controller=24,
@@ -1940,7 +1950,8 @@ def main() -> None:
             multiprocess_safety_mode=False,
             native_trace=False,
             native_trace_every=250,
-            native_trace_dir="simulator_output/mcts_dnn_logs",
+            # native_trace_dir="simulator_output/mcts_dnn_logs",
+            native_trace_dir=str(EXP_LOGS),
             infer_mode="torchscript_service",
             infer_service_count=1,
             infer_service_impl="cpp",
@@ -1953,12 +1964,15 @@ def main() -> None:
             fallback_to_python_infer=False,
         ),
         logging=LoggingGroup(
-            mcts_iter_log="simulator_output/mcts_dnn_logs/mcts_iter.csv",
-            mcts_root_log="simulator_output/mcts_dnn_logs/mcts_root.csv",
+            # mcts_iter_log="simulator_output/mcts_dnn_logs/mcts_iter.csv",
+            mcts_iter_log=str(EXP_LOGS / "mcts_iter.csv"),
+            # mcts_root_log="simulator_output/mcts_dnn_logs/mcts_root.csv",
+            mcts_root_log=str(EXP_LOGS / "mcts_root.csv"),
             flush_every=1,
         ),
         dataset=DatasetGroup(
-            out_dir="simulator_output/mcts_dnn_dataset/train",
+            # out_dir="simulator_output/mcts_dnn_dataset/train",
+            out_dir=str(EXP_DATA),
             shard_size=512,
         ),
         run=RunGroup(
@@ -1969,7 +1983,7 @@ def main() -> None:
             iterations=1000,
             feature_version=1,
             sample_from_mcts_policy=True,
-            selfplay_policy_temperature=1.35,
+            selfplay_policy_temperature=1.45,
             max_forced_hops_per_root=512,
             history_max_total_steps=12000,
         ),
@@ -1979,7 +1993,7 @@ def main() -> None:
     # TODO: Remove useless feilds and move the config class to eval_utils
     evaluator_cfg = EvaluatorConfig(
         num_random_games=20,
-        max_history_depth=15,  # no history for now (can add later if you want to test it in the arena)
+        max_history_depth=10,  # no history for now (can add later if you want to test it in the arena)
         random_seed_base=12345,
         adv_iterations_per_root=2000,
         cont_iterations_per_root=2000,
@@ -2003,12 +2017,14 @@ def main() -> None:
     roots_per_generation = 1250
     adv_iterations_per_root = 1000
     cont_iterations_per_root = 1000
-    train_steps_per_generation = 50 
+    train_steps_per_generation = 45 
     max_batch_size = 256
-    train_log_csv = Path("simulator_output/mcts_dnn_logs/train_metrics.csv")
-    ckpt_dir = Path("simulator_output/mcts_dnn_checkpoints")
+    # train_log_csv = Path("simulator_output/mcts_dnn_logs/train_metrics.csv")
+    train_log_csv = EXP_LOGS / "train_metrics.csv"
+    # ckpt_dir = Path("simulator_output/mcts_dnn_checkpoints")
+    ckpt_dir = EXP_CKPT
     use_virtual_env = True
-    replay_capacity_samples = 15000
+    replay_capacity_samples = 45000
     replay_max_cached_shards = 1024
     replay_seed = 2026
 

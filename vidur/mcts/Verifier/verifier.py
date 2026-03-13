@@ -73,7 +73,7 @@ BEST_PATH_OUT = Path("simulator_output/best_path.csv")
 CHECK_TRIVIAL = True # If True, run fixed policy verifier after MCTS verifier, You need to have the last row to be adversary in the adversary.csv for it to work, and the fixed policy will start from the state right after applying that adversary action.
 ADVERSARY_CSV_PATH = Path(__file__).with_name("adversary.csv")
 
-FIXED_POLICY_PREFILL_BUDGET = 512  # e.g. 512, 1024, ..., 3072
+FIXED_POLICY_PREFILL_BUDGET = 1024  # e.g. 512, 1024, ..., 3072
 FIXED_POLICY_HEURISTIC = "SJF"     # one of: SJF, EDF, LST, LJF
 FIXED_POLICY_MAX_STEPS = 200       # safety cap
 FIXED_POLICY_PRINT_EACH_STEP = False
