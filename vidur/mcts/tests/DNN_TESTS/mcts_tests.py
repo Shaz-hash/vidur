@@ -20,6 +20,7 @@ from typing import Dict, List, Optional, Tuple
 # -----------------------------
 
 RUN_EVAL_DEBUG_LOGS = False
+DEBUG_SAMPLER_LOGS = False
 
 # -----------------------------
 # Config (matches alphaZero defaults)
@@ -41,6 +42,7 @@ DECODE_TOL_PER_BUCKET_SEC = 50e-3  # 50 ms per 10 decode tokens (eval logs only)
 
 PRIOR_SUM_TOL = 1e-6
 PRIOR_POS_EPS = 1e-12  # treat <= this as "zero / invalid"
+SAMPLER_DEBUG_TIME_TOL_SEC = 2e-3
 # -----------------------------
 
 @dataclass
@@ -89,9 +91,9 @@ def _resolve_existing_path(candidates: List[str]) -> str:
             return p
     raise FileNotFoundError(f"None of these paths exist: {candidates}")
 
-def _resolve_mcts_iter_paths() -> List[str]:
+def _resolve_mcts_iter_paths(cli_args: Optional[List[str]] = None) -> List[str]:
     # If user passes args, treat them as glob patterns/paths.
-    args = sys.argv[1:]
+    args = list(cli_args) if cli_args is not None else sys.argv[1:]
     paths: List[str] = []
 
     if args:
@@ -133,9 +135,9 @@ def _resolve_mcts_iter_paths() -> List[str]:
 
 
 
-def _resolve_eval_debug_paths() -> List[str]:
+def _resolve_eval_debug_paths(cli_args: Optional[List[str]] = None) -> List[str]:
     # If args are passed, treat them as file/glob/dir inputs.
-    args = sys.argv[1:]
+    args = list(cli_args) if cli_args is not None else sys.argv[1:]
     paths: List[str] = []
 
     if args:
@@ -185,6 +187,24 @@ def _other_player(player: str) -> str:
     if player == "controller":
         return "adversary"
     return ""
+
+
+def _extract_cli_flags_and_paths() -> List[str]:
+    global RUN_EVAL_DEBUG_LOGS, DEBUG_SAMPLER_LOGS
+    raw = list(sys.argv[1:])
+    paths: List[str] = []
+    for arg in raw:
+        if arg == "--debug-sampler":
+            DEBUG_SAMPLER_LOGS = True
+            continue
+        if arg == "--eval-debug":
+            RUN_EVAL_DEBUG_LOGS = True
+            continue
+        if arg == "--mcts-debug":
+            RUN_EVAL_DEBUG_LOGS = False
+            continue
+        paths.append(arg)
+    return paths
 
 
 def load_rows_eval(eval_game_path: str) -> List[Row]:
@@ -977,6 +997,8 @@ def test_controller_time_delta(
         # decode_total > 0 => add eval-only extra tolerance by 10-token buckets
         extra_tol = _decode_eval_extra_tol_sec(decode_total)
         upper_tol = DEADLINE_TOL + extra_tol
+        if DEBUG_SAMPLER_LOGS:
+            upper_tol = max(upper_tol, SAMPLER_DEBUG_TIME_TOL_SEC)
         if dt - upper_tol > hi:
             _fail(
                 "test_controller_time_delta",
@@ -1242,6 +1264,14 @@ def run_trace(trace_rows: List[Row], *, prefill_profile: Dict[int, float]) -> in
             if new_ids_sorted:
                 ctx.max_seen_request_id = max(ctx.max_seen_request_id, max(new_ids_sorted))
 
+            # Sampler-compat mode: collapsed logs skip intermediate decode snap steps.
+            # Reset decode deadlines for active decode requests to adversary batch time
+            # so objective reconstruction does not over-count hidden intervals.
+            if DEBUG_SAMPLER_LOGS and adv_request_count > 0:
+                for rs in ctx.requests.values():
+                    if rs.remaining_prefill == 0 and rs.prefill_completed_at is not None and (not rs.completed):
+                        rs.decode_next_deadline = float(row.sim_time) + float(rs.decode_slo)
+
         else:
             # controller row: incorporate any seen ids
             if ids_seen:
@@ -1407,7 +1437,8 @@ def main() -> None:
         ]
     )
 
-    log_paths = _resolve_eval_debug_paths() if RUN_EVAL_DEBUG_LOGS else _resolve_mcts_iter_paths()
+    cli_paths = _extract_cli_flags_and_paths()
+    log_paths = _resolve_eval_debug_paths(cli_paths) if RUN_EVAL_DEBUG_LOGS else _resolve_mcts_iter_paths(cli_paths)
     prefill_profile = load_prefill_profile(prefill_profile_path)
 
     grand_traces = 0
@@ -1444,8 +1475,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
 
 
 
