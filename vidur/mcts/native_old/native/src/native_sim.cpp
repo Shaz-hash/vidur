@@ -7,7 +7,6 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
-#include "game_rules_native.hpp"
 
 namespace mcts_native {
 
@@ -48,21 +47,17 @@ static std::unordered_map<int, int> alloc_vec_to_map(const std::vector<Allocatio
     return out;
 }
 
-static void maybe_fast_forward_decode_only_to_next_adv_second(
-    NativeSimState& state,
-    const NativeRuntimeConfig& cfg
-) {
+static void maybe_fast_forward_decode_only_to_next_adv_second(NativeSimState& state) {
     const double last = state.stats.last_prefill_batch_time;
     if (last < 0.0) return;
 
-    const double target = next_adversary_release_time(last, cfg);
-    if (target < 0.0) return;
+    const double target = last + 1.0;
     if (state.sim_time >= target - 1e-9) return;
 
     bool any_decode = false;
     for (const auto& r : state.requests) {
         if (r.completed) continue;
-        if (remaining_prefill(r) > 0 && !r.prefill_done) return;  // prefill pending => do not fast-forward
+        if (remaining_prefill(r) > 0 && !r.prefill_done) return;  // cannot fast-forward with prefill pending
         if (r.prefill_done && remaining_decode(r) > 0) any_decode = true;
     }
     if (!any_decode) return;
@@ -73,7 +68,6 @@ static void maybe_fast_forward_decode_only_to_next_adv_second(
         state.stats.decode_next_deadline_by_id[r.request_id] = target + r.decode_slo;
     }
 }
-
 
 static void update_requests_and_stats(
     NativeSimState& state,
@@ -201,22 +195,15 @@ void NativeSim::apply_adversary_action_inplace(
     if (action.requests.empty() && action.stop_decode_ids.empty()) return;
 
     const double time_now = state.sim_time;
-    const bool has_requests = !action.requests.empty();
-
-    const double arrival_time = compute_adversary_arrival_time(
-        time_now,
-        state.stats.last_prefill_batch_time,
-        has_requests,
-        cfg
-    );
-
-    state.stats.last_prefill_batch_time = next_last_prefill_batch_time(
-        time_now,
-        state.stats.last_prefill_batch_time,
-        has_requests,
-        cfg
-    );
-
+    double arrival_time = std::floor(time_now);
+    if (!action.requests.empty()) {
+        if (state.stats.last_prefill_batch_time < 0.0) {
+            arrival_time = std::floor(time_now);
+        } else {
+            arrival_time = state.stats.last_prefill_batch_time + 1.0;
+        }
+        state.stats.last_prefill_batch_time = arrival_time;
+    }
 
     for (const auto& spec : action.requests) {
         NativeRequestState req;
@@ -251,7 +238,7 @@ void NativeSim::apply_adversary_action_inplace(
         else state.stats.active_request_ids.insert(rid);
     }
 
-    const double window_start = arrival_window_start(time_now, cfg);
+    const double window_start = time_now - 1.0;
     std::vector<double> recent;
     recent.reserve(state.stats.recent_arrivals.size());
     for (double t : state.stats.recent_arrivals) {
@@ -376,7 +363,7 @@ void NativeSim::apply_controller_action_inplace(
     }
 
     if (!has_prefill) {
-        maybe_fast_forward_decode_only_to_next_adv_second(state, cfg);
+        maybe_fast_forward_decode_only_to_next_adv_second(state);
     }
 
     update_requests_and_stats(state, batch_tokens_by_id);

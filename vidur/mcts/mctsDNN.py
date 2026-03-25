@@ -1280,8 +1280,23 @@ class VidurMCTS:
 
 
 
+    # def _native_mcts_enabled(self) -> bool:
+    #     return bool(getattr(self._cfg, "native_mcts_enabled", False)) and _mcts_native is not None
+
     def _native_mcts_enabled(self) -> bool:
-        return bool(getattr(self._cfg, "native_mcts_enabled", False)) and _mcts_native is not None
+        if not bool(getattr(self._cfg, "native_mcts_enabled", False)):
+            return False
+        if _mcts_native is None:
+            raise RuntimeError(
+                "native_mcts_enabled=True but vidur.mcts.mcts_native is unavailable."
+            )
+        if not bool(getattr(self._cfg, "torchscript_full_native_search", False)):
+            raise RuntimeError(
+                "native_mcts_enabled=True now requires torchscript_full_native_search=True "
+                "(mixed callback path is intentionally disabled)."
+            )
+        return True
+
 
 
     def _native_infer_callback(self, dnn_model: Any):
@@ -1390,8 +1405,11 @@ class VidurMCTS:
     ) -> None:
         if _mcts_native is None:
             raise RuntimeError("native_mcts_enabled=True but vidur.mcts.mcts_native is unavailable")
-        if not hasattr(_mcts_native, "search_mcts_dnn"):
-            raise RuntimeError("mcts_native.search_mcts_dnn is missing; rebuild native module")
+        if not hasattr(_mcts_native, "search_mcts_dnn_torchscript"):
+            raise RuntimeError(
+                "mcts_native.search_mcts_dnn_torchscript is missing; rebuild native module."
+            )
+
 
         reward_knee = float(getattr(self._cfg, "reward_knee", 25.0))
         reward_max_penalty = float(getattr(self._cfg, "reward_max_penalty", 40.0))
@@ -1436,54 +1454,35 @@ class VidurMCTS:
 
         native_ts_runtime = getattr(dnn_model, "_native_ts_runtime", None)
         native_ts_model_version = getattr(dnn_model, "_native_ts_model_version", None)
-        # If a native TorchScript runtime is present, prefer full-native search.
-        # This avoids the mixed callback bridge (C++ -> Python infer callback),
-        # which has been unstable under multiprocess load.
-        use_full_native_ts = bool(getattr(self._cfg, "torchscript_full_native_search", False))
-        if (
-            not use_full_native_ts
-            and native_ts_runtime is not None
-            and native_ts_model_version is not None
-            and hasattr(_mcts_native, "search_mcts_dnn_torchscript")
-        ):
-            use_full_native_ts = True
-            if not bool(getattr(self, "_auto_native_ts_full_search_logged", False)):
-                print(
-                    "[VidurMCTS] auto-enabled full native torchscript search "
-                    "(avoids unstable callback bridge path)",
-                    flush=True,
-                )
-                self._auto_native_ts_full_search_logged = True
-        if (
-            use_full_native_ts
-            and
-            native_ts_runtime is not None
-            and native_ts_model_version is not None
-            and hasattr(_mcts_native, "search_mcts_dnn_torchscript")
-        ):
-            native_search_fn = _mcts_native.search_mcts_dnn_torchscript
-            try:
-                if (
-                    hasattr(_mcts_native, "NativeInferServiceRuntime")
-                    and hasattr(_mcts_native, "search_mcts_dnn_torchscript_service")
-                    and isinstance(native_ts_runtime, _mcts_native.NativeInferServiceRuntime)
-                ):
-                    native_search_fn = _mcts_native.search_mcts_dnn_torchscript_service
-            except Exception:
-                pass
 
-            native_result = native_search_fn(
-                infer_runtime=native_ts_runtime,
-                model_version=int(native_ts_model_version),
-                **common_kwargs,
+        if native_ts_runtime is None or native_ts_model_version is None:
+            raise RuntimeError(
+                "Full-native search requires model adapter with "
+                "_native_ts_runtime and _native_ts_model_version. "
+                "Mixed callback fallback is disabled."
             )
-        else:
-            native_result = _mcts_native.search_mcts_dnn(
-                infer_cb=self._native_infer_callback(dnn_model),
-                **common_kwargs,
-            )
+
+        native_search_fn = _mcts_native.search_mcts_dnn_torchscript
+        if (
+            hasattr(_mcts_native, "NativeInferServiceRuntime")
+            and isinstance(native_ts_runtime, _mcts_native.NativeInferServiceRuntime)
+        ):
+            if not hasattr(_mcts_native, "search_mcts_dnn_torchscript_service"):
+                raise RuntimeError(
+                    "Runtime is NativeInferServiceRuntime but "
+                    "mcts_native.search_mcts_dnn_torchscript_service is missing."
+                )
+            native_search_fn = _mcts_native.search_mcts_dnn_torchscript_service
+
+        native_result = native_search_fn(
+            infer_runtime=native_ts_runtime,
+            model_version=int(native_ts_model_version),
+            **common_kwargs,
+        )
+
         if not isinstance(native_result, dict):
             raise RuntimeError("native search returned invalid payload")
+
 
         perf = native_result.get("perf")
         if isinstance(perf, dict) and bool(getattr(self._cfg, "native_profile", True)):

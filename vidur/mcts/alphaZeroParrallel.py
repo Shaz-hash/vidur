@@ -325,6 +325,36 @@ def _infer_cpp_runtime_enabled(cfg: "AlphaZeroConfig") -> bool:
     return bool(getattr(ncfg, "enabled", False)) and str(getattr(ncfg, "infer_mode", "python")) == "torchscript_cpp"
 
 
+def _validate_full_native_only_config(cfg: "AlphaZeroConfig") -> None:
+    ncfg = getattr(cfg, "native", None)
+    if ncfg is None or not bool(getattr(ncfg, "enabled", False)):
+        return
+    if str(getattr(ncfg, "backend", "python")) != "cpp_virtual":
+        raise RuntimeError("native.enabled=True requires native.backend='cpp_virtual'")
+    infer_mode = str(getattr(ncfg, "infer_mode", "python"))
+    if infer_mode not in {"torchscript_cpp", "torchscript_service"}:
+        raise RuntimeError(
+            "native.enabled=True requires infer_mode in {'torchscript_cpp','torchscript_service'} "
+            "for full-native search."
+        )
+    if not bool(getattr(ncfg, "torchscript_full_native_search", False)):
+        raise RuntimeError(
+            "native.enabled=True requires torchscript_full_native_search=True "
+            "(mixed callback path disabled)."
+        )
+
+
+def _assert_model_has_native_ts_runtime(model: object, *, where: str) -> None:
+    runtime = getattr(model, "_native_ts_runtime", None)
+    model_version = getattr(model, "_native_ts_model_version", None)
+    if runtime is None or model_version is None:
+        raise RuntimeError(
+            f"{where}: native_mcts_enabled=True requires model adapter exposing "
+            "_native_ts_runtime and _native_ts_model_version."
+        )
+
+
+
 def _infer_service_count(cfg: "AlphaZeroConfig") -> int:
     ncfg = getattr(cfg, "native", None)
     if ncfg is None:
@@ -559,22 +589,12 @@ def _selfplay_worker_main(
     _, env, _, explore_cfg = _build_env_and_simulator(cfg, use_virtual_env=use_virtual_env)
     multiprocess_safety_mode = bool(getattr(getattr(cfg, "native", None), "multiprocess_safety_mode", True))
     safe_multi = multiprocess_safety_mode and int(total_workers) > 1
-    if safe_multi:
-        if bool(getattr(explore_cfg, "native_mcts_enabled", False)):
-            setattr(explore_cfg, "native_mcts_enabled", False)
-            print(
-                f"[worker {worker_id}] safety: disabled native_mcts_enabled for multiprocess stability",
-                flush=True,
-            )
-        if hasattr(env, "_native_enabled") and bool(getattr(env, "_native_enabled", False)):
-            try:
-                setattr(env, "_native_enabled", False)
-                print(
-                    f"[worker {worker_id}] safety: disabled native controller sampler for multiprocess stability",
-                    flush=True,
-                )
-            except Exception:
-                pass
+    if safe_multi and bool(getattr(explore_cfg, "native_mcts_enabled", False)):
+        raise RuntimeError(
+            "multiprocess_safety_mode=True with workers>1 disables native path, "
+            "which is incompatible with full-native-only configuration. "
+            "Set native.multiprocess_safety_mode=False."
+        )
 
     # Build model once per process; reload weights each generation
     model = AlphaZeroModel(
@@ -687,7 +707,11 @@ def _selfplay_worker_main(
 
                 infer_mode = str(task.get("infer_mode", "python"))
                 if safe_multi and infer_mode == "torchscript_cpp":
-                    infer_mode = "python"
+                    raise RuntimeError(
+                        "safe_multi would downgrade infer_mode=torchscript_cpp to python; "
+                        "disallowed in full-native-only mode."
+                    )
+
                 native_mcts_on = bool(getattr(explore_cfg, "native_mcts_enabled", False))
                 if (
                     infer_mode == "torchscript_service"
@@ -765,6 +789,13 @@ def _selfplay_worker_main(
                         fallback_model=model,
                         fallback_to_python=bool(task.get("fallback_to_python_infer", True)),
                     )
+
+                if native_mcts_on:
+                    _assert_model_has_native_ts_runtime(
+                        run_model,
+                        where=f"worker {worker_id} selfplay gen={gen}",
+                    )
+
 
                 # Per-worker writer
                 writer = ReplayWriter(ReplayWriterConfig(out_dir=out_dir, shard_size=cfg.dataset.shard_size))
@@ -854,10 +885,14 @@ def _selfplay_worker_main(
                 candidate_model_for_arena = arena_candidate_model
                 best_model_for_arena = arena_best_model
 
+                native_mcts_on = bool(getattr(explore_cfg, "native_mcts_enabled", False))
                 infer_mode = str(task.get("infer_mode", "python"))
                 if safe_multi and infer_mode == "torchscript_cpp":
-                    infer_mode = "python"
-                native_mcts_on = bool(getattr(explore_cfg, "native_mcts_enabled", False))
+                    raise RuntimeError(
+                        "safe_multi would downgrade infer_mode=torchscript_cpp to python; "
+                        "disallowed in full-native-only mode."
+                    )
+
                 if (
                     infer_mode == "torchscript_service"
                     and native_mcts_on
@@ -989,6 +1024,18 @@ def _selfplay_worker_main(
                         fallback_model=arena_best_model,
                         fallback_to_python=fallback_to_python,
                     )
+
+                if native_mcts_on:
+                    _assert_model_has_native_ts_runtime(
+                        candidate_model_for_arena,
+                        where=f"worker {worker_id} arena candidate gen={gen}",
+                    )
+                    _assert_model_has_native_ts_runtime(
+                        best_model_for_arena,
+                        where=f"worker {worker_id} arena best gen={gen}",
+                    )
+
+
 
                 adv_iters = int(task["adv_iterations_per_root"])
                 cont_iters = int(task["cont_iterations_per_root"])
@@ -1988,6 +2035,7 @@ def main() -> None:
             history_max_total_steps=12000,
         ),
     )
+    _validate_full_native_only_config(cfg)
 
 
     # TODO: Remove useless feilds and move the config class to eval_utils

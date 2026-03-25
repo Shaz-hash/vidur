@@ -44,7 +44,7 @@ pybind11_add_module(mcts_native
     src/pybind_module.cpp
     src/native_sim.cpp
     src/native_predictor.cpp
-    src/game_rules_v1_native.cpp
+    src/native_mcts.cpp
 )
 
 target_include_directories(mcts_native PRIVATE

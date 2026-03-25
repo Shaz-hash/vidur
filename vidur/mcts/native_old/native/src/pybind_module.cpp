@@ -42,12 +42,11 @@
 #include <torch/script.h>
 #include <torch/torch.h>
 
+#include "native_mcts.hpp"
 #include "native_predictor.hpp"
 #include "native_sim.hpp"
 #include "native_types.hpp"
 #include "infer_shared.hpp"
-#include "game_rules_native.hpp"
-
 
 namespace py = pybind11;
 using namespace mcts_native;
@@ -83,6 +82,7 @@ torch::Tensor native_value_real_from_output(torch::Tensor value_raw) {
 }
 }  // namespace
 
+struct NativeActionSpace {};
 struct NativeTreeNode;
 struct NativeSearchCfg;
 
@@ -193,10 +193,230 @@ static bool native_trace_should_log(long long count) {
 static std::atomic<long long> g_native_ts_search_calls{0};
 static std::atomic<long long> g_native_ts_infer_calls{0};
 
+static inline int nonneg_i(int x) { return x < 0 ? 0 : x; }
+
 static inline double now_sec() {
     return std::chrono::duration_cast<std::chrono::duration<double>>(
         std::chrono::steady_clock::now().time_since_epoch()
     ).count();
+}
+
+static double nearest_prefill_estimate(
+    int tokens,
+    const std::vector<int>& profile_tokens,
+    const std::vector<double>& profile_times
+) {
+    const size_t n = std::min(profile_tokens.size(), profile_times.size());
+    if (n == 0) return 0.0;
+
+    size_t best = 0;
+    long long best_dist = std::llabs((long long)profile_tokens[0] - (long long)tokens);
+    for (size_t i = 1; i < n; ++i) {
+        long long d = std::llabs((long long)profile_tokens[i] - (long long)tokens);
+        if (d < best_dist) {
+            best_dist = d;
+            best = i;
+        }
+    }
+    return profile_times[best];
+}
+
+static ControllerActionSpecNative make_zero_action() {
+    ControllerActionSpecNative a;
+    a.token_budget = 0;
+    a.valid = true;
+    return a;
+}
+
+static ControllerActionSpecNative build_controller_action(
+    const std::vector<int>& ordered_indices,
+    int prefill_budget,
+    const char* heur_name,
+    const std::vector<PrefillRecord>& prefill_records,
+    const std::vector<AllocationEntry>& decode_template,
+    int decode_budget
+) {
+    ControllerActionSpecNative out;
+    out.valid = true;
+    out.heuristic = heur_name;
+    out.strategy = "Fixed";
+
+    out.decode_allocations = decode_template;
+    out.token_allocations = decode_template;
+    out.selected_request_ids.reserve(decode_template.size() + ordered_indices.size());
+    for (const auto& e : decode_template) {
+        out.selected_request_ids.push_back(e.request_id);
+    }
+
+    int remaining_budget = nonneg_i(prefill_budget);
+    int used_prefill = 0;
+
+    for (int idx : ordered_indices) {
+        if (remaining_budget <= 0) break;
+        const PrefillRecord& r = prefill_records[idx];
+        int cap = nonneg_i(r.rem_pref);
+        if (cap <= 0) continue;
+
+        int alloc = (cap < remaining_budget) ? cap : remaining_budget;
+        if (alloc <= 0) continue;
+
+        out.prefill_allocations.push_back({r.rid, alloc});
+        out.token_allocations.push_back({r.rid, alloc});
+        out.selected_request_ids.push_back(r.rid);
+
+        remaining_budget -= alloc;
+        used_prefill += alloc;
+    }
+
+    out.token_budget = decode_budget + used_prefill;
+    return out;
+}
+
+ControllerSampleOutput sample_controller_actions_native(
+    const std::vector<ControllerRequestStateNative>& request_states,
+    double sim_time,
+    const std::vector<int>& budgets,
+    const std::vector<int>& profile_tokens,
+    const std::vector<double>& profile_times
+) {
+    ControllerSampleOutput out;
+    const int num_heur = 4;
+    const int num_budgets = (int)budgets.size();
+    const int num_actions = num_heur * num_budgets;
+
+    if (num_actions <= 0) {
+        out.actions.resize(1);
+        out.mask.resize(1, 0);
+        out.actions[0] = make_zero_action();
+        out.mask[0] = 1;
+        return out;
+    }
+
+    out.actions.resize((size_t)num_actions);
+    out.mask.assign((size_t)num_actions, 0);
+
+    if (request_states.empty()) {
+        out.actions[0] = make_zero_action();
+        out.mask[0] = 1;
+        return out;
+    }
+
+    std::vector<PrefillRecord> prefill_records;
+    prefill_records.reserve(request_states.size());
+
+    std::vector<int> decode_candidates;
+    decode_candidates.reserve(request_states.size());
+
+    std::vector<AllocationEntry> decode_template;
+    decode_template.reserve(request_states.size());
+
+    int total_remaining_prefill = 0;
+
+    for (const auto& rs : request_states) {
+        const int rid = rs.request_id;
+        if (!rs.prefill_done) {
+            int rem_pref = nonneg_i(rs.remaining_prefill);
+            if (rem_pref > 0) {
+                total_remaining_prefill += rem_pref;
+
+                const double edf_key = rs.arrived_at + rs.prefill_slo;
+                const double remaining_slo = rs.prefill_slo - std::max(0.0, sim_time - rs.arrived_at);
+                const double est = nearest_prefill_estimate(rem_pref, profile_tokens, profile_times);
+                const double lst_key = remaining_slo - est;
+
+                prefill_records.push_back(PrefillRecord{rid, rem_pref, edf_key, lst_key});
+            }
+        } else {
+            if (nonneg_i(rs.remaining_decode) > 0) {
+                decode_candidates.push_back(rid);
+                decode_template.push_back({rid, 1});
+            }
+        }
+    }
+
+    if (total_remaining_prefill == 0) {
+        ControllerActionSpecNative a;
+        a.valid = true;
+        a.heuristic = "SJF";
+        a.strategy = "Fixed";
+        a.decode_allocations = decode_template;
+        a.token_allocations = decode_template;
+        a.selected_request_ids = decode_candidates;
+        a.token_budget = (int)decode_template.size();
+
+        out.actions[0] = std::move(a);
+        out.mask[0] = 1;
+        return out;
+    }
+
+    const int decode_budget = (int)decode_candidates.size();
+    const int n = (int)prefill_records.size();
+
+    std::vector<int> ordered_sjf((size_t)n);
+    std::iota(ordered_sjf.begin(), ordered_sjf.end(), 0);
+
+    auto ordered_edf = ordered_sjf;
+    auto ordered_lst = ordered_sjf;
+
+    std::stable_sort(
+        ordered_sjf.begin(), ordered_sjf.end(),
+        [&](int a, int b) {
+            const auto& ra = prefill_records[a];
+            const auto& rb = prefill_records[b];
+            if (ra.rem_pref != rb.rem_pref) return ra.rem_pref < rb.rem_pref;
+            return ra.rid < rb.rid;
+        }
+    );
+    std::stable_sort(
+        ordered_edf.begin(), ordered_edf.end(),
+        [&](int a, int b) {
+            const auto& ra = prefill_records[a];
+            const auto& rb = prefill_records[b];
+            if (ra.edf_key != rb.edf_key) return ra.edf_key < rb.edf_key;
+            return ra.rid < rb.rid;
+        }
+    );
+    std::stable_sort(
+        ordered_lst.begin(), ordered_lst.end(),
+        [&](int a, int b) {
+            const auto& ra = prefill_records[a];
+            const auto& rb = prefill_records[b];
+            if (ra.lst_key != rb.lst_key) return ra.lst_key < rb.lst_key;
+            return ra.rid < rb.rid;
+        }
+    );
+
+    auto ordered_ljf = ordered_sjf;
+    std::reverse(ordered_ljf.begin(), ordered_ljf.end());
+
+    const std::vector<int>* orders[4] = {&ordered_sjf, &ordered_edf, &ordered_lst, &ordered_ljf};
+    const char* names[4] = {"SJF", "EDF", "LST", "LJF"};
+
+    bool any_valid = false;
+    for (int b_idx = 0; b_idx < num_budgets; ++b_idx) {
+        const int budget = nonneg_i(budgets[(size_t)b_idx]);
+        const bool budget_valid = (total_remaining_prefill > 0) ? (budget <= total_remaining_prefill) : (b_idx == 0);
+
+        for (int h_idx = 0; h_idx < 4; ++h_idx) {
+            const int idx = b_idx * 4 + h_idx;
+            if (!budget_valid) {
+                out.mask[(size_t)idx] = 0;
+                continue;
+            }
+            out.actions[(size_t)idx] = build_controller_action(
+                *orders[h_idx], budget, names[h_idx], prefill_records, decode_template, decode_budget
+            );
+            out.mask[(size_t)idx] = 1;
+            any_valid = true;
+        }
+    }
+
+    if (!any_valid) {
+        out.actions[0] = make_zero_action();
+        out.mask[0] = 1;
+    }
+
+    return out;
 }
 
 static py::dict alloc_to_pydict(const std::vector<AllocationEntry>& v) {
@@ -205,27 +425,89 @@ static py::dict alloc_to_pydict(const std::vector<AllocationEntry>& v) {
     return d;
 }
 
-static py::object import_action_type(const char* name) {
-    try {
-        return py::module_::import("vidur.mcts.game_types").attr(name);
-    } catch (...) {
-        return py::module_::import("vidur.mcts.environment").attr(name);
+py::tuple sample_controller_actions_pyready(
+    const std::vector<ControllerRequestStateNative>& request_states,
+    double sim_time,
+    const std::vector<int>& budgets,
+    const std::vector<int>& profile_tokens,
+    const std::vector<double>& profile_times,
+    int num_actions
+) {
+    ControllerSampleOutput out = sample_controller_actions_native(
+        request_states, sim_time, budgets, profile_tokens, profile_times
+    );
+
+    py::object ControllerAction =
+        py::module_::import("vidur.mcts.environment").attr("ControllerAction");
+
+    py::list actions_by_index;
+    py::list mask;
+
+    for (int i = 0; i < num_actions; ++i) {
+        actions_by_index.append(py::none());
+        mask.append(py::bool_(false));
     }
+
+    int n = std::min(num_actions, (int)out.mask.size());
+    bool any_valid = false;
+
+    for (int idx = 0; idx < n; ++idx) {
+        if (!out.mask[(size_t)idx]) continue;
+        const auto& a = out.actions[(size_t)idx];
+
+        py::list selected;
+        for (int rid : a.selected_request_ids) selected.append(py::int_(rid));
+        py::object selected_obj = selected.size() ? py::object(selected) : py::none();
+
+        py::object heur_obj = a.heuristic.empty()
+            ? py::reinterpret_borrow<py::object>(py::none())
+            : py::reinterpret_steal<py::object>(py::str(a.heuristic).release());
+        py::object strat_obj = a.strategy.empty()
+            ? py::reinterpret_borrow<py::object>(py::none())
+            : py::reinterpret_steal<py::object>(py::str(a.strategy).release());
+
+        py::object py_action = ControllerAction(
+            py::arg("token_budget") = py::int_(a.token_budget),
+            py::arg("selected_request_ids") = selected_obj,
+            py::arg("token_allocations") = alloc_to_pydict(a.token_allocations),
+            py::arg("prefill_allocations") = alloc_to_pydict(a.prefill_allocations),
+            py::arg("decode_allocations") = alloc_to_pydict(a.decode_allocations),
+            py::arg("heuristic") = heur_obj,
+            py::arg("strategy") = strat_obj
+        );
+
+        actions_by_index[py::int_(idx)] = py_action;
+        mask[py::int_(idx)] = py::bool_(true);
+        any_valid = true;
+    }
+
+    if (!any_valid && num_actions > 0) {
+        actions_by_index[py::int_(0)] = ControllerAction(
+            py::arg("token_budget") = 0,
+            py::arg("selected_request_ids") = py::none()
+        );
+        mask[py::int_(0)] = py::bool_(true);
+    }
+
+    return py::make_tuple(actions_by_index, mask);
 }
 
-static const py::object& controller_action_cls() {
-    static py::object cls = import_action_type("ControllerAction");
-    return cls;
-}
-
-static const py::object& adversary_action_cls() {
-    static py::object cls = import_action_type("AdversaryAction");
-    return cls;
-}
-
-static const py::object& adversary_request_spec_cls() {
-    static py::object cls = import_action_type("AdversaryRequestSpec");
-    return cls;
+py::tuple sample_adversary_actions_pyready(int num_actions) {
+    py::object AdversaryAction = py::module_::import("vidur.mcts.environment").attr("AdversaryAction");
+    py::list actions;
+    py::list mask;
+    for (int i = 0; i < num_actions; ++i) {
+        actions.append(py::none());
+        mask.append(py::bool_(false));
+    }
+    if (num_actions > 0) {
+        actions[py::int_(0)] = AdversaryAction(
+            py::arg("requests") = py::list(),
+            py::arg("stop_decode_ids") = py::list()
+        );
+        mask[py::int_(0)] = py::bool_(true);
+    }
+    return py::make_tuple(actions, mask);
 }
 
 struct NativeTsModelPair {
@@ -1318,6 +1600,12 @@ struct NativeSearchCfg {
     int max_cached_state_snapshots = 4096;
 };
 
+struct NativeActionMask {
+    py::list actions;
+    std::vector<int> mask;
+    std::vector<int> valid;
+};
+
 struct NativeTreeNode {
     std::string player;
     int node_id = 0;
@@ -1583,6 +1871,61 @@ static std::string next_player(const std::string& player) {
     return (player == "adversary") ? "controller" : "adversary";
 }
 
+static py::list to_pybool_list(const std::vector<int>& mask) {
+    py::list out;
+    for (int x : mask) out.append(py::bool_(x != 0));
+    return out;
+}
+
+static std::vector<int> mask_to_vec(const py::object& obj, size_t n_expected) {
+    py::list mask_list;
+    if (py::isinstance<py::list>(obj) || py::isinstance<py::tuple>(obj)) {
+        mask_list = obj.cast<py::list>();
+    } else if (py::hasattr(obj, "tolist")) {
+        mask_list = obj.attr("tolist")().cast<py::list>();
+    } else {
+        throw std::runtime_error("mask must be list/tuple/tensor-like");
+    }
+    std::vector<int> out;
+    out.reserve(n_expected > 0 ? n_expected : (size_t)py::len(mask_list));
+    const size_t n = std::max(n_expected, (size_t)py::len(mask_list));
+    for (size_t i = 0; i < n; ++i) {
+        bool v = false;
+        if (i < (size_t)py::len(mask_list)) {
+            v = py::cast<bool>(mask_list[py::int_(i)]);
+        }
+        out.push_back(v ? 1 : 0);
+    }
+    return out;
+}
+
+static NativeActionMask actions_and_mask(
+    const py::object& env,
+    const py::object& state,
+    const std::string& player,
+    int max_branching
+) {
+    py::object out_obj;
+    if (player == "controller") {
+        out_obj = env.attr("sample_controller_actions")(state, py::int_(max_branching));
+    } else {
+        out_obj = env.attr("sample_adversary_actions")(state, py::int_(max_branching));
+    }
+    py::tuple tup = out_obj.cast<py::tuple>();
+    py::list actions = tup[0].cast<py::list>();
+    std::vector<int> mask = mask_to_vec(tup[1].cast<py::object>(), (size_t)py::len(actions));
+
+    std::vector<int> valid;
+    const size_t n = (size_t)py::len(actions);
+    valid.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        if (i < mask.size() && mask[i] != 0 && !actions[py::int_(i)].is_none()) {
+            valid.push_back((int)i);
+        }
+    }
+    return NativeActionMask{actions, std::move(mask), std::move(valid)};
+}
+
 static double evaluate_state_cost(const py::object& env, const py::object& state) {
     py::tuple t = env.attr("evaluate_objective")(state).cast<py::tuple>();
     const double v = py::cast<double>(t[0]);
@@ -1637,6 +1980,30 @@ static std::map<int, double> normalize_prior_map(
     const double inv_s = 1.0 / s;
     std::map<int, double> out;
     for (int k : keys) out[k] = std::max(0.0, prior_by_idx.at(k)) * inv_s;
+    return out;
+}
+
+static std::string controller_action_key(const py::object& action) {
+    std::vector<std::pair<int, int>> pairs;
+    try {
+        py::object alloc_obj = action.attr("token_allocations");
+        if (!alloc_obj.is_none()) {
+            py::dict d = alloc_obj.cast<py::dict>();
+            for (const auto& item : d) {
+                pairs.emplace_back(py::cast<int>(item.first), py::cast<int>(item.second));
+            }
+        }
+    } catch (...) {
+    }
+    std::sort(pairs.begin(), pairs.end());
+    std::string out;
+    out.reserve(pairs.size() * 16);
+    for (const auto& p : pairs) {
+        out += std::to_string(p.first);
+        out.push_back(':');
+        out += std::to_string(p.second);
+        out.push_back(';');
+    }
     return out;
 }
 
@@ -1796,6 +2163,55 @@ static int action_index_for_child(const NativeTreeNode& node, int child_idx) {
     return -1;
 }
 
+static int create_child(
+    std::vector<NativeTreeNode>& nodes,
+    int parent_idx,
+    int action_index,
+    const py::object& action_obj,
+    double prior,
+    int& next_node_id
+) {
+    NativeTreeNode child;
+    const auto& parent = nodes[(size_t)parent_idx];
+    child.player = next_player(parent.player);
+    child.node_id = next_node_id++;
+    child.depth = parent.depth + 1;
+    child.parent = parent_idx;
+    child.parent_action_index = action_index;
+    child.parent_action = action_obj;
+    child.prior = prior;
+    nodes.push_back(std::move(child));
+    int idx = (int)nodes.size() - 1;
+    nodes[(size_t)parent_idx].children[action_index] = idx;
+    return idx;
+}
+
+static void apply_edge_transition(
+    std::vector<NativeTreeNode>& nodes,
+    int parent_idx,
+    int child_idx,
+    py::object& state,
+    const py::object& env,
+    const NativeSearchCfg& cfg
+) {
+    auto& parent = nodes[(size_t)parent_idx];
+    auto& child = nodes[(size_t)child_idx];
+    const double parent_cost = parent.state_cost;
+    if (parent.player == "adversary") {
+        state = env.attr("apply_adversary_action_only")(
+            state, child.parent_action, py::arg("inplace") = true
+        );
+    } else {
+        state = env.attr("apply_controller_action_only")(
+            state, child.parent_action, py::arg("inplace") = true
+        );
+    }
+    const double child_cost = evaluate_state_cost(env, state);
+    child.reward = transition_reward(cfg, parent_cost, child_cost);
+    child.state_cost = child_cost;
+    child.sim_time = py::cast<double>(state.attr("simulator").attr("_time"));
+}
+
 static std::pair<double, std::vector<double>> uniform_value_and_priors(
     const std::vector<int>& valid,
     size_t action_count
@@ -1810,6 +2226,143 @@ static std::pair<double, std::vector<double>> uniform_value_and_priors(
         }
     }
     return std::make_pair(0.0, std::move(priors));
+}
+
+static std::tuple<double, bool, int> expand_node(
+    std::vector<NativeTreeNode>& nodes,
+    int node_idx,
+    py::object& state,
+    const py::object& env,
+    const py::function& infer_cb,
+    const NativeSearchCfg& cfg,
+    std::mt19937& rng,
+    int& next_node_id,
+    bool record_expand_debug = false
+) {
+    auto am = actions_and_mask(env, state, nodes[(size_t)node_idx].player, cfg.max_branching);
+    nodes[(size_t)node_idx].num_valid_actions = (int)am.valid.size();
+    nodes[(size_t)node_idx].nn_valid_mask = am.mask;
+    if (record_expand_debug) {
+        nodes[(size_t)node_idx].last_expand_children_created.clear();
+        nodes[(size_t)node_idx].last_expand_dedup.clear();
+    }
+
+    if (am.valid.empty()) {
+        return std::make_tuple(0.0, false, 0);
+    }
+
+    if (am.valid.size() == 1) {
+        const int idx = am.valid[0];
+        if (nodes[(size_t)node_idx].children.find(idx) == nodes[(size_t)node_idx].children.end()) {
+            create_child(
+                nodes,
+                node_idx,
+                idx,
+                am.actions[py::int_(idx)],
+                1.0,
+                next_node_id
+            );
+        }
+        return std::make_tuple(0.0, false, 1);
+    }
+
+    const size_t a = (size_t)py::len(am.actions);
+    double model_value = 0.0;
+    std::vector<double> priors;
+    bool used_model = false;
+    if (cfg.uniform_prior_value) {
+        auto uniform_out = uniform_value_and_priors(am.valid, a);
+        model_value = uniform_out.first;
+        priors = std::move(uniform_out.second);
+    } else {
+        py::tuple infer_out = infer_cb(
+            state,
+            py::str(nodes[(size_t)node_idx].player),
+            to_pybool_list(am.mask)
+        ).cast<py::tuple>();
+        model_value = py::cast<double>(infer_out[0]);
+        priors = infer_out[1].cast<std::vector<double>>();
+        if (priors.size() < a) priors.resize(a, 0.0);
+        used_model = true;
+    }
+
+    nodes[(size_t)node_idx].has_nn_value = true;
+    nodes[(size_t)node_idx].nn_value_controller = model_value;
+    nodes[(size_t)node_idx].nn_priors = priors;
+
+    const bool is_controller_player = (nodes[(size_t)node_idx].player == "controller");
+
+    const double t_thr0 = now_sec();
+    std::map<int, double> valid_prior_by_idx;
+    for (int i : am.valid) {
+        valid_prior_by_idx[i] = (i >= 0 && (size_t)i < priors.size()) ? priors[(size_t)i] : 0.0;
+    }
+    std::map<int, double> norm_prior = normalize_prior_map(valid_prior_by_idx);
+
+    nodes[(size_t)node_idx].nn_priors_after_threshold.assign(priors.size(), 0.0);
+    for (const auto& kv : norm_prior) {
+        if (kv.first >= 0 && (size_t)kv.first < nodes[(size_t)node_idx].nn_priors_after_threshold.size()) {
+            nodes[(size_t)node_idx].nn_priors_after_threshold[(size_t)kv.first] = kv.second;
+        }
+    }
+
+    nodes[(size_t)node_idx].action_alias_to_canonical.clear();
+    nodes[(size_t)node_idx].canonical_to_action_aliases.clear();
+
+    std::vector<int> canonical_indices;
+    std::map<int, double> canonical_prior;
+
+    if (is_controller_player) {
+        std::map<std::string, int> sig_to_canon;
+        for (int idx : am.valid) {
+            py::object action_obj = am.actions[py::int_(idx)];
+            if (action_obj.is_none()) continue;
+            const std::string sig = controller_action_key(action_obj);
+            auto it = sig_to_canon.find(sig);
+            int canon = idx;
+            if (it == sig_to_canon.end()) {
+                sig_to_canon[sig] = canon;
+                nodes[(size_t)node_idx].canonical_to_action_aliases[canon] = {idx};
+            } else {
+                canon = it->second;
+                nodes[(size_t)node_idx].canonical_to_action_aliases[canon].push_back(idx);
+            }
+            nodes[(size_t)node_idx].action_alias_to_canonical[idx] = canon;
+        }
+        for (const auto& kv : nodes[(size_t)node_idx].canonical_to_action_aliases) {
+            canonical_indices.push_back(kv.first);
+            double psum = 0.0;
+            for (int aidx : kv.second) {
+                auto itp = norm_prior.find(aidx);
+                if (itp != norm_prior.end()) psum += itp->second;
+            }
+            canonical_prior[kv.first] = psum;
+        }
+    } else {
+        canonical_indices = am.valid;
+        for (int idx : canonical_indices) {
+            auto itp = norm_prior.find(idx);
+            canonical_prior[idx] = (itp != norm_prior.end()) ? itp->second : 0.0;
+        }
+    }
+
+    ensure_node_capacity(nodes, canonical_indices.size() + 4, nullptr);
+
+    for (int idx : canonical_indices) {
+        if (nodes[(size_t)node_idx].children.find(idx) != nodes[(size_t)node_idx].children.end()) continue;
+        py::object action_obj = am.actions[py::int_(idx)];
+        if (action_obj.is_none()) continue;
+        create_child(
+            nodes,
+            node_idx,
+            idx,
+            action_obj,
+            canonical_prior[idx],
+            next_node_id
+        );
+    }
+
+    return std::make_tuple(model_value, used_model, (int)am.valid.size());
 }
 
 static void maybe_add_root_dirichlet_noise(
@@ -1890,6 +2443,206 @@ static void maybe_add_root_dirichlet_noise(
         root.nn_priors_after_threshold = noisy_full;
     }
 }
+
+static py::dict search_mcts_dnn(
+    py::object env,
+    py::object root_state,
+    std::string root_player,
+    int iterations,
+    py::function infer_cb,
+    bool uniform_prior_value,
+    int max_branching,
+    bool root_dirichlet_noise_enabled,
+    double root_dirichlet_alpha,
+    double root_dirichlet_epsilon,
+    double pb_c_base,
+    double pb_c_init,
+    double discount_factor,
+    double prefill_step_time,
+    double reward_knee,
+    double reward_max_penalty,
+    double reward_tail_alpha,
+    int seed,
+    int root_node_id,
+    int root_depth,
+    int game_id,
+    int root_id,
+    std::string iter_log_path,
+    bool iter_complete_log
+) {
+    (void)game_id;
+    (void)root_id;
+    (void)iter_log_path;
+    (void)iter_complete_log;
+    NativeSearchCfg cfg;
+    cfg.max_branching = max_branching;
+    cfg.uniform_prior_value = uniform_prior_value;
+    cfg.root_dirichlet_noise_enabled = root_dirichlet_noise_enabled;
+    cfg.root_dirichlet_alpha = root_dirichlet_alpha;
+    cfg.root_dirichlet_epsilon = root_dirichlet_epsilon;
+    cfg.pb_c_base = pb_c_base;
+    cfg.pb_c_init = pb_c_init;
+    cfg.discount_factor = discount_factor;
+    cfg.prefill_step_time = prefill_step_time;
+    cfg.reward_knee = reward_knee;
+    cfg.reward_max_penalty = reward_max_penalty;
+    cfg.reward_tail_alpha = reward_tail_alpha;
+    cfg.seed = seed;
+    cfg.root_node_id = root_node_id;
+    cfg.root_depth = root_depth;
+    cfg.max_cached_state_snapshots = native_env_int("VIDUR_NATIVE_MAX_CACHED_STATE_SNAPSHOTS", 4096);
+
+    std::mt19937 rng((uint32_t)cfg.seed);
+    NativeMinMaxStats minmax;
+
+    std::vector<NativeTreeNode> nodes;
+    {
+        const size_t expected_nodes =
+            (size_t)std::max(8, iterations + 8) * (size_t)std::max(2, max_branching);
+        nodes.reserve(expected_nodes);
+    }
+
+    NativeTreeNode root;
+    root.player = root_player;
+    root.node_id = cfg.root_node_id;
+    root.depth = cfg.root_depth;
+    root.parent = -1;
+    root.parent_action = py::none();
+    root.state_cost = evaluate_state_cost(env, root_state);
+    root.sim_time = py::cast<double>(root_state.attr("simulator").attr("_time"));
+    nodes.push_back(std::move(root));
+
+    int next_node_id = cfg.root_node_id + 1;
+    py::object root_work;
+    try {
+        root_work = root_state.attr("fork")(py::arg("flag") = false);
+    } catch (...) {
+        root_work = root_state.attr("fork")();
+    }
+    auto root_expand = expand_node(nodes, 0, root_work, env, infer_cb, cfg, rng, next_node_id);
+    maybe_add_root_dirichlet_noise(
+        nodes,
+        0,
+        std::get<1>(root_expand),
+        std::get<2>(root_expand),
+        cfg,
+        rng
+    );
+
+    for (int it = 0; it < iterations; ++it) {
+        py::object state;
+        try {
+            state = root_state.attr("fork")(py::arg("flag") = false);
+        } catch (...) {
+            state = root_state.attr("fork")();
+        }
+
+        int current = 0;
+        std::vector<int> search_path;
+        search_path.reserve(32);
+        search_path.push_back(current);
+
+        while (!nodes[(size_t)current].children.empty()) {
+            int child_idx = select_child(nodes, current, cfg, minmax, rng);
+            if (child_idx < 0) break;
+            apply_edge_transition(nodes, current, child_idx, state, env, cfg);
+            current = child_idx;
+            search_path.push_back(current);
+        }
+
+        while (true) {
+            auto am = actions_and_mask(env, state, nodes[(size_t)current].player, cfg.max_branching);
+            nodes[(size_t)current].num_valid_actions = (int)am.valid.size();
+            if (am.valid.size() != 1) break;
+
+            const int only_idx = am.valid[0];
+            auto it_child = nodes[(size_t)current].children.find(only_idx);
+            int child_idx = -1;
+            if (it_child == nodes[(size_t)current].children.end()) {
+                child_idx = create_child(
+                    nodes,
+                    current,
+                    only_idx,
+                    am.actions[py::int_(only_idx)],
+                    1.0,
+                    next_node_id
+                );
+            } else {
+                child_idx = it_child->second;
+            }
+            apply_edge_transition(nodes, current, child_idx, state, env, cfg);
+            current = child_idx;
+            search_path.push_back(current);
+        }
+
+        auto leaf_expand = expand_node(nodes, current, state, env, infer_cb, cfg, rng, next_node_id);
+        double value = std::get<0>(leaf_expand);
+
+        for (int i = (int)search_path.size() - 1; i >= 0; --i) {
+            const int node_idx = search_path[(size_t)i];
+            auto& node = nodes[(size_t)node_idx];
+            node.value_sum += value;
+            node.visits += 1;
+
+            if (node.parent < 0) continue;
+            auto& parent = nodes[(size_t)node.parent];
+            const bool parent_is_branching =
+                (parent.num_valid_actions > 1) || (parent.children.size() > 1);
+            const double disc = time_discount(cfg, node.sim_time, parent.sim_time);
+            const double reward_used = parent_is_branching ? node.reward : 0.0;
+
+            if (parent_is_branching && node.visits > 0) {
+                const double q = reward_used + disc * (node.value_sum / (double)node.visits);
+                minmax.update(q);
+            }
+            value = reward_used + disc * value;
+        }
+    }
+
+    const auto& root_final = nodes[0];
+    py::dict out;
+    out["root_node_id"] = py::int_(root_final.node_id);
+    out["root_depth"] = py::int_(root_final.depth);
+    out["root_player"] = py::str(root_final.player);
+    out["root_visits"] = py::int_(root_final.visits);
+    out["root_value_sum"] = py::float_(root_final.value_sum);
+    out["root_state_cost"] = py::float_(root_final.state_cost);
+    out["root_sim_time"] = py::float_(root_final.sim_time);
+    out["root_num_valid_actions"] = py::int_(root_final.num_valid_actions);
+    out["root_nn_value_controller"] = root_final.has_nn_value
+        ? py::object(py::float_(root_final.nn_value_controller))
+        : py::object(py::none());
+    out["root_nn_priors"] = py::cast(root_final.nn_priors);
+    out["root_nn_priors_after_threshold"] = py::cast(root_final.nn_priors_after_threshold);
+    out["root_nn_valid_mask"] = py::cast(root_final.nn_valid_mask);
+    out["action_alias_to_canonical"] = py::cast(root_final.action_alias_to_canonical);
+    out["canonical_to_action_aliases"] = py::cast(root_final.canonical_to_action_aliases);
+
+    py::list children;
+    for (const auto& kv : root_final.children) {
+        const int action_idx = kv.first;
+        const auto& child = nodes[(size_t)kv.second];
+        py::dict c;
+        c["index"] = py::int_(action_idx);
+        c["node_id"] = py::int_(child.node_id);
+        c["depth"] = py::int_(child.depth);
+        c["player"] = py::str(child.player);
+        c["prior"] = py::float_(child.prior);
+        c["reward"] = py::float_(child.reward);
+        c["visits"] = py::int_(child.visits);
+        c["value_sum"] = py::float_(child.value_sum);
+        c["state_cost"] = py::float_(child.state_cost);
+        c["sim_time"] = py::float_(child.sim_time);
+        c["num_valid_actions"] = py::int_(child.num_valid_actions);
+        c["parent_action"] = child.parent_action;
+        c["parent_action_index"] = py::int_(child.parent_action_index);
+        children.append(c);
+    }
+    out["children"] = children;
+    out["node_count"] = py::int_(nodes.size());
+    return out;
+}
+
 struct NativeActionMaskFull {
     std::vector<ControllerActionSpecNative> controller_actions;
     std::vector<AdversaryActionSpecNative> adversary_actions;
@@ -1914,7 +2667,7 @@ static std::string controller_action_signature(const ControllerActionSpecNative&
 }
 
 static py::object controller_action_to_py(const ControllerActionSpecNative& a) {
-    const py::object& ControllerAction = controller_action_cls();
+    py::object ControllerAction = py::module_::import("vidur.mcts.environment").attr("ControllerAction");
     py::list selected;
     for (int rid : a.selected_request_ids) selected.append(py::int_(rid));
     py::object selected_obj = selected.size() ? py::object(selected) : py::none();
@@ -1936,8 +2689,9 @@ static py::object controller_action_to_py(const ControllerActionSpecNative& a) {
 }
 
 static py::object adversary_action_to_py(const AdversaryActionSpecNative& a) {
-    const py::object& AdversaryRequestSpec = adversary_request_spec_cls();
-    const py::object& AdversaryAction = adversary_action_cls();
+    py::module_ env_mod = py::module_::import("vidur.mcts.environment");
+    py::object AdversaryRequestSpec = env_mod.attr("AdversaryRequestSpec");
+    py::object AdversaryAction = env_mod.attr("AdversaryAction");
     py::list reqs;
     for (const auto& r : a.requests) {
         reqs.append(AdversaryRequestSpec(
@@ -2435,20 +3189,6 @@ static NativeRuntimeConfig runtime_cfg_from_env(const py::object& env) {
     } catch (...) {
     }
 
-    try {
-        py::object gr = env.attr("_game_rules");
-        if (py::hasattr(gr, "name")) cfg.game_version_name = py::cast<std::string>(gr.attr("name"));
-        cfg.adversary_send_interval_sec = py_get_f(gr, "send_interval_sec", cfg.adversary_send_interval_sec);
-        cfg.arrival_window_sec = py_get_f(gr, "arrival_window_sec", cfg.arrival_window_sec);
-        cfg.first_arrival_floor = py_get_b(gr, "first_arrival_floor", cfg.first_arrival_floor);
-        cfg.supports_native_controller_sampler =
-            py_get_b(gr, "supports_native_controller_sampler", cfg.supports_native_controller_sampler);
-        cfg.adversary_num_actions = py_get_i(gr, "adversary_num_actions", cfg.adversary_num_actions);
-        cfg.adversary_fixed_decode_tokens = py_get_i(gr, "fixed_decode_tokens", cfg.adversary_fixed_decode_tokens);
-    } catch (...) {}
-
-    cfg.game_version_id = static_cast<int>(resolve_game_version_id(cfg.game_version_name));
-        
     if (cfg.prefill_profile_tokens.empty()) {
         cfg.prefill_profile_tokens = {cfg.max_request_tokens};
         cfg.prefill_profile_times = {0.001};
@@ -2697,13 +3437,52 @@ static NativeActionMaskFull actions_and_mask_full_native(
 ) {
     NativeActionMaskFull out;
     if (player == "controller") {
-        ControllerSampleOutput c = sample_controller_actions_for_rules(state, runtime_cfg);
+        const int step = std::max(1, runtime_cfg.interval_request_size);
+        std::vector<int> budgets;
+        budgets.reserve(6);
+        for (int i = 1; i <= 6; ++i) budgets.push_back(step * i);
+        auto view = NativeSim::controller_view_from_state(state);
+        ControllerSampleOutput c = sample_controller_actions_native(
+            view,
+            state.sim_time,
+            budgets,
+            runtime_cfg.prefill_profile_tokens,
+            runtime_cfg.prefill_profile_times
+        );
         out.controller_actions = std::move(c.actions);
         out.mask = std::move(c.mask);
     } else {
-        AdversarySampleOutput adv = sample_adversary_actions_for_rules(state, runtime_cfg);
-        out.adversary_actions = std::move(adv.actions);
-        out.mask = std::move(adv.mask);
+        const int num_actions = std::max(1, runtime_cfg.adversary_num_actions);
+        out.adversary_actions.resize((size_t)num_actions);
+        out.mask.assign((size_t)num_actions, 0);
+
+        const bool can_send = (state.stats.last_prefill_batch_time < 0.0)
+            || (state.sim_time >= state.stats.last_prefill_batch_time + 1.0 - 1e-9);
+        if (!can_send) {
+            out.adversary_actions[0].valid = true;
+            out.mask[0] = 1;
+        } else {
+            const double prefill_slo = nearest_prefill_estimate(
+                runtime_cfg.max_request_tokens,
+                runtime_cfg.prefill_profile_tokens,
+                runtime_cfg.prefill_profile_times
+            );
+            for (int i = 0; i < num_actions; ++i) {
+                AdversaryActionSpecNative a;
+                a.valid = true;
+                a.requests.reserve((size_t)(i + 1));
+                for (int k = 0; k < i + 1; ++k) {
+                    AdversaryRequestSpecNative r;
+                    r.prefill_tokens = runtime_cfg.max_request_tokens;
+                    r.decode_tokens = runtime_cfg.adversary_fixed_decode_tokens;
+                    r.prefill_slo = prefill_slo;
+                    r.decode_slo = runtime_cfg.default_decode_slo;
+                    a.requests.push_back(r);
+                }
+                out.adversary_actions[(size_t)i] = std::move(a);
+                out.mask[(size_t)i] = 1;
+            }
+        }
     }
 
     out.valid.reserve(out.mask.size());
@@ -3138,13 +3917,6 @@ static py::dict search_mcts_dnn_torchscript_impl(
 
     const double t_state0 = now_sec();
     NativeRuntimeConfig runtime_cfg = runtime_cfg_from_env(env);
-    if (!runtime_cfg.supports_native_controller_sampler) {
-        throw std::runtime_error(
-            "Full-native search unsupported for game rules '" + runtime_cfg.game_version_name +
-            "' (supports_native_controller_sampler=False)."
-        );
-    }
-
     NativeSimState root_native_state = native_state_from_py(env, root_state);
     perf.state_build_sec += (now_sec() - t_state0);
     if (native_trace_should_log(search_call)) {
@@ -3881,6 +4653,66 @@ PYBIND11_MODULE(mcts_native, m) {
             py::arg("player"),
             py::arg("model_version"));
 
+    py::class_<NativeMCTS>(m, "NativeMCTS")
+        .def(py::init<>())
+        .def_static("search", []() { NativeMCTS::search(); });
+
+    py::class_<NativeActionSpace>(m, "NativeActionSpace")
+        .def(py::init<>())
+        .def_static("sample_controller_actions", &sample_controller_actions_pyready,
+            py::arg("request_states"),
+            py::arg("sim_time"),
+            py::arg("budgets"),
+            py::arg("profile_tokens"),
+            py::arg("profile_times"),
+            py::arg("num_actions"))
+        .def_static("sample_adversary_actions", &sample_adversary_actions_pyready,
+            py::arg("num_actions"));
+
+    m.def(
+        "sample_controller_actions",
+        &sample_controller_actions_native,
+        py::arg("request_states"),
+        py::arg("sim_time"),
+        py::arg("budgets"),
+        py::arg("profile_tokens"),
+        py::arg("profile_times")
+    );
+    m.def("sample_controller_actions_pyready",
+      &sample_controller_actions_pyready,
+      py::arg("request_states"),
+      py::arg("sim_time"),
+      py::arg("budgets"),
+      py::arg("profile_tokens"),
+      py::arg("profile_times"),
+      py::arg("num_actions"));
+    m.def(
+      "search_mcts_dnn",
+      &search_mcts_dnn,
+      py::arg("env"),
+      py::arg("root_state"),
+      py::arg("root_player"),
+      py::arg("iterations"),
+      py::arg("infer_cb"),
+      py::arg("uniform_prior_value") = false,
+      py::arg("max_branching"),
+      py::arg("root_dirichlet_noise_enabled"),
+      py::arg("root_dirichlet_alpha"),
+      py::arg("root_dirichlet_epsilon"),
+      py::arg("pb_c_base"),
+      py::arg("pb_c_init"),
+      py::arg("discount_factor"),
+      py::arg("prefill_step_time"),
+      py::arg("reward_knee"),
+      py::arg("reward_max_penalty"),
+      py::arg("reward_tail_alpha"),
+      py::arg("seed"),
+      py::arg("root_node_id"),
+      py::arg("root_depth"),
+      py::arg("game_id") = 0,
+      py::arg("root_id") = 0,
+      py::arg("iter_log_path") = "",
+      py::arg("iter_complete_log") = false);
     m.def(
       "search_mcts_dnn_torchscript",
       &search_mcts_dnn_torchscript,

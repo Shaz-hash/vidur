@@ -20,14 +20,60 @@ from vidur.types import EventType
 from .launch_mcts_job import MCTSConstraintConfig, MCTSExploreConfig
 from .prefill_calibrator import PrefillProfile
 
-## Importing the game versions 
-from .game_types import AdversaryAction, AdversaryRequestSpec, ControllerAction
-from .Game_Versions import resolve_game_version
-
 # TODO : Remove this import after debugging
 import time ## For Debugging
 
 
+
+## These are the dimensions along which adversary will take an action. Some combination of these within constraints
+@dataclass
+class AdversaryRequestSpec:
+    prefill_tokens: int
+    decode_tokens: int
+    prefill_slo: float
+    decode_slo: float
+
+
+## Selected combination by adversary on its turn
+@dataclass
+class AdversaryAction:
+    requests: List[AdversaryRequestSpec] = field(default_factory=list)
+    stop_decode_ids: List[int] = field(default_factory=list)
+
+
+## These are the dimensions along which the controller will take an action.
+@dataclass
+class ControllerAction:
+    token_budget: int
+    selected_request_ids: Optional[List[int]] = None
+    token_allocations: Dict[int, int] = field(default_factory=dict)
+    prefill_allocations: Dict[int, int] = field(default_factory=dict)
+    decode_allocations: Dict[int, int] = field(default_factory=dict)
+    heuristic: Optional[str] = None          # NEW
+    strategy: Optional[str] = None           # NEW
+    mapping: Optional[Tuple[int, ...]] = None   # NEW: prefill mapping vector
+
+
+
+@dataclass
+class _ControllerBudgetTracker:
+    allocations: Dict[int, Tuple[int, int]]
+    baseline_prefill: Dict[int, int]
+    baseline_decode: Dict[int, int]
+    tracked_requests: Dict[int, Request]  # NEW
+
+    def is_satisfied(self) -> bool:
+        for rid, (prefill_budget, decode_budget) in self.allocations.items():
+            req = self.tracked_requests.get(rid)
+            if req is None:
+                continue
+            gained_prefill = req.num_processed_prefill_tokens - self.baseline_prefill.get(rid, 0)
+            if gained_prefill < prefill_budget:
+                return False
+            gained_decode = req.num_processed_decode_tokens - self.baseline_decode.get(rid, 0)
+            if gained_decode < decode_budget:
+                return False
+        return True
 
 ## MCTS node carrying useful states for propogating upwards + helping in exploitation vs exploration goal
 @dataclass
@@ -113,7 +159,6 @@ class VidurMCTSEnvironment:
         self.all_possible_Controller_States: Dict[Tuple[Tuple[int, ...], str, str], Dict[str, Any]] = {}
         self._base_snapshot = base_simulator.snapshot_state()
         self._history_root_snapshot = None
-        self._game_rules = resolve_game_version(getattr(explore_cfg, "game_version", "game_version_1"))
 
         # TODO : later this variable will encode max length + prefill + decode lengths
         if self._constraints.max_request_tokens is None:
@@ -175,6 +220,7 @@ class VidurMCTSEnvironment:
         return VidurMCTSState(sim, stats_template.clone())
 
 
+
     # ------------------------------------------------------------------ #
     # Action sampling for Players
     # ------------------------------------------------------------------ #
@@ -182,27 +228,69 @@ class VidurMCTSEnvironment:
     def sample_adversary_actions(
         self, state: VidurMCTSState, max_samples: int
     ) -> Tuple[List[Optional[AdversaryAction]], List[bool]]:
-        del max_samples
+        """
+        6 deterministic adversary actions.
+
+        Index i (0..5) => send (i+1) requests, each with:
+        - prefill_tokens = 3072 (or constraints.max_request_tokens)
+        - decode_tokens  = 1000 (fixed)
+
+        Gating:
+        - Only allow sending a batch if >= 1.0s has passed since the last prefill batch time
+            (tracked by state.stats.last_prefill_batch_time, which _apply_adversary_action updates).
+        - If not allowed yet: return a single no-op at index 0 (mask[0]=True) to avoid branching.
+        """
         self._drain_arrivals(state.simulator)
 
-        prefill_size = int(getattr(self._constraints, "max_request_tokens", 3072) or 3072)
-        slo_opts = self._constraints.request_slo_options
-        prefill_slo_time = float(self._prefill_profile.lookup(prefill_size))
-        decode_slo_time = (
-            float(slo_opts.decode_slos[0]) / 1000.0
-            if getattr(slo_opts, "decode_slos", None)
-            else 0.0
-        )
+        NUM_ACTIONS = 6
+        actions_by_index: List[Optional[AdversaryAction]] = [None] * NUM_ACTIONS
+        mask: List[bool] = [False] * NUM_ACTIONS
 
-        
-        actions_by_index, mask = self._game_rules.sample_adversary_actions(
-            sim_time=float(state.simulator._time),
-            last_prefill_batch_time=getattr(state.stats, "last_prefill_batch_time", None),
-            prefill_tokens=prefill_size,
-            prefill_slo_time=float(prefill_slo_time),
-            decode_slo_time=float(decode_slo_time),
-        )
+        sim_time = float(state.simulator._time)
+
+        last = getattr(state.stats, "last_prefill_batch_time", None)
+        can_send = (last is None) or (sim_time >= float(last) + 1.0 - 1e-9)
+
+        # not time yet -> forced no-op (single valid action)
+        if not can_send:
+            actions_by_index[0] = AdversaryAction(requests=[], stop_decode_ids=[])
+            mask[0] = True
+            return actions_by_index, mask
+
+        # build real batch actions
+        prefill_size = int(getattr(self._constraints, "max_request_tokens", 3072) or 3072)
+        DECODE_TOKENS_FIXED = 5000
+
+        slo_opts = self._constraints.request_slo_options
+
+        base_prefill = float(self._prefill_profile.lookup(prefill_size))
+        prefill_slo_time = base_prefill
+    
+        if getattr(slo_opts, "decode_slos", None):
+            decode_slo_time = float(slo_opts.decode_slos[0]) / 1000.0
+        else:
+            decode_slo_time = 0.0
+
+        for i in range(NUM_ACTIONS):
+            count = i + 1
+            specs: List[AdversaryRequestSpec] = []
+            for _ in range(count):
+                specs.append(
+                    AdversaryRequestSpec(
+                        prefill_tokens=prefill_size,
+                        decode_tokens=DECODE_TOKENS_FIXED,
+                        prefill_slo=float(prefill_slo_time),
+                        decode_slo=float(decode_slo_time),
+                    )
+                )
+
+            actions_by_index[i] = AdversaryAction(requests=specs, stop_decode_ids=[])
+            mask[i] = True
+
         return actions_by_index, mask
+
+
+
 
 
     def sample_controller_actions(
@@ -211,18 +299,219 @@ class VidurMCTSEnvironment:
         max_samples: int,
         use_state_cache: bool = True,
     ) -> Tuple[List[Optional[ControllerAction]], List[bool]]:
-        del max_samples, use_state_cache
+        """
+        Deterministic controller action indexing (24 actions total):
+
+        Budgets (6):  step * [1..6]   (fallback step=512 => [512..3072])
+        Heuristics (4): ["SJF", "EDF", "LST", "LJF"]
+
+        Indexing:
+        index = budget_idx * 4 + heur_idx
+
+        budget_idx: 0..5 corresponds to budgets: [step,2step,3step,4step,5step,6step]
+        heur_idx:   0..3 corresponds to heuristics order above
+
+        Each action deterministically:
+        - sorts current *prefill* requests using the chosen heuristic
+        - allocates prefill tokens greedily in that order up to the chosen budget
+        - allocates decode tokens as 1 for every decode-eligible request (same as before)
+        - fills ControllerAction.{token_allocations,prefill_allocations,decode_allocations}
+
+        Masking rule:
+        Let S = sum of remaining prefill tokens across all prefill requests.
+        - If S > 0: budgets > S are masked False (so their 4 heuristic actions are invalid).
+        - If S == 0: allow only the first budget group (budget_idx==0) as valid (so you still have valid actions for decode-only / no-op).
+
+        Returns:
+        actions_by_index: length 24, entries are ControllerAction or None
+        mask: length 24, bool validity for each index
+        """
 
         self._drain_arrivals(state.simulator)
+        sim_time = state.simulator._time
         step = int(self._constraints.interval_request_size or 512)
 
+        # Fixed 6 budgets (fallback: 512..3072 if step==512)
+        budgets: List[int] = [step * i for i in range(1, 7)]
+
+        # Build lookup once
         request_lookup = self._build_request_lookup(state.simulator)
-        actions_by_index, mask = self._game_rules.sample_controller_actions(
-            request_lookup=request_lookup,
-            sim_time=float(state.simulator._time),
-            prefill_step=int(step),
-            prefill_eta_table_lookup_fn=lambda tokens: float(self._prefill_profile.lookup(int(tokens))),
-        )
+        waiting_ids_all = sorted(request_lookup.keys())
+
+        # Always return fixed-size outputs
+        NUM_HEUR = 4
+        NUM_BUDGETS = 6
+        NUM_ACTIONS = NUM_HEUR * NUM_BUDGETS  # 24
+        actions_by_index: List[Optional[ControllerAction]] = [None] * NUM_ACTIONS
+        mask: List[bool] = [False] * NUM_ACTIONS
+
+        # If nothing exists, return a single no-op at index 0 (valid)
+        if not waiting_ids_all:
+            actions_by_index[0] = ControllerAction(token_budget=0, selected_request_ids=None)
+            mask[0] = True
+            return actions_by_index, mask
+
+        # Helpers
+        def remaining_prefill(req: Request) -> int:
+            return max(0, req.num_prefill_tokens - req.num_processed_prefill_tokens)
+
+        def prefill_done(req: Request) -> bool:
+            return getattr(req, "_is_prefill_complete", req.is_prefill_complete)
+
+        # Prefill candidates only
+        prefill_ids: List[int] = []
+        for rid in waiting_ids_all:
+            req = request_lookup.get(rid)
+            if req is None:
+                continue
+            if remaining_prefill(req) > 0 and not prefill_done(req):
+                prefill_ids.append(rid)
+
+        # Decode candidates: always included in every action (1 decode token each)
+        decode_candidates: List[int] = []
+        for rid in waiting_ids_all:
+            req = request_lookup.get(rid)
+            if req is None:
+                continue
+            remaining_decode = max(0, req.num_decode_tokens - req.num_processed_decode_tokens)
+            if prefill_done(req) and remaining_decode > 0:
+                decode_candidates.append(rid)
+
+        decode_candidates = sorted(decode_candidates)
+
+        # Compute total remaining prefill tokens S for masking budgets
+        total_remaining_prefill = 0
+        for rid in prefill_ids:
+            total_remaining_prefill += remaining_prefill(request_lookup[rid])
+
+
+        # If there is no remaining prefill in the whole system, all 24 actions are equivalent
+        # (they will only allocate decode tokens or do nothing). To avoid pointless branching,
+        # force a single valid action (index 0).
+        if total_remaining_prefill == 0:
+            decode_base = {rid: 1 for rid in decode_candidates}
+            token_alloc = dict(decode_base)
+            selected = sorted(token_alloc.keys())
+            a = ControllerAction(
+                token_budget=len(decode_base),
+                selected_request_ids=selected if selected else None,
+                token_allocations=token_alloc,
+                prefill_allocations={},
+                decode_allocations=decode_base,
+                heuristic="SJF",          # consistent with index 0 template
+                strategy="Fixed",
+            )
+            actions_by_index = [None] * 24
+            mask = [False] * 24
+            actions_by_index[0] = a
+            mask[0] = True
+            return actions_by_index, mask
+
+        # Heuristic order functions (deterministic)
+        def order_sjf(ids: List[int]) -> List[int]:
+            return sorted(ids, key=lambda rid: remaining_prefill(request_lookup[rid]))
+
+        def order_edf(ids: List[int]) -> List[int]:
+            return sorted(
+                ids,
+                key=lambda rid: (
+                    getattr(request_lookup[rid], "arrived_at", 0.0)
+                    + getattr(request_lookup[rid], "prefill_slo_time", 0.0)
+                ),
+            )
+
+        def order_lst(ids: List[int]) -> List[int]:
+            def slack(rid: int) -> float:
+                req = request_lookup[rid]
+                remaining_slo = (
+                    getattr(req, "prefill_slo_time", 0.0)
+                    - max(0.0, sim_time - getattr(req, "arrived_at", 0.0))
+                )
+                est = self._prefill_profile.lookup(remaining_prefill(req))
+                return remaining_slo - est
+
+            return sorted(ids, key=slack)
+
+        def order_slowdown(ids: List[int]) -> List[int]:
+            def ratio(rid: int) -> float:
+                req = request_lookup[rid]
+                waited = max(0.0, sim_time - getattr(req, "arrived_at", 0.0))
+                est_full = self._prefill_profile.lookup(getattr(req, "num_prefill_tokens", 0)) or 1e-9
+                return waited / est_full
+
+            return sorted(ids, key=ratio, reverse=True)
+
+        def order_ljf(ids: List[int]) -> List[int]:
+            return sorted(ids, key=lambda rid: remaining_prefill(request_lookup[rid]), reverse=True)
+
+
+        heuristics = [
+            ("SJF", order_sjf),
+            ("EDF", order_edf),
+            ("LST", order_lst),
+            ("LJF", order_ljf),
+        ]
+
+        def build_action(ordered_prefill: List[int], prefill_budget: int, heur_name: str) -> ControllerAction:
+            # Greedy deterministic allocation across ordered prefill requests
+            remaining_budget = max(0, int(prefill_budget))
+            pre: Dict[int, int] = {}
+
+            for rid in ordered_prefill:
+                if remaining_budget <= 0:
+                    break
+                cap = remaining_prefill(request_lookup[rid])
+                if cap <= 0:
+                    continue
+                alloc = min(cap, remaining_budget)
+                if alloc > 0:
+                    pre[rid] = alloc
+                    remaining_budget -= alloc
+
+            # Decode: 1 token each
+            dec = {rid: 1 for rid in decode_candidates}
+
+            token_alloc = {**pre, **dec}
+            selected = sorted(set(token_alloc.keys()))
+            total_budget = sum(token_alloc.values())
+
+            a = ControllerAction(
+                token_budget=total_budget,
+                selected_request_ids=selected if selected else None,
+                token_allocations=token_alloc,
+                prefill_allocations=pre,
+                decode_allocations=dec,
+                heuristic=heur_name,
+                strategy="Fixed",  # optional label
+            )
+            return a
+
+        # Build the fixed indexed action list + mask
+        for b_idx, b in enumerate(budgets):
+            # Budget masking based on total remaining prefill
+            if total_remaining_prefill > 0:
+                budget_valid = b <= total_remaining_prefill
+            else:
+                # No prefill left: allow only the first budget group so we still have valid actions
+                budget_valid = (b_idx == 0)
+
+            for h_idx, (h_name, order_fn) in enumerate(heuristics):
+                idx = b_idx * NUM_HEUR + h_idx
+
+                if not budget_valid:
+                    mask[idx] = False
+                    actions_by_index[idx] = None
+                    continue
+
+                mask[idx] = True
+                ordered_prefill = order_fn(prefill_ids) if prefill_ids else []
+                actions_by_index[idx] = build_action(ordered_prefill, b, h_name)
+
+        # Safety: ensure at least one valid action exists
+        if not any(mask):
+            actions_by_index[0] = ControllerAction(token_budget=0, selected_request_ids=None)
+            mask[0] = True
+
         return actions_by_index, mask
 
 
@@ -369,20 +658,16 @@ class VidurMCTSEnvironment:
         time_now = sim._time 
 
         # Bucket logical arrival time down to the nearest lowest whole second e.g. if time now is 1.2s --> arrival time is 1.0s
-        has_requests = bool(action.requests)
-        arrival_time = float(
-            self._game_rules.compute_adversary_arrival_time(
-                sim_time=float(time_now),
-                last_prefill_batch_time=getattr(state.stats, "last_prefill_batch_time", None),
-                has_requests=has_requests,
-            )
-        )
-        state.stats.last_prefill_batch_time = self._game_rules.next_last_prefill_batch_time(
-            sim_time=float(time_now),
-            last_prefill_batch_time=getattr(state.stats, "last_prefill_batch_time", None),
-            has_requests=has_requests,
-        )
+        if action.requests:
+            if state.stats.last_prefill_batch_time is None:
+                arrival_time = math.floor(time_now)  # or use time_now if you want fractional base
+            else:
+                arrival_time = state.stats.last_prefill_batch_time + 1.0
 
+            state.stats.last_prefill_batch_time = arrival_time
+        else:
+            # no new prefill requests; don't touch last_prefill_batch_time
+            arrival_time = math.floor(time_now)  # unused since no requests
 
         # sync the global counter to THIS simulator’s current max request id
         lookup = self._build_request_lookup(sim)
@@ -418,7 +703,7 @@ class VidurMCTSEnvironment:
                 req.num_decode_tokens = max(req.num_processed_decode_tokens, 0)
 
         # Maintain arrival history within 1 second window for QPS constraint
-        window_start = float(self._game_rules.arrival_window_start(sim_time=float(time_now)))
+        window_start = time_now - 1.0
         state.stats.recent_arrivals = [
             t for t in state.stats.recent_arrivals if t >= window_start
         ]
@@ -853,21 +1138,7 @@ class VidurMCTSEnvironment:
             return
 
         sim_t = float(sim._time)
-        try:
-            ## For game version 2
-            target_t = self._game_rules.next_adversary_release_time(
-                last_prefill_batch_time=float(last),
-                sim_time=sim_t,
-            )
-        except TypeError:
-            ## For game version 1
-            target_t = self._game_rules.next_adversary_release_time(
-                last_prefill_batch_time=float(last),
-            )
-
-        if target_t is None:
-            return
-        target_t = float(target_t)
+        target_t = float(last) + 1.0
         if sim_t >= target_t - 1e-9:
             return  # adversary already allowed
 

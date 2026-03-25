@@ -119,15 +119,6 @@ struct NativeRuntimeConfig {
 
     std::vector<int> prefill_profile_tokens;
     std::vector<double> prefill_profile_times;
-
-    int game_version_id = 1;
-    std::string game_version_name = "game_version_1";
-    double adversary_send_interval_sec = 1.0;
-    double arrival_window_sec = 1.0;
-    bool first_arrival_floor = true;
-    bool supports_native_controller_sampler = true;
-
-
 };
 
 } // namespace mcts_native

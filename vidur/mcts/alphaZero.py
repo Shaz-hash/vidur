@@ -481,6 +481,34 @@ def _infer_cpp_runtime_enabled(cfg: "AlphaZeroConfig") -> bool:
         return False
     return bool(getattr(ncfg, "enabled", False)) and str(getattr(ncfg, "infer_mode", "python")) == "torchscript_cpp"
 
+def _validate_full_native_only_config(cfg: "AlphaZeroConfig") -> None:
+    ncfg = getattr(cfg, "native", None)
+    if ncfg is None or not bool(getattr(ncfg, "enabled", False)):
+        return
+    if str(getattr(ncfg, "backend", "python")) != "cpp_virtual":
+        raise RuntimeError("native.enabled=True requires native.backend='cpp_virtual'")
+    infer_mode = str(getattr(ncfg, "infer_mode", "python"))
+    if infer_mode not in {"torchscript_cpp", "torchscript_service"}:
+        raise RuntimeError(
+            "native.enabled=True requires infer_mode in {'torchscript_cpp','torchscript_service'} "
+            "for full-native search."
+        )
+    if not bool(getattr(ncfg, "torchscript_full_native_search", False)):
+        raise RuntimeError(
+            "native.enabled=True requires torchscript_full_native_search=True "
+            "(mixed callback path disabled)."
+        )
+
+
+def _assert_model_has_native_ts_runtime(model: object, *, where: str) -> None:
+    runtime = getattr(model, "_native_ts_runtime", None)
+    model_version = getattr(model, "_native_ts_model_version", None)
+    if runtime is None or model_version is None:
+        raise RuntimeError(
+            f"{where}: native_mcts_enabled=True requires model adapter exposing "
+            "_native_ts_runtime and _native_ts_model_version."
+        )
+
 
 def _wait_for_infer_service(addr: str, *, timeout_s: float = 30.0) -> None:
     if TorchScriptInferClient is None:
@@ -716,7 +744,7 @@ def main() -> None:
             root_id=0,
             root_depth=0,
             root_player="adversary",
-            iterations=1000,
+            iterations=5000,
             feature_version=1,
         ),
         native=NativeRuntimeGroup(
@@ -735,10 +763,11 @@ def main() -> None:
         ),
     )
 
+    _validate_full_native_only_config(cfg)
 
     ## MODEL TRAINING PARMS FOR SELF-IMPROVEMENT LOOP:
     num_generations = 1
-    history_nontrivial_hops = 10
+    history_nontrivial_hops = 0
     roots_per_generation = 1
     adv_iterations_per_root = 8000
     cont_iterations_per_root = 8000
@@ -863,6 +892,11 @@ def main() -> None:
                 fallback_model=model,
                 fallback_to_python=bool(cfg.native.fallback_to_python_infer),
             )
+
+
+    if bool(getattr(explore_cfg, "native_mcts_enabled", False)):
+        _assert_model_has_native_ts_runtime(run_model, where="alphaZero single-process")
+    
 
     writer = ReplayWriter(
         ReplayWriterConfig(out_dir=Path(cfg.dataset.out_dir), shard_size=cfg.dataset.shard_size)

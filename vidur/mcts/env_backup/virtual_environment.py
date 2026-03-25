@@ -11,10 +11,13 @@ from vidur.entities.batch_stage import BatchStage
 from vidur.types.replica_id import ReplicaId
 from vidur.utils.slo_manager import SLOManager
 
-from .game_types import AdversaryAction, AdversaryRequestSpec, ControllerAction
-from .environment import VidurGameStats, VidurMCTSState
-from .Game_Versions import resolve_game_version
-
+from .environment import (
+    AdversaryAction,
+    AdversaryRequestSpec,
+    ControllerAction,
+    VidurGameStats,
+    VidurMCTSState,
+)
 from .launch_mcts_job import MCTSConstraintConfig, MCTSExploreConfig
 from .prefill_calibrator import PrefillProfile
 from .virtual_simulator import VirtualSimulator
@@ -69,7 +72,6 @@ class VirtualVidurMCTSEnvironment:
         )
         self._base_snapshot = base_simulator.snapshot_state()
         self._history_root_snapshot = None
-        self._game_rules = resolve_game_version(getattr(explore_cfg, "game_version", "game_version_1"))
 
         if self._constraints.max_request_tokens is None:
             self._constraints.max_request_tokens = self._prefill_profile.max_tokens
@@ -193,53 +195,164 @@ class VirtualVidurMCTSEnvironment:
         del max_samples
         self._drain_arrivals(state.simulator)
 
+        num_actions = 6
+        actions_by_index: List[Optional[AdversaryAction]] = [None] * num_actions
+        mask: List[bool] = [False] * num_actions
+
+        sim_time = float(state.simulator._time)
+        last = getattr(state.stats, "last_prefill_batch_time", None)
+        can_send = (last is None) or (sim_time >= float(last) + 1.0 - 1e-9)
+
+        if not can_send:
+            actions_by_index[0] = AdversaryAction(requests=[], stop_decode_ids=[])
+            mask[0] = True
+            return actions_by_index, mask
+
         prefill_size = int(getattr(self._constraints, "max_request_tokens", 3072) or 3072)
+        decode_tokens_fixed = 5000
         slo_opts = self._constraints.request_slo_options
-        prefill_slo_time = float(self._prefill_profile.lookup(prefill_size))
+
+        base_prefill = float(self._prefill_profile.lookup(prefill_size))
+        prefill_slo_time = base_prefill
         decode_slo_time = (
             float(slo_opts.decode_slos[0]) / 1000.0
             if getattr(slo_opts, "decode_slos", None)
             else 0.0
         )
 
-        actions_by_index, mask = self._game_rules.sample_adversary_actions(
-            sim_time=float(state.simulator._time),
-            last_prefill_batch_time=getattr(state.stats, "last_prefill_batch_time", None),
-            prefill_tokens=prefill_size,
-            prefill_slo_time=float(prefill_slo_time),
-            decode_slo_time=float(decode_slo_time),
-        )
+        for i in range(num_actions):
+            count = i + 1
+            specs: List[AdversaryRequestSpec] = []
+            for _ in range(count):
+                specs.append(
+                    AdversaryRequestSpec(
+                        prefill_tokens=prefill_size,
+                        decode_tokens=decode_tokens_fixed,
+                        prefill_slo=float(prefill_slo_time),
+                        decode_slo=float(decode_slo_time),
+                    )
+                )
+            actions_by_index[i] = AdversaryAction(requests=specs, stop_decode_ids=[])
+            mask[i] = True
+
         return actions_by_index, mask
 
-    # TODO : We might not need native version here 
+
     def sample_controller_actions(
         self,
         state: VidurMCTSState,
         max_samples: int,
         use_state_cache: bool = True,
     ) -> Tuple[List[Optional[ControllerAction]], List[bool]]:
+        if self._native_enabled and _mcts_native is not None:
+            try:
+                return self._sample_controller_actions_native(
+                    state,
+                    max_samples=max_samples,
+                    use_state_cache=use_state_cache,
+                )
+            except Exception:
+                if self._native_strict_compat:
+                    raise
         return self._sample_controller_actions_python(
             state,
             max_samples=max_samples,
             use_state_cache=use_state_cache,
         )
 
-
-
-    # TODo : Might be needed to delete this 
     def _sample_controller_actions_native(
         self,
         state: VidurMCTSState,
         max_samples: int,
         use_state_cache: bool = True,
     ) -> Tuple[List[Optional[ControllerAction]], List[bool]]:
-        del state, max_samples, use_state_cache
-        raise RuntimeError(
-            "Native controller sampler bridge is disabled in full-native-only pipeline. "
-            "Use _sample_controller_actions_python."
+        del max_samples, use_state_cache
+
+        self._drain_arrivals(state.simulator)
+        sim_time = float(state.simulator._time)
+        step = int(self._constraints.interval_request_size or 512)
+
+        budget_cache = self._controller_budgets_cache
+        budgets = budget_cache.get(step)
+        if budgets is None:
+            budgets = tuple(step * i for i in range(1, 7))
+            budget_cache[step] = budgets
+
+        num_heur = 4
+        num_actions = num_heur * len(budgets)
+        actions_by_index: List[Optional[ControllerAction]] = [None] * num_actions
+        mask: List[bool] = [False] * num_actions
+
+        req_map = self._req_map(state.simulator)
+        active_ids = state.stats.active_request_ids
+        if not active_ids:
+            actions_by_index[0] = ControllerAction(token_budget=0, selected_request_ids=None)
+            mask[0] = True
+            return actions_by_index, mask
+
+        if not hasattr(self, "_cpp_profile_tokens") or not hasattr(self, "_cpp_profile_times"):
+            entries = dict(getattr(self._prefill_profile, "entries", {}) or {})
+            self._cpp_profile_tokens = sorted(int(k) for k in entries.keys())
+            self._cpp_profile_times = [float(entries[k]) for k in self._cpp_profile_tokens]
+
+        self._perf.setdefault("ctrl_sample_total", 0.0)
+        self._perf.setdefault("ctrl_sample_pack", 0.0)
+        self._perf.setdefault("ctrl_sample_cpp", 0.0)
+        self._perf.setdefault("ctrl_sample_unpack", 0.0)
+        self._perf.setdefault("ctrl_sample_calls", 0.0)
+        self._perf["ctrl_sample_calls"] += 1.0
+
+        t_all = time.perf_counter()
+
+        t_pack = time.perf_counter()
+        req_states = []
+        for rid0 in sorted(active_ids):
+            rid = int(rid0)
+            req = req_map.get(rid)
+            if req is None:
+                continue
+            rs = _mcts_native.ControllerRequestStateNative()
+            rs.request_id = rid
+            rs.prefill_done = bool(getattr(req, "_is_prefill_complete", req.is_prefill_complete))
+            rs.remaining_prefill = int(self._remaining_prefill(req))
+            rs.remaining_decode = int(self._remaining_decode(req))
+            rs.arrived_at = float(getattr(req, "arrived_at", 0.0))
+            rs.prefill_slo = float(getattr(req, "prefill_slo_time", 0.0))
+            req_states.append(rs)
+        self._perf["ctrl_sample_pack"] += time.perf_counter() - t_pack
+
+        t_cpp = time.perf_counter()
+        out_actions, out_mask = _mcts_native.sample_controller_actions_pyready(
+            req_states,
+            sim_time,
+            [int(b) for b in budgets],
+            self._cpp_profile_tokens,
+            self._cpp_profile_times,
+            int(num_actions),
         )
+        self._perf["ctrl_sample_cpp"] += time.perf_counter() - t_cpp
 
+        t_unpack = time.perf_counter()
+        actions = list(out_actions)
+        if len(actions) < num_actions:
+            actions.extend([None] * (num_actions - len(actions)))
+        elif len(actions) > num_actions:
+            actions = actions[:num_actions]
 
+        mask = [bool(x) for x in out_mask]
+        if len(mask) < num_actions:
+            mask.extend([False] * (num_actions - len(mask)))
+        elif len(mask) > num_actions:
+            mask = mask[:num_actions]
+
+        actions_by_index = [a for a in actions]
+        if not any(mask):
+            actions_by_index[0] = ControllerAction(token_budget=0, selected_request_ids=None)
+            mask[0] = True
+
+        self._perf["ctrl_sample_unpack"] += time.perf_counter() - t_unpack
+        self._perf["ctrl_sample_total"] += time.perf_counter() - t_all
+        return actions_by_index, mask
 
     def _sample_controller_actions_python(
         self,
@@ -248,17 +361,141 @@ class VirtualVidurMCTSEnvironment:
         use_state_cache: bool = True,
     ) -> Tuple[List[Optional[ControllerAction]], List[bool]]:
         del max_samples, use_state_cache
+
         self._drain_arrivals(state.simulator)
+        sim_time = float(state.simulator._time)
         step = int(self._constraints.interval_request_size or 512)
 
-        request_lookup = self._build_request_lookup(state.simulator, state)
-        actions_by_index, mask = self._game_rules.sample_controller_actions(
-            request_lookup=request_lookup,
-            sim_time=float(state.simulator._time),
-            prefill_step=int(step),
-            prefill_eta_table_lookup_fn=lambda tokens: float(self._prefill_profile.lookup(int(tokens))),
-        )
+        budget_cache = self._controller_budgets_cache
+        budgets = budget_cache.get(step)
+        if budgets is None:
+            budgets = tuple(step * i for i in range(1, 7))
+            budget_cache[step] = budgets
+
+        req_map = self._req_map(state.simulator)
+        active_ids = state.stats.active_request_ids
+
+        num_heur = 4
+        num_budgets = len(budgets)
+        num_actions = num_heur * num_budgets
+        actions_by_index: List[Optional[ControllerAction]] = [None] * num_actions
+        mask: List[bool] = [False] * num_actions
+
+        if not active_ids:
+            actions_by_index[0] = ControllerAction(token_budget=0, selected_request_ids=None)
+            mask[0] = True
+            return actions_by_index, mask
+
+        prefill_ids: List[int] = []
+        rem_pref_by_id: Dict[int, int] = {}
+        edf_key_by_id: Dict[int, float] = {}
+        lst_key_by_id: Dict[int, float] = {}
+        total_remaining_prefill = 0
+        decode_candidates: List[int] = []
+        decode_base_template: Dict[int, int] = {}
+
+        for rid0 in sorted(active_ids):
+            rid = int(rid0)
+            req = req_map.get(rid)
+            if req is None:
+                continue
+
+            prefill_done = bool(getattr(req, "_is_prefill_complete", req.is_prefill_complete))
+            if not prefill_done:
+                rem_pref = self._remaining_prefill(req)
+                if rem_pref > 0:
+                    prefill_ids.append(rid)
+                    rem_pref_by_id[rid] = rem_pref
+                    total_remaining_prefill += rem_pref
+
+                    arrived_at = float(getattr(req, "arrived_at", 0.0))
+                    prefill_slo = float(getattr(req, "prefill_slo_time", 0.0))
+                    edf_key_by_id[rid] = arrived_at + prefill_slo
+
+                    remaining_slo = prefill_slo - max(0.0, sim_time - arrived_at)
+                    est = float(self._prefill_profile.lookup(rem_pref))
+                    lst_key_by_id[rid] = remaining_slo - est
+            else:
+                if self._remaining_decode(req) > 0:
+                    decode_candidates.append(rid)
+                    decode_base_template[rid] = 1
+
+        if total_remaining_prefill == 0:
+            decode_base = dict(decode_base_template)
+            token_alloc = dict(decode_base)
+            a = ControllerAction(
+                token_budget=len(decode_base),
+                selected_request_ids=sorted(token_alloc.keys()) if token_alloc else None,
+                token_allocations=token_alloc,
+                prefill_allocations={},
+                decode_allocations=decode_base,
+                heuristic="SJF",
+                strategy="Fixed",
+            )
+            actions_by_index[0] = a
+            mask[0] = True
+            return actions_by_index, mask
+
+        ordered_sjf = sorted(prefill_ids, key=lambda rid: (rem_pref_by_id[rid], rid))
+        ordered_edf = sorted(prefill_ids, key=lambda rid: (edf_key_by_id[rid], rid))
+        ordered_lst = sorted(prefill_ids, key=lambda rid: (lst_key_by_id[rid], rid))
+        ordered_ljf = list(reversed(ordered_sjf))
+        heuristics = [
+            ("SJF", ordered_sjf),
+            ("EDF", ordered_edf),
+            ("LST", ordered_lst),
+            ("LJF", ordered_ljf),
+        ]
+        decode_budget = len(decode_candidates)
+
+        def build_action(ordered_prefill: List[int], prefill_budget: int, heur_name: str) -> ControllerAction:
+            remaining_budget = max(0, int(prefill_budget))
+            pre: Dict[int, int] = {}
+            used_prefill = 0
+
+            for rid in ordered_prefill:
+                if remaining_budget <= 0:
+                    break
+                cap = rem_pref_by_id[rid]
+                if cap <= 0:
+                    continue
+                alloc = cap if cap < remaining_budget else remaining_budget
+                pre[rid] = alloc
+                remaining_budget -= alloc
+                used_prefill += alloc
+
+            decode_alloc = dict(decode_base_template)
+            token_alloc = dict(decode_alloc)
+            token_alloc.update(pre)
+            selected = sorted(token_alloc.keys()) if token_alloc else None
+            return ControllerAction(
+                token_budget=decode_budget + used_prefill,
+                selected_request_ids=selected,
+                token_allocations=token_alloc,
+                prefill_allocations=pre,
+                decode_allocations=decode_alloc,
+                heuristic=heur_name,
+                strategy="Fixed",
+            )
+
+        for b_idx, budget in enumerate(budgets):
+            budget_valid = (budget <= total_remaining_prefill) if total_remaining_prefill > 0 else (b_idx == 0)
+            for h_idx, (h_name, ordered_prefill) in enumerate(heuristics):
+                idx = b_idx * num_heur + h_idx
+                if not budget_valid:
+                    mask[idx] = False
+                    actions_by_index[idx] = None
+                    continue
+                mask[idx] = True
+                actions_by_index[idx] = build_action(ordered_prefill, budget, h_name)
+
+        if not any(mask):
+            actions_by_index[0] = ControllerAction(token_budget=0, selected_request_ids=None)
+            mask[0] = True
         return actions_by_index, mask
+
+
+
 
 
 
@@ -392,19 +629,15 @@ class VirtualVidurMCTSEnvironment:
 
         sim = state.simulator
         time_now = float(sim._time)
-        has_requests = bool(action.requests)
-        arrival_time = float(
-            self._game_rules.compute_adversary_arrival_time(
-                sim_time=float(time_now),
-                last_prefill_batch_time=getattr(state.stats, "last_prefill_batch_time", None),
-                has_requests=has_requests,
-            )
-        )
-        state.stats.last_prefill_batch_time = self._game_rules.next_last_prefill_batch_time(
-            sim_time=float(time_now),
-            last_prefill_batch_time=getattr(state.stats, "last_prefill_batch_time", None),
-            has_requests=has_requests,
-        )
+
+        if action.requests:
+            if state.stats.last_prefill_batch_time is None:
+                arrival_time = math.floor(time_now)
+            else:
+                arrival_time = float(state.stats.last_prefill_batch_time) + 1.0
+            state.stats.last_prefill_batch_time = float(arrival_time)
+        else:
+            arrival_time = math.floor(time_now)
 
         # lookup = self._build_request_lookup(sim)
         # Request._id = max(lookup.keys()) if lookup else -1
@@ -445,7 +678,7 @@ class VirtualVidurMCTSEnvironment:
                 req._num_decode_tokens = max(int(req.num_processed_decode_tokens), 0)
 
         self._update_active_ids_for(state, action.stop_decode_ids)
-        window_start = float(self._game_rules.arrival_window_start(sim_time=float(time_now)))
+        window_start = float(time_now) - 1.0
         state.stats.recent_arrivals = [t for t in state.stats.recent_arrivals if float(t) >= window_start]
         # self._rebuild_scheduler_views(sim)
 
@@ -594,20 +827,7 @@ class VirtualVidurMCTSEnvironment:
             return
 
         sim_t = float(sim._time)
-        try:
-            ## For game version 2
-            target_t = self._game_rules.next_adversary_release_time(
-                last_prefill_batch_time=float(last),
-                sim_time=sim_t,
-            )
-        except TypeError:
-            ## For game version 1
-            target_t = self._game_rules.next_adversary_release_time(
-                last_prefill_batch_time=float(last),
-            )
-        if target_t is None:
-            return
-        target_t = float(target_t)
+        target_t = float(last) + 1.0
         if sim_t >= target_t - 1e-9:
             return
 
