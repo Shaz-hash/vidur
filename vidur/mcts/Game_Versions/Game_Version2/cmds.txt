@@ -1,0 +1,47 @@
+Cmake command :
+
+cmake --build vidur/vidur/mcts/Game_Versions/Game_Version2/native/build_venv -j 8
+
+
+
+cd /home/shazer/Desktop/Research/Vidur && \
+PYTHONPATH=/home/shazer/Desktop/Research/Vidur/vidur \
+/home/shazer/Desktop/Research/Vidur/vidur/.venv/bin/python3 \
+-m vidur.mcts.tests.DNN_TESTS.Game_Version2.mcts_tests \
+/home/shazer/Desktop/Research/Vidur/vidur/simulator_output/Game_Version2/mcts_dnn_logs/gen_000000/mcts_iter_p00_native.csv
+
+
+cd /home/shazer/Desktop/Research/Vidur && \
+PYTHONPATH=/home/shazer/Desktop/Research/Vidur/vidur \
+/home/shazer/Desktop/Research/Vidur/vidur/.venv/bin/python3 \
+-m vidur.mcts.tests.DNN_TESTS.Game_Version2.mcts_tests \
+/home/shazer/Desktop/Research/Vidur/vidur/simulator_output/Game_Version2/mcts_dnn_logs/gen_000000/mcts_iter_p*_native.csv
+
+
+
+cd /home/shazer/Desktop/Research/Vidur && \
+PYTHONPATH=/home/shazer/Desktop/Research/Vidur/vidur \
+/home/shazer/Desktop/Research/Vidur/vidur/.venv/bin/python3 -m vidur.mcts.prefill_calibrator \
+  --output /home/shazer/Desktop/Research/Vidur/vidur/simulator_output/new_prefill_profile.csv \
+  --step 128 \
+  --max_tokens 4096 \
+  --replica_config_model_name meta-llama/Meta-Llama-3-8B \
+  --replica_config_device a100 \
+  --replica_config_network_device a100_dgx \
+  --cluster_config_num_replicas 1 \
+  --replica_config_tensor_parallel_size 1 \
+  --replica_config_num_pipeline_stages 1 \
+  --global_scheduler_config_type round_robin \
+  --replica_scheduler_config_type vllm_v1 \
+  --vllm_v1_scheduler_config_batch_size_cap 512 \
+  --execution_time_predictor_config_type random_forest \
+  --random_forest_execution_time_predictor_config_prediction_max_tokens_per_request 8192 \
+  --random_forest_execution_time_predictor_config_prediction_max_batch_size 256 \
+  --random_forest_execution_time_predictor_config_prediction_max_prefill_chunk_size 4096 \
+  --random_forest_execution_time_predictor_config_cache_dir /home/shazer/Desktop/Research/Vidur/vidur/cache \
+  --no-snapshot_rng_state
+
+
+
+TO kill :
+pkill -9 -f "vidur.mcts.Game_Versions.Game_Version2.alphaZero_parrallel|multiProcessUtils.py|spawn_main"

@@ -14,23 +14,24 @@ Then calls SelfPlayRunner.run_single_root(...)
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional, Sequence, Tuple
-import json
+from dataclasses import dataclass, replace
+from typing import Any, Optional, Sequence, Tuple
 
 import torch
 import time  
 
 # from ..environment import VidurMCTSEnvironment, VidurMCTSState
-from ..environment import VidurMCTSEnvironment, VidurMCTSState, AdversaryAction, ControllerAction
-
+from ..config import GameVersion2Config
+from ....environment import VidurMCTSState
+from ....game_types import AdversaryAction, ControllerAction
 from ..mctsDNN import VidurMCTS
 from .history_root import HistoryRootGenerator
 from .infer import build_model_inputs
-from .types import ModelInputs
 from .replay_write import ReplayWriter, make_root_sample
+from ..logger.evaluation_pipeline_logger import ArenaGameCycleFileLogger, arena_state_snapshot_for_log
 import math 
 import random
+import json
 
 
 def _mask_to_list(mask) -> list[bool]:
@@ -165,29 +166,68 @@ class SingleRootRun:
     feature_version: int = 1
     root_node_id_override: int | None = None
 
+@dataclass(frozen=True)
+class RootSearchResult:
+    mask_list: list[bool]
+    mcts_prior: list[float]
+    best_idx: int
+    root_node_id: int
+
 
 class SelfPlayRunner:
     def __init__(
         self,
         *,
-        env: VidurMCTSEnvironment,
+        env: Any,
         mcts: VidurMCTS,
         model,
         writer: ReplayWriter,
         device_for_features: torch.device = torch.device("cpu"),
+        game_v2_cfg: Optional[GameVersion2Config] = None,
     ) -> None:
         self.env = env
         self.mcts = mcts
         self.model = model
         self.writer = writer
         self.device = device_for_features
-        #self.history = HistoryRootGenerator(env=self.env , max_branching = self.mcts._cfg.max_branching, iter_logger = getattr(self.mcts, '_iter_logger', None))
+        self._gv2_cfg = game_v2_cfg if game_v2_cfg is not None else getattr(env, "_gv2_cfg", None)
         self.history = HistoryRootGenerator(
             env=self.env,
-            max_branching=self.mcts._cfg.max_branching,
             iter_logger=getattr(self.mcts, "_iter_logger", None),
             root_logger=getattr(self.mcts, "_root_logger", None),
         )
+
+    def _sample_actions_readonly(self, state: VidurMCTSState, player: str):
+        probe = state.fork(flag=False)
+        if player == "controller":
+            return self.env.sample_controller_actions(probe)
+        return self.env.sample_adversary_actions(probe)
+
+    def _resolve_history_settings(
+        self,
+        *,
+        history_nontrivial_hops: Optional[int] = None,
+        history_seed: Optional[int] = None,
+        max_forced_hops_per_root: Optional[int] = None,
+        history_max_total_steps: Optional[int] = None,
+        log_history_rows: Optional[bool] = None,
+    ) -> tuple[int, int, int, int, bool]:
+        hcfg = getattr(self._gv2_cfg, "history_root", None)
+
+        hops = int(history_nontrivial_hops if history_nontrivial_hops is not None else getattr(hcfg, "nontrivial_hops", 0))
+        seed = int(history_seed if history_seed is not None else getattr(hcfg, "seed", 0))
+        max_forced = int(
+            max_forced_hops_per_root
+            if max_forced_hops_per_root is not None
+            else getattr(hcfg, "max_forced_hops_per_root", 1024)
+        )
+        max_total = int(
+            history_max_total_steps
+            if history_max_total_steps is not None
+            else getattr(hcfg, "max_total_steps", 20000)
+        )
+        log_rows = bool(log_history_rows if log_history_rows is not None else getattr(hcfg, "log_history_rows", True))
+        return hops, seed, max_forced, max_total, log_rows
 
 
     def _advance_to_branching_root(
@@ -198,61 +238,21 @@ class SelfPlayRunner:
         *,
         max_hops: int = 1024,
     ) -> tuple[VidurMCTSState, str, int]:
-        """
-        Advance the real self-play state through forced moves until the current player
-        has >1 *unique* actions (controller uniqueness uses the same key as MCTS dedupe).
-
-        Returns: (state, player_to_act, updated_depth)
-        """
-        max_hops_i = max(1, int(max_hops))
-        for _ in range(max_hops_i):
-           
-            if player == "controller":
-                actions_by_index, mask = self.env.sample_controller_actions(state, self.mcts._cfg.max_branching)
-                mask_list = _mask_to_list(mask)
-                valid = [i for i, ok in enumerate(mask_list) if ok and actions_by_index[i] is not None]
-
-                if len(valid) != 1:
-                    return state, player, depth  # 0 (terminal) or >1 (branching)
-
-                forced_idx = valid[0]
-                action = actions_by_index[forced_idx]
-                assert action is not None
-                state = self.env.apply_controller_action_only(state, action, inplace=True)
-                player = "adversary"
-                depth += 1
-                continue
-
-            # player == "adversary"
-            actions_by_index, mask = self.env.sample_adversary_actions(
-                state, self.mcts._cfg.max_branching
-            )
-            mask_list = _mask_to_list(mask)
-            valid = [i for i, ok in enumerate(mask_list) if ok and actions_by_index[i] is not None]
-            if not valid:
-                return state, player, depth
-
-            if len(valid) > 1:
-                return state, player, depth  # branching root
-
-            # forced: apply the only valid adversary action and continue
-            forced_idx = valid[0]
-            action = actions_by_index[forced_idx]
-            assert action is not None
-            state = self.env.apply_adversary_action_only(state, action, inplace=True)
-            player = "controller"
-            depth += 1
-
-        print(
-            f"[SelfPlayRunner] advance cap reached: max_hops={max_hops_i} "
-            f"depth={depth} player={player}; proceeding without guaranteed branching"
+        state, player, depth, _next_id, _last_parent, _forced_steps = self.history.advance_to_branching_root(
+            state,
+            player,
+            depth,
+            game_id=-1,          # unused when log_steps=False
+            root_id=-1,          # unused when log_steps=False
+            log_node_id=0,       # unused when log_steps=False
+            log_parent_id=None,  # unused when log_steps=False
+            max_hops=int(max_hops),
+            log_steps=False,
         )
         return state, player, depth
 
 
-
-
-    def run_single_root(self, cfg: SingleRootRun, root_state: Optional[VidurMCTSState] = None  ) -> None:
+    def run_single_root(self, cfg: SingleRootRun, root_state: Optional[VidurMCTSState] = None  ) -> RootSearchResult:
         state = root_state or self.env.initial_state()
 
         t0 = time.perf_counter()
@@ -282,10 +282,7 @@ class SelfPlayRunner:
         )
 
         # Mask from env for this root/player (fixed action indexing)
-        if cfg.root_player == "controller":
-            _, mask = self.env.sample_controller_actions(state, self.mcts._cfg.max_branching)
-        else:
-            _, mask = self.env.sample_adversary_actions(state, self.mcts._cfg.max_branching)
+        _, mask = self._sample_actions_readonly(state, cfg.root_player)
         mask_list = _mask_to_list(mask)
 
         # MCTS targets from the built root
@@ -295,12 +292,15 @@ class SelfPlayRunner:
 
         # Build model inputs (CPU) and force action_mask to env mask
         base_inputs = build_model_inputs(state, cfg.root_player, self.device)
-        inputs = ModelInputs(
-            req_features=base_inputs.req_features,
-            global_features=base_inputs.global_features,
-            req_mask=base_inputs.req_mask,
-            action_mask=torch.tensor(mask_list, dtype=torch.bool, device=self.device).unsqueeze(0),
+        inputs = replace(
+            base_inputs,
+            action_mask=torch.tensor(
+                mask_list,
+                dtype=torch.bool,
+                device=base_inputs.global_features.device,
+            ).unsqueeze(0),
         )
+
 
         # Write one root sample into dataset shards
         sample = make_root_sample(
@@ -326,6 +326,12 @@ class SelfPlayRunner:
             f"fork_dt={t1 - t0:.6f}s "
             f"search_dt={t2 - t1:.6f}s encode/write_dt={t3 - t2:.6f}s"
         )
+        return RootSearchResult(
+            mask_list=mask_list,
+            mcts_prior=mcts_prior,
+            best_idx=int(best_idx),
+            root_node_id=int(root.node_id),
+        )
 
     # TODO : seems like start_root_depth is unncessary & we might not even need to use the best action if run_single_root is doing it 
     def run_n_roots(
@@ -333,25 +339,34 @@ class SelfPlayRunner:
         *,
         game_id: int,
         num_roots: int,
-        # iterations_per_root: int = 5000,
         adv_iterations_per_root: int = 1000,
         cont_iterations_per_root: int = 500,
         max_batch_size: int = 72,
         start_root_id: int = 0,
         start_root_depth: int = 0,
         start_player: str = "adversary",
-        history_nontrivial_hops: int = 0,
         feature_version: int = 1,
         initial_state: Optional[VidurMCTSState] = None,
-        history_seed: Optional[int] = None,
         sample_from_mcts_policy: bool = False,
         selfplay_policy_temperature: float = 0.0,
         action_seed_base: int = 0,
-        max_forced_hops_per_root: int = 1024,
-        history_max_total_steps: int = 20000,
+        history_nontrivial_hops: Optional[int] = None,
+        history_seed: Optional[int] = None,
+        max_forced_hops_per_root: Optional[int] = None,
+        history_max_total_steps: Optional[int] = None,
+        log_history_rows: Optional[bool] = None,
     ) -> VidurMCTSState:
         # state = initial_state or self.env.initial_state()
         # player = start_player
+
+        # Resolving History State 
+        hist_hops, hist_seed, max_forced_hops, hist_max_total_steps, hist_log_rows = self._resolve_history_settings(
+            history_nontrivial_hops=history_nontrivial_hops,
+            history_seed=history_seed,
+            max_forced_hops_per_root=max_forced_hops_per_root,
+            history_max_total_steps=history_max_total_steps,
+            log_history_rows=log_history_rows,
+        )
 
         state = initial_state or self.env.initial_state()
         player = start_player
@@ -360,20 +375,21 @@ class SelfPlayRunner:
         last_log_node_id: int | None = None
 
 
-        if int(history_nontrivial_hops) > 0:
+        if int(hist_hops) > 0:
             state, player, depth, next_log_node_id, last_log_node_id = self.history.generate_history_root(
                 state,
                 player,
                 depth,
-                nontrivial_hops=int(history_nontrivial_hops),
+                nontrivial_hops=int(hist_hops),
                 game_id=int(game_id),
-                root_id_for_logs=int(start_root_id),  # history rows attach to the first root
-                log_history=True,
+                root_id_for_logs=int(start_root_id),
+                log_history=bool(hist_log_rows),
                 log_node_id_start=next_log_node_id,
                 log_parent_id_start=last_log_node_id,
-                seed=history_seed,
-                max_total_steps=int(history_max_total_steps),
+                seed=int(hist_seed),
+                max_total_steps=int(hist_max_total_steps),
             )
+
             # IMPORTANT: prevent MCTS from reusing history node ids
             self.mcts._node_counter = int(next_log_node_id)
 
@@ -389,8 +405,9 @@ class SelfPlayRunner:
                 state,
                 player,
                 depth,
-                max_hops=int(max_forced_hops_per_root),
+                max_hops=int(max_forced_hops),
             )
+
 
             requests_in_system = int(self.env.describe_state(state).get("requests_in_system", 0))
             if requests_in_system > int(max_batch_size):
@@ -407,7 +424,7 @@ class SelfPlayRunner:
             iters = int(adv_iterations_per_root if player == "adversary" else cont_iterations_per_root)
             
             # 1) Run one root search + write one dataset sample
-            self.run_single_root(
+            root_res = self.run_single_root(
                 SingleRootRun(
                     game_id=game_id,
                     root_id=root_id,
@@ -421,18 +438,18 @@ class SelfPlayRunner:
             )
 
             # 2) Choose best action index from visit counts (greedy argmax)
-            if player == "controller":
-                actions_by_index, mask = self.env.sample_controller_actions(state, self.mcts._cfg.max_branching)
-            else:
-                actions_by_index, mask = self.env.sample_adversary_actions(state, self.mcts._cfg.max_branching)
-
-            mask_list = _mask_to_list(mask)
-
             root = self.mcts._root
-            mcts_prior, best_idx = _compute_mcts_prior_from_root(root, mask_list)
+            if root is None or not root.children:
+                if hasattr(self.mcts, "clear_search_state"):
+                    self.mcts.clear_search_state(drop_scratch=True)
+                break
 
+            mask_list = list(root_res.mask_list)
+            mcts_prior = list(root_res.mcts_prior)
+            best_idx = int(root_res.best_idx)
 
-            ## Sampling done using MCTS generated Prior if set in the configuration 
+            chosen_idx = int(best_idx)
+            # Sampling
             if sample_from_mcts_policy and player == "controller":
                 node_seed = (
                     int(action_seed_base) * 1000003 + int(game_id) * 9176 + int(root_id) * 37 + int(depth) * 13
@@ -443,17 +460,36 @@ class SelfPlayRunner:
                     temperature=float(selfplay_policy_temperature),
                     seed=int(node_seed),
                 )
-                if 0 <= sampled_idx < len(actions_by_index) and actions_by_index[sampled_idx] is not None:
-                    best_idx = sampled_idx
+                if 0 <= sampled_idx < len(mask_list) and mask_list[sampled_idx]:
+                    chosen_idx = int(sampled_idx)
 
+            alias_to_canon = getattr(root, "action_alias_to_canonical", {}) or {}
+            canon_idx = int(alias_to_canon.get(int(chosen_idx), int(chosen_idx)))
 
-            if not (0 <= best_idx < len(actions_by_index)):
-                raise RuntimeError(f"best_idx={best_idx} out of range for actions_by_index length={len(actions_by_index)}")
-            if not mask_list[best_idx]:
-                raise RuntimeError(f"best_idx={best_idx} is not valid per mask")
-            action = actions_by_index[best_idx]
+            child = root.children.get(canon_idx)
+            action = child.parent_action if child is not None else None
+            best_idx = int(chosen_idx)  # keep logged best as selected policy index
+
+            
             if action is None:
-                raise RuntimeError(f"actions_by_index[{best_idx}] is None even though mask is True")
+                actions_by_index, mask = self._sample_actions_readonly(state, player)
+                mask_list_fb = _mask_to_list(mask)
+                if not (0 <= chosen_idx < len(actions_by_index)) or not mask_list_fb[chosen_idx]:
+                    valid = [i for i, ok in enumerate(mask_list_fb) if ok and actions_by_index[i] is not None]
+                    if not valid:
+                        if hasattr(self.mcts, "clear_search_state"):
+                            self.mcts.clear_search_state(drop_scratch=True)
+                        break
+                    chosen_idx = int(max(valid, key=lambda i: (float(mcts_prior[i]), -int(i))))
+                    best_idx = int(chosen_idx)  # update best_idx to reflect fallback choice
+                action = actions_by_index[chosen_idx]
+                if action is None:
+                    if hasattr(self.mcts, "clear_search_state"):
+                        self.mcts.clear_search_state(drop_scratch=True)
+                    break
+
+
+
 
             # 2b) Log the actually executed action (after optional sampling).
             # This is separate from mcts.search_dnn() root log, which records
@@ -474,6 +510,31 @@ class SelfPlayRunner:
                 viol, lateness = self.env.evaluate_objective(state)
                 sampled_flag = int(sample_from_mcts_policy and player == "controller")
 
+                sim_time_now = float(state.simulator._time)
+                if str(player).strip().lower() == "adversary":
+                    try:
+                        decision_state_time = float(self.env._v2_current_adv_tick(state))
+                    except Exception:
+                        decision_state_time = sim_time_now
+                else:
+                    decision_state_time = sim_time_now
+
+                state_desc = self.env.describe_state(state)
+                last_adv_raw = state_desc.get("last_adv_tick", "")
+                try:
+                    state_last_adv_tick = None if last_adv_raw in ("", None) else float(last_adv_raw)
+                except Exception:
+                    state_last_adv_tick = None
+
+                decode_counted: dict[int, int] = {}
+                for k, v in (state_desc.get("decode_tokens_counted_by_id") or {}).items():
+                    try:
+                        ik = int(k)
+                        if ik >= 0:
+                            decode_counted[ik] = int(v)
+                    except Exception:
+                        pass
+
                 root_logger.log_root(
                     game_id=int(game_id),
                     root_id=int(root_id),
@@ -492,11 +553,22 @@ class SelfPlayRunner:
                     best_action_json=_action_to_json(action),
                     phase="train_root_applied",
                     cycle_label=f"sampled={sampled_flag}",
-                    sim_time=float(state.simulator._time),
+                    sim_time=sim_time_now,
+                    decision_state_time=float(decision_state_time),
+                    state_pending_adv_tick=bool(state_desc.get("pending_adv_tick", False)),
+                    state_last_adv_tick=state_last_adv_tick,
+                    state_active_ids=[int(x) for x in (state_desc.get("active_request_ids") or [])],
+                    state_completed_request_ids=[int(x) for x in (state_desc.get("completed_request_ids") or [])],
+                    state_decode_credit_balance=int(state_desc.get("decode_credit_balance", 0)),
+                    state_decode_tokens_counted_by_id=decode_counted,
                     slo_violations=int(viol),
                     total_lateness=float(lateness),
                     total_cost=float(float(viol) + float(lateness)),
                 )
+
+
+
+                
 
             # 3) Advance simulator state in-place
             if player == "adversary":
@@ -536,7 +608,7 @@ class SelfPlayRunner:
         cycle_label: str,
         prefer_nonempty_adversary: bool,
     ):
-        # search on fork so arena state is not mutated by search
+        # Search on a fork so arena state is not mutated by search.
         search_state = state.fork(flag=False)
 
         self.mcts.search_dnn(
@@ -553,38 +625,51 @@ class SelfPlayRunner:
         )
 
         try:
-            if player == "controller":
-                actions_by_index, mask = self.env.sample_controller_actions(state, self.mcts._cfg.max_branching)
-            else:
-                actions_by_index, mask = self.env.sample_adversary_actions(state, self.mcts._cfg.max_branching)
-
-            mask_list = _mask_to_list(mask)
-            valid = [i for i, ok in enumerate(mask_list) if ok and actions_by_index[i] is not None]
-            if not valid:
+            root = self.mcts._root
+            if root is None or not root.children:
                 return None, -1
 
-            candidate_valid = list(valid)
-            if player == "adversary" and prefer_nonempty_adversary:
+            # Use canonical children directly from the searched tree.
+            candidate_idxs = [
+                int(i)
+                for i, ch in root.children.items()
+                if ch is not None and ch.parent_action is not None
+            ]
+            if not candidate_idxs:
+                return None, -1
+
+            # Optional arena bias: if adversary has launch actions, prefer those over pure stop/no-op.
+            if player == "adversary" and bool(prefer_nonempty_adversary):
                 nonempty = [
-                    i for i in valid
-                    if isinstance(actions_by_index[i], AdversaryAction)
-                    and len((actions_by_index[i].requests or [])) > 0
+                    i
+                    for i in candidate_idxs
+                    if isinstance(root.children[i].parent_action, AdversaryAction)
+                    and len((root.children[i].parent_action.requests or [])) > 0
                 ]
                 if nonempty:
-                    candidate_valid = nonempty
+                    candidate_idxs = nonempty
 
-            root = self.mcts._root
-            mcts_prior, best_idx = _compute_mcts_prior_from_root(root, mask_list)
+            # Choose by visits first (MCTS policy), then prior, then stable index tie-break.
+            best_idx = max(
+                candidate_idxs,
+                key=lambda i: (
+                    int(getattr(root.children[i], "visits", 0)),
+                    float(getattr(root.children[i], "prior", 0.0)),
+                    -int(i),
+                ),
+            )
 
-            if best_idx not in candidate_valid:
-                best_idx = max(candidate_valid, key=lambda i: (float(mcts_prior[i]), -int(i)))
-
-            action = actions_by_index[int(best_idx)]
+            action = root.children[int(best_idx)].parent_action
+            if action is None:
+                return None, -1
             return action, int(best_idx)
+
         finally:
             if hasattr(self.mcts, "clear_search_state"):
                 self.mcts.clear_search_state(drop_scratch=True)
 
+
+    
 
     def _run_arena_cycle(
         self,
@@ -604,6 +689,7 @@ class SelfPlayRunner:
         arena_max_controller_cleanup_steps: int,
         arena_max_total_turns: int,
         feature_version: int,
+        cycle_file_logger = None,
     ) -> dict:
         state = self.env.clone_state_from_snapshot(base_snapshot, base_stats)
         player = str(base_player)
@@ -640,6 +726,12 @@ class SelfPlayRunner:
                 end_reason = "no_valid_action"
                 break
 
+            # States for Arena logging :
+            sim_before = float(state.simulator._time)
+            player_before = str(player)
+            depth_before = int(depth)
+            turn_before = int(turns)
+
             if player == "adversary":
                 generated = len((action.requests or [])) if isinstance(action, AdversaryAction) else 0
                 state = self.env.apply_adversary_action_only(state, action, inplace=True)
@@ -654,6 +746,31 @@ class SelfPlayRunner:
             depth += 1
             turns += 1
 
+            viol_step, lateness_step = self.env.evaluate_objective(state)
+            step_cost = float(viol_step) + float(lateness_step)
+            state_log = arena_state_snapshot_for_log(self.env, state)
+
+            ## Logging Arena step move :
+            if cycle_file_logger is not None:
+                cycle_file_logger.write_step(
+                    game_id=int(game_id),
+                    cycle_label=str(cycle_label),
+                    phase="arena_step",  # or "cleanup_step" in cleanup loop
+                    turn=int(turn_before),
+                    depth=int(depth_before),
+                    player_acted=str(player_before),
+                    player_to_act_next=str(player),
+                    action_repr=repr(action),
+                    sim_time_before=float(sim_before),
+                    sim_time_after=float(state.simulator._time),
+                    total_cost=step_cost,
+                    slo_violations=int(viol_step),
+                    total_lateness=float(lateness_step),
+                    **state_log,
+                )
+
+
+
         if not end_reason and float(state.simulator._time) >= deadline_t:
             end_reason = "time_limit"
 
@@ -663,16 +780,42 @@ class SelfPlayRunner:
             and float(state.simulator._time) < deadline_t
             and self._has_prefill_pending(state)
         ):
+
+            sim_before = float(state.simulator._time)
+            player_before = str(player)
+            depth_before = int(depth)
+            turn_before = int(turns)
+
             if player == "adversary":
-                state = self.env.apply_adversary_action_only(
-                    state,
-                    AdversaryAction(requests=[], stop_decode_ids=[]),
-                    inplace=True,
-                )
+                noop = AdversaryAction(requests=[], stop_decode_ids=[])
+                state = self.env.apply_adversary_action_only(state, noop, inplace=True)
                 player = "controller"
                 depth += 1
                 turns += 1
+                # Eval logging for noop adversary action in cleanup :
+                viol_step, lateness_step = self.env.evaluate_objective(state)
+                step_cost = float(viol_step) + float(lateness_step)
+                state_log = arena_state_snapshot_for_log(self.env, state)
+
+                if cycle_file_logger is not None:
+                    cycle_file_logger.write_step(
+                        game_id=int(game_id),
+                        cycle_label=str(cycle_label),
+                        phase="cleanup_step",
+                        turn=int(turn_before),
+                        depth=int(depth_before),
+                        player_acted=str(player_before),
+                        player_to_act_next=str(player),
+                        action_repr=repr(noop),
+                        sim_time_before=float(sim_before),
+                        sim_time_after=float(state.simulator._time),
+                        total_cost=step_cost,
+                        slo_violations=int(viol_step),
+                        total_lateness=float(lateness_step),
+                        **state_log,
+                    )
                 continue
+
 
             action, _ = self._pick_mcts_action_for_arena_step(
                 state=state,
@@ -686,6 +829,7 @@ class SelfPlayRunner:
                 cycle_label=str(cycle_label),
                 prefer_nonempty_adversary=False,
             )
+            
             if action is None:
                 end_reason = end_reason or "cleanup_no_valid_action"
                 break
@@ -695,6 +839,28 @@ class SelfPlayRunner:
             depth += 1
             turns += 1
             cleanup_steps += 1
+
+            viol_step, lateness_step = self.env.evaluate_objective(state)
+            step_cost = float(viol_step) + float(lateness_step)
+            state_log = arena_state_snapshot_for_log(self.env, state)   
+            if cycle_file_logger is not None:
+                cycle_file_logger.write_step(
+                    game_id=int(game_id),
+                    cycle_label=str(cycle_label),
+                    phase="cleanup_step",  # or "cleanup_step" in cleanup loop
+                    turn=int(turn_before),
+                    depth=int(depth_before),
+                    player_acted=str(player_before),
+                    player_to_act_next=str(player),
+                    action_repr=repr(action),
+                    sim_time_before=float(sim_before),
+                    sim_time_after=float(state.simulator._time),
+                    total_cost=step_cost,
+                    slo_violations=int(viol_step),
+                    total_lateness=float(lateness_step),
+                    **state_log,
+                )
+
 
         if not end_reason:
             if float(state.simulator._time) >= deadline_t:
@@ -763,7 +929,17 @@ class SelfPlayRunner:
         start_player: str = "adversary",
         start_root_depth: int = 0,
         history_root_id_for_logs: int = 0,
+        cycle_file_logger = None,
     ) -> dict:
+
+        # Util functions for logging :
+        history_events: list[dict] = []
+
+        def _history_cb(ev: dict) -> None:
+            ev2 = dict(ev)
+            ev2["turn"] = len(history_events)
+            history_events.append(ev2)
+
         state = self.env.initial_state()
         player = str(start_player)
         depth = int(start_root_depth)
@@ -781,11 +957,36 @@ class SelfPlayRunner:
                 log_history=True,
                 log_node_id_start=next_log_node_id,
                 log_parent_id_start=last_log_node_id,
+                step_callback=_history_cb,
             )
             self.mcts._node_counter = int(next_log_node_id)
 
         base_snapshot = state.simulator.snapshot_state()
         base_stats = state.stats.clone()
+
+        ## Logging the History Events for the Arena Game :
+
+        if cycle_file_logger is not None and history_events:
+            for cycle_label in ("candidate_as_adversary", "best_as_adversary"):
+                for ev in history_events:
+                    cycle_file_logger.write_step(
+                        game_id=int(game_id),
+                        cycle_label=cycle_label,
+                        phase=f"history_step:{ev.get('phase', '')}",
+                        turn=int(ev.get("turn", 0)),
+                        depth=int(ev.get("depth_before", depth)),
+                        player_acted=str(ev.get("player_acted", "")),
+                        player_to_act_next=str(ev.get("player_to_act_next", "")),
+                        action_repr=str(ev.get("action_repr", "")),
+                        sim_time_before=float(ev.get("sim_time_before", state.simulator._time)),
+                        sim_time_after=float(ev.get("sim_time_after", state.simulator._time)),
+                        total_cost=float(ev.get("total_cost", 0.0)),
+                        slo_violations=int(ev.get("slo_violations", 0)),
+                        total_lateness=float(ev.get("total_lateness", 0.0)),
+                    )
+
+
+        ## Logging ends
 
         cycle_a = self._run_arena_cycle(
             base_snapshot=base_snapshot,
@@ -803,6 +1004,7 @@ class SelfPlayRunner:
             arena_max_controller_cleanup_steps=int(arena_max_controller_cleanup_steps),
             arena_max_total_turns=int(arena_max_total_turns),
             feature_version=int(feature_version),
+            cycle_file_logger=cycle_file_logger,
         )
 
         cycle_b = self._run_arena_cycle(
@@ -821,6 +1023,7 @@ class SelfPlayRunner:
             arena_max_controller_cleanup_steps=int(arena_max_controller_cleanup_steps),
             arena_max_total_turns=int(arena_max_total_turns),
             feature_version=int(feature_version),
+            cycle_file_logger=cycle_file_logger,
         )
 
         ca = float(cycle_a["total_cost"])

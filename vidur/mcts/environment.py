@@ -49,6 +49,9 @@ class VidurGameStats:
     decode_tokens_counted: Dict[int, int] = field(default_factory=dict)
     decode_next_deadline_by_id: Dict[int, float] = field(default_factory=dict)
 
+    dropped_request_ids: Set[int] = field(default_factory=set)
+    stopped_decode_request_ids: Set[int] = field(default_factory=set)
+
     # Prefill bookkeeping: once prefill is complete, we can stop recomputing prefill lateness
     prefill_lateness_finalized: Set[int] = field(default_factory=set)
     violated_request_ids: Set[int] = field(default_factory=set)
@@ -72,6 +75,8 @@ class VidurGameStats:
             decode_next_deadline_by_id=dict(self.decode_next_deadline_by_id),
             prefill_lateness_finalized=set(self.prefill_lateness_finalized),
             violated_request_ids=set(self.violated_request_ids),
+            dropped_request_ids=set(self.dropped_request_ids),
+            stopped_decode_request_ids=set(self.stopped_decode_request_ids),
             active_request_ids=set(self.active_request_ids),
             last_prefill_batch_time=self.last_prefill_batch_time,
         )

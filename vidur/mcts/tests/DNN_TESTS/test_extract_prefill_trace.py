@@ -33,6 +33,108 @@ def _as_int(x: str) -> Optional[int]:
         return None
 
 
+def _as_float(x: str) -> Optional[float]:
+    x = (x or "").strip()
+    if x == "":
+        return None
+    try:
+        return float(x)
+    except ValueError:
+        return None
+
+
+def is_internal_phase(row: Dict[str, str]) -> bool:
+    return (row.get("phase") or "").strip().startswith("internal:")
+
+
+def row_start_time(row: Dict[str, str]) -> float:
+    st = _as_float(row.get("start_time", ""))
+    if st is not None:
+        return st
+    sim_t = _as_float(row.get("sim_time", ""))
+    return 0.0 if sim_t is None else sim_t
+
+
+def row_end_time(row: Dict[str, str]) -> float:
+    et = _as_float(row.get("end_time", ""))
+    if et is not None:
+        return et
+    return row_start_time(row)
+
+
+def _fmt_float(v: float) -> str:
+    return f"{float(v):.15g}"
+
+
+def _sim_iter_key(row: Dict[str, str]) -> int:
+    si = _as_int(row.get("sim_iteration", ""))
+    return si if si is not None else 10**18
+
+
+def _node_key(row: Dict[str, str]) -> int:
+    nid = _as_int(row.get("node_id", ""))
+    return nid if nid is not None else 10**18
+
+
+def _phase_key(row: Dict[str, str]) -> int:
+    return 1 if is_internal_phase(row) else 0
+
+
+def _reorganize_trace_rows_for_readability(
+    rows: List[Dict[str, str]],
+    *,
+    shift_action_time_to_first_internal_start: bool,
+) -> List[Dict[str, str]]:
+    """
+    Reorder rows within each sim_iteration as:
+      non-internal rows first, then internal rows.
+
+    Optional readability tweak:
+      if a sim_iteration has both non-internal and internal rows, shift each
+      non-internal row's sim_time/start_time/end_time to first internal start_time.
+      This makes controller decision rows appear at decision boundary before FF rows.
+    """
+    buckets: Dict[int, List[Dict[str, str]]] = {}
+    for r in rows:
+        buckets.setdefault(_sim_iter_key(r), []).append(r)
+
+    out: List[Dict[str, str]] = []
+    for sim_iter in sorted(buckets.keys()):
+        group = list(buckets[sim_iter])
+        non_internal = [r for r in group if not is_internal_phase(r)]
+        internal = [r for r in group if is_internal_phase(r)]
+
+        non_internal.sort(key=lambda r: (row_start_time(r), row_end_time(r), _node_key(r)))
+        internal.sort(key=lambda r: (row_start_time(r), row_end_time(r), _node_key(r)))
+
+        if shift_action_time_to_first_internal_start and non_internal and internal:
+            first_internal_start = row_start_time(internal[0])
+            shifted_non_internal: List[Dict[str, str]] = []
+            for r in non_internal:
+                rr = dict(r)
+                rr["sim_time"] = _fmt_float(first_internal_start)
+                if "start_time" in rr:
+                    rr["start_time"] = _fmt_float(first_internal_start)
+                if "end_time" in rr:
+                    rr["end_time"] = _fmt_float(first_internal_start)
+                shifted_non_internal.append(rr)
+            non_internal = shifted_non_internal
+
+        out.extend(non_internal)
+        out.extend(internal)
+
+    out.sort(
+        key=lambda r: (
+            _sim_iter_key(r),
+            _phase_key(r),
+            row_start_time(r),
+            row_end_time(r),
+            _node_key(r),
+        )
+    )
+    return out
+
+
 def _default_log_path() -> Path:
     candidates = [
         Path("vidur/simulator_output/mcts_dnn_logs/mcts_iter.csv"),
@@ -90,6 +192,9 @@ def build_tree(rows: List[Dict[str, str]], *, game_id: Optional[int], root_id: O
         return ci < ei
 
     for r in filtered:
+        # Internal rows are debug-only events; they should not affect node tree topology.
+        if is_internal_phase(r):
+            continue
         nid = _as_int(r.get("node_id", ""))
         if nid is None:
             continue
@@ -133,6 +238,30 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--game_id", type=int, default=None)
     ap.add_argument("--root_id", type=int, default=None)
+    ap.add_argument(
+        "--organize_rows",
+        action="store_true",
+        default=True,
+        help="Reorder extracted rows per sim_iteration (action rows before internal rows).",
+    )
+    ap.add_argument(
+        "--no_organize_rows",
+        dest="organize_rows",
+        action="store_false",
+        help="Keep raw chronological ordering from mcts_iter.",
+    )
+    ap.add_argument(
+        "--shift_action_time",
+        action="store_true",
+        default=True,
+        help="When internal rows exist in a sim_iteration, shift action-row sim/start/end to first internal start_time.",
+    )
+    ap.add_argument(
+        "--no_shift_action_time",
+        dest="shift_action_time",
+        action="store_false",
+        help="Do not shift action-row times.",
+    )
     args = ap.parse_args()
 
     log_path = Path(args.log_path) if args.log_path else _default_log_path()
@@ -168,7 +297,48 @@ def main() -> None:
     rng = random.Random(int(args.seed))
     chosen_adv, chosen_len, chosen_path = rng.choice(best)
 
-    trace_rows: List[Dict[str, str]] = [node_row[nid] for nid in chosen_path if nid in node_row]
+    path_rows: List[Dict[str, str]] = [node_row[nid] for nid in chosen_path if nid in node_row]
+    if not path_rows:
+        raise SystemExit("Chosen path is empty.")
+
+    chosen_game = _as_int(path_rows[0].get("game_id", ""))
+    chosen_root = _as_int(path_rows[0].get("root_id", ""))
+    chosen_iters = {
+        _as_int(r.get("sim_iteration", ""))
+        for r in path_rows
+        if _as_int(r.get("sim_iteration", "")) is not None
+    }
+
+    trace_rows: List[Dict[str, str]] = []
+    for r in rows:
+        gid = _as_int(r.get("game_id", ""))
+        rid = _as_int(r.get("root_id", ""))
+        sid = _as_int(r.get("sim_iteration", ""))
+
+        if chosen_game is not None and gid != chosen_game:
+            continue
+        if chosen_root is not None and rid != chosen_root:
+            continue
+        if sid not in chosen_iters:
+            continue
+
+        trace_rows.append(r)
+
+    trace_rows.sort(
+        key=lambda r: (
+            _sim_iter_key(r),
+            row_start_time(r),
+            row_end_time(r),
+            _phase_key(r),
+            _node_key(r),
+        )
+    )
+
+    if bool(args.organize_rows):
+        trace_rows = _reorganize_trace_rows_for_readability(
+            trace_rows,
+            shift_action_time_to_first_internal_start=bool(args.shift_action_time),
+        )
 
     out_dir = Path(__file__).resolve().parent
     out_path = Path(args.out_path) if args.out_path else (out_dir / "extracted_trace.csv")
@@ -183,7 +353,9 @@ def main() -> None:
     print(f"[OK] log_path={log_path}")
     print(f"[OK] wrote trace to {out_path}")
     print(f"[OK] chosen trace length={chosen_len} adversary_prefill_sends={chosen_adv}")
-    print("[TRACE] node_ids:", " -> ".join(str(_as_int(r.get('node_id','')) or '?') for r in trace_rows))
+    print(f"[TRACE] extracted_rows={len(trace_rows)}")
+    print(f"[TRACE] chosen_path_nodes={len(chosen_path)}")
+    print("[TRACE] path_node_ids:", " -> ".join(str(nid) for nid in chosen_path))
 
 
 if __name__ == "__main__":
