@@ -23,13 +23,18 @@ struct SearchInput {
 
     // Search hyper-parameters (mirroring Python defaults unless overridden).
     int max_forced_hops = 2000;
-    double pb_c_base = 5000.0;
-    double pb_c_init = 0.75;
+    double pb_c_base = 1500.0; // Decrease for more exploration : normal value 5000
+    double pb_c_init = 1.50; // Increase for more exploration at low visit counts : normal value 0.75
     double discount_factor = 0.98;
     double prefill_step_time = 0.015725797204323228;
     double reward_knee = 25.0;
     double reward_max_penalty = 40.0;
     double reward_tail_alpha = 1.0 / 15.0;
+
+    // Root Dirichlet noise (AlphaZero style): root-only
+    bool root_dirichlet_noise_enabled = false;
+    double root_dirichlet_alpha = 0.3;
+    double root_dirichlet_epsilon = 0.25;
 
     // Environment/simulator config (optional overrides).
     GV2EnvConfig env_cfg;

@@ -270,7 +270,7 @@ class MCTSSearchConfig:
     prior_value_mode: str = "model"  # "model" | "uniform"
     root_dirichlet_noise_enabled: bool = True
     root_dirichlet_alpha: float = 0.6
-    root_dirichlet_epsilon: float = 0.25
+    root_dirichlet_epsilon: float = 0.35
 
     # Time-discount config
     discount_factor: float = 0.98
@@ -454,7 +454,7 @@ class MultipleProcessTrainingConfig:
 
     num_processes: int = 20
     num_generations: int = 500
-    roots_per_generation: int = 6000
+    roots_per_generation: int = 2000
 
     adv_iterations_per_root: int = 1000
     cont_iterations_per_root: int = 1000
@@ -469,9 +469,9 @@ class MultipleProcessTrainingConfig:
     history_max_total_steps: int = 20000
     log_history_rows: bool = True
 
-    sample_from_mcts_policy: bool = False
-    selfplay_policy_temperature: float = 1.0
-    action_seed_base: int = 0
+    sample_from_mcts_policy: bool = True
+    selfplay_policy_temperature: float = 2.0 # increase the temperature for more exploration in the sampled actions from the mcts policy during self-play, which can lead to more diverse training data and potentially better generalization of the trained model. Tune this parameter based on the desired level of exploration vs exploitation in the self-play data generation.
+    action_seed_base: int = 4 ## used for the dirichlet noise + potential future stochasticity in action sampling in root creation for training
 
     replay_capacity_samples: int = 56000
     replay_max_cached_shards: int = 12000

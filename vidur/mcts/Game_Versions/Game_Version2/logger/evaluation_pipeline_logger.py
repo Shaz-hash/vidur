@@ -199,6 +199,7 @@ class EvaluationMetricsLogger:
         "candidate_checkpoint",
         "best_checkpoint_before",
         "best_checkpoint_after",
+        "candidate_train_samples_used",
         "num_games",
         "candidate_points",
         "best_points",
@@ -222,7 +223,24 @@ class EvaluationMetricsLogger:
         if self._writer is not None:
             return
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        write_header = not self._path.exists()
+        expected_header = ",".join(self.FIELDS)
+        write_header = True
+        if self._path.exists():
+            try:
+                if self._path.stat().st_size > 0:
+                    write_header = False
+                    with self._path.open("r", encoding="utf-8") as f:
+                        existing_header = f.readline().rstrip("\n")
+                    if existing_header != expected_header:
+                        raise ValueError(
+                            f"Existing eval metrics header mismatch at {self._path}.\n"
+                            f"Expected: {expected_header}\n"
+                            f"Found:    {existing_header}\n"
+                            "Delete/rename old eval metrics CSV or update logger fields."
+                        )
+            except OSError:
+                write_header = True
+
         self._file = self._path.open("a", newline="", encoding="utf-8")
         self._writer = csv.DictWriter(self._file, fieldnames=self.FIELDS)
         if write_header:
@@ -235,6 +253,7 @@ class EvaluationMetricsLogger:
         candidate_checkpoint: str,
         best_checkpoint_before: str,
         best_checkpoint_after: str,
+        candidate_train_samples_used: int,
         num_games: int,
         candidate_points: float,
         best_points: float,
@@ -252,9 +271,7 @@ class EvaluationMetricsLogger:
         row = {
             "time": float(time.time()),
             "generation": int(generation),
-            "candidate_checkpoint": str(candidate_checkpoint),
-            "best_checkpoint_before": str(best_checkpoint_before),
-            "best_checkpoint_after": str(best_checkpoint_after),
+            "candidate_train_samples_used": int(candidate_train_samples_used),
             "num_games": int(num_games),
             "candidate_points": float(candidate_points),
             "best_points": float(best_points),
@@ -265,6 +282,9 @@ class EvaluationMetricsLogger:
             "promoted_to_best": bool(promoted_to_best),
             "arena_results_csv": str(arena_results_csv),
             "arena_games_dir": str(arena_games_dir),
+            "candidate_checkpoint": str(candidate_checkpoint),
+            "best_checkpoint_before": str(best_checkpoint_before),
+            "best_checkpoint_after": str(best_checkpoint_after),
         }
 
         self._writer.writerow(row)

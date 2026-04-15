@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <iomanip>
 #include <initializer_list>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -267,6 +268,160 @@ std::string json_i32_i32_map(const std::unordered_map<int, int>& mp) {
         oss << "\"" << keys[i] << "\":" << it->second;
     }
     oss << "}";
+    return oss.str();
+}
+
+std::string json_i32_f64_map(const std::unordered_map<int, double>& mp) {
+    std::vector<int> keys;
+    keys.reserve(mp.size());
+    for (const auto& kv : mp) keys.push_back(kv.first);
+    std::sort(keys.begin(), keys.end());
+    std::ostringstream oss;
+    oss << std::setprecision(17);
+    oss << "{";
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        if (i > 0) oss << ",";
+        const auto it = mp.find(keys[i]);
+        if (it == mp.end()) continue;
+        oss << "\"" << keys[i] << "\":" << it->second;
+    }
+    oss << "}";
+    return oss.str();
+}
+
+std::string json_escape(const std::string& s) {
+    std::ostringstream oss;
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"': oss << "\\\""; break;
+            case '\\': oss << "\\\\"; break;
+            case '\b': oss << "\\b"; break;
+            case '\f': oss << "\\f"; break;
+            case '\n': oss << "\\n"; break;
+            case '\r': oss << "\\r"; break;
+            case '\t': oss << "\\t"; break;
+            default:
+                if (c < 0x20u) {
+                    oss << "\\u" << std::hex << std::setw(4) << std::setfill('0')
+                        << static_cast<int>(c) << std::dec << std::setfill(' ');
+                } else {
+                    oss << static_cast<char>(c);
+                }
+        }
+    }
+    return oss.str();
+}
+
+std::string json_string(const std::string& s) {
+    return "\"" + json_escape(s) + "\"";
+}
+
+std::string json_string_vec(const std::vector<std::string>& xs) {
+    std::ostringstream oss;
+    oss << "[";
+    for (std::size_t i = 0; i < xs.size(); ++i) {
+        if (i > 0) oss << ",";
+        oss << json_string(xs[i]);
+    }
+    oss << "]";
+    return oss.str();
+}
+
+std::string build_native_config_json(
+    const SearchInput& in,
+    int model_version,
+    const std::string& iter_log_path,
+    const std::string& root_log_path) {
+    std::ostringstream oss;
+    oss << std::setprecision(17);
+    oss << "{\n";
+    oss << "  \"contract_version\": " << json_string(in.contract_version) << ",\n";
+    oss << "  \"model_version\": " << model_version << ",\n";
+    oss << "  \"root\": {\n";
+    oss << "    \"player\": " << json_string(in.root_player) << ",\n";
+    oss << "    \"iterations\": " << in.iterations << ",\n";
+    oss << "    \"game_id\": " << in.game_id << ",\n";
+    oss << "    \"root_id\": " << in.root_id << ",\n";
+    oss << "    \"root_node_id\": " << in.root_node_id << ",\n";
+    oss << "    \"root_depth\": " << in.root_depth << ",\n";
+    oss << "    \"seed\": " << in.seed << ",\n";
+    oss << "    \"decision_state_time\": " << in.decision_state_time << ",\n";
+    oss << "    \"root_phase\": " << json_string(in.root_phase) << ",\n";
+    oss << "    \"cycle_label\": " << json_string(in.cycle_label) << "\n";
+    oss << "  },\n";
+    oss << "  \"search\": {\n";
+    oss << "    \"max_forced_hops\": " << in.max_forced_hops << ",\n";
+    oss << "    \"pb_c_base\": " << in.pb_c_base << ",\n";
+    oss << "    \"pb_c_init\": " << in.pb_c_init << ",\n";
+    oss << "    \"discount_factor\": " << in.discount_factor << ",\n";
+    oss << "    \"prefill_step_time\": " << in.prefill_step_time << ",\n";
+    oss << "    \"reward_knee\": " << in.reward_knee << ",\n";
+    oss << "    \"reward_max_penalty\": " << in.reward_max_penalty << ",\n";
+    oss << "    \"reward_tail_alpha\": " << in.reward_tail_alpha << ",\n";
+    oss << "    \"reuse_root_infer_inputs\": " << (in.reuse_root_infer_inputs ? "true" : "false") << ",\n";
+    oss << "    \"root_dirichlet_noise_enabled\": " << (in.root_dirichlet_noise_enabled ? "true" : "false") << ",\n";
+    oss << "    \"root_dirichlet_alpha\": " << in.root_dirichlet_alpha << ",\n";
+    oss << "    \"root_dirichlet_epsilon\": " << in.root_dirichlet_epsilon << "\n";
+    oss << "  },\n";
+    oss << "  \"environment\": {\n";
+    oss << "    \"adversary_tick_sec\": " << in.env_cfg.adversary_tick_sec << ",\n";
+    oss << "    \"launch_window_sec\": " << in.env_cfg.launch_window_sec << ",\n";
+    oss << "    \"max_requests_per_launch_window\": " << in.env_cfg.max_requests_per_launch_window << ",\n";
+    oss << "    \"prefill_window_cap_tokens\": " << in.env_cfg.prefill_window_cap_tokens << ",\n";
+    oss << "    \"max_prefill_tokens_per_request\": " << in.env_cfg.max_prefill_tokens_per_request << ",\n";
+    oss << "    \"max_decode_tokens_per_request\": " << in.env_cfg.max_decode_tokens_per_request << ",\n";
+    oss << "    \"min_decode_tokens_per_request\": " << in.env_cfg.min_decode_tokens_per_request << ",\n";
+    oss << "    \"decode_slo_time_default\": " << in.env_cfg.decode_slo_time_default << ",\n";
+    oss << "    \"auto_drop_lateness_sec\": " << in.env_cfg.auto_drop_lateness_sec << ",\n";
+    oss << "    \"drop_cost\": " << in.env_cfg.drop_cost << ",\n";
+    oss << "    \"controller_noop_prefill_only_jump_to_next_adv_tick\": "
+        << (in.env_cfg.controller_noop_prefill_only_jump_to_next_adv_tick ? "true" : "false") << ",\n";
+    oss << "    \"enforce_nonnegative_decode_credits\": "
+        << (in.env_cfg.enforce_nonnegative_decode_credits ? "true" : "false") << ",\n";
+    oss << "    \"decode_credit_mint_per_prefill_complete\": " << in.env_cfg.decode_credit_mint_per_prefill_complete
+        << ",\n";
+    oss << "    \"adversary_sampler\": {\n";
+    oss << "      \"max_launch_count_per_tick\": " << in.env_cfg.adversary_sampler.max_launch_count_per_tick << ",\n";
+    oss << "      \"allowed_prefill_tokens\": " << json_i32_vec(in.env_cfg.adversary_sampler.allowed_prefill_tokens) << ",\n";
+    oss << "      \"stop_rule_names\": " << json_string_vec(in.env_cfg.adversary_sampler.stop_rule_names) << ",\n";
+    oss << "      \"strict_masking\": " << (in.env_cfg.adversary_sampler.strict_masking ? "true" : "false") << ",\n";
+    oss << "      \"prefill_slo_by_tokens\": " << json_i32_f64_map(in.env_cfg.adversary_sampler.prefill_slo_by_tokens) << "\n";
+    oss << "    },\n";
+    oss << "    \"controller_sampler\": {\n";
+    oss << "      \"eviction_rule_names\": " << json_string_vec(in.env_cfg.controller_sampler.eviction_rule_names) << ",\n";
+    oss << "      \"prefill_budget_options\": " << json_i32_vec(in.env_cfg.controller_sampler.prefill_budget_options) << ",\n";
+    oss << "      \"ordering_heuristics\": " << json_string_vec(in.env_cfg.controller_sampler.ordering_heuristics) << ",\n";
+    oss << "      \"strict_masking\": " << (in.env_cfg.controller_sampler.strict_masking ? "true" : "false") << ",\n";
+    oss << "      \"prefill_eta_tokens_per_sec\": " << in.env_cfg.controller_sampler.prefill_eta_tokens_per_sec << ",\n";
+    oss << "      \"enforce_nonnegative_decode_credits\": "
+        << (in.env_cfg.controller_sampler.enforce_nonnegative_decode_credits ? "true" : "false") << "\n";
+    oss << "    }\n";
+    oss << "  },\n";
+    oss << "  \"simulator\": {\n";
+    oss << "    \"predictor_csv_path\": " << json_string(in.predictor_csv_path) << ",\n";
+    oss << "    \"adversary_tick_sec\": " << in.sim_cfg.adversary_tick_sec << ",\n";
+    oss << "    \"prefill_profile_tokens\": " << json_i32_vec(in.sim_cfg.prefill_profile_tokens) << ",\n";
+    oss << "    \"prefill_profile_times\": " << json_f64_vec(in.sim_cfg.prefill_profile_times) << ",\n";
+    oss << "    \"fallback_total_time_sec\": " << in.sim_cfg.fallback_total_time_sec << ",\n";
+    oss << "    \"fallback_model_time_sec\": " << in.sim_cfg.fallback_model_time_sec << "\n";
+    oss << "  },\n";
+    oss << "  \"inputs\": {\n";
+    oss << "    \"action_mask_size\": " << in.action_mask.size() << ",\n";
+    oss << "    \"global_feature_size\": " << in.global_features.size() << ",\n";
+    oss << "    \"prefill_req_n\": " << in.root_infer_inputs.prefill_req_n << ",\n";
+    oss << "    \"prefill_req_d\": " << in.root_infer_inputs.prefill_req_d << ",\n";
+    oss << "    \"decode_req_n\": " << in.root_infer_inputs.decode_req_n << ",\n";
+    oss << "    \"decode_req_d\": " << in.root_infer_inputs.decode_req_d << ",\n";
+    oss << "    \"req_n\": " << in.root_infer_inputs.req_n << ",\n";
+    oss << "    \"req_d\": " << in.root_infer_inputs.req_d << "\n";
+    oss << "  },\n";
+    oss << "  \"logging\": {\n";
+    oss << "    \"log_events\": " << (in.log_events ? "true" : "false") << ",\n";
+    oss << "    \"profile\": " << (in.profile ? "true" : "false") << ",\n";
+    oss << "    \"iter_log_path\": " << json_string(iter_log_path) << ",\n";
+    oss << "    \"root_log_path\": " << json_string(root_log_path) << "\n";
+    oss << "  }\n";
+    oss << "}\n";
     return oss.str();
 }
 
@@ -891,6 +1046,16 @@ py::dict search_mcts_dnn_gv2_torchscript(
     in.pb_c_base = get_double({"pb_c_base", "mcts_pb_c_base"}, in.pb_c_base);
     in.pb_c_init = get_double({"pb_c_init", "mcts_pb_c_init"}, in.pb_c_init);
     in.discount_factor = get_double({"discount_factor", "mcts_discount_factor"}, in.discount_factor);
+    in.root_dirichlet_noise_enabled = get_bool(
+        {"root_dirichlet_noise_enabled"},
+        in.root_dirichlet_noise_enabled);
+    in.root_dirichlet_alpha = get_double(
+        {"root_dirichlet_alpha"},
+        in.root_dirichlet_alpha);
+    in.root_dirichlet_epsilon = get_double(
+        {"root_dirichlet_epsilon"},
+        in.root_dirichlet_epsilon);
+
     // in.prefill_step_time = get_double({"prefill_step_time"}, in.prefill_step_time);
     in.prefill_step_time = get_double({"discount_time_denominator_sec", "prefill_step_time"},in.prefill_step_time);
     in.reward_knee = get_double({"reward_knee"}, in.reward_knee);
@@ -950,6 +1115,14 @@ py::dict search_mcts_dnn_gv2_torchscript(
     in.sim_cfg.fallback_model_time_sec = get_double(
         {"fallback_model_time_sec"},
         in.sim_cfg.fallback_model_time_sec);
+
+    if (log_events && (!iter_log_path.empty() || !root_log_path.empty())) {
+        const std::string config_json_path = default_native_config_json_path(iter_log_path, root_log_path);
+        if (!config_json_path.empty()) {
+            NativeConfigJsonLogger config_logger(config_json_path);
+            config_logger.write_once(build_native_config_json(in, model_version, iter_log_path, root_log_path));
+        }
+    }
 
     SearchOutput out = run_search_torchscript(in, infer_runtime, model_version);
 

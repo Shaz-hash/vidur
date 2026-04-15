@@ -219,4 +219,35 @@ void NativeRootCsvLogger::write(const NativeRootLogRow& row) {
     maybe_flush();
 }
 
+NativeConfigJsonLogger::NativeConfigJsonLogger(std::string path)
+    : path_(std::move(path)) {}
+
+void NativeConfigJsonLogger::write_once(const std::string& json_payload) {
+    if (path_.empty()) return;
+    ensure_parent_dir(path_);
+    if (file_has_content(path_)) return;
+
+    std::ofstream out(path_, std::ios::out | std::ios::trunc);
+    if (!out.good()) {
+        throw std::runtime_error("Failed to open native config log: " + path_);
+    }
+    out << json_payload;
+    out.flush();
+}
+
+std::string default_native_config_json_path(
+    const std::string& iter_log_path,
+    const std::string& root_log_path) {
+    const std::string& base = root_log_path.empty() ? iter_log_path : root_log_path;
+    if (base.empty()) return "";
+
+    std::filesystem::path p(base);
+    std::filesystem::path dir = p.has_parent_path() ? p.parent_path() : std::filesystem::path(".");
+    std::string stem = p.stem().string();
+    if (stem.empty()) {
+        return (dir / "native_config.json").string();
+    }
+    return (dir / (stem + ".config.json")).string();
+}
+
 }  // namespace mcts_native_gv2

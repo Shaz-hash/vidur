@@ -44,6 +44,53 @@ def _safe_int(x: Any, default: int = 0) -> int:
         return default
 
 
+def _compact_action_repr(s: str, max_len: int = 72) -> str:
+    t = " ".join(str(s or "").split())
+    if len(t) <= max_len:
+        return t
+    return t[: max_len - 3] + "..."
+
+
+
+def _topk_actions_json(
+    probs: Sequence[float],
+    valid_mask: Sequence[bool],
+    action_repr_by_index: Optional[Dict[int, str]],
+    k: int = 5,
+) -> str:
+    if not probs:
+        return "[]"
+
+    mask = list(valid_mask) if valid_mask is not None else []
+    cand: list[tuple[int, float]] = []
+
+    for i, p in enumerate(probs):
+        if mask:
+            if i >= len(mask) or not bool(mask[i]):
+                continue
+        cand.append((int(i), float(p)))
+
+    if not cand:
+        cand = [(int(i), float(p)) for i, p in enumerate(probs)]
+
+    cand.sort(key=lambda x: (x[1], -x[0]), reverse=True)
+
+    out = []
+    amap = action_repr_by_index or {}
+    for i, p in cand[: max(0, int(k))]:
+        raw = amap.get(int(i), "")
+        label = _compact_action_repr(raw) if str(raw or "").strip() else f"idx={int(i)}"
+        out.append(
+            {
+                "i": int(i),
+                "p": round(float(p), 6),
+                "a": label,
+            }
+        )
+    return _j(out)
+
+
+
 class DNNMCTSIterationLogger:
     """
     One row per MCTS simulation step (per root).
@@ -90,13 +137,16 @@ class DNNMCTSIterationLogger:
         "num_valid_actions",
         "unique_actions",
 
-
         # values
         "nn_value_controller",
         # "mcts_value_controller",
 
         # absolute cost snapshot (optional but useful)
         "objective_cost",
+
+        "model_top5_actions_json",
+        "mcts_top5_actions_json",
+
 
         # simulator snapshot fields (same as your old logger)
         "sim_time",
@@ -608,9 +658,11 @@ class DNNMCTSRootSummaryLogger:
         "model_root_prior_json",
         "normalized_root_prior_json",
         "valid_action_mask_json",
+        "model_top5_actions_json",
 
         "mcts_root_value_controller",
         "mcts_root_prior_json",
+        "mcts_top5_actions_json",
         "best_action_index",
         "best_action_mcts_prob",
         "best_action_model_prob",
@@ -695,6 +747,9 @@ class DNNMCTSRootSummaryLogger:
 
         mcts_root_value_controller: float,
         mcts_root_prior: Sequence[float],
+
+        action_repr_by_index: Optional[Dict[int, str]] = None,
+
         # best_action_index: int,
         best_action_index: Optional[int],
         best_action_repr: str = "",
@@ -735,12 +790,29 @@ class DNNMCTSRootSummaryLogger:
             "num_simulations": int(num_simulations),
 
             "model_root_value_controller": _safe_float(model_root_value_controller),
-            "model_root_prior_json": _j(list(model_root_prior)),
-            "normalized_root_prior_json": _j(list(normalized_root_prior)),
-            "valid_action_mask_json": _j(list(valid_action_mask)),
+
+            # Keep legacy columns present in schema but empty to avoid wide logs.
+            "model_root_prior_json": "",
+            "normalized_root_prior_json": "",
+            "valid_action_mask_json": "",
+            "model_top5_actions_json": _topk_actions_json(
+                model_root_prior, valid_action_mask, action_repr_by_index, k=5
+            ),
 
             "mcts_root_value_controller": _safe_float(mcts_root_value_controller),
-            "mcts_root_prior_json": _j(list(mcts_root_prior)),
+            # Keep legacy column present in schema but empty to avoid wide logs.
+            "mcts_root_prior_json": "",
+            "mcts_top5_actions_json": _topk_actions_json(
+                mcts_root_prior, valid_action_mask, action_repr_by_index, k=5
+            ),
+
+
+            # "model_root_prior_json": _j(list(model_root_prior)),
+            # "normalized_root_prior_json": _j(list(normalized_root_prior)),
+            # "valid_action_mask_json": _j(list(valid_action_mask)),
+
+            # "mcts_root_value_controller": _safe_float(mcts_root_value_controller),
+            # "mcts_root_prior_json": _j(list(mcts_root_prior)),
             # "best_action_index": int(best_action_index),
             "best_action_index": "" if best_action_index is None else int(best_action_index),
             "best_action_mcts_prob": _safe_float(best_mcts),

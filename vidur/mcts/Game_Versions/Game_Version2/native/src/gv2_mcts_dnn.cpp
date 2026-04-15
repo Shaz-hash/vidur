@@ -415,6 +415,10 @@ public:
         out.root_state_cost = root->state_cost;
         out.root_sim_time = root->sim_time;
 
+        const bool root_nn_called = std::get<1>(root_expand);
+        apply_root_dirichlet_noise(root.get(), root_nn_called, root_valid_actions);
+
+
         // Root NN payload; for forced/terminal roots keep deterministic fallback.
         if (root->has_nn_value) {
             out.root_nn_value_controller = root->nn_value_controller;
@@ -688,6 +692,116 @@ private:
         }
         return prior_score + value_score;
     }
+
+    void apply_root_dirichlet_noise(TreeNode* root, bool nn_called, int num_valid_actions) {
+        if (root == nullptr) return;
+        if (!in_.root_dirichlet_noise_enabled) return;
+        if (!nn_called) return;
+        if (num_valid_actions <= 1) return;
+        if (root->children.empty()) return;
+
+        const double alpha = in_.root_dirichlet_alpha;
+        double eps = in_.root_dirichlet_epsilon;
+
+        if (alpha <= 0.0 || eps <= 0.0) return;
+        eps = clampv(eps, 0.0, 1.0);
+
+        std::vector<int> child_indices;
+        child_indices.reserve(root->children.size());
+        for (const auto& kv : root->children) child_indices.push_back(kv.first);
+        std::sort(child_indices.begin(), child_indices.end());
+
+        const int n = static_cast<int>(child_indices.size());
+        if (n <= 1) return;
+
+        std::gamma_distribution<double> gamma(alpha, 1.0);
+        std::vector<double> noise_raw(static_cast<std::size_t>(n), 0.0);
+        double s = 0.0;
+        for (int i = 0; i < n; ++i) {
+            const double g = gamma(rng_);
+            noise_raw[static_cast<std::size_t>(i)] = g;
+            s += g;
+        }
+
+        std::vector<double> noise(static_cast<std::size_t>(n), 0.0);
+        if (s <= 1e-12) {
+            const double u = 1.0 / static_cast<double>(n);
+            std::fill(noise.begin(), noise.end(), u);
+        } else {
+            const double inv_s = 1.0 / s;
+            for (int i = 0; i < n; ++i) {
+                noise[static_cast<std::size_t>(i)] = noise_raw[static_cast<std::size_t>(i)] * inv_s;
+            }
+        }
+
+        std::unordered_map<int, double> mixed;
+        mixed.reserve(child_indices.size());
+        for (int j = 0; j < n; ++j) {
+            const int idx = child_indices[static_cast<std::size_t>(j)];
+            auto it = root->children.find(idx);
+            if (it == root->children.end() || it->second == nullptr) continue;
+            const double p = std::max(0.0, it->second->prior);
+            mixed[idx] = (1.0 - eps) * p + eps * noise[static_cast<std::size_t>(j)];
+        }
+
+        double z = 0.0;
+        for (const auto& kv : mixed) z += kv.second;
+
+        if (z <= 1e-12) {
+            const double u = 1.0 / static_cast<double>(n);
+            for (int idx : child_indices) {
+                auto it = root->children.find(idx);
+                if (it != root->children.end() && it->second != nullptr) {
+                    it->second->prior = u;
+                }
+            }
+        } else {
+            const double inv_z = 1.0 / z;
+            for (int idx : child_indices) {
+                auto it = root->children.find(idx);
+                if (it != root->children.end() && it->second != nullptr) {
+                    it->second->prior = std::max(0.0, mixed[idx]) * inv_z;
+                }
+            }
+        }
+
+        // Keep alias-level debug priors aligned with noisy root child priors.
+        if (!root->nn_priors_after_threshold.empty()) {
+            const int a = static_cast<int>(root->nn_priors_after_threshold.size());
+            std::vector<double> noisy_full(static_cast<std::size_t>(a), 0.0);
+
+            if (!root->canonical_to_action_aliases.empty()) {
+                for (const auto& kv : root->canonical_to_action_aliases) {
+                    const int canon = kv.first;
+                    auto itc = root->children.find(canon);
+                    if (itc == root->children.end() || itc->second == nullptr) continue;
+
+                    std::vector<int> alias_ids;
+                    alias_ids.reserve(kv.second.size());
+                    for (int x : kv.second) {
+                        if (x >= 0 && x < a) alias_ids.push_back(x);
+                    }
+                    if (alias_ids.empty()) continue;
+
+                    const double share = itc->second->prior / static_cast<double>(alias_ids.size());
+                    for (int ai : alias_ids) {
+                        noisy_full[static_cast<std::size_t>(ai)] = share;
+                    }
+                }
+            } else {
+                for (const auto& kv : root->children) {
+                    const int idx = kv.first;
+                    if (idx >= 0 && idx < a && kv.second != nullptr) {
+                        noisy_full[static_cast<std::size_t>(idx)] = kv.second->prior;
+                    }
+                }
+            }
+
+            root->nn_priors_after_threshold = std::move(noisy_full);
+        }
+    }
+
+
 
     SelectionResult select_child(TreeNode* node) {
         SelectionResult out;

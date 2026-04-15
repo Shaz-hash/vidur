@@ -149,4 +149,17 @@ private:
     void maybe_flush();
 };
 
+class NativeConfigJsonLogger {
+public:
+    explicit NativeConfigJsonLogger(std::string path);
+    void write_once(const std::string& json_payload);
+
+private:
+    std::string path_;
+};
+
+std::string default_native_config_json_path(
+    const std::string& iter_log_path,
+    const std::string& root_log_path);
+
 }  // namespace mcts_native_gv2

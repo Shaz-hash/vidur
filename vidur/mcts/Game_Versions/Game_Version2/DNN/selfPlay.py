@@ -157,6 +157,37 @@ def _action_to_json(action) -> str:
     return ""
 
 
+def _compact_action_label(action: Any) -> str:
+    try:
+        if isinstance(action, AdversaryAction):
+            reqs = list(action.requests or [])
+            n_req = int(len(reqs))
+            pf_vals = sorted({int(getattr(r, "prefill_tokens", 0)) for r in reqs if r is not None})
+            if not pf_vals:
+                pf_txt = "-"
+            elif len(pf_vals) == 1:
+                pf_txt = str(int(pf_vals[0]))
+            else:
+                pf_txt = "{%s}" % ("/".join(str(int(x)) for x in pf_vals[:3]) + ("+" if len(pf_vals) > 3 else ""))
+            stop_ids = sorted(int(x) for x in (action.stop_decode_ids or []))
+            stop_txt = "none" if not stop_ids else ",".join(str(x) for x in stop_ids[:3]) + ("+" if len(stop_ids) > 3 else "")
+            return f"A:n={n_req},pf={pf_txt},stop={stop_txt}"
+
+        if isinstance(action, ControllerAction):
+            budget = int(getattr(action, "token_budget", 0) or 0)
+            pre = {int(k): int(v) for k, v in (getattr(action, "prefill_allocations", {}) or {}).items()}
+            dec = {int(k): int(v) for k, v in (getattr(action, "decode_allocations", {}) or {}).items()}
+            pre_total = int(sum(pre.values()))
+            dec_total = int(sum(dec.values()))
+            strategy = str(getattr(action, "strategy", "") or "")
+            eviction = strategy.split("|")[-1] if strategy else "none"
+            heur = str(getattr(action, "heuristic", "") or "-")
+            return f"C:b={budget},pf={pre_total},dc={dec_total},ev={eviction},h={heur}"
+    except Exception:
+        return ""
+    return ""
+
+
 
 @dataclass(frozen=True)
 class SingleRootRun:
@@ -636,11 +667,33 @@ class SelfPlayRunner:
             mcts_prior = list(root_res.mcts_prior)
             best_idx = int(root_res.best_idx)
 
+            # chosen_idx = int(best_idx)
+            # # Sampling
+            # if sample_from_mcts_policy and player == "controller":
+            #     node_seed = (
+            #         int(action_seed_base) * 1000003 + int(game_id) * 9176 + int(root_id) * 37 + int(depth) * 13
+            #     )
+            #     sampled_idx = _sample_action_from_mcts_policy(
+            #         prior=mcts_prior,
+            #         mask=mask_list,
+            #         temperature=float(selfplay_policy_temperature),
+            #         seed=int(node_seed),
+            #     )
+            #     if 0 <= sampled_idx < len(mask_list) and mask_list[sampled_idx]:
+            #         chosen_idx = int(sampled_idx)
+
+
             chosen_idx = int(best_idx)
-            # Sampling
-            if sample_from_mcts_policy and player == "controller":
+            # Sampling (enabled for both controller and adversary)
+            did_policy_sample = False
+            if sample_from_mcts_policy:
+                player_salt = 1 if player == "adversary" else 0
                 node_seed = (
-                    int(action_seed_base) * 1000003 + int(game_id) * 9176 + int(root_id) * 37 + int(depth) * 13
+                    int(action_seed_base) * 1000003
+                    + int(game_id) * 9176
+                    + int(root_id) * 37
+                    + int(depth) * 13
+                    + int(player_salt)
                 )
                 sampled_idx = _sample_action_from_mcts_policy(
                     prior=mcts_prior,
@@ -650,6 +703,8 @@ class SelfPlayRunner:
                 )
                 if 0 <= sampled_idx < len(mask_list) and mask_list[sampled_idx]:
                     chosen_idx = int(sampled_idx)
+                    did_policy_sample = True
+
 
             alias_to_canon = getattr(root, "action_alias_to_canonical", {}) or {}
             canon_idx = int(alias_to_canon.get(int(chosen_idx), int(chosen_idx)))
@@ -682,7 +737,9 @@ class SelfPlayRunner:
             # 2b) Apply selected action in-place first, then log applied-state root row.
             player_acted = str(player)
             root_depth_before = int(depth)
-            sampled_flag = int(sample_from_mcts_policy and player_acted == "controller")
+            # sampled_flag = int(sample_from_mcts_policy and player_acted == "controller")
+            sampled_flag = int(did_policy_sample)
+
             try:
                 if player_acted == "adversary":
                     decision_state_time_for_row = float(search_root_state.simulator._time)
@@ -763,6 +820,33 @@ class SelfPlayRunner:
                     except Exception:
                         pass
 
+                action_repr_by_index: dict[int, str] = {}
+                try:
+                    alias_to_canon = getattr(root, "action_alias_to_canonical", {}) or {}
+                    n_actions = max(len(model_prior), len(mcts_prior), len(mask_list))
+                    for idx in range(int(n_actions)):
+                        cidx = int(alias_to_canon.get(int(idx), int(idx)))
+                        ch = root.children.get(cidx)
+                        if ch is not None and getattr(ch, "parent_action", None) is not None:
+                            lab = _compact_action_label(ch.parent_action)
+                            if lab:
+                                action_repr_by_index[int(idx)] = lab
+                except Exception:
+                    action_repr_by_index = {}
+
+                try:
+                    actions_for_labels, _ = self._sample_actions_readonly(search_root_state, player_acted)
+                    for idx, act in enumerate(actions_for_labels):
+                        if int(idx) in action_repr_by_index:
+                            continue
+                        if act is None:
+                            continue
+                        lab = _compact_action_label(act)
+                        if lab:
+                            action_repr_by_index[int(idx)] = lab
+                except Exception:
+                    pass
+
                 root_logger.log_root(
                     game_id=int(game_id),
                     root_id=int(root_id),
@@ -776,6 +860,7 @@ class SelfPlayRunner:
                     valid_action_mask=mask_list,
                     mcts_root_value_controller=float(root.mean_value()),
                     mcts_root_prior=mcts_prior,
+                    action_repr_by_index=action_repr_by_index,
                     best_action_index=int(best_idx),
                     best_action_repr=repr(action),
                     best_action_json=_action_to_json(action),

@@ -43,6 +43,37 @@ class MinMaxStats:
             # We normalize only when we have set the maximum and minimum values
             return (value - self.minimum) / (self.maximum - self.minimum)
         return value
+
+
+def _compact_action_label(action: Any) -> str:
+    try:
+        if isinstance(action, AdversaryAction):
+            reqs = list(action.requests or [])
+            n_req = int(len(reqs))
+            pf_vals = sorted({int(getattr(r, "prefill_tokens", 0)) for r in reqs if r is not None})
+            if not pf_vals:
+                pf_txt = "-"
+            elif len(pf_vals) == 1:
+                pf_txt = str(int(pf_vals[0]))
+            else:
+                pf_txt = "{%s}" % ("/".join(str(int(x)) for x in pf_vals[:3]) + ("+" if len(pf_vals) > 3 else ""))
+            stop_ids = sorted(int(x) for x in (action.stop_decode_ids or []))
+            stop_txt = "none" if not stop_ids else ",".join(str(x) for x in stop_ids[:3]) + ("+" if len(stop_ids) > 3 else "")
+            return f"A:n={n_req},pf={pf_txt},stop={stop_txt}"
+
+        if isinstance(action, ControllerAction):
+            budget = int(getattr(action, "token_budget", 0) or 0)
+            pre = {int(k): int(v) for k, v in (getattr(action, "prefill_allocations", {}) or {}).items()}
+            dec = {int(k): int(v) for k, v in (getattr(action, "decode_allocations", {}) or {}).items()}
+            pre_total = int(sum(pre.values()))
+            dec_total = int(sum(dec.values()))
+            strategy = str(getattr(action, "strategy", "") or "")
+            eviction = strategy.split("|")[-1] if strategy else "none"
+            heur = str(getattr(action, "heuristic", "") or "-")
+            return f"C:b={budget},pf={pre_total},dc={dec_total},ev={eviction},h={heur}"
+    except Exception:
+        return ""
+    return ""
  
 
 @dataclass
@@ -565,7 +596,7 @@ class VidurMCTS:
             return
 
         alpha = float(getattr(self._cfg, "root_dirichlet_alpha", 0.3) or 0.0)
-        eps = float(getattr(self._cfg, "root_dirichlet_epsilon", 0.25) or 0.0)
+        eps = float(getattr(self._cfg, "root_dirichlet_epsilon", 0.35) or 0.0)
 
         if alpha <= 0.0 or eps <= 0.0:
             return
@@ -912,8 +943,8 @@ class VidurMCTS:
         q_min: Optional[float] = None,
         q_max: Optional[float] = None,
     ) -> float:
-        pb_c_base = getattr(self._cfg, "pb_c_base", 5000)
-        pb_c_init = getattr(self._cfg, "pb_c_init", 0.75)
+        pb_c_base = getattr(self._cfg, "pb_c_base", 1500)
+        pb_c_init = getattr(self._cfg, "pb_c_init", 1.5)
 
         pb_c = math.log((parent.visits + pb_c_base + 1.0) / pb_c_base) + pb_c_init
         pb_c *= math.sqrt(parent.visits + 1.0) / (child.visits + 1.0)
@@ -1810,8 +1841,8 @@ class VidurMCTS:
             "max_forced_hops": int(
                 getattr(self._cfg, "max_forced_hops", getattr(self._cfg, "max_forced_hops_per_root", 1024))
             ),
-            "pb_c_base": float(getattr(self._cfg, "pb_c_base", 5000.0)),
-            "pb_c_init": float(getattr(self._cfg, "pb_c_init", 0.75)),
+            "pb_c_base": float(getattr(self._cfg, "pb_c_base", 1000.0)),
+            "pb_c_init": float(getattr(self._cfg, "pb_c_init", 2.5)),
             "discount_factor": float(getattr(self._cfg, "discount_factor", 0.98)),
             # "prefill_step_time": float(getattr(self, "_prefill_step_time", 0.0388862329)),
             "prefill_step_time": float(getattr(self, "_discount_time_denom", getattr(self, "_prefill_step_time", 0.015725797204323228))),
@@ -1830,6 +1861,9 @@ class VidurMCTS:
             decode_slo_default = float(decode_slos[0]) if decode_slos else 50.0
             cfg_payload.update(
                 {
+                    "root_dirichlet_noise_enabled": bool(getattr(self._cfg, "root_dirichlet_noise_enabled", False)),
+                    "root_dirichlet_alpha": float(getattr(self._cfg, "root_dirichlet_alpha", 0.3)),
+                    "root_dirichlet_epsilon": float(getattr(self._cfg, "root_dirichlet_epsilon", 0.25)),
                     "adversary_tick_sec": float(gv2_cfg.timing.adversary_tick_sec),
                     "launch_window_sec": float(gv2_cfg.timing.launch_window_sec),
                     "max_requests_per_launch_window": int(gv2_cfg.timing.max_requests_per_launch_window),
@@ -2082,7 +2116,7 @@ class VidurMCTS:
 
         ## CREATING LOGS FOR THE ROOT :
 
-        best_action_repr = repr(best_action) if best_action is not None else ""
+        best_action_repr = _compact_action_label(best_action) or (repr(best_action) if best_action is not None else "")
         best_action_json = ""
 
         try:
@@ -2153,6 +2187,41 @@ class VidurMCTS:
             except Exception:
                 pass
 
+
+        ## Extra code to get action representation for logging top n actions from root :
+        action_repr_by_index: dict[int, str] = {}
+        try:
+            alias_to_canon = getattr(self._root, "action_alias_to_canonical", {}) or {}
+            n_actions = max(len(model_prior), len(mcts_prior), len(mask))
+            for idx in range(int(n_actions)):
+                cidx = int(alias_to_canon.get(int(idx), int(idx)))
+                ch = self._root.children.get(cidx)
+                if ch is not None and getattr(ch, "parent_action", None) is not None:
+                    lab = _compact_action_label(ch.parent_action) or str(ch.parent_action)
+                    if lab:
+                        action_repr_by_index[int(idx)] = lab
+        except Exception:
+            action_repr_by_index = {}
+        # Fallback: if child parent_action is unavailable (common in native-applied trees),
+        # use full index-aligned sampled action space so top-k labels match root policy indices.
+        try:
+            if str(root_player) == "controller":
+                actions_by_index_for_labels, _ = self._env.sample_controller_actions(rootState)
+            else:
+                actions_by_index_for_labels, _ = self._env.sample_adversary_actions(rootState)
+
+            for idx, act in enumerate(actions_by_index_for_labels):
+                if int(idx) in action_repr_by_index:
+                    continue
+                if act is None:
+                    continue
+                lab = _compact_action_label(act) or str(act)
+                if lab:
+                    action_repr_by_index[int(idx)] = lab
+        except Exception:
+            pass
+
+
         self._root_logger.log_root(
             game_id=game_id,
             root_id=root_id,
@@ -2166,6 +2235,7 @@ class VidurMCTS:
             valid_action_mask=mask,
             mcts_root_value_controller=self._root.mean_value(),
             mcts_root_prior=mcts_prior,
+            action_repr_by_index=action_repr_by_index,
             best_action_index=best_idx,
             best_action_repr=best_action_repr,
             best_action_json=best_action_json,

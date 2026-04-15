@@ -6,8 +6,10 @@ import csv
 import multiprocessing as mp
 import os
 import queue
+import math
 import random
 import shutil
+import copy
 import sys
 import time
 import traceback
@@ -219,6 +221,20 @@ def _next_generation_index(dataset_base: Path) -> int:
         if tail.isdigit():
             max_gen = max(max_gen, int(tail))
     return max_gen + 1
+
+def _compute_train_steps_this_generation(
+    cfg: MultipleProcessTrainingConfig,
+    replay_total_samples: int,
+) -> int:
+    base_steps = max(1, int(cfg.train_steps_per_generation))
+    roots_ref = max(1, int(cfg.roots_per_generation))
+
+    # proportional scaling: replay/roots
+    ratio = float(max(1, int(replay_total_samples))) / float(roots_ref)
+    steps = int(math.ceil(base_steps * ratio))
+
+    return steps
+
 
 def _load_weights_into_model(model: torch.nn.Module, weights_path: Path) -> None:
     blob = torch.load(weights_path, map_location="cpu")
@@ -448,6 +464,7 @@ def _selfplay_worker_main(
                 mcts = VidurMCTS(
                     env=env,
                     explore_cfg=explore_cfg,
+                    rng=random.Random(int(task["action_seed_base"])),
                     log_path=iter_log,
                     tree_log_path=root_log,
                     logger_flush_every=int(cfg.logging.flush_every),
@@ -541,10 +558,18 @@ def _selfplay_worker_main(
                     task_seed,
                     torch_deterministic=bool(cfg.game_v2.reproducibility.torch_deterministic),
                 )
+                arena_seed = int(task.get("action_seed_base", task.get("task_seed", 0)))
+                # Disabling Dirichlet Noise for Arena
+                arena_explore_cfg = copy.deepcopy(explore_cfg)
+                setattr(arena_explore_cfg, "root_dirichlet_noise_enabled", False)
+                setattr(arena_explore_cfg, "root_dirichlet_alpha", 0.0)
+                setattr(arena_explore_cfg, "root_dirichlet_epsilon", 0.0)
+
 
                 arena_mcts = VidurMCTS(
                     env=env,
-                    explore_cfg=explore_cfg,
+                    explore_cfg=arena_explore_cfg,   # <- use arena-specific cfg
+                    rng=random.Random(arena_seed),
                     log_path=None,
                     tree_log_path=None,
                     logger_flush_every=int(cfg.logging.flush_every),
@@ -754,9 +779,13 @@ def run_parallel_self_improvement(cfg: MultipleProcessTrainingConfig) -> None:
             gen_dataset_dir = dataset_base / f"gen_{gen:06d}"
             gen_dataset_dir.mkdir(parents=True, exist_ok=True)
 
+            # Enforce best-anchored generation flow:
+            # - candidate training starts from current best checkpoint
+            # - self-play data for this generation is produced by current best
+            _load_trainer_from_checkpoint(trainer, best_ckpt_path)
+
             weights_path = ckpt_dir / f"selfplay_weights_gen_{gen:06d}.pt"
-            model_state_cpu = {k: v.detach().cpu() for k, v in trainer.model.state_dict().items()}
-            torch.save({"model_state": model_state_cpu}, weights_path)
+            shutil.copyfile(best_ckpt_path, weights_path)
 
             native_on = bool(str(cfg.environment_lang).strip().lower() == "native")
             native_model_version = int(gen * 100 + 1)
@@ -839,7 +868,9 @@ def run_parallel_self_improvement(cfg: MultipleProcessTrainingConfig) -> None:
                     f"Replay buffer empty after generation={gen}, added_from_gen={added_from_gen}, dir={gen_dataset_dir}"
                 )
 
-            for step_in_gen in range(int(cfg.train_steps_per_generation)):
+            # for step_in_gen in range(int(cfg.train_steps_per_generation)):
+            train_steps_this_gen = _compute_train_steps_this_generation(cfg, replay_buffer.total_samples)
+            for step_in_gen in range(int(train_steps_this_gen)):
                 samples = replay_buffer.sample_batch(int(cfg.train_batch_size))
                 batch_by_player = collate_mixed_samples(samples, device=trainer.device)
                 metrics = trainer.train_step(batch_by_player)
@@ -986,12 +1017,15 @@ def run_parallel_self_improvement(cfg: MultipleProcessTrainingConfig) -> None:
                 promoted = bool(arena_metrics["passed"])
                 if promoted:
                     shutil.copyfile(gen_ckpt_path, best_ckpt_path)
+                    # Drop replay samples from the old-best lineage.
+                    replay_buffer.reset_for_new_best()
 
                 eval_metrics_logger.log_generation(
                     generation=int(gen),
                     candidate_checkpoint=str(gen_ckpt_path),
                     best_checkpoint_before=str(best_before),
                     best_checkpoint_after=str(best_ckpt_path),
+                    candidate_train_samples_used=int(train_steps_this_gen) * int(cfg.train_batch_size),
                     num_games=int(arena_metrics["num_eval_roots"]),
                     candidate_points=float(arena_metrics["candidate_points"]),
                     best_points=float(arena_metrics["best_points"]),
