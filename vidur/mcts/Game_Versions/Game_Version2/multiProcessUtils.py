@@ -433,13 +433,11 @@ def _selfplay_worker_main(
 
                 _load_weights_into_model(model, Path(task["weights_path"]))
 
-                # For native :
                 if native_runtime is not None:
                     mv = int(task["native_model_version"])
                     mspec = str(task["native_model_spec"])
                     native_runtime.load_models({mv: mspec})
                     _attach_native_runtime(model, native_runtime, mv)
-
 
                 task_seed = int(task.get("task_seed", 0))
                 _set_global_seeds(
@@ -501,6 +499,14 @@ def _selfplay_worker_main(
                     log_history_rows=bool(task["log_history_rows"]),
                 )
 
+                # IMPORTANT: flush dataset/log files before acknowledging success
+                if writer is not None:
+                    writer.close()
+                    writer = None
+                if mcts is not None:
+                    mcts.close()
+                    mcts = None
+
                 result_q.put(
                     {
                         "ok": True,
@@ -510,6 +516,7 @@ def _selfplay_worker_main(
                         "out_dir": str(out_dir),
                     }
                 )
+
             except Exception as exc:
                 result_q.put(
                     {
@@ -521,6 +528,7 @@ def _selfplay_worker_main(
                     }
                 )
             finally:
+                # Fallback close only if not already closed
                 if writer is not None:
                     try:
                         writer.close()
