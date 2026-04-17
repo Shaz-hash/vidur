@@ -307,7 +307,7 @@ def main() -> None:
             root_id=0,
             root_depth=0,
             root_player="adversary",
-            iterations=1000,
+            iterations=4000,
             feature_version=1,
         ),
     )
@@ -321,8 +321,8 @@ def main() -> None:
     ## MODEL TRAINING PARMS FOR SELF-IMPROVEMENT LOOP:
     num_generations = 1
     roots_per_generation = 1
-    adv_iterations_per_root = 1000
-    cont_iterations_per_root = 1000
+    adv_iterations_per_root = 4000
+    cont_iterations_per_root = 4000
     # train_steps_per_generation = 200   
     max_batch_size = 256
     train_log_csv = Path("simulator_output/mcts_dnn_logs/train_metrics.csv")

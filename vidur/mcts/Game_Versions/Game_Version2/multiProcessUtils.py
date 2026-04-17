@@ -148,6 +148,8 @@ def _build_constraints_and_explore(
     setattr(explore_cfg, "root_dirichlet_noise_enabled", bool(search.root_dirichlet_noise_enabled))
     setattr(explore_cfg, "root_dirichlet_alpha", float(search.root_dirichlet_alpha))
     setattr(explore_cfg, "root_dirichlet_epsilon", float(search.root_dirichlet_epsilon))
+    setattr(explore_cfg, "pb_c_base", float(search.pb_c_base))
+    setattr(explore_cfg, "pb_c_init", float(search.pb_c_init))
 
     setattr(explore_cfg, "discount_factor", float(search.discount_factor))
     if search.discount_time_denominator_sec is not None:
@@ -276,14 +278,17 @@ def _build_arena_game_entries(
     generation: int,
 ) -> list[dict]:
     ecfg = cfg.evaluation
-    rng = random.Random(int(ecfg.random_seed_base) + int(generation))
+    # rng = random.Random(int(ecfg.random_seed_base) + int(generation))
+    # n = int(ecfg.num_games)
+    # max_hops = int(ecfg.max_history_hops)
+
+    # hops = [int(rng.randint(0, max_hops)) for _ in range(n)]
+    # if bool(ecfg.ensure_zero_hop_game) and n > 0:
+    #     hops[0] = 0
+
     n = int(ecfg.num_games)
-    max_hops = int(ecfg.max_history_hops)
-
-    hops = [int(rng.randint(0, max_hops)) for _ in range(n)]
-    if bool(ecfg.ensure_zero_hop_game) and n > 0:
-        hops[0] = 0
-
+    hops = list(cfg.arena_hops_for_generation(generation, n))
+    
     base_gid = int(cfg.run.game_id) + int(ecfg.game_id_offset) + int(generation) * 1_000_000
     out: list[dict] = []
     for i, h in enumerate(hops):
@@ -817,6 +822,9 @@ def run_parallel_self_improvement(cfg: MultipleProcessTrainingConfig) -> None:
                 workers=int(cfg.num_processes),
             )
 
+            # Creating history hops :
+            selfplay_hops = cfg.selfplay_hops_for_generation(gen)
+
             tasks_sent = 0
             for wid, (start, count) in enumerate(splits):
                 if count <= 0:
@@ -847,7 +855,8 @@ def run_parallel_self_improvement(cfg: MultipleProcessTrainingConfig) -> None:
                         "adv_iterations_per_root": int(cfg.adv_iterations_per_root),
                         "cont_iterations_per_root": int(cfg.cont_iterations_per_root),
                         "max_batch_size": int(cfg.max_batch_size),
-                        "history_nontrivial_hops": int(cfg.history_hops_per_worker[wid]),
+                        # "history_nontrivial_hops": int(cfg.history_hops_per_worker[wid]),
+                        "history_nontrivial_hops": int(selfplay_hops[wid]),
                         "history_seed": history_seed,
                         "sample_from_mcts_policy": bool(cfg.sample_from_mcts_policy),
                         "selfplay_policy_temperature": float(cfg.selfplay_policy_temperature),
@@ -1025,8 +1034,8 @@ def run_parallel_self_improvement(cfg: MultipleProcessTrainingConfig) -> None:
                 promoted = bool(arena_metrics["passed"])
                 if promoted:
                     shutil.copyfile(gen_ckpt_path, best_ckpt_path)
-                    # Drop replay samples from the old-best lineage.
-                    replay_buffer.reset_for_new_best()
+                    # AlphaGo Zero-style replay: keep rolling-window history across promotions.
+                    # Eviction is handled only by capacity in BestModelReplayBuffer.
 
                 eval_metrics_logger.log_generation(
                     generation=int(gen),

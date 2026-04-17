@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, Sequence
 import math
+import random
 from pathlib import Path
 
 
@@ -46,6 +47,48 @@ def _default_sim_cli_args() -> Tuple[str, ...]:
         "--no-snapshot_rng_state",
     )
 
+
+# add near global helpers
+def _sample_hops(
+    *,
+    count: int,
+    min_hop: int,
+    max_hop: int,
+    seed: int,
+    ensure_zero: bool,
+    unique: bool,
+) -> Tuple[int, ...]:
+    if count < 0:
+        raise ValueError("count must be >= 0")
+    if min_hop > max_hop:
+        raise ValueError("min_hop cannot exceed max_hop")
+    if count == 0:
+        return tuple()
+
+    rng = random.Random(int(seed))
+    lo, hi = int(min_hop), int(max_hop)
+
+    if unique:
+        pop = list(range(lo, hi + 1))
+        if count > len(pop):
+            raise ValueError(f"Cannot sample {count} unique hops from [{lo}, {hi}]")
+        if ensure_zero:
+            if not (lo <= 0 <= hi):
+                raise ValueError("ensure_zero=True requires 0 in hop range")
+            if count == 1:
+                return (0,)
+            pop.remove(0)
+            out = [0] + rng.sample(pop, k=count - 1)
+            rng.shuffle(out)
+            return tuple(int(x) for x in out)
+        return tuple(int(x) for x in rng.sample(pop, k=count))
+
+    out = [int(rng.randint(lo, hi)) for _ in range(count)]
+    if ensure_zero:
+        if not (lo <= 0 <= hi):
+            raise ValueError("ensure_zero=True requires 0 in hop range")
+        out[0] = 0
+    return tuple(out)
 
 
 
@@ -178,14 +221,14 @@ class FeatureConfig:
     slack_drop_den_sec: float = 2.0
 
     # Global normalization
-    system_load_den: float = 60.0                  # 10 + 50
-    active_prefill_count_den: float = 10.0
-    active_decode_count_den: float = 50.0
-    total_remaining_prefill_den: float = 10.0 * 4096.0
-    total_decode_generated_active_den: float = 50.0 * 864.0
+    system_load_den: float = 120.0                 # 20 + 100
+    active_prefill_count_den: float = 20.0
+    active_decode_count_den: float = 100.0
+    total_remaining_prefill_den: float = 20.0 * 4096.0
+    total_decode_generated_active_den: float = 100.0 * 864.0
     violated_count_den: float = 100.0
-    prefill_near_drop_den: float = 10.0
-    decode_near_drop_den: float = 50.0
+    prefill_near_drop_den: float = 20.0
+    decode_near_drop_den: float = 100.0
 
     # Near-drop bands
     near_drop_lateness_low_sec: float = 0.5
@@ -270,7 +313,11 @@ class MCTSSearchConfig:
     prior_value_mode: str = "model"  # "model" | "uniform"
     root_dirichlet_noise_enabled: bool = True
     root_dirichlet_alpha: float = 0.6
-    root_dirichlet_epsilon: float = 0.35
+    root_dirichlet_epsilon: float = 0.30
+
+    # PUCT constants.
+    pb_c_base: float = 1500.0
+    pb_c_init: float = 1.25
 
     # Time-discount config
     discount_factor: float = 0.98
@@ -291,6 +338,10 @@ class MCTSSearchConfig:
             raise ValueError("root_dirichlet_alpha must be >= 0")
         if not (0.0 <= self.root_dirichlet_epsilon <= 1.0):
             raise ValueError("root_dirichlet_epsilon must be in [0,1]")
+        if self.pb_c_base <= 0.0:
+            raise ValueError("pb_c_base must be > 0")
+        if self.pb_c_init < 0.0:
+            raise ValueError("pb_c_init must be >= 0")
 
         if not (0.0 < self.discount_factor <= 1.0):
             raise ValueError("discount_factor must be in (0, 1]")
@@ -382,7 +433,7 @@ class RunGroup:
     root_id: int = 0
     root_depth: int = 0
     root_player: str = "adversary"
-    iterations: int = 1000
+    iterations: int = 4000
     feature_version: int = 1
 
 
@@ -391,9 +442,11 @@ class RunGroup:
 class EvaluationGroup:
     enabled: bool = True
 
-    num_games: int = 20
+    num_games: int = 70
     game_id_offset: int = 900_000
     random_seed_base: int = 12345
+
+    unique_history_hops: bool = True
 
     # history hops sampled uniformly in [0, max_history_hops]
     max_history_hops: int = 100
@@ -403,15 +456,15 @@ class EvaluationGroup:
     arena_time_limit_sec: float = 5.0
 
     # arena MCTS search budgets
-    arena_iters_adversary: int = 1000
-    arena_iters_controller: int = 1000
+    arena_iters_adversary: int = 2000
+    arena_iters_controller: int = 2000
 
     # safety guards only
     arena_max_total_turns_safety: int = 4096
     arena_max_controller_cleanup_steps_safety: int = 1024
 
     # winner rule
-    arena_win_threshold: float = 0.75
+    arena_win_threshold: float = 0.70
     tie_points: float = 0.5
 
     # start state settings
@@ -452,19 +505,23 @@ class MultipleProcessTrainingConfig:
 
 
 
-    num_processes: int = 20
+    num_processes: int = 70
     num_generations: int = 500
-    roots_per_generation: int = 2000
+    roots_per_generation: int = 7000
 
-    adv_iterations_per_root: int = 1000
-    cont_iterations_per_root: int = 1000
+    adv_iterations_per_root: int = 4000
+    cont_iterations_per_root: int = 4000
     max_batch_size: int = 256
 
-    train_steps_per_generation: int = 40
+    train_steps_per_generation: int = 136
     train_batch_size: int = 256
 
     history_seed: int = 0
-    history_hops_per_worker: Tuple[int, ...] = tuple(range(0, 100, 5))  # length must equal num_processes
+    history_hops_min: int = 0
+    history_hops_max: int = 100
+    history_hops_unique_per_generation: bool = True
+    history_hops_force_zero: bool = True
+    history_hops_per_worker: Tuple[int, ...] = tuple(range(70))  # fallback/static mode
     max_forced_hops_per_root: int = 1024
     history_max_total_steps: int = 20000
     log_history_rows: bool = True
@@ -473,8 +530,8 @@ class MultipleProcessTrainingConfig:
     selfplay_policy_temperature: float = 2.0 # increase the temperature for more exploration in the sampled actions from the mcts policy during self-play, which can lead to more diverse training data and potentially better generalization of the trained model. Tune this parameter based on the desired level of exploration vs exploitation in the self-play data generation.
     action_seed_base: int = 4 ## used for the dirichlet noise + potential future stochasticity in action sampling in root creation for training
 
-    replay_capacity_samples: int = 56000
-    replay_max_cached_shards: int = 12000
+    replay_capacity_samples: int = 120000
+    replay_max_cached_shards: int = 50000
     replay_seed: int = 2026
 
     checkpoints_dir: str = _under_vidur("simulator_output", "Game_Version2", "mcts_dnn_checkpoints")
@@ -482,6 +539,28 @@ class MultipleProcessTrainingConfig:
     
     use_virtual_env: bool = True
     worker_result_timeout_sec: int = 7200
+
+    def selfplay_hops_for_generation(self, generation: int) -> Tuple[int, ...]:
+        if not self.history_hops_unique_per_generation:
+            return tuple(int(x) for x in self.history_hops_per_worker)
+        return _sample_hops(
+            count=int(self.num_processes),
+            min_hop=int(self.history_hops_min),
+            max_hop=int(self.history_hops_max),
+            seed=int(self.history_seed) + int(generation),
+            ensure_zero=bool(self.history_hops_force_zero),
+            unique=True,
+        )
+
+    def arena_hops_for_generation(self, generation: int, num_games: int) -> Tuple[int, ...]:
+        return _sample_hops(
+            count=int(num_games),
+            min_hop=0,
+            max_hop=int(self.evaluation.max_history_hops),
+            seed=int(self.evaluation.random_seed_base) + int(generation),
+            ensure_zero=bool(self.evaluation.ensure_zero_hop_game),
+            unique=bool(self.evaluation.unique_history_hops),
+        )
 
     def validate(self) -> None:
         self.game_v2.validate()
@@ -540,6 +619,25 @@ class MultipleProcessTrainingConfig:
 
         if self.worker_result_timeout_sec <= 0:
             raise ValueError("worker_result_timeout_sec must be > 0")
+
+
+        if self.history_hops_min < 0:
+            raise ValueError("history_hops_min must be >= 0")
+        if self.history_hops_max < self.history_hops_min:
+            raise ValueError("history_hops_max must be >= history_hops_min")
+        if self.history_hops_force_zero and not (self.history_hops_min <= 0 <= self.history_hops_max):
+            raise ValueError("history hop range must include 0 when history_hops_force_zero=True")
+
+        if self.history_hops_unique_per_generation:
+            if self.num_processes > (self.history_hops_max - self.history_hops_min + 1):
+                raise ValueError("num_processes exceeds unique history-hop capacity")
+        else:
+            if len(self.history_hops_per_worker) != self.num_processes:
+                raise ValueError("history_hops_per_worker length must equal num_processes")
+
+        if self.evaluation.unique_history_hops:
+            if self.evaluation.num_games > (self.evaluation.max_history_hops + 1):
+                raise ValueError("evaluation.num_games exceeds unique arena history-hop capacity")
 
         # Evaluation config validation
         if self.evaluation.enabled:

@@ -944,7 +944,7 @@ class VidurMCTS:
         q_max: Optional[float] = None,
     ) -> float:
         pb_c_base = getattr(self._cfg, "pb_c_base", 1500)
-        pb_c_init = getattr(self._cfg, "pb_c_init", 1.5)
+        pb_c_init = getattr(self._cfg, "pb_c_init", 1.25)
 
         pb_c = math.log((parent.visits + pb_c_base + 1.0) / pb_c_base) + pb_c_init
         pb_c *= math.sqrt(parent.visits + 1.0) / (child.visits + 1.0)
@@ -992,8 +992,8 @@ class VidurMCTS:
         q_min: Optional[float],
         q_max: Optional[float],
     ) -> Dict[str, float]:
-        pb_c_base = getattr(self._cfg, "pb_c_base", 5000)
-        pb_c_init = getattr(self._cfg, "pb_c_init", 0.75)
+        pb_c_base = getattr(self._cfg, "pb_c_base", 1500)
+        pb_c_init = getattr(self._cfg, "pb_c_init", 1.25)
 
         pb_c = math.log((parent.visits + pb_c_base + 1.0) / pb_c_base) + pb_c_init
         pb_c *= math.sqrt(parent.visits + 1.0) / (child.visits + 1.0)
@@ -1841,8 +1841,8 @@ class VidurMCTS:
             "max_forced_hops": int(
                 getattr(self._cfg, "max_forced_hops", getattr(self._cfg, "max_forced_hops_per_root", 1024))
             ),
-            "pb_c_base": float(getattr(self._cfg, "pb_c_base", 1000.0)),
-            "pb_c_init": float(getattr(self._cfg, "pb_c_init", 2.5)),
+            "pb_c_base": float(getattr(self._cfg, "pb_c_base", 1500.0)),
+            "pb_c_init": float(getattr(self._cfg, "pb_c_init", 1.25)),
             "discount_factor": float(getattr(self._cfg, "discount_factor", 0.98)),
             # "prefill_step_time": float(getattr(self, "_prefill_step_time", 0.0388862329)),
             "prefill_step_time": float(getattr(self, "_discount_time_denom", getattr(self, "_prefill_step_time", 0.015725797204323228))),

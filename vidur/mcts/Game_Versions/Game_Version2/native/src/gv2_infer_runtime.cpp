@@ -419,16 +419,16 @@ NativeInferInputsGV2 NativeTorchScriptInferRuntimeGV2::build_inputs_from_state(
         out.global_features[static_cast<std::size_t>(idx)] = static_cast<float>(v);
     };
 
-    set_global(0, static_cast<double>(num_prefill + num_decode) / safe_den(cfg.system_load_den, 60.0));
-    set_global(1, static_cast<double>(num_prefill) / safe_den(cfg.active_prefill_count_den, 10.0));
-    set_global(2, static_cast<double>(num_decode) / safe_den(cfg.active_decode_count_den, 50.0));
-    set_global(3, static_cast<double>(total_remaining_prefill) / safe_den(cfg.total_remaining_prefill_den, 40960.0));
-    set_global(4, static_cast<double>(total_decode_generated_active) / safe_den(cfg.total_decode_generated_active_den, 43200.0));
+    set_global(0, static_cast<double>(num_prefill + num_decode) / safe_den(cfg.system_load_den, 120.0));
+    set_global(1, static_cast<double>(num_prefill) / safe_den(cfg.active_prefill_count_den, 20.0));
+    set_global(2, static_cast<double>(num_decode) / safe_den(cfg.active_decode_count_den, 100.0));
+    set_global(3, static_cast<double>(total_remaining_prefill) / safe_den(cfg.total_remaining_prefill_den, 81920.0));
+    set_global(4, static_cast<double>(total_decode_generated_active) / safe_den(cfg.total_decode_generated_active_den, 86400.0));
     set_global(5, static_cast<double>(num_violated_active) / safe_den(cfg.violated_count_den, 100.0));
-    set_global(6, static_cast<double>(p_late_05_15) / safe_den(cfg.prefill_near_drop_den, 10.0));
-    set_global(7, static_cast<double>(p_late_15) / safe_den(cfg.prefill_near_drop_den, 10.0));
-    set_global(8, static_cast<double>(d_late_05_15) / safe_den(cfg.decode_near_drop_den, 50.0));
-    set_global(9, static_cast<double>(d_late_15) / safe_den(cfg.decode_near_drop_den, 50.0));
+    set_global(6, static_cast<double>(p_late_05_15) / safe_den(cfg.prefill_near_drop_den, 20.0));
+    set_global(7, static_cast<double>(p_late_15) / safe_den(cfg.prefill_near_drop_den, 20.0));
+    set_global(8, static_cast<double>(d_late_05_15) / safe_den(cfg.decode_near_drop_den, 100.0));
+    set_global(9, static_cast<double>(d_late_15) / safe_den(cfg.decode_near_drop_den, 100.0));
     set_global(10, ewma_norm);
 
     out.req_features.assign(static_cast<std::size_t>(out.req_n) * static_cast<std::size_t>(out.req_d), 0.0f);

@@ -48,14 +48,14 @@ struct NativeFeatureBuildConfigGV2 {
     double lateness_den_sec = 2.0;
     double slack_drop_den_sec = 2.0;
 
-    double system_load_den = 60.0;
-    double active_prefill_count_den = 10.0;
-    double active_decode_count_den = 50.0;
-    double total_remaining_prefill_den = 40960.0;
-    double total_decode_generated_active_den = 43200.0;
+    double system_load_den = 120.0;
+    double active_prefill_count_den = 20.0;
+    double active_decode_count_den = 100.0;
+    double total_remaining_prefill_den = 81920.0;
+    double total_decode_generated_active_den = 86400.0;
     double violated_count_den = 100.0;
-    double prefill_near_drop_den = 10.0;
-    double decode_near_drop_den = 50.0;
+    double prefill_near_drop_den = 20.0;
+    double decode_near_drop_den = 100.0;
 
     double near_drop_lateness_low_sec = 0.5;
     double near_drop_lateness_high_sec = 1.5;

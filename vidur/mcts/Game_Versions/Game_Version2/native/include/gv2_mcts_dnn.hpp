@@ -24,7 +24,7 @@ struct SearchInput {
     // Search hyper-parameters (mirroring Python defaults unless overridden).
     int max_forced_hops = 2000;
     double pb_c_base = 1500.0; // Decrease for more exploration : normal value 5000
-    double pb_c_init = 1.50; // Increase for more exploration at low visit counts : normal value 0.75
+    double pb_c_init = 1.25; // Increase for more exploration at low visit counts : normal value 0.75
     double discount_factor = 0.98;
     double prefill_step_time = 0.015725797204323228;
     double reward_knee = 25.0;

@@ -1,0 +1,15 @@
+# ninja log v5
+1	240	1776318196466836486	CMakeFiles/mcts_native_gv2.dir/src/gv2_types.cpp.o	88237770e0572
+2	287	1776318196513836502	CMakeFiles/mcts_native_gv2.dir/src/gv2_credits.cpp.o	140e503253fc6355
+4	512	1776318196738836582	CMakeFiles/mcts_native_gv2.dir/src/gv2_logger.cpp.o	7bacce4bb3d281e5
+2	855	1776318197081836703	CMakeFiles/mcts_native_gv2.dir/src/gv2_virtual_environment.cpp.o	3ccec76c3fa9a30d
+2	883	1776318197109836713	CMakeFiles/mcts_native_gv2.dir/src/gv2_player_sample_actions.cpp.o	2d8fa05b584194c8
+240	1115	1776318197341836795	CMakeFiles/mcts_native_gv2.dir/src/virtual_simulator.cpp.o	b56226060b0b2830
+3	7654	1776318203874839239	CMakeFiles/mcts_native_gv2.dir/src/gv2_mcts_dnn.cpp.o	292be51ca7eef293
+3	7927	1776318204146839345	CMakeFiles/mcts_native_gv2.dir/src/gv2_infer_runtime.cpp.o	c2a56e3e29d182a7
+1	9841	1776318206060840094	CMakeFiles/mcts_native_gv2.dir/src/pybind_module.cpp.o	c03a768de90f574d
+9841	11462	1776318207689840732	/home/ubuntu/vidur/vidur/mcts/mcts_native_gv2.cpython-310-x86_64-linux-gnu.so	45c8e2dfe8507fc5
+14	7722	1776398147409142785	CMakeFiles/mcts_native_gv2.dir/src/gv2_mcts_dnn.cpp.o	292be51ca7eef293
+14	7890	1776398147576140620	CMakeFiles/mcts_native_gv2.dir/src/gv2_infer_runtime.cpp.o	c2a56e3e29d182a7
+13	9792	1776398149477883563	CMakeFiles/mcts_native_gv2.dir/src/pybind_module.cpp.o	c03a768de90f574d
+9792	11430	1776398151123551631	/home/ubuntu/vidur/vidur/mcts/mcts_native_gv2.cpython-310-x86_64-linux-gnu.so	45c8e2dfe8507fc5

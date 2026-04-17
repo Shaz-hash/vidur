@@ -44,4 +44,15 @@ PYTHONPATH=/home/shazer/Desktop/Research/Vidur/vidur \
 
 
 TO kill :
-pkill -9 -f "vidur.mcts.Game_Versions.Game_Version2.alphaZero_parrallel|multiProcessUtils.py|spawn_main"
+PIDFILE=/home/ubuntu/vidur/simulator_output/Game_Version2/mcts_dnn_logs/alphaZeroParrallel.pid
+[ -f "$PIDFILE" ] && kill -9 "$(cat "$PIDFILE")" 2>/dev/null
+pkill -9 -f "/home/ubuntu/vidur/.venv/bin/python -c from multiprocessing.spawn import spawn_main"
+pkill -9 -f "vidur\.mcts\.Game_Versions\.Game_Version2\.alphaZero_parrallel"
+
+
+
+cd /home/ubuntu/vidur && \
+mkdir -p simulator_output/Game_Version2/mcts_dnn_logs && \
+nohup env PYTHONPATH=/home/ubuntu/vidur /home/ubuntu/vidur/.venv/bin/python -u -m vidur.mcts.Game_Versions.Game_Version2.alphaZero_parrallel \
+  > simulator_output/Game_Version2/mcts_dnn_logs/alphaZeroParrallel.out 2>&1 < /dev/null & \
+echo $! > simulator_output/Game_Version2/mcts_dnn_logs/alphaZeroParrallel.pid
