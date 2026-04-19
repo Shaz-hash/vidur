@@ -166,6 +166,10 @@ class VirtualSimulator:
 
         self._restore_pool_requests_by_id: dict[int, Request] = {}
         self._restore_pool_requests_free: list[Request] = []
+        self._restore_pool_free_cap = int(
+            max(0, getattr(config, "mcts_restore_pool_free_cap", 300) or 0)
+        )
+        self._request_id_counter = int(getattr(Request, "_id", -1))
 
     @property
     def replica_id(self) -> ReplicaId:
@@ -185,6 +189,15 @@ class VirtualSimulator:
 
     def _primary_replica_scheduler(self) -> _VirtualReplicaScheduler:
         return next(iter(self._scheduler._replica_schedulers.values()))
+
+    def _trim_restore_pool_requests_free(self) -> None:
+        cap = int(self._restore_pool_free_cap)
+        if cap < 0:
+            return
+        free_pool = self._restore_pool_requests_free
+        if len(free_pool) <= cap:
+            return
+        del free_pool[cap:]
 
     def snapshot_state(self) -> Dict[str, Any]:
         rs = self._primary_replica_scheduler()
@@ -208,7 +221,7 @@ class VirtualSimulator:
             "running_ids": running_ids,
             "overrides": {int(k): int(v) for k, v in rs._token_budget_overrides.items()},
             "entity_counters": {
-                "Request": int(getattr(Request, "_id", -1)),
+                "Request": int(getattr(self, "_request_id_counter", getattr(Request, "_id", -1))),
                 "Batch": int(getattr(Batch, "_id", -1)),
                 "BatchStage": int(getattr(BatchStage, "_id", -1)),
             },
@@ -236,6 +249,7 @@ class VirtualSimulator:
         for rid in list(self._restore_pool_requests_by_id.keys()):
             if rid not in live_ids:
                 self._restore_pool_requests_free.append(self._restore_pool_requests_by_id.pop(rid))
+        self._trim_restore_pool_requests_free()
 
         request_lookup: Dict[int, Request] = {}
         for rid, state in request_states.items():
@@ -276,6 +290,7 @@ class VirtualSimulator:
         counters = dict(snapshot.get("entity_counters", {}))
         if "Request" in counters:
             Request._id = int(counters["Request"])
+            self._request_id_counter = int(counters["Request"])
         if "Batch" in counters:
             Batch._id = int(counters["Batch"])
         if "BatchStage" in counters:
@@ -309,6 +324,7 @@ class VirtualSimulator:
         for rid in list(self._restore_pool_requests_by_id.keys()):
             if rid not in live_ids:
                 self._restore_pool_requests_free.append(self._restore_pool_requests_by_id.pop(rid))
+        self._trim_restore_pool_requests_free()
 
         request_lookup: Dict[int, Request] = {}
         for rid, state in request_states.items():
@@ -338,6 +354,9 @@ class VirtualSimulator:
             "time": float(self._time),
             "request_states": request_states,
             "overrides": {int(k): int(v) for k, v in rs._token_budget_overrides.items()},
+            "entity_counters": {
+                "Request": int(getattr(self, "_request_id_counter", getattr(Request, "_id", -1))),
+            },
         }
 
 
@@ -351,6 +370,18 @@ class VirtualSimulator:
         }
 
         rs._requests = self._restore_request_lookup_from_states(request_states)
+
+        counters = dict(snapshot.get("entity_counters", {}))
+        request_counter = counters.get("Request", None)
+        if request_counter is None:
+            request_counter = snapshot.get("request_id_counter", None)
+        if request_counter is None:
+            request_counter = max(
+                max((int(rid) for rid in request_states.keys()), default=-1),
+                int(getattr(Request, "_id", -1)),
+            )
+        Request._id = int(request_counter)
+        self._request_id_counter = int(request_counter)
 
         # Fast mode: no waiting/running reconstruction needed for virtual MCTS path
         rs._waiting_queue.clear()
