@@ -120,26 +120,75 @@ class BestModelReplayBuffer:
             return []
         if self._total_samples <= 0 or not self._windows:
             raise RuntimeError("Replay buffer is empty; add generation shards before sampling")
+        if not self._weights or max(self._weights) <= 0:
+            raise RuntimeError("Replay buffer has no effective shard weights to sample from")
 
-        out: List[RootSample] = []
-        max_attempts = max(64, batch_size * 8)
-        attempts = 0
+        windows_list = list(self._windows)
+        chosen_indices = self._rng.choices(
+            range(len(windows_list)),
+            weights=self._weights,
+            k=batch_size,
+        )
 
-        while len(out) < batch_size:
-            attempts += 1
-            if attempts > max_attempts:
+        index_counts: dict[int, int] = {}
+        for idx in chosen_indices:
+            index_counts[idx] = int(index_counts.get(idx, 0)) + 1
+
+        sampled_by_index: dict[int, list[RootSample]] = {}
+        for idx, count in index_counts.items():
+            window = windows_list[int(idx)]
+            shard = self._load_shard(window.path)
+            upper = min(len(shard), int(window.num_samples))
+            low = int(window.drop_prefix)
+            if upper <= low:
                 raise RuntimeError(
-                    f"Replay sampling failed after {attempts} attempts "
-                    f"(windows={len(self._windows)}, total={self._total_samples})"
+                    f"Replay sampling encountered empty effective shard window: "
+                    f"path={window.path}, low={low}, upper={upper}"
                 )
 
-            chosen = self._rng.choices(list(self._windows), weights=self._weights, k=1)[0]
-            sample = self._sample_from_window(chosen)
-            if sample is None:
-                continue
-            out.append(sample)
+            picks: list[RootSample] = []
+            for _ in range(int(count)):
+                sample_idx = self._rng.randrange(low, upper)
+                item = shard[sample_idx]
+                if not isinstance(item, dict):
+                    raise TypeError(f"Unexpected sample type {type(item)} in shard {window.path}")
+                picks.append(item)
+            sampled_by_index[int(idx)] = picks
+
+        offsets: dict[int, int] = {int(idx): 0 for idx in index_counts.keys()}
+        out: List[RootSample] = []
+        for idx in chosen_indices:
+            idx = int(idx)
+            pos = int(offsets[idx])
+            out.append(sampled_by_index[idx][pos])
+            offsets[idx] = pos + 1
 
         return out
+
+    def preload_all_shards(self, *, max_shards: int) -> dict[str, int]:
+        limit = max(1, int(max_shards))
+        windows_list = list(self._windows)
+        if len(windows_list) > limit:
+            return {
+                "loaded_shards": 0,
+                "cached_shards": int(len(self._cache)),
+                "num_shards": int(len(windows_list)),
+            }
+
+        if len(windows_list) > self.max_cached_shards:
+            self.max_cached_shards = int(len(windows_list))
+
+        loaded = 0
+        for window in windows_list:
+            if window.path not in self._cache:
+                self._load_shard(window.path)
+                loaded += 1
+
+        return {
+            "loaded_shards": int(loaded),
+            "cached_shards": int(len(self._cache)),
+            "num_shards": int(len(windows_list)),
+        }
 
     def _append_shard(self, *, path: Path, num_samples: int) -> int:
         if num_samples <= 0:
@@ -226,5 +275,3 @@ class BestModelReplayBuffer:
         if not p.is_absolute():
             p = (Path.cwd() / p).resolve()
         return p
-
-

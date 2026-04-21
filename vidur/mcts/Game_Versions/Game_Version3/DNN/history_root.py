@@ -51,6 +51,9 @@ class _HistoryRootBatchSession:
     exhausted: bool = False
     seen_signatures: set[tuple[Any, ...]] = field(default_factory=set)
     active_path: list[_HistoryFrontierNode] = field(default_factory=list)
+    shared_seen_signatures: Any | None = None
+    shared_seen_lock: Any | None = None
+    allow_duplicate_fallback: bool = True
 
 
 class HistoryRootGenerator:
@@ -844,6 +847,7 @@ class HistoryRootGenerator:
         node: _HistoryFrontierNode,
         root_id: int,
     ) -> dict[str, Any]:
+        history_signature = self._node_signature(node)
         root_state = self._restore_frontier_state(node).fork(flag=False)
         pre_ctrl_snapshot = node.pre_controller_snapshot if node.player == "adversary" else None
         pre_ctrl_stats = node.pre_controller_stats if node.player == "adversary" else None
@@ -856,6 +860,7 @@ class HistoryRootGenerator:
             "pre_controller_snapshot": pre_ctrl_snapshot,
             "pre_controller_stats": pre_ctrl_stats,
             "history_hops": int(node.history_hops),
+            "history_signature": history_signature,
         }
 
     def _create_root_batch_session(
@@ -872,6 +877,7 @@ class HistoryRootGenerator:
         min_history_hops: Optional[int],
         max_history_hops: Optional[int],
         max_children_per_expand: Optional[int],
+        initial_seen_signatures: Optional[Sequence[tuple[Any, ...]]],
     ) -> _HistoryRootBatchSession:
         target_roots = max(0, int(num_roots))
         min_hops = int(nontrivial_hops if min_history_hops is None else min_history_hops)
@@ -892,6 +898,7 @@ class HistoryRootGenerator:
             rng=random.Random(int(seed)),
             anchor_budget=max(4, int(target_roots) * 3),
             max_iterations=max(200, int(target_roots) * 50),
+            seen_signatures=set(initial_seen_signatures or ()),
         )
 
     def _prepare_session_node(
@@ -908,6 +915,35 @@ class HistoryRootGenerator:
             max_children_per_expand=session.max_children_per_expand,
             remaining_need=int(remaining_need),
         )
+
+    def _try_claim_signature(
+        self,
+        *,
+        session: _HistoryRootBatchSession,
+        signature: tuple[Any, ...],
+    ) -> bool:
+        if signature in session.seen_signatures:
+            return False
+
+        shared_seen = session.shared_seen_signatures
+        shared_lock = session.shared_seen_lock
+        if shared_seen is None:
+            session.seen_signatures.add(signature)
+            return True
+
+        claimed = False
+        if shared_lock is None:
+            if signature not in shared_seen:
+                shared_seen[signature] = 1
+                claimed = True
+        else:
+            with shared_lock:
+                if signature not in shared_seen:
+                    shared_seen[signature] = 1
+                    claimed = True
+
+        session.seen_signatures.add(signature)
+        return bool(claimed)
 
     def _make_anchor_node(self, session: _HistoryRootBatchSession) -> _HistoryFrontierNode | None:
         if int(session.anchors_built) >= int(session.anchor_budget):
@@ -944,9 +980,8 @@ class HistoryRootGenerator:
                     return None
 
                 sig = self._node_signature(anchor)
-                if sig in session.seen_signatures:
+                if not self._try_claim_signature(session=session, signature=sig):
                     continue
-                session.seen_signatures.add(sig)
                 return anchor
 
             node = session.active_path[-1]
@@ -969,9 +1004,8 @@ class HistoryRootGenerator:
                 session.active_path.append(child)
 
             sig = self._node_signature(child)
-            if sig in session.seen_signatures:
+            if not self._try_claim_signature(session=session, signature=sig):
                 continue
-            session.seen_signatures.add(sig)
             return child
 
         return None
@@ -980,6 +1014,8 @@ class HistoryRootGenerator:
         node = self._next_unique_root_node(session)
         if node is not None:
             return node
+        if not bool(session.allow_duplicate_fallback):
+            return None
 
         if int(session.emitted_roots) >= int(session.target_roots):
             return None
@@ -1011,6 +1047,10 @@ class HistoryRootGenerator:
         max_history_hops: Optional[int] = None,
         max_children_per_expand: Optional[int] = None,
         batch_size: int = 64,
+        initial_seen_signatures: Optional[Sequence[tuple[Any, ...]]] = None,
+        shared_seen_signatures: Any | None = None,
+        shared_seen_lock: Any | None = None,
+        allow_duplicate_fallback: bool = True,
     ) -> Iterator[list[dict[str, Any]]]:
         del game_id
         del log_history
@@ -1027,7 +1067,11 @@ class HistoryRootGenerator:
             min_history_hops=min_history_hops,
             max_history_hops=max_history_hops,
             max_children_per_expand=max_children_per_expand,
+            initial_seen_signatures=initial_seen_signatures,
         )
+        session.shared_seen_signatures = shared_seen_signatures
+        session.shared_seen_lock = shared_seen_lock
+        session.allow_duplicate_fallback = bool(allow_duplicate_fallback)
         if int(session.target_roots) <= 0:
             return
 
@@ -1062,6 +1106,10 @@ class HistoryRootGenerator:
         min_history_hops: Optional[int] = None,
         max_history_hops: Optional[int] = None,
         max_children_per_expand: Optional[int] = None,
+        initial_seen_signatures: Optional[Sequence[tuple[Any, ...]]] = None,
+        shared_seen_signatures: Any | None = None,
+        shared_seen_lock: Any | None = None,
+        allow_duplicate_fallback: bool = True,
     ) -> list[dict[str, Any]]:
         roots: list[dict[str, Any]] = []
         for batch in self.generate_roots_batch_iter(
@@ -1079,6 +1127,10 @@ class HistoryRootGenerator:
             max_history_hops=max_history_hops,
             max_children_per_expand=max_children_per_expand,
             batch_size=max(1, min(int(num_roots), 64)),
+            initial_seen_signatures=initial_seen_signatures,
+            shared_seen_signatures=shared_seen_signatures,
+            shared_seen_lock=shared_seen_lock,
+            allow_duplicate_fallback=bool(allow_duplicate_fallback),
         ):
             roots.extend(batch)
         return roots

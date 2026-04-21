@@ -137,9 +137,9 @@ class Trainer:
             req_features = batch.get("req_features")
             req_mask = batch.get("req_mask")
 
-            action_mask = batch["action_mask"]
-            target_policy = batch["target_policy"]
             target_value = batch["target_value"]
+            action_mask = batch.get("action_mask")
+            target_policy = batch.get("target_policy")
 
             bsz = int(global_features.shape[0])
             total_count += bsz
@@ -159,6 +159,8 @@ class Trainer:
             if bool(self.cfg.value_only) or float(self.cfg.policy_weight) <= 0.0:
                 p_loss = torch.zeros((), device=self.device)
             else:
+                if action_mask is None or target_policy is None:
+                    raise RuntimeError("Policy tensors missing for non-value-only training batch")
                 p_loss = self._policy_loss(policy_logits, target_policy, action_mask)
             v_loss = self._value_loss(value_raw, target_value)
             v_mse, v_mae = self._value_errors(value_raw, target_value)
@@ -255,9 +257,9 @@ class Trainer:
             req_features = batch.get("req_features")
             req_mask = batch.get("req_mask")
 
-            action_mask = batch["action_mask"]
-            target_policy = batch["target_policy"]
             target_value = batch["target_value"]
+            action_mask = batch.get("action_mask")
+            target_policy = batch.get("target_policy")
 
             bsz = int(global_features.shape[0])
             total_count += bsz
@@ -277,6 +279,8 @@ class Trainer:
             if bool(self.cfg.value_only) or float(self.cfg.policy_weight) <= 0.0:
                 p_loss = 0.0
             else:
+                if action_mask is None or target_policy is None:
+                    raise RuntimeError("Policy tensors missing for non-value-only eval batch")
                 p_loss = self._policy_loss(policy_logits, target_policy, action_mask).item()
             v_loss = self._value_loss(value_raw, target_value).item()
             v_mse_t, v_mae_t = self._value_errors(value_raw, target_value)

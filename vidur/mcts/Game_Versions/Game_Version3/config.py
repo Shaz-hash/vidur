@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, Sequence
 import math
+import os
 import random
 from pathlib import Path
 
@@ -26,6 +27,11 @@ def _default_model_device() -> str:
     # except Exception:
     #     return "cpu"
     return "cpu"
+
+
+def _default_train_num_threads() -> int:
+    cpu_count = os.cpu_count() or 1
+    return max(1, min(8, int(cpu_count)))
 
 
 def _default_sim_cli_args() -> Tuple[str, ...]:
@@ -211,7 +217,7 @@ class FeatureConfig:
     d_prefill_req: int = 10
     n_decode_req: int = 50
     d_decode_req: int = 13
-    d_global: int = 22
+    d_global: int = 24
 
     # Per-request normalization
     prefill_total_den: float = 4096.0
@@ -549,9 +555,16 @@ class MultipleProcessTrainingConfig:
 
 
 
-    num_processes: int = 40
-    num_generations: int = 1
+    num_processes: int = 60
+    max_concurrent_selfplay_workers: int = 60
+    max_workers_per_interval: int = 3
+    selfplay_dynamic_chunk_roots: int = 128
+    selfplay_zero_progress_interval_patience: int = 4
+    selfplay_launch_rss_limit_gb: float = 120.0
+    selfplay_launch_poll_sec: float = 2.0
+    num_generations: int = 20
     roots_per_generation: int = 40000
+    sample_cycles_per_generation: int = 8
 
     adv_iterations_per_root: int = 4000
     cont_iterations_per_root: int = 4000
@@ -560,6 +573,8 @@ class MultipleProcessTrainingConfig:
     train_steps_per_generation: int = 136
     train_batch_size: int = 256
     train_target_epochs_per_generation: float = 20.0
+    train_progress_print_every_steps: int = 100
+    train_num_threads: int = field(default_factory=_default_train_num_threads)
 
     history_seed: int = 0
     history_hops_min: int = 0
@@ -572,6 +587,7 @@ class MultipleProcessTrainingConfig:
     max_forced_hops_per_root: int = 1024
     history_max_total_steps: int = 20000
     history_root_batch_size: int = 64
+    history_allow_duplicate_root_fallback: bool = False
     virtual_simulator_max_free_request_pool: int = 300
     log_history_rows: bool = True
     eval_split_ratio: float = 0.1
@@ -581,8 +597,11 @@ class MultipleProcessTrainingConfig:
     selfplay_policy_temperature: float = 2.0 # increase the temperature for more exploration in the sampled actions from the mcts policy during self-play, which can lead to more diverse training data and potentially better generalization of the trained model. Tune this parameter based on the desired level of exploration vs exploitation in the self-play data generation.
     action_seed_base: int = 4 ## used for the dirichlet noise + potential future stochasticity in action sampling in root creation for training
 
-    replay_capacity_samples: int = 120000
-    replay_max_cached_shards: int = 50000
+    replay_capacity_samples: int = 400000
+    replay_max_cached_shards: int = 5000
+    replay_preload_all_shards_on_reuse: bool = True
+    replay_preload_all_shards_each_generation: bool = True
+    replay_preload_max_shards: int = 5000
     replay_seed: int = 2026
 
     checkpoints_dir: str = _under_vidur("simulator_output", "Game_Version3", "mcts_dnn_checkpoints")
@@ -590,7 +609,8 @@ class MultipleProcessTrainingConfig:
     
     use_virtual_env: bool = True
     worker_result_timeout_sec: int = 7200
-    reuse_dataset_generation: int = 0
+    reuse_dataset_generation: int = -1
+    reuse_dataset_generation_only_once: bool = False
     reuse_dataset_reset_replay_each_generation: bool = True
 
     def selfplay_hop_ranges_for_generation(self, generation: int) -> Tuple[Tuple[int, int], ...]:
@@ -642,10 +662,28 @@ class MultipleProcessTrainingConfig:
             
         if self.num_processes <= 0:
             raise ValueError("num_processes must be > 0")
+        if int(self.max_concurrent_selfplay_workers) <= 0:
+            raise ValueError("max_concurrent_selfplay_workers must be > 0")
+        if int(self.max_concurrent_selfplay_workers) > int(self.num_processes):
+            raise ValueError("max_concurrent_selfplay_workers cannot exceed num_processes")
+        if int(self.max_workers_per_interval) <= 0:
+            raise ValueError("max_workers_per_interval must be > 0")
+        if int(self.max_workers_per_interval) > int(self.max_concurrent_selfplay_workers):
+            raise ValueError("max_workers_per_interval cannot exceed max_concurrent_selfplay_workers")
+        if int(self.selfplay_dynamic_chunk_roots) <= 0:
+            raise ValueError("selfplay_dynamic_chunk_roots must be > 0")
+        if int(self.selfplay_zero_progress_interval_patience) <= 0:
+            raise ValueError("selfplay_zero_progress_interval_patience must be > 0")
+        if float(self.selfplay_launch_rss_limit_gb) <= 0.0:
+            raise ValueError("selfplay_launch_rss_limit_gb must be > 0")
+        if float(self.selfplay_launch_poll_sec) <= 0.0:
+            raise ValueError("selfplay_launch_poll_sec must be > 0")
         if self.num_generations <= 0:
             raise ValueError("num_generations must be > 0")
         if self.roots_per_generation <= 0:
             raise ValueError("roots_per_generation must be > 0")
+        if self.sample_cycles_per_generation <= 0:
+            raise ValueError("sample_cycles_per_generation must be > 0")
 
         if self.adv_iterations_per_root <= 0 or self.cont_iterations_per_root <= 0:
             raise ValueError("adv_iterations_per_root and cont_iterations_per_root must be > 0")
@@ -658,6 +696,10 @@ class MultipleProcessTrainingConfig:
             raise ValueError("train_batch_size must be > 0")
         if float(self.train_target_epochs_per_generation) <= 0.0:
             raise ValueError("train_target_epochs_per_generation must be > 0")
+        if int(self.train_progress_print_every_steps) <= 0:
+            raise ValueError("train_progress_print_every_steps must be > 0")
+        if int(self.train_num_threads) <= 0:
+            raise ValueError("train_num_threads must be > 0")
 
         if self.history_seed < 0:
             raise ValueError("history_seed must be >= 0")
@@ -694,6 +736,8 @@ class MultipleProcessTrainingConfig:
             raise ValueError("replay_capacity_samples must be > 0")
         if self.replay_max_cached_shards <= 0:
             raise ValueError("replay_max_cached_shards must be > 0")
+        if self.replay_preload_max_shards <= 0:
+            raise ValueError("replay_preload_max_shards must be > 0")
         if self.replay_seed < 0:
             raise ValueError("replay_seed must be >= 0")
 

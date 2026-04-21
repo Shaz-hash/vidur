@@ -518,7 +518,6 @@ class VidurMCTS:
 
         return alias_to_canon, canon_to_aliases, canonical_indices
 
-
     def _evaluate_adversary_action_q_two_step(
         self,
         *,
@@ -570,8 +569,9 @@ class VidurMCTS:
 
         adv_child_snapshot, adv_child_stats = self._snapshot_state_and_stats(adv_child_state)
 
-        worst_q: float | None = None
-        worst_tuple: tuple[float, float, float, float, float, float] | None = None
+        best_controller_idx: int | None = None
+        best_controller_q: float | None = None
+        best_controller_tuple: tuple[float, float, float, float, float, float] | None = None
 
         for cidx in controller_canonical_indices:
             ctrl_action = controller_actions_by_index[cidx]
@@ -585,8 +585,6 @@ class VidurMCTS:
                 inplace=True,
             )
 
-            # Bootstrap from the controller-produced state.
-            # Discount is measured from the original adversary root state to this controller-produced state.
             q_tuple = self._compose_q_from_state(
                 leaf_state=controller_leaf_state,
                 parent_cost=parent_cost,
@@ -598,12 +596,17 @@ class VidurMCTS:
 
             q = float(q_tuple[0])
 
-            # Because this is controller-perspective value, "worst for controller" = minimum q.
-            if worst_q is None or q < worst_q:
-                worst_q = q
-                worst_tuple = q_tuple
+            # Controller is maximizing controller-valued Q.
+            if (
+                best_controller_q is None
+                or q > best_controller_q
+                or (q == best_controller_q and (best_controller_idx is None or int(cidx) < int(best_controller_idx)))
+            ):
+                best_controller_idx = int(cidx)
+                best_controller_q = q
+                best_controller_tuple = q_tuple
 
-        if worst_tuple is None:
+        if best_controller_tuple is None:
             return self._compose_q_from_state(
                 leaf_state=adv_child_state,
                 parent_cost=parent_cost,
@@ -613,8 +616,10 @@ class VidurMCTS:
                 model_version=int(model_version),
             )
 
-        return worst_tuple
+        return best_controller_tuple
 
+
+  
     def _evaluate_depth1_action_q(
         self,
         *,

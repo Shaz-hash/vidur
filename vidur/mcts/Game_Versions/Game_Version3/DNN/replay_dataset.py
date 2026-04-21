@@ -202,6 +202,9 @@ def collate_player_samples(
     samples: Sequence[RootSample],
     *,
     device: torch.device,
+    include_policy_tensors: bool = True,
+    include_legacy_fallback: bool = True,
+    include_ids: bool = True,
 ) -> Dict[str, Any]:
     if not samples:
         raise ValueError("No samples to collate")
@@ -209,8 +212,6 @@ def collate_player_samples(
     player = samples[0]["player"]
     if any(s["player"] != player for s in samples):
         raise ValueError("collate_player_samples received mixed players")
-
-    a = _num_actions(player)
 
     n_p = int(DEFAULT_DNN_SPEC.n_prefill_req)
     n_d = int(DEFAULT_DNN_SPEC.n_decode_req)
@@ -230,49 +231,57 @@ def collate_player_samples(
     if decode_req_mask is not None:
         decode_req_mask = decode_req_mask.to(device)
 
-    action_mask = torch.stack([s["inputs"]["action_mask"] for s in samples], dim=0).to(device).to(torch.bool)
-    if action_mask.shape[1] != a:
-        raise ValueError(f"action_mask width {action_mask.shape[1]} != expected {a} for player={player}")
-
-    target_policy = torch.stack([s["targets"]["policy"] for s in samples], dim=0).to(device)
     target_value = torch.stack([s["targets"]["value"] for s in samples], dim=0).to(device).view(-1)
 
-    target_policy = target_policy * action_mask.to(dtype=target_policy.dtype)
-    denom = target_policy.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-    target_policy = target_policy / denom
-
-    # optional legacy fields for compatibility
-    legacy_width = max(int(prefill_req_features.size(-1)), int(decode_req_features.size(-1)))
-    req_features = torch.cat(
-        [
-            F.pad(prefill_req_features, (0, legacy_width - int(prefill_req_features.size(-1)))),
-            F.pad(decode_req_features, (0, legacy_width - int(decode_req_features.size(-1)))),
-        ],
-        dim=1,
-    )
-    req_mask = None
-    if prefill_req_mask is not None and decode_req_mask is not None:
-        req_mask = torch.cat([prefill_req_mask, decode_req_mask], dim=1)
-
-    return {
+    out: Dict[str, Any] = {
         "player": player,
         "prefill_req_features": prefill_req_features,
         "decode_req_features": decode_req_features,
         "global_features": global_features,
         "prefill_req_mask": prefill_req_mask,
         "decode_req_mask": decode_req_mask,
-        "req_features": req_features,  # legacy
-        "req_mask": req_mask,          # legacy
-        "action_mask": action_mask,
-        "target_policy": target_policy,
         "target_value": target_value,
-        "ids": {
+    }
+
+    if include_policy_tensors:
+        a = _num_actions(player)
+        action_mask = torch.stack([s["inputs"]["action_mask"] for s in samples], dim=0).to(device).to(torch.bool)
+        if action_mask.shape[1] != a:
+            raise ValueError(f"action_mask width {action_mask.shape[1]} != expected {a} for player={player}")
+
+        target_policy = torch.stack([s["targets"]["policy"] for s in samples], dim=0).to(device)
+        target_policy = target_policy * action_mask.to(dtype=target_policy.dtype)
+        denom = target_policy.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        target_policy = target_policy / denom
+
+        out["action_mask"] = action_mask
+        out["target_policy"] = target_policy
+
+    if include_legacy_fallback:
+        legacy_width = max(int(prefill_req_features.size(-1)), int(decode_req_features.size(-1)))
+        req_features = torch.cat(
+            [
+                F.pad(prefill_req_features, (0, legacy_width - int(prefill_req_features.size(-1)))),
+                F.pad(decode_req_features, (0, legacy_width - int(decode_req_features.size(-1)))),
+            ],
+            dim=1,
+        )
+        req_mask = None
+        if prefill_req_mask is not None and decode_req_mask is not None:
+            req_mask = torch.cat([prefill_req_mask, decode_req_mask], dim=1)
+
+        out["req_features"] = req_features
+        out["req_mask"] = req_mask
+
+    if include_ids:
+        out["ids"] = {
             "game_id": torch.tensor([s["game_id"] for s in samples], device=device),
             "root_id": torch.tensor([s["root_id"] for s in samples], device=device),
             "root_node_id": torch.tensor([s["root_node_id"] for s in samples], device=device),
             "root_depth": torch.tensor([s["root_depth"] for s in samples], device=device),
-        },
-    }
+        }
+
+    return out
 
 
 
@@ -281,6 +290,9 @@ def collate_mixed_samples(
     samples: Sequence[RootSample],
     *,
     device: torch.device,
+    include_policy_tensors: bool = True,
+    include_legacy_fallback: bool = True,
+    include_ids: bool = True,
 ) -> Dict[str, Optional[Dict[str, Any]]]:
     """
     Returns:
@@ -290,5 +302,11 @@ def collate_mixed_samples(
     out: Dict[str, Optional[Dict[str, Any]]] = {"controller": None, "adversary": None}
     for p in ["controller", "adversary"]:
         if groups[p]:
-            out[p] = collate_player_samples(groups[p], device=device)
+            out[p] = collate_player_samples(
+                groups[p],
+                device=device,
+                include_policy_tensors=include_policy_tensors,
+                include_legacy_fallback=include_legacy_fallback,
+                include_ids=include_ids,
+            )
     return out

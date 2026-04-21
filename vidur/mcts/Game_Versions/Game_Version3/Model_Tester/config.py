@@ -9,7 +9,7 @@ from ..config import DEFAULT_MULTIPROCESS_TRAINING_CONFIG, MultipleProcessTraini
 
 
 def _repo_root() -> Path:
-    # .../vidur/vidur/mcts/Game_Versions/Game_Version2/Model_Tester/config.py -> /home/ubuntu/vidur
+    # .../vidur/vidur/mcts/Game_Versions/Game_Version3/Model_Tester/config.py -> /home/ubuntu/vidur
     return Path(__file__).resolve().parents[5]
 
 
@@ -20,8 +20,13 @@ def _under_repo(*parts: str) -> str:
 @dataclass(frozen=True)
 class TrivialControllerPolicyConfig:
     heuristic: str = "SJF"
-    budget_tokens: int = 1024
+    budget_tokens: int = 512
     eviction_rule: str = "evict_none"
+
+
+@dataclass(frozen=True)
+class TrivialAdversaryPolicyConfig:
+    heuristic: str = "max_prefill_tokens"
 
 
 @dataclass(frozen=True)
@@ -36,13 +41,13 @@ class ModelTesterConfig:
     # Model under test
     model_checkpoint_path: str = _under_repo(
         "simulator_output",
-        "Game_Version2",
+        "Game_Version3",
         "mcts_dnn_checkpoints",
         "best.pt",
     )
 
     # Outputs
-    output_dir: str = _under_repo("simulator_output", "Game_Version2", "Model_Trivial_Results")
+    output_dir: str = _under_repo("simulator_output", "Game_Version3", "Model_Tester_Results")
 
     # History sampling
     history_seed: int = 2026
@@ -52,17 +57,16 @@ class ModelTesterConfig:
     history_hops_force_zero: bool = True  # ensures one game starts from initial state
 
     # Arena controls
-    arena_time_limit_sec: float = 5.0
+    arena_time_limit_sec: float = 8.0
     arena_max_controller_cleanup_steps: int = 1024
     arena_max_total_turns: int = 4096
 
-    # MCTS budgets
-    cycle1_adv_iterations_per_root: int = 2000
-    cycle1_cont_iterations_per_root: int = 2000
-    cycle2_adv_iterations_per_root: int = 2000
+    # One-step bootstrap selector controls
+    bootstrap_model_version: int = 1
 
-    # Trivial policy in cycle-2 (model adversary vs trivial controller)
+    # Trivial baselines used in the arena comparisons.
     trivial_policy: TrivialControllerPolicyConfig = field(default_factory=TrivialControllerPolicyConfig)
+    trivial_adversary_policy: TrivialAdversaryPolicyConfig = field(default_factory=TrivialAdversaryPolicyConfig)
 
     # Runtime
     environment_lang: str = "native"  # "python" | "native"
@@ -75,7 +79,7 @@ class ModelTesterConfig:
     native_model_version: int = 777_001
     native_torchscript_dir: str = _under_repo(
         "simulator_output",
-        "Game_Version2",
+        "Game_Version3",
         "torchscript",
         "model_tester",
     )
@@ -182,18 +186,25 @@ class ModelTesterConfig:
         if self.arena_max_total_turns <= 0:
             raise ValueError("arena_max_total_turns must be > 0")
 
-        if self.cycle1_adv_iterations_per_root <= 0:
-            raise ValueError("cycle1_adv_iterations_per_root must be > 0")
-        if self.cycle1_cont_iterations_per_root <= 0:
-            raise ValueError("cycle1_cont_iterations_per_root must be > 0")
-        if self.cycle2_adv_iterations_per_root <= 0:
-            raise ValueError("cycle2_adv_iterations_per_root must be > 0")
+        if int(self.bootstrap_model_version) <= 0:
+            raise ValueError("bootstrap_model_version must be > 0")
 
         if self.environment_lang not in {"python", "native"}:
             raise ValueError("environment_lang must be 'python' or 'native'")
 
         if self.trivial_policy.budget_tokens < 0:
             raise ValueError("trivial_policy.budget_tokens must be >= 0")
+        if self.trivial_adversary_policy.heuristic not in {
+            "noop",
+            "first_valid",
+            "first_valid_nonempty",
+            "max_request_count",
+            "max_prefill_tokens",
+        }:
+            raise ValueError(
+                "trivial_adversary_policy.heuristic must be one of "
+                "{noop, first_valid, first_valid_nonempty, max_request_count, max_prefill_tokens}"
+            )
 
         gv2_cfg = self.to_pipeline_cfg().game_v2
         if self.trivial_policy.heuristic not in set(gv2_cfg.controller_action.ordering_heuristics):
@@ -212,4 +223,3 @@ class ModelTesterConfig:
 
 
 DEFAULT_MODEL_TESTER_CONFIG = ModelTesterConfig()
-

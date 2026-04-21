@@ -50,6 +50,14 @@ from .types import ModelInputs
 _SPEC = DEFAULT_DNN_SPEC
 _CFG = DEFAULT_GAME_V2_CONFIG
 F = _CFG.features
+_MAX_REQUESTS_PER_LAUNCH_WINDOW: float = float(max(1, int(_CFG.timing.max_requests_per_launch_window)))
+_MAX_PREFILL_TOKENS_PER_LAUNCH_WINDOW: float = float(
+    max(
+        1,
+        int(_CFG.request.target_prefill_tokens_per_request_avg_window)
+        * int(_CFG.timing.max_requests_per_launch_window),
+    )
+)
 
 N_PREFILL_REQ: int = int(_SPEC.n_prefill_req)
 D_PREFILL_REQ: int = int(_SPEC.d_prefill_req)
@@ -437,6 +445,14 @@ def build_model_inputs(
     objective_cost = float(slo_violations) + float(slo_lateness_sum)
     launch_count, launch_prefill, ewma = _recent_launch_summary(state, sim_time)
     decode_credit = _decode_credit_available(state)
+    remaining_launch_request_headroom = max(
+        0.0,
+        float(_MAX_REQUESTS_PER_LAUNCH_WINDOW) - float(launch_count),
+    )
+    remaining_launch_prefill_headroom = max(
+        0.0,
+        float(_MAX_PREFILL_TOKENS_PER_LAUNCH_WINDOW) - float(launch_prefill),
+    )
 
     global_feat = torch.tensor(
         [[
@@ -458,6 +474,8 @@ def build_model_inputs(
             _norm01(d_late_15, F.decode_near_drop_den),
             _norm01(launch_count, F.recent_launch_count_den),
             _norm01(launch_prefill, F.recent_launch_prefill_den),
+            _norm01(remaining_launch_request_headroom, _MAX_REQUESTS_PER_LAUNCH_WINDOW),
+            _norm01(remaining_launch_prefill_headroom, _MAX_PREFILL_TOKENS_PER_LAUNCH_WINDOW),
             _norm01(ewma, F.recent_launch_count_den),
             _norm01(decode_credit, F.decode_credit_den),
             1.0 if num_prefill > 0 else 0.0,
@@ -575,7 +593,6 @@ def _infer_debug_dump(
             f.write(text)
     else:
         print(text)
-
 
 
 

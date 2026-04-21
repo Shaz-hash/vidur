@@ -67,6 +67,18 @@ class ArenaGameCycleFileLogger:
         "valid_action_count",      # NEW
         "iterations_requested",    # NEW
         "iterations_used",         # NEW
+        "chosen_q_value",
+        "chosen_reward",
+        "chosen_discount",
+        "chosen_bootstrap",
+        "chosen_child_cost",
+        "candidate_ranking_mode",
+        "candidate_top5_action_reprs",
+        "candidate_top5_q_values",
+        "candidate_top5_rewards",
+        "candidate_top5_discounts",
+        "candidate_top5_bootstraps",
+        "candidate_top5_child_costs",
         "end_reason",
     ]
 
@@ -116,6 +128,18 @@ class ArenaGameCycleFileLogger:
         valid_action_count: int | None = None,      # NEW
         iterations_requested: int | None = None,    # NEW
         iterations_used: int | None = None,         # NEW
+        chosen_q_value: float | None = None,
+        chosen_reward: float | None = None,
+        chosen_discount: float | None = None,
+        chosen_bootstrap: float | None = None,
+        chosen_child_cost: float | None = None,
+        candidate_ranking_mode: str | None = None,
+        candidate_top5_action_reprs: list[str] | None = None,
+        candidate_top5_q_values: list[float] | None = None,
+        candidate_top5_rewards: list[float] | None = None,
+        candidate_top5_discounts: list[float] | None = None,
+        candidate_top5_bootstraps: list[float] | None = None,
+        candidate_top5_child_costs: list[float] | None = None,
         end_reason: str = "",
     ) -> None:
         path = self._path_for_cycle(game_id=game_id, cycle_label=cycle_label)
@@ -144,6 +168,18 @@ class ArenaGameCycleFileLogger:
                 "valid_action_count": "" if valid_action_count is None else int(valid_action_count),            # NEW
                 "iterations_requested": "" if iterations_requested is None else int(iterations_requested),      # NEW
                 "iterations_used": "" if iterations_used is None else int(iterations_used),                     # NEW
+                "chosen_q_value": "" if chosen_q_value is None else float(chosen_q_value),
+                "chosen_reward": "" if chosen_reward is None else float(chosen_reward),
+                "chosen_discount": "" if chosen_discount is None else float(chosen_discount),
+                "chosen_bootstrap": "" if chosen_bootstrap is None else float(chosen_bootstrap),
+                "chosen_child_cost": "" if chosen_child_cost is None else float(chosen_child_cost),
+                "candidate_ranking_mode": "" if candidate_ranking_mode is None else str(candidate_ranking_mode),
+                "candidate_top5_action_reprs": "" if candidate_top5_action_reprs is None else json.dumps([str(x) for x in candidate_top5_action_reprs]),
+                "candidate_top5_q_values": "" if candidate_top5_q_values is None else json.dumps([float(x) for x in candidate_top5_q_values]),
+                "candidate_top5_rewards": "" if candidate_top5_rewards is None else json.dumps([float(x) for x in candidate_top5_rewards]),
+                "candidate_top5_discounts": "" if candidate_top5_discounts is None else json.dumps([float(x) for x in candidate_top5_discounts]),
+                "candidate_top5_bootstraps": "" if candidate_top5_bootstraps is None else json.dumps([float(x) for x in candidate_top5_bootstraps]),
+                "candidate_top5_child_costs": "" if candidate_top5_child_costs is None else json.dumps([float(x) for x in candidate_top5_child_costs]),
                 "end_reason": str(end_reason),
             },
         )
@@ -182,10 +218,86 @@ class ArenaGameCycleFileLogger:
                 "decode_credit_balance": "",
                 "decode_processed_tokens_by_id": "",
                 "prefill_remaining_by_id": "",
+                "selection_mode": "",
+                "valid_action_count": "",
+                "iterations_requested": "",
+                "iterations_used": "",
+                "chosen_q_value": "",
+                "chosen_reward": "",
+                "chosen_discount": "",
+                "chosen_bootstrap": "",
+                "chosen_child_cost": "",
+                "candidate_ranking_mode": "",
+                "candidate_top5_action_reprs": "",
+                "candidate_top5_q_values": "",
+                "candidate_top5_rewards": "",
+                "candidate_top5_discounts": "",
+                "candidate_top5_bootstraps": "",
+                "candidate_top5_child_costs": "",
                 "end_reason": str(end_reason),
             },
         )
 
+
+class ArenaModelActionDetailLogger:
+    _FIELDS = [
+        "game_id",
+        "cycle_label",
+        "phase",
+        "turn",
+        "depth",
+        "player_acted",
+        "rank",
+        "action_repr",
+        "q_value",
+        "immediate_reward",
+        "discount",
+        "bootstrap_value",
+        "child_cost",
+    ]
+
+    def __init__(self, games_dir: Path) -> None:
+        self.games_dir = Path(games_dir)
+        self.games_dir.mkdir(parents=True, exist_ok=True)
+
+    def _path_for_cycle(self, game_id: int, cycle_label: str) -> Path:
+        return self.games_dir / f"game_{int(game_id)}_{str(cycle_label)}_model_action_details.csv"
+
+    def write_ranked_actions(
+        self,
+        *,
+        game_id: int,
+        cycle_label: str,
+        phase: str,
+        turn: int,
+        depth: int,
+        player_acted: str,
+        ranked_rows: list[dict],
+    ) -> None:
+        path = self._path_for_cycle(game_id=game_id, cycle_label=cycle_label)
+        write_header = not path.exists()
+        with path.open("a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=self._FIELDS)
+            if write_header:
+                w.writeheader()
+            for row in ranked_rows:
+                w.writerow(
+                    {
+                        "game_id": int(game_id),
+                        "cycle_label": str(cycle_label),
+                        "phase": str(phase),
+                        "turn": int(turn),
+                        "depth": int(depth),
+                        "player_acted": str(player_acted),
+                        "rank": int(row.get("rank", 0)),
+                        "action_repr": str(row.get("action_repr", "")),
+                        "q_value": float(row.get("q_value", 0.0)),
+                        "immediate_reward": float(row.get("immediate_reward", 0.0)),
+                        "discount": float(row.get("discount", 0.0)),
+                        "bootstrap_value": float(row.get("bootstrap_value", 0.0)),
+                        "child_cost": float(row.get("child_cost", 0.0)),
+                    }
+                )
 
 
 class EvaluationMetricsLogger:

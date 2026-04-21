@@ -50,6 +50,8 @@ def select_trivial_controller_action(
     heuristic: str,
     budget_tokens: int,
     eviction_rule: str,
+    actions_by_index: Optional[Sequence[Any | None]] = None,
+    valid_indices: Optional[Sequence[int]] = None,
 ) -> Tuple[Optional[ControllerAction], Dict[str, Any]]:
     """
     Select a fixed controller policy action from existing sampled valid actions:
@@ -63,13 +65,21 @@ def select_trivial_controller_action(
     total_prefill = _total_remaining_prefill(env, state)
     target_prefill = int(min(max(0, int(budget_tokens)), max(0, int(total_prefill))))
 
-    actions_by_index, mask = runner._sample_actions_readonly(state, "controller")
-    mask_list = _mask_to_list(mask)
-    valid_indices = [
-        int(i)
-        for i, ok in enumerate(mask_list)
-        if bool(ok) and i < len(actions_by_index) and actions_by_index[i] is not None
-    ]
+    if actions_by_index is None or valid_indices is None:
+        actions_by_index, mask = runner._sample_actions_readonly(state, "controller")
+        mask_list = _mask_to_list(mask)
+        valid_indices = [
+            int(i)
+            for i, ok in enumerate(mask_list)
+            if bool(ok) and i < len(actions_by_index) and actions_by_index[i] is not None
+        ]
+    else:
+        actions_by_index = list(actions_by_index)
+        valid_indices = [
+            int(i)
+            for i in list(valid_indices)
+            if int(i) < len(actions_by_index) and actions_by_index[int(i)] is not None
+        ]
 
     if total_prefill <= 0:
         return make_strict_noop_controller_action(eviction_rule=eviction_rule), {
@@ -156,4 +166,3 @@ def select_trivial_controller_action(
         "target_prefill_budget": int(target_prefill),
         "chosen_prefill_budget": int(chosen_pref),
     }
-

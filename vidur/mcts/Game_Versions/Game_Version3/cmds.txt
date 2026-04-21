@@ -58,11 +58,6 @@ pkill -9 -f "vidur\.mcts\.Game_Versions\.Game_Version3\.alphaZero_parrallel"
 
 
 
-cd /home/ubuntu/vidur && \
-mkdir -p simulator_output/Game_Version2/mcts_dnn_logs && \
-nohup env PYTHONPATH=/home/ubuntu/vidur /home/ubuntu/vidur/.venv/bin/python -u -m vidur.mcts.Game_Versions.Game_Version2.alphaZero_parrallel \
-  > simulator_output/Game_Version2/mcts_dnn_logs/alphaZeroParrallel.out 2>&1 < /dev/null & \
-echo $! > simulator_output/Game_Version2/mcts_dnn_logs/alphaZeroParrallel.pid
 
 to run cmd :
 
@@ -72,3 +67,10 @@ nohup env PYTHONPATH=/home/ubuntu/vidur /home/ubuntu/vidur/.venv/bin/python -u \
   -m vidur.mcts.Game_Versions.Game_Version3.alphaZero_parrallel \
   > simulator_output/Game_Version3/mcts_dnn_logs/alphaZeroParrallel.out 2>&1 < /dev/null & \
 echo $! > simulator_output/Game_Version3/mcts_dnn_logs/alphaZeroParrallel.pid
+
+
+For tester :
+cd /home/ubuntu/vidur && \
+PYTHONPATH=/home/ubuntu/vidur \
+/home/ubuntu/vidur/.venv/bin/python \
+-m vidur.mcts.Game_Versions.Game_Version3.Model_Tester.run

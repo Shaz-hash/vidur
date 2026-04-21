@@ -70,6 +70,7 @@ class PreparedHistoryRoot:
     pre_controller_snapshot: Any | None = None
     pre_controller_stats: Any | None = None
     history_hops: int = 0
+    history_signature: Any | None = None
 
 
 class SelfPlayRunner:
@@ -267,6 +268,7 @@ class SelfPlayRunner:
                 pre_controller_snapshot=obj.get("pre_controller_snapshot", None),
                 pre_controller_stats=obj.get("pre_controller_stats", None),
                 history_hops=int(obj.get("history_hops", 0)),
+                history_signature=obj.get("history_signature", None),
             )
 
         return PreparedHistoryRoot(
@@ -278,6 +280,7 @@ class SelfPlayRunner:
             pre_controller_snapshot=getattr(obj, "pre_controller_snapshot", None),
             pre_controller_stats=getattr(obj, "pre_controller_stats", None),
             history_hops=int(getattr(obj, "history_hops", 0)),
+            history_signature=getattr(obj, "history_signature", None),
         )
 
     def _prepare_history_roots(
@@ -295,6 +298,7 @@ class SelfPlayRunner:
         history_seed: int,
         history_max_total_steps: int,
         log_history_rows: bool,
+        history_seen_signatures: Optional[Sequence[Any]] = None,
     ) -> List[PreparedHistoryRoot]:
         if hasattr(self.history, "generate_roots_batch"):
             try:
@@ -311,6 +315,7 @@ class SelfPlayRunner:
                     seed=int(history_seed),
                     max_total_steps=int(history_max_total_steps),
                     log_history=bool(log_history_rows),
+                    initial_seen_signatures=history_seen_signatures,
                 )
                 return [
                     self._coerce_prepared_root(x, int(start_root_id) + i)
@@ -379,6 +384,10 @@ class SelfPlayRunner:
         history_max_total_steps: int,
         log_history_rows: bool,
         root_batch_size: int,
+        history_seen_signatures: Optional[Sequence[Any]] = None,
+        shared_history_signatures: Any | None = None,
+        shared_history_lock: Any | None = None,
+        allow_duplicate_history_fallback: bool = True,
     ) -> Iterator[list[PreparedHistoryRoot]]:
         batch_size = max(1, int(root_batch_size))
         if hasattr(self.history, "generate_roots_batch_iter"):
@@ -397,6 +406,10 @@ class SelfPlayRunner:
                     max_total_steps=int(history_max_total_steps),
                     log_history=bool(log_history_rows),
                     batch_size=int(batch_size),
+                    initial_seen_signatures=history_seen_signatures,
+                    shared_seen_signatures=shared_history_signatures,
+                    shared_seen_lock=shared_history_lock,
+                    allow_duplicate_fallback=bool(allow_duplicate_history_fallback),
                 )
                 for batch_idx, raw_batch in enumerate(raw_batches):
                     offset = int(batch_idx) * int(batch_size)
@@ -535,6 +548,10 @@ class SelfPlayRunner:
         model_version: int = 0,
         eval_split_ratio: float = 0.0,
         eval_split_seed: int = 0,
+        history_seen_signatures: Optional[Sequence[Any]] = None,
+        shared_history_signatures: Any | None = None,
+        shared_history_lock: Any | None = None,
+        allow_duplicate_history_fallback: bool = True,
     ) -> VidurMCTSState:
         del sample_from_mcts_policy
         del selfplay_policy_temperature
@@ -556,6 +573,7 @@ class SelfPlayRunner:
         split_ratio = max(0.0, min(1.0, float(eval_split_ratio)))
         split_rng = random.Random(int(eval_split_seed))
         unique_root_sigs: set[tuple[Any, ...]] = set()
+        emitted_history_signatures: list[Any] = []
         roots_generated = 0
         processed_batches = 0
 
@@ -588,6 +606,10 @@ class SelfPlayRunner:
             history_max_total_steps=int(hist_max_total_steps),
             log_history_rows=bool(hist_log_rows),
             root_batch_size=int(history_root_batch_size),
+            history_seen_signatures=history_seen_signatures,
+            shared_history_signatures=shared_history_signatures,
+            shared_history_lock=shared_history_lock,
+            allow_duplicate_history_fallback=bool(allow_duplicate_history_fallback),
         ):
             processed_batches += 1
             for pr in prepared_batch:
@@ -604,6 +626,8 @@ class SelfPlayRunner:
                     max_hops=int(max_forced_hops),
                 )
                 unique_root_sigs.add(self._root_signature(root_state, root_player, root_depth))
+                if pr.history_signature is not None:
+                    emitted_history_signatures.append(pr.history_signature)
 
                 search_root_state = root_state
                 if root_player == "adversary":
@@ -681,7 +705,7 @@ class SelfPlayRunner:
                     # Tree state is still cleared every root.
                     self.mcts.clear_search_state(drop_scratch=False)
 
-                if progress_tag and (int(roots_generated) % 100 == 0):
+                if progress_tag and (int(roots_generated) % 400 == 0):
                     train_total = int(controller_train_samples + adversary_train_samples)
                     eval_total = int(controller_eval_samples + adversary_eval_samples)
                     print(
@@ -690,7 +714,7 @@ class SelfPlayRunner:
                         flush=True,
                     )
 
-            if progress_tag:
+            if progress_tag and (int(processed_batches) % 4 == 0):
                 batch_end_root = int(roots_generated)
                 batch_start_root = max(1, batch_end_root - len(prepared_batch) + 1) if prepared_batch else batch_end_root
                 print(
@@ -713,6 +737,8 @@ class SelfPlayRunner:
             "history_hops_min": int(hist_hops_min),
             "history_hops_max": int(hist_hops_max),
             "eval_split_ratio": float(split_ratio),
+            "history_signatures": emitted_history_signatures,
+            "num_history_roots_emitted": int(len(emitted_history_signatures)),
         }
 
         if progress_tag:
