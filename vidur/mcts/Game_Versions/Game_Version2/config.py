@@ -20,12 +20,11 @@ def _under_vidur(*parts: str) -> str:
     return str(_vidur_repo_dir().joinpath(*parts))
 
 def _default_model_device() -> str:
-    # try:
-    #     import torch
-    #     return "cuda" if torch.cuda.is_available() else "cpu"
-    # except Exception:
-    #     return "cpu"
-    return "cpu"
+    try:
+        import torch
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        return "cpu"
 
 
 def _default_sim_cli_args() -> Tuple[str, ...]:
@@ -480,6 +479,87 @@ class EvaluationLoggingGroup:
     )
 
 
+@dataclass(frozen=True)
+class NetworkGroup:
+    enabled: bool = False
+    node_role: str = "local"  # "local" | "head" | "worker"
+
+    aws_region: str = "us-east-1"
+    s3_bucket: str = ""
+    s3_prefix: str = "gv2-network"
+    sqs_job_queue_url: str = ""
+    sqs_result_queue_url: str = ""
+    dynamodb_job_table: str = ""
+    dynamodb_worker_table: str = ""
+
+    worker_name: str = ""
+    worker_model_device: str = "cpu"
+    worker_poll_wait_sec: int = 10
+    worker_heartbeat_sec: int = 30
+    worker_stale_after_sec: int = 120
+    worker_registration_timeout_sec: int = 300
+
+    job_visibility_timeout_sec: int = 3600
+    result_poll_timeout_sec: int = 30
+
+    max_total_workers: int = 280
+    max_arena_workers: int = 70
+    selfplay_roots_per_task: int = 32
+    arena_games_per_task: int = 1
+    background_selfplay_during_arena: bool = True
+
+    local_staging_dir: str = _under_vidur("simulator_output", "Game_Version2", "network")
+    s3_model_prefix: str = "models"
+    s3_result_prefix: str = "results"
+
+    def validate(self) -> None:
+        if self.node_role not in {"local", "head", "worker"}:
+            raise ValueError("network.node_role must be 'local', 'head', or 'worker'")
+        if not self.enabled:
+            return
+
+        if not str(self.aws_region).strip():
+            raise ValueError("network.aws_region cannot be empty when network.enabled=True")
+        if not str(self.s3_bucket).strip():
+            raise ValueError("network.s3_bucket cannot be empty when network.enabled=True")
+        if not str(self.sqs_job_queue_url).strip():
+            raise ValueError("network.sqs_job_queue_url cannot be empty when network.enabled=True")
+        if not str(self.sqs_result_queue_url).strip():
+            raise ValueError("network.sqs_result_queue_url cannot be empty when network.enabled=True")
+        if not str(self.dynamodb_job_table).strip():
+            raise ValueError("network.dynamodb_job_table cannot be empty when network.enabled=True")
+        if not str(self.dynamodb_worker_table).strip():
+            raise ValueError("network.dynamodb_worker_table cannot be empty when network.enabled=True")
+        if self.max_total_workers <= 0:
+            raise ValueError("network.max_total_workers must be > 0")
+        if self.max_arena_workers <= 0:
+            raise ValueError("network.max_arena_workers must be > 0")
+        if self.max_arena_workers > self.max_total_workers:
+            raise ValueError("network.max_arena_workers cannot exceed network.max_total_workers")
+        if self.selfplay_roots_per_task <= 0:
+            raise ValueError("network.selfplay_roots_per_task must be > 0")
+        if self.arena_games_per_task <= 0:
+            raise ValueError("network.arena_games_per_task must be > 0")
+        if self.worker_poll_wait_sec <= 0:
+            raise ValueError("network.worker_poll_wait_sec must be > 0")
+        if self.worker_heartbeat_sec <= 0:
+            raise ValueError("network.worker_heartbeat_sec must be > 0")
+        if self.worker_stale_after_sec <= 0:
+            raise ValueError("network.worker_stale_after_sec must be > 0")
+        if self.worker_registration_timeout_sec <= 0:
+            raise ValueError("network.worker_registration_timeout_sec must be > 0")
+        if self.job_visibility_timeout_sec <= 0:
+            raise ValueError("network.job_visibility_timeout_sec must be > 0")
+        if self.result_poll_timeout_sec <= 0:
+            raise ValueError("network.result_poll_timeout_sec must be > 0")
+        if not str(self.local_staging_dir).strip():
+            raise ValueError("network.local_staging_dir cannot be empty when network.enabled=True")
+        if not str(self.s3_model_prefix).strip():
+            raise ValueError("network.s3_model_prefix cannot be empty when network.enabled=True")
+        if not str(self.s3_result_prefix).strip():
+            raise ValueError("network.s3_result_prefix cannot be empty when network.enabled=True")
+
+
 
 @dataclass(frozen=True)
 class MultipleProcessTrainingConfig:
@@ -492,6 +572,7 @@ class MultipleProcessTrainingConfig:
     run: RunGroup = field(default_factory=RunGroup)
     evaluation: EvaluationGroup = field(default_factory=EvaluationGroup)
     evaluation_logging: EvaluationLoggingGroup = field(default_factory=EvaluationLoggingGroup)
+    network: NetworkGroup = field(default_factory=NetworkGroup)
 
 
     ## Environment :
@@ -665,6 +746,8 @@ class MultipleProcessTrainingConfig:
                 raise ValueError("evaluation.start_player must be 'adversary' or 'controller'")
             if self.evaluation.feature_version <= 0:
                 raise ValueError("evaluation.feature_version must be > 0")
+
+        self.network.validate()
 
 
 
