@@ -1,0 +1,10 @@
+[
+  {
+    "name": "aws-gpu-AlphaGoZero",
+    "ssh_host": "aws-gpu-AlphaGoZero",
+    "public_ip": "13.223.0.244",
+    "repo_dir": "/home/ubuntu/vidur",
+    "python": "/home/ubuntu/vidur/.venv/bin/python"
+  }
+]
+
