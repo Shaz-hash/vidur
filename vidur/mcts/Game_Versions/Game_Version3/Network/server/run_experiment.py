@@ -14,6 +14,12 @@ def _parse_args() -> tuple[argparse.Namespace, list[str]]:
     )
     parser.add_argument("--start-generation", type=int, default=0)
     parser.add_argument("--num-generations", type=int, default=defaults.num_generations)
+    parser.add_argument(
+        "--initial-model-version",
+        type=int,
+        default=1,
+        help="Model version label for start-generation. Keep positive when starting from an existing best.pt.",
+    )
     parser.add_argument("--session-prefix", default="gv3_network_experiment")
     parser.add_argument("--machine", action="append", default=None)
     parser.add_argument("--weights-path", default=str(DEFAULT_NETWORK_CONFIG.paths.default_weights_path))
@@ -31,6 +37,7 @@ def main() -> None:
 
     for gen in range(start, start + count):
         session_id = f"{args.session_prefix}_gen_{int(gen):06d}"
+        model_version = int(args.initial_model_version) + int(gen) - int(start)
         cmd = [
             sys.executable,
             "-m",
@@ -40,7 +47,7 @@ def main() -> None:
             "--generation",
             str(int(gen)),
             "--model-version",
-            str(int(gen)),
+            str(int(model_version)),
             "--weights-path",
             str(args.weights_path),
         ]
@@ -50,7 +57,7 @@ def main() -> None:
 
         print(
             f"[GV3 network experiment] generation {int(gen) - int(start) + 1}/{int(count)} "
-            f"starting: gen={int(gen):06d}, session_id={session_id}",
+            f"starting: gen={int(gen):06d}, model_version={int(model_version)}, session_id={session_id}",
             flush=True,
         )
         subprocess.run(cmd, check=True)

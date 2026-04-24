@@ -628,7 +628,7 @@ def main() -> None:
         shard_size=int(args.shard_size),
     )
     generation = int(args.generation)
-    model_version = int(generation if args.model_version is None else args.model_version)
+    model_version = int((generation + 1) if args.model_version is None else args.model_version)
     local_weights = Path(args.weights_path).expanduser()
     if not local_weights.is_absolute():
         local_weights = repo_root() / local_weights
