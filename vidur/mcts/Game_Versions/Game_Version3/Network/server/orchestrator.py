@@ -215,6 +215,7 @@ def _build_task(
         history_nontrivial_hops=int(history_hops_min),
         history_hops_min=int(history_hops_min),
         history_hops_max=int(history_hops_max),
+        history_hop_interval_width=int(task_defaults.history_hop_interval_width),
         history_seed=int(history_seed) + int(cycle_index) * 10_000 + int(task_index) * 1009,
         sample_from_mcts_policy=bool(task_defaults.sample_from_mcts_policy),
         selfplay_policy_temperature=float(task_defaults.selfplay_policy_temperature),
@@ -552,6 +553,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--machine", action="append", default=None, help="Machine name/SSH host/IP to use")
     parser.add_argument("--session-id", default=f"gv3_network_{utc_now_iso().replace(':', '').replace('-', '')}")
     parser.add_argument("--generation", type=int, default=defaults.generation)
+    parser.add_argument("--num-generations", type=int, default=defaults.num_generations)
     parser.add_argument("--model-version", type=int, default=None)
     parser.add_argument("--weights-path", default=str(paths.default_weights_path))
     parser.add_argument("--total-roots", type=int, default=defaults.total_roots_per_generation)
@@ -560,6 +562,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--num-roots-per-machine", type=int, default=defaults.num_roots_per_machine)
     parser.add_argument("--history-hops-min", type=int, default=defaults.history_hops_min)
     parser.add_argument("--history-hops-max", type=int, default=defaults.history_hops_max)
+    parser.add_argument("--history-hop-interval-width", type=int, default=defaults.history_hop_interval_width)
     parser.add_argument("--history-seed", type=int, default=defaults.history_seed)
     parser.add_argument("--worker-model-device", default=defaults.worker_model_device)
     parser.add_argument("--worker-cpu-fraction", type=float, default=defaults.worker_cpu_fraction)
@@ -589,6 +592,9 @@ def _parse_args() -> argparse.Namespace:
         default=defaults.local_train_progress_print_every_steps,
     )
     parser.add_argument("--train-num-threads", type=int, default=defaults.local_train_num_threads)
+    parser.add_argument("--replay-capacity-samples", type=int, default=defaults.local_replay_capacity_samples)
+    parser.add_argument("--replay-max-cached-shards", type=int, default=defaults.local_replay_max_cached_shards)
+    parser.add_argument("--replay-seed", type=int, default=defaults.local_replay_seed)
     parser.add_argument("--output-dir", default=str(paths.output_dir))
     parser.add_argument("--process-log-path", default=str(paths.process_log_path))
     parser.add_argument("--dataset-dir", default=str(paths.dataset_dir))
@@ -606,6 +612,7 @@ def main() -> None:
         total_roots_per_generation=int(args.total_roots),
         roots_per_cycle=int(args.roots_per_cycle),
         sample_cycles_per_generation=int(args.sample_cycles_per_generation),
+        history_hop_interval_width=int(args.history_hop_interval_width),
         adv_iterations_per_root=int(args.adv_iterations_per_root),
         cont_iterations_per_root=int(args.cont_iterations_per_root),
         worker_cpu_fraction=float(args.worker_cpu_fraction),
@@ -651,7 +658,7 @@ def main() -> None:
     if int(args.roots_per_cycle) > 0:
         roots_per_cycle = int(args.roots_per_cycle)
     elif int(args.total_roots) > 0:
-        roots_per_cycle = int(args.total_roots)
+        roots_per_cycle = int((int(args.total_roots) + int(cycles) - 1) // int(cycles))
     else:
         roots_per_cycle = int(args.num_roots_per_machine) * int(len(machines))
     total_roots_required = int(roots_per_cycle) * int(cycles)
@@ -754,7 +761,7 @@ def main() -> None:
     if not bool(args.skip_training):
         training_summary = train_network_generation(
             generation=int(generation),
-            model_version=int(generation),
+            model_version=int(model_version),
             total_roots_required=int(total_roots_required),
             roots_per_cycle=int(roots_per_cycle),
             sample_cycles_per_generation=int(cycles),
@@ -769,6 +776,9 @@ def main() -> None:
             train_target_epochs=float(args.train_target_epochs),
             train_progress_every_steps=int(args.train_progress_every_steps),
             train_num_threads=int(args.train_num_threads),
+            replay_capacity_samples=int(args.replay_capacity_samples),
+            replay_max_cached_shards=int(args.replay_max_cached_shards),
+            replay_seed=int(args.replay_seed),
             log_line=lambda message: _log_line(process_log_path, message),
         )
     _log_line(

@@ -67,6 +67,9 @@ def _network_training_cfg(
     train_target_epochs: float,
     train_progress_every_steps: int,
     train_num_threads: int,
+    replay_capacity_samples: int,
+    replay_max_cached_shards: int,
+    replay_seed: int,
 ) -> MultipleProcessTrainingConfig:
     base = DEFAULT_MULTIPROCESS_TRAINING_CONFIG
     cfg = replace(
@@ -83,6 +86,9 @@ def _network_training_cfg(
         roots_per_generation=max(1, int(roots_per_cycle)),
         sample_cycles_per_generation=max(1, int(sample_cycles_per_generation)),
         num_generations=1,
+        replay_capacity_samples=max(1, int(replay_capacity_samples)),
+        replay_max_cached_shards=max(1, int(replay_max_cached_shards)),
+        replay_seed=int(replay_seed),
     )
     if int(train_batch_size) > 0:
         cfg = replace(cfg, train_batch_size=int(train_batch_size))
@@ -135,6 +141,9 @@ def train_network_generation(
     train_target_epochs: float = 0.0,
     train_progress_every_steps: int = 0,
     train_num_threads: int = 0,
+    replay_capacity_samples: int = 400_000,
+    replay_max_cached_shards: int = 5_000,
+    replay_seed: int = 2026,
     log_line: LogLine | None = None,
 ) -> NetworkTrainingSummary:
     log = log_line or _default_log_line
@@ -153,6 +162,9 @@ def train_network_generation(
         train_target_epochs=float(train_target_epochs),
         train_progress_every_steps=int(train_progress_every_steps),
         train_num_threads=int(train_num_threads),
+        replay_capacity_samples=int(replay_capacity_samples),
+        replay_max_cached_shards=int(replay_max_cached_shards),
+        replay_seed=int(replay_seed),
     )
 
     _set_global_seeds(
@@ -376,10 +388,11 @@ def train_network_generation(
     finally:
         eval_metrics_logger.close()
 
+    train_samples_total = int(replay_buffer.total_samples)
     summary = NetworkTrainingSummary(
         generation=int(gen),
         model_version=int(trained_model_version),
-        train_samples=int(replay_buffer.total_samples),
+        train_samples=int(train_samples_total),
         eval_samples=int(len(eval_samples)),
         train_steps=int(train_steps_this_gen),
         checkpoint_path=str(gen_ckpt_path),
@@ -389,6 +402,7 @@ def train_network_generation(
         eval_metrics=dict(eval_metrics),
     )
 
+    replay_buffer.reset_for_new_best()
     del train_rows
     del eval_samples
     del eval_prediction_rows

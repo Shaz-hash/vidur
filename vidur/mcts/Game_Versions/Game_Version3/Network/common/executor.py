@@ -55,6 +55,7 @@ def _task_cfg(task: NetworkSelfplayTask) -> MultipleProcessTrainingConfig:
         history_seed=int(task.history_seed),
         history_hops_min=int(task.history_hops_min),
         history_hops_max=int(task.history_hops_max),
+        history_hop_interval_width=int(task.history_hop_interval_width),
         history_hops_per_worker=tuple(_worker_hop_ranges(task)),
         max_forced_hops_per_root=int(task.max_forced_hops_per_root),
         history_max_total_steps=int(task.history_max_total_steps),
@@ -75,14 +76,18 @@ def _inclusive_hop_count(task: NetworkSelfplayTask) -> int:
     return max(1, int(task.history_hops_max) - int(task.history_hops_min) + 1)
 
 
+def _hop_interval_count(task: NetworkSelfplayTask) -> int:
+    width = max(1, int(task.history_hop_interval_width))
+    return max(1, int(math.ceil(float(_inclusive_hop_count(task)) / float(width))))
+
+
 def _resolve_worker_processes(task: NetworkSelfplayTask) -> int:
     explicit = int(task.worker_processes)
     if explicit > 0:
         requested = explicit
     else:
-        cpu_count = int(os.cpu_count() or 1)
-        requested = int(math.floor(float(cpu_count) * float(task.worker_cpu_fraction)))
-    return max(1, min(int(requested), int(task.num_roots), _inclusive_hop_count(task)))
+        requested = _hop_interval_count(task)
+    return max(1, min(int(requested), int(task.num_roots), _hop_interval_count(task)))
 
 
 def _resolve_max_concurrent_workers(task: NetworkSelfplayTask) -> int:
@@ -90,7 +95,9 @@ def _resolve_max_concurrent_workers(task: NetworkSelfplayTask) -> int:
     explicit = int(task.max_concurrent_workers)
     if explicit > 0:
         return max(1, min(explicit, resolved_processes))
-    return resolved_processes
+    cpu_count = int(os.cpu_count() or 1)
+    requested = int(math.floor(float(cpu_count) * float(task.worker_cpu_fraction)))
+    return max(1, min(int(requested), resolved_processes))
 
 
 def _partition_inclusive_range(lo: int, hi: int, parts: int) -> list[tuple[int, int]]:
@@ -112,11 +119,19 @@ def _partition_inclusive_range(lo: int, hi: int, parts: int) -> list[tuple[int, 
 
 
 def _worker_hop_ranges(task: NetworkSelfplayTask) -> list[tuple[int, int]]:
-    return _partition_inclusive_range(
-        int(task.history_hops_min),
-        int(task.history_hops_max),
-        _resolve_worker_processes(task),
-    )
+    width = max(1, int(task.history_hop_interval_width))
+    lo = int(task.history_hops_min)
+    hi = max(int(task.history_hops_max), lo)
+    out: list[tuple[int, int]] = []
+    for _ in range(int(_resolve_worker_processes(task))):
+        if lo > hi:
+            break
+        interval_hi = min(int(hi), int(lo + width - 1))
+        out.append((int(lo), int(interval_hi)))
+        lo = int(interval_hi + 1)
+    if not out:
+        out.append((int(task.history_hops_min), int(task.history_hops_min)))
+    return out
 
 
 def _execute_multiprocess_selfplay(task: NetworkSelfplayTask) -> dict[str, Any]:

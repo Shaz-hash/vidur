@@ -32,6 +32,7 @@ class NetworkSelfplayTask:
     history_nontrivial_hops: int
     history_hops_min: int
     history_hops_max: int
+    history_hop_interval_width: int
     history_seed: int
     sample_from_mcts_policy: bool
     selfplay_policy_temperature: float
