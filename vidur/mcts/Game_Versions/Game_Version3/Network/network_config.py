@@ -66,6 +66,10 @@ class NetworkPathConfig:
     def received_log_csv(self) -> Path:
         return self.output_dir / "server_received.csv"
 
+    @property
+    def cleanup_log_csv(self) -> Path:
+        return self.output_dir / "cleanup_log.csv"
+
 
 @dataclass(frozen=True)
 class NetworkTaskDefaults:
@@ -102,9 +106,19 @@ class NetworkTaskDefaults:
 
 
 @dataclass(frozen=True)
+class NetworkCleanupConfig:
+    cleanup_after_generation_done: bool = True
+    remove_local_received: bool = True
+    remove_remote_results: bool = True
+    remove_remote_tasks: bool = True
+    fail_on_remote_cleanup_error: bool = False
+
+
+@dataclass(frozen=True)
 class NetworkConfig:
     paths: NetworkPathConfig = field(default_factory=NetworkPathConfig)
     task: NetworkTaskDefaults = field(default_factory=NetworkTaskDefaults)
+    cleanup: NetworkCleanupConfig = field(default_factory=NetworkCleanupConfig)
 
 
 DEFAULT_NETWORK_CONFIG = NetworkConfig()
@@ -131,4 +145,3 @@ def selected_machines(
     if missing:
         raise ValueError(f"Unknown network machine(s): {sorted(missing)}")
     return out
-

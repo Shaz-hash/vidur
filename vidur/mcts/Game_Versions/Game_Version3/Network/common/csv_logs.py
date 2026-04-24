@@ -61,6 +61,25 @@ CLIENT_COLUMNS = (
     "error",
 )
 
+CLEANUP_COLUMNS = (
+    "session_id",
+    "task_id",
+    "machine_name",
+    "machine_ip",
+    "cleanup_at_utc",
+    "generation",
+    "model_version",
+    "local_result_dir",
+    "remote_result_dir",
+    "remote_task_dir",
+    "remove_local_received",
+    "remove_remote_results",
+    "remove_remote_tasks",
+    "dry_run",
+    "status",
+    "error",
+)
+
 
 def append_csv_row(path: Path, columns: Iterable[str], row: Mapping[str, Any]) -> None:
     p = Path(path)
@@ -72,4 +91,3 @@ def append_csv_row(path: Path, columns: Iterable[str], row: Mapping[str, Any]) -
         if write_header:
             writer.writeheader()
         writer.writerow({k: row.get(k, "") for k in cols})
-
