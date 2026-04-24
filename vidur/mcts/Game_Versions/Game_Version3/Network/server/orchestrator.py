@@ -4,6 +4,7 @@ import argparse
 import json
 import shlex
 import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -40,22 +41,82 @@ def _safe_id(value: str) -> str:
     return "".join(out).strip("_") or "machine"
 
 
-def _run(cmd: list[str], *, check: bool = True) -> subprocess.CompletedProcess:
-    print("+ " + " ".join(shlex.quote(x) for x in cmd), flush=True)
-    return subprocess.run(cmd, check=check, text=True)
+def _append_process_log(path: Path | None, text: str) -> None:
+    if path is None:
+        return
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("a", encoding="utf-8") as f:
+        f.write(text)
+        if text and not text.endswith("\n"):
+            f.write("\n")
 
 
-def _ssh(machine: NetworkMachineConfig, remote_cmd: str, *, check: bool = True) -> subprocess.CompletedProcess:
-    return _run(["ssh", machine.ssh_host, remote_cmd], check=check)
+def _log_line(path: Path | None, message: str) -> None:
+    print(message, flush=True)
+    _append_process_log(path, message + "\n")
 
 
-def _rsync_to(machine: NetworkMachineConfig, local_path: Path, remote_path: str) -> None:
-    _run(["rsync", "-az", str(local_path), f"{machine.ssh_host}:{remote_path}"])
+def _run(
+    cmd: list[str],
+    *,
+    check: bool = True,
+    process_log_path: Path | None = None,
+) -> subprocess.CompletedProcess:
+    cmd_line = "+ " + " ".join(shlex.quote(x) for x in cmd)
+    _log_line(process_log_path, cmd_line)
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    output: list[str] = []
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        output.append(line)
+        sys.stdout.write(line)
+        sys.stdout.flush()
+        _append_process_log(process_log_path, line)
+    returncode = proc.wait()
+    if check and returncode != 0:
+        raise subprocess.CalledProcessError(returncode, cmd, output="".join(output))
+    return subprocess.CompletedProcess(cmd, returncode, stdout="".join(output))
 
 
-def _rsync_from(machine: NetworkMachineConfig, remote_path: str, local_path: Path) -> None:
+def _ssh(
+    machine: NetworkMachineConfig,
+    remote_cmd: str,
+    *,
+    check: bool = True,
+    process_log_path: Path | None = None,
+) -> subprocess.CompletedProcess:
+    return _run(["ssh", machine.ssh_host, remote_cmd], check=check, process_log_path=process_log_path)
+
+
+def _rsync_to(
+    machine: NetworkMachineConfig,
+    local_path: Path,
+    remote_path: str,
+    *,
+    process_log_path: Path | None = None,
+) -> None:
+    _run(["rsync", "-az", str(local_path), f"{machine.ssh_host}:{remote_path}"], process_log_path=process_log_path)
+
+
+def _rsync_from(
+    machine: NetworkMachineConfig,
+    remote_path: str,
+    local_path: Path,
+    *,
+    process_log_path: Path | None = None,
+) -> None:
     local_path.mkdir(parents=True, exist_ok=True)
-    _run(["rsync", "-az", f"{machine.ssh_host}:{remote_path.rstrip('/')}/", f"{local_path}/"])
+    _run(
+        ["rsync", "-az", f"{machine.ssh_host}:{remote_path.rstrip('/')}/", f"{local_path}/"],
+        process_log_path=process_log_path,
+    )
 
 
 def load_machines(path: Path) -> list[NetworkMachineConfig]:
@@ -210,8 +271,18 @@ def dispatch_task(
     remote_result_dir: str,
     allocation_log_csv: Path,
     received_log_csv: Path,
+    process_log_path: Path | None,
 ) -> dict[str, Any]:
     sent_at = utc_now_iso()
+    _log_line(
+        process_log_path,
+        (
+            f"[GV3 network server] dispatch starting: task={task.task_id}, "
+            f"machine={machine.name}, roots={int(task.num_roots)}, "
+            f"history_range=[{int(task.history_hops_min)}, {int(task.history_hops_max)}], "
+            f"model_version={int(task.model_version)}"
+        ),
+    )
     local_task_path.parent.mkdir(parents=True, exist_ok=True)
     write_json(local_task_path, task.to_dict())
     append_csv_row(
@@ -228,32 +299,52 @@ def dispatch_task(
             str(remote_result_dir),
         ]
     )
-    _ssh(machine, remote_mkdir)
-    _rsync_to(machine, local_weights_path, remote_weights_path)
-    _rsync_to(machine, local_task_path, remote_task_path)
+    _ssh(machine, remote_mkdir, process_log_path=process_log_path)
+    _rsync_to(machine, local_weights_path, remote_weights_path, process_log_path=process_log_path)
+    _rsync_to(machine, local_task_path, remote_task_path, process_log_path=process_log_path)
     append_csv_row(
         allocation_log_csv,
         ALLOCATION_COLUMNS,
         _allocation_row(task, sent_at, "sent"),
     )
 
-    remote_cmd = (
+    remote_process_log = (
+        Path(machine.repo_dir) / "simulator_output" / "Game_Version3" / "mcts_dnn_logs" / "alphaZeroParrallel.out"
+    )
+    worker_header = (
+        f"[GV3 network worker] task={task.task_id} machine={machine.name} "
+        f"roots={int(task.num_roots)} model_version={int(task.model_version)} "
+        f"history_range=[{int(task.history_hops_min)}, {int(task.history_hops_max)}] start={utc_now_iso()}"
+    )
+    worker_footer_prefix = f"[GV3 network worker] task={task.task_id} machine={machine.name}"
+    worker_cmd = (
         f"cd {shlex.quote(machine.repo_dir)} && "
         f"PYTHONPATH={shlex.quote(machine.repo_dir)} "
-        f"{shlex.quote(machine.python)} -m "
+        f"{shlex.quote(machine.python)} -u -m "
         "vidur.mcts.Game_Versions.Game_Version3.Network.client.run_task "
         f"--task {shlex.quote(remote_task_path)}"
     )
+    remote_inner = (
+        "set -o pipefail; "
+        f"mkdir -p {shlex.quote(str(remote_process_log.parent))}; "
+        f"printf '%s\\n' {shlex.quote(worker_header)} >> {shlex.quote(str(remote_process_log))}; "
+        f"({worker_cmd}) 2>&1 | tee -a {shlex.quote(str(remote_process_log))}; "
+        "status=${PIPESTATUS[0]}; "
+        f"printf '%s exit=%s finish=%s\\n' {shlex.quote(worker_footer_prefix)} "
+        f"\"$status\" \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" >> {shlex.quote(str(remote_process_log))}; "
+        "exit $status"
+    )
+    remote_cmd = f"bash -lc {shlex.quote(remote_inner)}"
 
     remote_status = "ok"
     remote_error = ""
-    completed = _ssh(machine, remote_cmd, check=False)
+    completed = _ssh(machine, remote_cmd, check=False, process_log_path=process_log_path)
     if completed.returncode != 0:
         remote_status = "failed"
         remote_error = f"remote command exited with code {completed.returncode}"
 
     try:
-        _rsync_from(machine, remote_result_dir, local_result_dir)
+        _rsync_from(machine, remote_result_dir, local_result_dir, process_log_path=process_log_path)
     except Exception as exc:
         remote_status = "failed"
         remote_error = f"{remote_error}; pull failed: {exc}".strip("; ")
@@ -282,6 +373,15 @@ def dispatch_task(
     if remote_status != "ok":
         raise RuntimeError(f"Network task {task.task_id} failed: {remote_error}")
 
+    _log_line(
+        process_log_path,
+        (
+            f"[GV3 network server] dispatch complete: task={task.task_id}, "
+            f"machine={machine.name}, samples_total={int(verify_stats.get('samples_total', 0))}, "
+            f"train_samples={int(verify_stats.get('train_samples', 0))}, "
+            f"eval_samples={int(verify_stats.get('eval_samples', 0))}"
+        ),
+    )
     return {
         "task_id": task.task_id,
         "machine": machine.name,
@@ -308,6 +408,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-split-ratio", type=float, default=defaults.eval_split_ratio)
     parser.add_argument("--shard-size", type=int, default=defaults.shard_size)
     parser.add_argument("--output-dir", default=str(paths.output_dir))
+    parser.add_argument("--process-log-path", default=str(paths.process_log_path))
     return parser.parse_args()
 
 
@@ -326,12 +427,24 @@ def main() -> None:
         local_weights = repo_root() / local_weights
     if not local_weights.exists():
         raise FileNotFoundError(f"weights checkpoint not found: {local_weights}")
+    process_log_path = Path(args.process_log_path).expanduser()
+    if not process_log_path.is_absolute():
+        process_log_path = repo_root() / process_log_path
 
     machines = selected_machines(load_machines(Path(args.machines_config)), args.machine)
     if not machines:
         raise RuntimeError("No machines selected")
 
     paths.output_dir.mkdir(parents=True, exist_ok=True)
+    _log_line(
+        process_log_path,
+        (
+            f"[GV3 network server] session starting: session_id={args.session_id}, "
+            f"generation={int(generation)}, model_version={int(model_version)}, "
+            f"machines={','.join(m.name for m in machines)}, "
+            f"weights={local_weights}"
+        ),
+    )
     results: list[dict[str, Any]] = []
 
     for idx, machine in enumerate(machines):
@@ -371,10 +484,15 @@ def main() -> None:
             remote_result_dir=str(remote_result_dir),
             allocation_log_csv=paths.allocation_log_csv,
             received_log_csv=paths.received_log_csv,
+            process_log_path=process_log_path,
         )
         results.append(result)
 
-    print(json.dumps({"ok": True, "results": results}, indent=2, sort_keys=True), flush=True)
+    _log_line(
+        process_log_path,
+        f"[GV3 network server] session complete: session_id={args.session_id}, tasks={len(results)}",
+    )
+    _log_line(process_log_path, json.dumps({"ok": True, "results": results}, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":

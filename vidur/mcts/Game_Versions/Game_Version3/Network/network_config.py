@@ -70,6 +70,10 @@ class NetworkPathConfig:
     def cleanup_log_csv(self) -> Path:
         return self.output_dir / "cleanup_log.csv"
 
+    @property
+    def process_log_path(self) -> Path:
+        return gv3_output_dir() / "mcts_dnn_logs" / "alphaZeroParrallel.out"
+
 
 @dataclass(frozen=True)
 class NetworkTaskDefaults:
