@@ -431,15 +431,6 @@ def dispatch_task(
     process_log_path: Path | None,
 ) -> dict[str, Any]:
     sent_at = utc_now_iso()
-    _log_line(
-        process_log_path,
-        (
-            f"[GV3 network server] dispatch starting: task={task.task_id}, "
-            f"machine={machine.name}, roots={int(task.num_roots)}, "
-            f"history_range=[{int(task.history_hops_min)}, {int(task.history_hops_max)}], "
-            f"model_version={int(task.model_version)}"
-        ),
-    )
     local_task_path.parent.mkdir(parents=True, exist_ok=True)
     write_json(local_task_path, task.to_dict())
     append_csv_row(
@@ -697,13 +688,6 @@ def main() -> None:
         machine_root_counts = _partition_counts(int(roots_per_cycle), len(machines))
         cycle_root_base = int(task_defaults.start_root_id) + int(cycle_index) * int(roots_per_cycle)
         next_root_id = int(cycle_root_base)
-        _log_line(
-            process_log_path,
-            (
-                f"[GV3 network server] collection cycle {int(cycle_index) + 1}/{int(cycles)} starting: "
-                f"roots_per_cycle={int(roots_per_cycle)}, root_base={int(cycle_root_base)}"
-            ),
-        )
         for idx, machine in enumerate(machines):
             task_id_preview = f"{args.session_id}_c{int(cycle_index):03d}_{_safe_id(machine.name)}_{idx:03d}"
             remote_base = Path(machine.repo_dir) / "simulator_output" / "Game_Version3" / "network"
