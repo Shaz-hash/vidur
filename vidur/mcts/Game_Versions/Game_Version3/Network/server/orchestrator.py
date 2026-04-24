@@ -141,6 +141,28 @@ def load_machines(path: Path) -> list[NetworkMachineConfig]:
     return [NetworkMachineConfig(**item) for item in raw]
 
 
+def _partition_counts(total: int, parts: int) -> list[int]:
+    n = max(1, int(parts))
+    base, rem = divmod(max(0, int(total)), int(n))
+    return [int(base + (1 if idx < rem else 0)) for idx in range(int(n))]
+
+
+def _partition_inclusive_range(lo: int, hi: int, parts: int) -> list[tuple[int, int]]:
+    lo_i = int(lo)
+    hi_i = max(int(hi), int(lo_i))
+    count = int(hi_i - lo_i + 1)
+    n = max(1, min(int(parts), int(count)))
+    base, rem = divmod(int(count), int(n))
+    out: list[tuple[int, int]] = []
+    start = int(lo_i)
+    for idx in range(int(n)):
+        width = int(base + (1 if idx < rem else 0))
+        end = int(start + width - 1)
+        out.append((int(start), int(end)))
+        start = int(end + 1)
+    return out
+
+
 def _build_task(
     *,
     machine: NetworkMachineConfig,
@@ -159,7 +181,6 @@ def _build_task(
 ) -> NetworkSelfplayTask:
     machine_tag = _safe_id(machine.name)
     task_id = f"{session_id}_{machine_tag}_{task_index:03d}"
-    proc_name = f"proc_{machine_tag}_{task_index:03d}"
     return NetworkSelfplayTask(
         session_id=str(session_id),
         task_id=str(task_id),
@@ -169,8 +190,8 @@ def _build_task(
         model_version=int(model_version),
         weights_path=str(weights_remote_path),
         result_dir=str(remote_result_dir),
-        out_dir_train=str(Path(remote_result_dir) / "train" / proc_name),
-        out_dir_eval=str(Path(remote_result_dir) / "eval" / proc_name),
+        out_dir_train=str(Path(remote_result_dir) / "train"),
+        out_dir_eval=str(Path(remote_result_dir) / "eval"),
         logs_dir=str(Path(remote_result_dir) / "logs"),
         game_id=int(task_defaults.game_id_base) + int(task_index),
         num_roots=int(num_roots),
@@ -196,6 +217,15 @@ def _build_task(
         eval_split_seed=int(task_defaults.eval_split_seed) + int(task_index) * 20_011,
         task_seed=int(task_defaults.task_seed_base) + int(task_index) * 30_017,
         shard_size=int(task_defaults.shard_size),
+        worker_cpu_fraction=float(task_defaults.worker_cpu_fraction),
+        worker_processes=int(task_defaults.worker_processes),
+        max_concurrent_workers=int(task_defaults.max_concurrent_workers),
+        max_workers_per_interval=int(task_defaults.max_workers_per_interval),
+        selfplay_dynamic_chunk_roots=int(task_defaults.selfplay_dynamic_chunk_roots),
+        selfplay_zero_progress_interval_patience=int(task_defaults.selfplay_zero_progress_interval_patience),
+        selfplay_launch_rss_limit_gb=float(task_defaults.selfplay_launch_rss_limit_gb),
+        selfplay_launch_poll_sec=float(task_defaults.selfplay_launch_poll_sec),
+        worker_result_timeout_sec=int(task_defaults.worker_result_timeout_sec),
         model_device=str(worker_model_device),
         use_virtual_env=bool(task_defaults.use_virtual_env),
         allow_duplicate_history_fallback=bool(task_defaults.allow_duplicate_history_fallback),
@@ -421,11 +451,25 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--generation", type=int, default=defaults.generation)
     parser.add_argument("--model-version", type=int, default=None)
     parser.add_argument("--weights-path", default=str(paths.default_weights_path))
+    parser.add_argument("--total-roots", type=int, default=defaults.total_roots_per_generation)
     parser.add_argument("--num-roots-per-machine", type=int, default=defaults.num_roots_per_machine)
     parser.add_argument("--history-hops-min", type=int, default=defaults.history_hops_min)
     parser.add_argument("--history-hops-max", type=int, default=defaults.history_hops_max)
     parser.add_argument("--history-seed", type=int, default=defaults.history_seed)
     parser.add_argument("--worker-model-device", default=defaults.worker_model_device)
+    parser.add_argument("--worker-cpu-fraction", type=float, default=defaults.worker_cpu_fraction)
+    parser.add_argument("--worker-processes", type=int, default=defaults.worker_processes)
+    parser.add_argument("--max-concurrent-workers", type=int, default=defaults.max_concurrent_workers)
+    parser.add_argument("--max-workers-per-interval", type=int, default=defaults.max_workers_per_interval)
+    parser.add_argument("--selfplay-dynamic-chunk-roots", type=int, default=defaults.selfplay_dynamic_chunk_roots)
+    parser.add_argument(
+        "--selfplay-zero-progress-interval-patience",
+        type=int,
+        default=defaults.selfplay_zero_progress_interval_patience,
+    )
+    parser.add_argument("--selfplay-launch-rss-limit-gb", type=float, default=defaults.selfplay_launch_rss_limit_gb)
+    parser.add_argument("--selfplay-launch-poll-sec", type=float, default=defaults.selfplay_launch_poll_sec)
+    parser.add_argument("--worker-result-timeout-sec", type=int, default=defaults.worker_result_timeout_sec)
     parser.add_argument("--adv-iterations-per-root", type=int, default=defaults.adv_iterations_per_root)
     parser.add_argument("--cont-iterations-per-root", type=int, default=defaults.cont_iterations_per_root)
     parser.add_argument("--eval-split-ratio", type=float, default=defaults.eval_split_ratio)
@@ -440,8 +484,18 @@ def main() -> None:
     paths = replace(DEFAULT_NETWORK_CONFIG.paths, output_dir=Path(args.output_dir))
     task_defaults = replace(
         DEFAULT_NETWORK_CONFIG.task,
+        total_roots_per_generation=int(args.total_roots),
         adv_iterations_per_root=int(args.adv_iterations_per_root),
         cont_iterations_per_root=int(args.cont_iterations_per_root),
+        worker_cpu_fraction=float(args.worker_cpu_fraction),
+        worker_processes=int(args.worker_processes),
+        max_concurrent_workers=int(args.max_concurrent_workers),
+        max_workers_per_interval=int(args.max_workers_per_interval),
+        selfplay_dynamic_chunk_roots=int(args.selfplay_dynamic_chunk_roots),
+        selfplay_zero_progress_interval_patience=int(args.selfplay_zero_progress_interval_patience),
+        selfplay_launch_rss_limit_gb=float(args.selfplay_launch_rss_limit_gb),
+        selfplay_launch_poll_sec=float(args.selfplay_launch_poll_sec),
+        worker_result_timeout_sec=int(args.worker_result_timeout_sec),
         eval_split_ratio=float(args.eval_split_ratio),
         shard_size=int(args.shard_size),
     )
@@ -460,6 +514,22 @@ def main() -> None:
     if not machines:
         raise RuntimeError("No machines selected")
 
+    if int(args.total_roots) > 0:
+        machine_root_counts = _partition_counts(int(args.total_roots), len(machines))
+        machine_hop_ranges = _partition_inclusive_range(
+            int(args.history_hops_min),
+            int(args.history_hops_max),
+            len(machines),
+        )
+        if len(machine_hop_ranges) < len(machines):
+            machine_hop_ranges.extend([machine_hop_ranges[-1]] * (len(machines) - len(machine_hop_ranges)))
+    else:
+        machine_root_counts = [int(args.num_roots_per_machine) for _ in machines]
+        machine_hop_ranges = [
+            (int(args.history_hops_min), int(args.history_hops_max))
+            for _ in machines
+        ]
+
     paths.output_dir.mkdir(parents=True, exist_ok=True)
     _log_line(
         process_log_path,
@@ -467,8 +537,10 @@ def main() -> None:
             f"[GV3 network server] session starting: session_id={args.session_id}, "
             f"generation={int(generation)}, model_version={int(model_version)}, "
             f"machines={','.join(m.name for m in machines)}, "
+            f"total_roots={int(args.total_roots)}, "
             f"adv_iterations_per_root={int(task_defaults.adv_iterations_per_root)}, "
             f"cont_iterations_per_root={int(task_defaults.cont_iterations_per_root)}, "
+            f"worker_cpu_fraction={float(task_defaults.worker_cpu_fraction):.3f}, "
             f"weights={local_weights}"
         ),
     )
@@ -482,6 +554,8 @@ def main() -> None:
         remote_task_path = str(remote_task_dir / "task.json")
         remote_weights_path = str(remote_task_dir / "weights.pt")
 
+        machine_roots = int(machine_root_counts[idx])
+        machine_hops_min, machine_hops_max = machine_hop_ranges[idx]
         task = _build_task(
             machine=machine,
             task_defaults=task_defaults,
@@ -491,9 +565,9 @@ def main() -> None:
             weights_remote_path=remote_weights_path,
             remote_result_dir=str(remote_result_dir),
             task_index=int(idx),
-            num_roots=int(args.num_roots_per_machine),
-            history_hops_min=int(args.history_hops_min),
-            history_hops_max=int(args.history_hops_max),
+            num_roots=int(machine_roots),
+            history_hops_min=int(machine_hops_min),
+            history_hops_max=int(machine_hops_max),
             history_seed=int(args.history_seed),
             worker_model_device=str(args.worker_model_device),
         )

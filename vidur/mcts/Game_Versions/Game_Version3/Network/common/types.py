@@ -42,6 +42,15 @@ class NetworkSelfplayTask:
     eval_split_seed: int
     task_seed: int
     shard_size: int
+    worker_cpu_fraction: float = 0.70
+    worker_processes: int = 0
+    max_concurrent_workers: int = 0
+    max_workers_per_interval: int = 1
+    selfplay_dynamic_chunk_roots: int = 128
+    selfplay_zero_progress_interval_patience: int = 4
+    selfplay_launch_rss_limit_gb: float = 120.0
+    selfplay_launch_poll_sec: float = 2.0
+    worker_result_timeout_sec: int = 7200
     model_device: str = "auto"
     use_virtual_env: bool = True
     allow_duplicate_history_fallback: bool = True
@@ -86,4 +95,3 @@ class NetworkTaskResult:
     @property
     def result_path(self) -> Path:
         return Path(self.result_dir) / "result.json"
-

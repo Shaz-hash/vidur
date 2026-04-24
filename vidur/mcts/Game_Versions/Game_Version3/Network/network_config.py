@@ -79,6 +79,7 @@ class NetworkPathConfig:
 class NetworkTaskDefaults:
     generation: int = 0
     model_version: int = 0
+    total_roots_per_generation: int = 0
     num_roots_per_machine: int = 500
     history_hops_min: int = 0
     history_hops_max: int = 25
@@ -103,10 +104,19 @@ class NetworkTaskDefaults:
     log_history_rows: bool = True
     allow_duplicate_history_fallback: bool = True
     shard_size: int = 512
-    worker_model_device: str = "auto"
+    worker_model_device: str = "cpu"
     local_training_device: str = "auto"
     local_evaluation_device: str = "cpu"
     use_virtual_env: bool = True
+    worker_cpu_fraction: float = 0.70
+    worker_processes: int = 0
+    max_concurrent_workers: int = 0
+    max_workers_per_interval: int = 1
+    selfplay_dynamic_chunk_roots: int = 128
+    selfplay_zero_progress_interval_patience: int = 4
+    selfplay_launch_rss_limit_gb: float = 120.0
+    selfplay_launch_poll_sec: float = 2.0
+    worker_result_timeout_sec: int = 7200
 
 
 @dataclass(frozen=True)
