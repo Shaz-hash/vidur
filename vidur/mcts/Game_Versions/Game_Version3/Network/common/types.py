@@ -13,6 +13,7 @@ class NetworkSelfplayTask:
     machine_ip: str
     generation: int
     cycle_index: int
+    sample_cycles_per_generation: int
     model_version: int
     weights_path: str
     result_dir: str

@@ -23,7 +23,6 @@ from ..common.files import (
     write_json,
 )
 from ..common.types import NetworkSelfplayTask, NetworkTaskResult
-from ...logger.evaluation_pipeline_logger import EvaluationMetricsLogger
 from ..network_config import (
     DEFAULT_NETWORK_CONFIG,
     NetworkMachineConfig,
@@ -31,6 +30,7 @@ from ..network_config import (
     repo_root,
     selected_machines,
 )
+from .training import NetworkTrainingSummary, train_network_generation
 
 
 def _safe_id(value: str) -> str:
@@ -65,9 +65,12 @@ def _run(
     check: bool = True,
     process_log_path: Path | None = None,
     log_output_to_process_log: bool = True,
+    log_command_to_process_log: bool = False,
 ) -> subprocess.CompletedProcess:
     cmd_line = "+ " + " ".join(shlex.quote(x) for x in cmd)
-    _log_line(process_log_path, cmd_line)
+    print(cmd_line, flush=True)
+    if log_command_to_process_log:
+        _append_process_log(process_log_path, cmd_line + "\n")
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -175,6 +178,7 @@ def _build_task(
     weights_remote_path: str,
     remote_result_dir: str,
     cycle_index: int,
+    sample_cycles_per_generation: int,
     task_index: int,
     num_roots: int,
     start_root_id: int,
@@ -192,6 +196,7 @@ def _build_task(
         machine_ip=str(machine.public_ip),
         generation=int(generation),
         cycle_index=int(cycle_index),
+        sample_cycles_per_generation=int(sample_cycles_per_generation),
         model_version=int(model_version),
         weights_path=str(weights_remote_path),
         result_dir=str(remote_result_dir),
@@ -409,39 +414,6 @@ def _aggregate_result_stats(results: list[dict[str, Any]]) -> dict[str, int]:
     return out
 
 
-def _log_network_collection_metrics(
-    *,
-    eval_metrics_csv: Path,
-    generation: int,
-    model_version: int,
-    num_roots_required: int,
-    stats: dict[str, int],
-) -> None:
-    logger = EvaluationMetricsLogger(Path(eval_metrics_csv), flush_every=1)
-    nan = float("nan")
-    try:
-        logger.log_phase(
-            generation=int(generation),
-            model_version=int(model_version),
-            num_roots_required=int(num_roots_required),
-            num_unique_roots_created=int(stats.get("num_unique_roots", 0)),
-            phase="network_collection",
-            samples_needed=int(stats.get("train_samples_total", 0)) + int(stats.get("eval_samples_total", 0)),
-            controller_training_samples=int(stats.get("controller_train_samples", 0)),
-            controller_eval_samples=int(stats.get("controller_eval_samples", 0)),
-            adversary_training_samples=int(stats.get("adversary_train_samples", 0)),
-            adversary_eval_samples=int(stats.get("adversary_eval_samples", 0)),
-            value_mse_error=nan,
-            value_mae_error=nan,
-            controller_value_mse_error=nan,
-            controller_value_mae_error=nan,
-            adversary_value_mse_error=nan,
-            adversary_value_mae_error=nan,
-        )
-    finally:
-        logger.close()
-
-
 def dispatch_task(
     *,
     machine: NetworkMachineConfig,
@@ -496,12 +468,6 @@ def dispatch_task(
     remote_process_log = (
         Path(machine.repo_dir) / "simulator_output" / "Game_Version3" / "mcts_dnn_logs" / "alphaZeroParrallel.out"
     )
-    worker_header = (
-        f"[GV3 network worker] task={task.task_id} machine={machine.name} "
-        f"roots={int(task.num_roots)} model_version={int(task.model_version)} "
-        f"history_range=[{int(task.history_hops_min)}, {int(task.history_hops_max)}] start={utc_now_iso()}"
-    )
-    worker_footer_prefix = f"[GV3 network worker] task={task.task_id} machine={machine.name}"
     worker_cmd = (
         f"cd {shlex.quote(machine.repo_dir)} && "
         f"PYTHONPATH={shlex.quote(machine.repo_dir)} "
@@ -512,11 +478,8 @@ def dispatch_task(
     remote_inner = (
         "set -o pipefail; "
         f"mkdir -p {shlex.quote(str(remote_process_log.parent))}; "
-        f"printf '%s\\n' {shlex.quote(worker_header)} >> {shlex.quote(str(remote_process_log))}; "
         f"({worker_cmd}) 2>&1 | tee -a {shlex.quote(str(remote_process_log))}; "
         "status=${PIPESTATUS[0]}; "
-        f"printf '%s exit=%s finish=%s\\n' {shlex.quote(worker_footer_prefix)} "
-        f"\"$status\" \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" >> {shlex.quote(str(remote_process_log))}; "
         "exit $status"
     )
     remote_cmd = f"bash -lc {shlex.quote(remote_inner)}"
@@ -625,6 +588,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--cont-iterations-per-root", type=int, default=defaults.cont_iterations_per_root)
     parser.add_argument("--eval-split-ratio", type=float, default=defaults.eval_split_ratio)
     parser.add_argument("--shard-size", type=int, default=defaults.shard_size)
+    parser.add_argument("--local-training-device", default=defaults.local_training_device)
+    parser.add_argument("--skip-training", action="store_true", default=not bool(defaults.train_after_collection))
+    parser.add_argument("--train-batch-size", type=int, default=defaults.local_train_batch_size)
+    parser.add_argument("--train-target-epochs", type=float, default=defaults.local_train_target_epochs_per_generation)
+    parser.add_argument(
+        "--train-progress-every-steps",
+        type=int,
+        default=defaults.local_train_progress_print_every_steps,
+    )
+    parser.add_argument("--train-num-threads", type=int, default=defaults.local_train_num_threads)
     parser.add_argument("--output-dir", default=str(paths.output_dir))
     parser.add_argument("--process-log-path", default=str(paths.process_log_path))
     parser.add_argument("--dataset-dir", default=str(paths.dataset_dir))
@@ -750,6 +723,7 @@ def main() -> None:
                 weights_remote_path=remote_weights_path,
                 remote_result_dir=str(remote_result_dir),
                 cycle_index=int(cycle_index),
+                sample_cycles_per_generation=int(cycles),
                 task_index=int(idx),
                 num_roots=int(machine_roots),
                 start_root_id=int(next_root_id),
@@ -778,19 +752,41 @@ def main() -> None:
                 process_log_path=process_log_path,
             )
             results.append(result)
+        cycle_results = results[-len(machines) :]
+        cycle_stats = _aggregate_result_stats(cycle_results)
         _log_line(
             process_log_path,
-            f"[GV3 network server] collection cycle {int(cycle_index) + 1}/{int(cycles)} complete",
+            (
+                f"[GV3 network server] collection cycle {int(cycle_index) + 1}/{int(cycles)} received: "
+                f"roots_generated={int(cycle_stats.get('num_roots_generated', 0))}, "
+                f"unique_roots={int(cycle_stats.get('num_unique_roots', 0))}, "
+                f"train_samples={int(cycle_stats.get('train_samples_total', 0))}, "
+                f"eval_samples={int(cycle_stats.get('eval_samples_total', 0))}"
+            ),
         )
 
     aggregate_stats = _aggregate_result_stats(results)
-    _log_network_collection_metrics(
-        eval_metrics_csv=eval_metrics_csv,
-        generation=int(generation),
-        model_version=int(model_version),
-        num_roots_required=int(total_roots_required),
-        stats=aggregate_stats,
-    )
+    training_summary: NetworkTrainingSummary | None = None
+    if not bool(args.skip_training):
+        training_summary = train_network_generation(
+            generation=int(generation),
+            model_version=int(generation),
+            total_roots_required=int(total_roots_required),
+            roots_per_cycle=int(roots_per_cycle),
+            sample_cycles_per_generation=int(cycles),
+            dataset_dir=dataset_dir,
+            logs_dir=logs_dir,
+            eval_metrics_csv=eval_metrics_csv,
+            checkpoints_dir=checkpoints_dir,
+            initial_checkpoint_path=local_weights,
+            collection_stats=aggregate_stats,
+            local_training_device=str(args.local_training_device),
+            train_batch_size=int(args.train_batch_size),
+            train_target_epochs=float(args.train_target_epochs),
+            train_progress_every_steps=int(args.train_progress_every_steps),
+            train_num_threads=int(args.train_num_threads),
+            log_line=lambda message: _log_line(process_log_path, message),
+        )
     _log_line(
         process_log_path,
         (
@@ -799,10 +795,14 @@ def main() -> None:
             f"unique_roots={int(aggregate_stats.get('num_unique_roots', 0))}, "
             f"train_samples={int(aggregate_stats.get('train_samples_total', 0))}, "
             f"eval_samples={int(aggregate_stats.get('eval_samples_total', 0))}"
+            + (
+                f", train_steps={int(training_summary.train_steps)}, checkpoint={training_summary.checkpoint_path}"
+                if training_summary is not None
+                else ", training=skipped"
+            )
         ),
     )
-    _log_line(
-        process_log_path,
+    print(
         json.dumps(
             {
                 "ok": True,
@@ -811,11 +811,13 @@ def main() -> None:
                 "sample_cycles_per_generation": int(cycles),
                 "total_roots_required": int(total_roots_required),
                 "aggregate_stats": aggregate_stats,
+                "training_summary": training_summary.__dict__ if training_summary is not None else None,
                 "results": results,
             },
             indent=2,
             sort_keys=True,
         ),
+        flush=True,
     )
 
 

@@ -125,6 +125,11 @@ class NetworkTaskDefaults:
     worker_model_device: str = "cpu"
     local_training_device: str = "auto"
     local_evaluation_device: str = "cpu"
+    train_after_collection: bool = True
+    local_train_batch_size: int = 0
+    local_train_target_epochs_per_generation: float = 0.0
+    local_train_progress_print_every_steps: int = 0
+    local_train_num_threads: int = 0
     use_virtual_env: bool = True
     worker_cpu_fraction: float = 0.70
     worker_processes: int = 0

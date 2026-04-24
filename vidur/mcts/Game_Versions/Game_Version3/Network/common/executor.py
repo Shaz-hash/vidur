@@ -135,15 +135,6 @@ def _execute_multiprocess_selfplay(task: NetworkSelfplayTask) -> dict[str, Any]:
         torch_deterministic=bool(cfg.game_v2.reproducibility.torch_deterministic),
     )
 
-    print(
-        f"[GV3 network task={task.task_id}] multiprocess self-play starting: "
-        f"roots={int(task.num_roots)}, worker_processes={int(cfg.num_processes)}, "
-        f"max_concurrent={int(cfg.max_concurrent_selfplay_workers)}, "
-        f"hop_range=[{int(task.history_hops_min)}, {int(task.history_hops_max)}], "
-        f"worker_hop_ranges={worker_hop_ranges}, chunk_roots={int(cfg.selfplay_dynamic_chunk_roots)}",
-        flush=True,
-    )
-
     payloads = _build_selfplay_cycle_task_payloads(
         cfg,
         gen=int(task.generation),
@@ -177,9 +168,9 @@ def _execute_multiprocess_selfplay(task: NetworkSelfplayTask) -> dict[str, Any]:
         }
     )
     print(
-        f"[GV3 network task={task.task_id}] multiprocess self-play complete: "
-        f"roots_generated={int(run_stats['num_roots_generated'])}, "
-        f"unique_roots={int(run_stats['num_unique_roots'])}, "
+        f"[GV3 gen={int(task.generation):06d}] self-play cycle "
+        f"{int(task.cycle_index) + 1}/{int(task.sample_cycles_per_generation)} complete: "
+        f"unique_roots={int(run_stats['num_unique_roots'])}/{int(task.num_roots)}, "
         f"train_samples={int(run_stats['train_samples_total'])}, "
         f"eval_samples={int(run_stats['eval_samples_total'])}",
         flush=True,
