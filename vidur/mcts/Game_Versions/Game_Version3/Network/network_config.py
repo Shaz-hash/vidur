@@ -74,12 +74,30 @@ class NetworkPathConfig:
     def process_log_path(self) -> Path:
         return gv3_output_dir() / "mcts_dnn_logs" / "alphaZeroParrallel.out"
 
+    @property
+    def dataset_dir(self) -> Path:
+        return gv3_output_dir() / "mcts_dnn_dataset"
+
+    @property
+    def logs_dir(self) -> Path:
+        return gv3_output_dir() / "mcts_dnn_logs"
+
+    @property
+    def eval_metrics_csv(self) -> Path:
+        return self.logs_dir / "eval_metrics.csv"
+
+    @property
+    def checkpoints_dir(self) -> Path:
+        return gv3_output_dir() / "mcts_dnn_checkpoints"
+
 
 @dataclass(frozen=True)
 class NetworkTaskDefaults:
     generation: int = 0
     model_version: int = 0
     total_roots_per_generation: int = 0
+    roots_per_cycle: int = 0
+    sample_cycles_per_generation: int = 1
     num_roots_per_machine: int = 500
     history_hops_min: int = 0
     history_hops_max: int = 25

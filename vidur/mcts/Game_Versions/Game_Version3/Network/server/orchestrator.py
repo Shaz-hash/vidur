@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import shlex
 import subprocess
 import sys
@@ -22,6 +23,7 @@ from ..common.files import (
     write_json,
 )
 from ..common.types import NetworkSelfplayTask, NetworkTaskResult
+from ...logger.evaluation_pipeline_logger import EvaluationMetricsLogger
 from ..network_config import (
     DEFAULT_NETWORK_CONFIG,
     NetworkMachineConfig,
@@ -172,30 +174,33 @@ def _build_task(
     model_version: int,
     weights_remote_path: str,
     remote_result_dir: str,
+    cycle_index: int,
     task_index: int,
     num_roots: int,
+    start_root_id: int,
     history_hops_min: int,
     history_hops_max: int,
     history_seed: int,
     worker_model_device: str,
 ) -> NetworkSelfplayTask:
     machine_tag = _safe_id(machine.name)
-    task_id = f"{session_id}_{machine_tag}_{task_index:03d}"
+    task_id = f"{session_id}_c{int(cycle_index):03d}_{machine_tag}_{task_index:03d}"
     return NetworkSelfplayTask(
         session_id=str(session_id),
         task_id=str(task_id),
         machine_name=str(machine.name),
         machine_ip=str(machine.public_ip),
         generation=int(generation),
+        cycle_index=int(cycle_index),
         model_version=int(model_version),
         weights_path=str(weights_remote_path),
         result_dir=str(remote_result_dir),
         out_dir_train=str(Path(remote_result_dir) / "train"),
         out_dir_eval=str(Path(remote_result_dir) / "eval"),
         logs_dir=str(Path(remote_result_dir) / "logs"),
-        game_id=int(task_defaults.game_id_base) + int(task_index),
+        game_id=int(task_defaults.game_id_base) + int(cycle_index) * 100_000 + int(task_index),
         num_roots=int(num_roots),
-        start_root_id=int(task_defaults.start_root_id) + int(task_index) * int(num_roots),
+        start_root_id=int(start_root_id),
         start_root_depth=int(task_defaults.start_root_depth),
         start_player=str(task_defaults.start_player),
         feature_version=int(task_defaults.feature_version),
@@ -205,17 +210,17 @@ def _build_task(
         history_nontrivial_hops=int(history_hops_min),
         history_hops_min=int(history_hops_min),
         history_hops_max=int(history_hops_max),
-        history_seed=int(history_seed) + int(task_index) * 1009,
+        history_seed=int(history_seed) + int(cycle_index) * 10_000 + int(task_index) * 1009,
         sample_from_mcts_policy=bool(task_defaults.sample_from_mcts_policy),
         selfplay_policy_temperature=float(task_defaults.selfplay_policy_temperature),
-        action_seed_base=int(task_defaults.action_seed_base) + int(task_index) * 10_003,
+        action_seed_base=int(task_defaults.action_seed_base) + int(cycle_index) * 100_003 + int(task_index) * 10_003,
         max_forced_hops_per_root=int(task_defaults.max_forced_hops_per_root),
         history_max_total_steps=int(task_defaults.history_max_total_steps),
         history_root_batch_size=int(task_defaults.history_root_batch_size),
         log_history_rows=bool(task_defaults.log_history_rows),
         eval_split_ratio=float(task_defaults.eval_split_ratio),
-        eval_split_seed=int(task_defaults.eval_split_seed) + int(task_index) * 20_011,
-        task_seed=int(task_defaults.task_seed_base) + int(task_index) * 30_017,
+        eval_split_seed=int(task_defaults.eval_split_seed) + int(cycle_index) * 200_003 + int(task_index) * 20_011,
+        task_seed=int(task_defaults.task_seed_base) + int(cycle_index) * 300_007 + int(task_index) * 30_017,
         shard_size=int(task_defaults.shard_size),
         worker_cpu_fraction=float(task_defaults.worker_cpu_fraction),
         worker_processes=int(task_defaults.worker_processes),
@@ -304,6 +309,139 @@ def _verify_local_result(local_result_dir: Path) -> dict[str, int]:
     }
 
 
+def _copy_proc_dirs_to_generation(
+    *,
+    src_partition_dir: Path,
+    dst_partition_dir: Path,
+    task_id: str,
+) -> int:
+    src = Path(src_partition_dir)
+    dst = Path(dst_partition_dir)
+    if not src.exists():
+        return 0
+    dst.mkdir(parents=True, exist_ok=True)
+    copied = 0
+    task_tag = _safe_id(task_id)
+    for proc_dir in sorted(src.glob("proc_*")):
+        if not proc_dir.is_dir():
+            continue
+        dst_name = f"proc_net_{task_tag}_{proc_dir.name[5:]}"
+        dst_dir = dst / dst_name
+        if dst_dir.exists():
+            shutil.rmtree(dst_dir)
+        shutil.copytree(proc_dir, dst_dir)
+        copied += 1
+    if copied:
+        rewrite_manifest_paths_absolute(dst)
+    return copied
+
+
+def _copy_logs_to_generation(
+    *,
+    src_logs_dir: Path,
+    dst_gen_logs_dir: Path,
+    task_id: str,
+) -> int:
+    src = Path(src_logs_dir)
+    if not src.exists():
+        return 0
+    dst = Path(dst_gen_logs_dir) / f"network_{_safe_id(task_id)}"
+    if dst.exists():
+        shutil.rmtree(dst)
+    shutil.copytree(src, dst)
+    return sum(1 for p in dst.rglob("*") if p.is_file())
+
+
+def _mirror_result_to_generation_layout(
+    *,
+    task: NetworkSelfplayTask,
+    local_result_dir: Path,
+    dataset_dir: Path,
+    logs_dir: Path,
+) -> dict[str, int | str]:
+    gen_dataset_dir = Path(dataset_dir) / f"gen_{int(task.generation):06d}"
+    gen_train_dir = gen_dataset_dir / "train"
+    gen_eval_dir = gen_dataset_dir / "eval"
+    gen_logs_dir = Path(logs_dir) / f"gen_{int(task.generation):06d}"
+
+    train_proc_dirs = _copy_proc_dirs_to_generation(
+        src_partition_dir=Path(local_result_dir) / "train",
+        dst_partition_dir=gen_train_dir,
+        task_id=task.task_id,
+    )
+    eval_proc_dirs = _copy_proc_dirs_to_generation(
+        src_partition_dir=Path(local_result_dir) / "eval",
+        dst_partition_dir=gen_eval_dir,
+        task_id=task.task_id,
+    )
+    copied_logs = _copy_logs_to_generation(
+        src_logs_dir=Path(local_result_dir) / "logs",
+        dst_gen_logs_dir=gen_logs_dir,
+        task_id=task.task_id,
+    )
+    return {
+        "canonical_train_dir": str(gen_train_dir),
+        "canonical_eval_dir": str(gen_eval_dir),
+        "canonical_logs_dir": str(gen_logs_dir),
+        "canonical_train_proc_dirs": int(train_proc_dirs),
+        "canonical_eval_proc_dirs": int(eval_proc_dirs),
+        "canonical_log_files": int(copied_logs),
+    }
+
+
+def _aggregate_result_stats(results: list[dict[str, Any]]) -> dict[str, int]:
+    keys = (
+        "num_roots_requested",
+        "num_roots_generated",
+        "num_unique_roots",
+        "controller_train_samples",
+        "controller_eval_samples",
+        "adversary_train_samples",
+        "adversary_eval_samples",
+        "train_samples_total",
+        "eval_samples_total",
+    )
+    out = {k: 0 for k in keys}
+    for result in results:
+        stats = dict(result.get("run_stats", {}) or {})
+        for key in keys:
+            out[key] += int(stats.get(key, 0))
+    return out
+
+
+def _log_network_collection_metrics(
+    *,
+    eval_metrics_csv: Path,
+    generation: int,
+    model_version: int,
+    num_roots_required: int,
+    stats: dict[str, int],
+) -> None:
+    logger = EvaluationMetricsLogger(Path(eval_metrics_csv), flush_every=1)
+    nan = float("nan")
+    try:
+        logger.log_phase(
+            generation=int(generation),
+            model_version=int(model_version),
+            num_roots_required=int(num_roots_required),
+            num_unique_roots_created=int(stats.get("num_unique_roots", 0)),
+            phase="network_collection",
+            samples_needed=int(stats.get("train_samples_total", 0)) + int(stats.get("eval_samples_total", 0)),
+            controller_training_samples=int(stats.get("controller_train_samples", 0)),
+            controller_eval_samples=int(stats.get("controller_eval_samples", 0)),
+            adversary_training_samples=int(stats.get("adversary_train_samples", 0)),
+            adversary_eval_samples=int(stats.get("adversary_eval_samples", 0)),
+            value_mse_error=nan,
+            value_mae_error=nan,
+            controller_value_mse_error=nan,
+            controller_value_mae_error=nan,
+            adversary_value_mse_error=nan,
+            adversary_value_mae_error=nan,
+        )
+    finally:
+        logger.close()
+
+
 def dispatch_task(
     *,
     machine: NetworkMachineConfig,
@@ -316,6 +454,8 @@ def dispatch_task(
     remote_result_dir: str,
     allocation_log_csv: Path,
     received_log_csv: Path,
+    dataset_dir: Path,
+    logs_dir: Path,
     process_log_path: Path | None,
 ) -> dict[str, Any]:
     sent_at = utc_now_iso()
@@ -406,8 +546,15 @@ def dispatch_task(
         remote_error = result.error
 
     verify_stats: dict[str, int] = {}
+    canonical_stats: dict[str, int | str] = {}
     if result is not None and result.ok:
         verify_stats = _verify_local_result(local_result_dir)
+        canonical_stats = _mirror_result_to_generation_layout(
+            task=task,
+            local_result_dir=local_result_dir,
+            dataset_dir=dataset_dir,
+            logs_dir=logs_dir,
+        )
 
     append_csv_row(
         received_log_csv,
@@ -437,7 +584,9 @@ def dispatch_task(
         "task_id": task.task_id,
         "machine": machine.name,
         "local_result_dir": str(local_result_dir),
+        "run_stats": dict(result.run_stats or {}) if result is not None else {},
         **verify_stats,
+        **canonical_stats,
     }
 
 
@@ -452,6 +601,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--model-version", type=int, default=None)
     parser.add_argument("--weights-path", default=str(paths.default_weights_path))
     parser.add_argument("--total-roots", type=int, default=defaults.total_roots_per_generation)
+    parser.add_argument("--roots-per-cycle", type=int, default=defaults.roots_per_cycle)
+    parser.add_argument("--sample-cycles-per-generation", type=int, default=defaults.sample_cycles_per_generation)
     parser.add_argument("--num-roots-per-machine", type=int, default=defaults.num_roots_per_machine)
     parser.add_argument("--history-hops-min", type=int, default=defaults.history_hops_min)
     parser.add_argument("--history-hops-max", type=int, default=defaults.history_hops_max)
@@ -476,6 +627,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--shard-size", type=int, default=defaults.shard_size)
     parser.add_argument("--output-dir", default=str(paths.output_dir))
     parser.add_argument("--process-log-path", default=str(paths.process_log_path))
+    parser.add_argument("--dataset-dir", default=str(paths.dataset_dir))
+    parser.add_argument("--logs-dir", default=str(paths.logs_dir))
+    parser.add_argument("--eval-metrics-csv", default=str(paths.eval_metrics_csv))
+    parser.add_argument("--checkpoints-dir", default=str(paths.checkpoints_dir))
     return parser.parse_args()
 
 
@@ -485,6 +640,8 @@ def main() -> None:
     task_defaults = replace(
         DEFAULT_NETWORK_CONFIG.task,
         total_roots_per_generation=int(args.total_roots),
+        roots_per_cycle=int(args.roots_per_cycle),
+        sample_cycles_per_generation=int(args.sample_cycles_per_generation),
         adv_iterations_per_root=int(args.adv_iterations_per_root),
         cont_iterations_per_root=int(args.cont_iterations_per_root),
         worker_cpu_fraction=float(args.worker_cpu_fraction),
@@ -509,35 +666,52 @@ def main() -> None:
     process_log_path = Path(args.process_log_path).expanduser()
     if not process_log_path.is_absolute():
         process_log_path = repo_root() / process_log_path
+    dataset_dir = Path(args.dataset_dir).expanduser()
+    if not dataset_dir.is_absolute():
+        dataset_dir = repo_root() / dataset_dir
+    logs_dir = Path(args.logs_dir).expanduser()
+    if not logs_dir.is_absolute():
+        logs_dir = repo_root() / logs_dir
+    eval_metrics_csv = Path(args.eval_metrics_csv).expanduser()
+    if not eval_metrics_csv.is_absolute():
+        eval_metrics_csv = repo_root() / eval_metrics_csv
+    checkpoints_dir = Path(args.checkpoints_dir).expanduser()
+    if not checkpoints_dir.is_absolute():
+        checkpoints_dir = repo_root() / checkpoints_dir
 
     machines = selected_machines(load_machines(Path(args.machines_config)), args.machine)
     if not machines:
         raise RuntimeError("No machines selected")
 
-    if int(args.total_roots) > 0:
-        machine_root_counts = _partition_counts(int(args.total_roots), len(machines))
-        machine_hop_ranges = _partition_inclusive_range(
-            int(args.history_hops_min),
-            int(args.history_hops_max),
-            len(machines),
-        )
-        if len(machine_hop_ranges) < len(machines):
-            machine_hop_ranges.extend([machine_hop_ranges[-1]] * (len(machines) - len(machine_hop_ranges)))
+    cycles = max(1, int(args.sample_cycles_per_generation))
+    if int(args.roots_per_cycle) > 0:
+        roots_per_cycle = int(args.roots_per_cycle)
+    elif int(args.total_roots) > 0:
+        roots_per_cycle = int(args.total_roots)
     else:
-        machine_root_counts = [int(args.num_roots_per_machine) for _ in machines]
-        machine_hop_ranges = [
-            (int(args.history_hops_min), int(args.history_hops_max))
-            for _ in machines
-        ]
+        roots_per_cycle = int(args.num_roots_per_machine) * int(len(machines))
+    total_roots_required = int(roots_per_cycle) * int(cycles)
+    machine_hop_ranges = _partition_inclusive_range(
+        int(args.history_hops_min),
+        int(args.history_hops_max),
+        len(machines),
+    )
+    if len(machine_hop_ranges) < len(machines):
+        machine_hop_ranges.extend([machine_hop_ranges[-1]] * (len(machines) - len(machine_hop_ranges)))
 
     paths.output_dir.mkdir(parents=True, exist_ok=True)
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
+    selfplay_weights_path = checkpoints_dir / f"selfplay_weights_gen_{int(generation):06d}.pt"
+    shutil.copyfile(local_weights, selfplay_weights_path)
     _log_line(
         process_log_path,
         (
             f"[GV3 network server] session starting: session_id={args.session_id}, "
             f"generation={int(generation)}, model_version={int(model_version)}, "
             f"machines={','.join(m.name for m in machines)}, "
-            f"total_roots={int(args.total_roots)}, "
+            f"roots_per_cycle={int(roots_per_cycle)}, cycles={int(cycles)}, "
+            f"total_roots_required={int(total_roots_required)}, "
             f"adv_iterations_per_root={int(task_defaults.adv_iterations_per_root)}, "
             f"cont_iterations_per_root={int(task_defaults.cont_iterations_per_root)}, "
             f"worker_cpu_fraction={float(task_defaults.worker_cpu_fraction):.3f}, "
@@ -546,54 +720,103 @@ def main() -> None:
     )
     results: list[dict[str, Any]] = []
 
-    for idx, machine in enumerate(machines):
-        task_id_preview = f"{args.session_id}_{_safe_id(machine.name)}_{idx:03d}"
-        remote_base = Path(machine.repo_dir) / "simulator_output" / "Game_Version3" / "network"
-        remote_task_dir = remote_base / "tasks" / args.session_id / task_id_preview
-        remote_result_dir = remote_base / "results" / args.session_id / task_id_preview
-        remote_task_path = str(remote_task_dir / "task.json")
-        remote_weights_path = str(remote_task_dir / "weights.pt")
+    for cycle_index in range(int(cycles)):
+        machine_root_counts = _partition_counts(int(roots_per_cycle), len(machines))
+        cycle_root_base = int(task_defaults.start_root_id) + int(cycle_index) * int(roots_per_cycle)
+        next_root_id = int(cycle_root_base)
+        _log_line(
+            process_log_path,
+            (
+                f"[GV3 network server] collection cycle {int(cycle_index) + 1}/{int(cycles)} starting: "
+                f"roots_per_cycle={int(roots_per_cycle)}, root_base={int(cycle_root_base)}"
+            ),
+        )
+        for idx, machine in enumerate(machines):
+            task_id_preview = f"{args.session_id}_c{int(cycle_index):03d}_{_safe_id(machine.name)}_{idx:03d}"
+            remote_base = Path(machine.repo_dir) / "simulator_output" / "Game_Version3" / "network"
+            remote_task_dir = remote_base / "tasks" / args.session_id / task_id_preview
+            remote_result_dir = remote_base / "results" / args.session_id / task_id_preview
+            remote_task_path = str(remote_task_dir / "task.json")
+            remote_weights_path = str(remote_task_dir / "weights.pt")
 
-        machine_roots = int(machine_root_counts[idx])
-        machine_hops_min, machine_hops_max = machine_hop_ranges[idx]
-        task = _build_task(
-            machine=machine,
-            task_defaults=task_defaults,
-            session_id=str(args.session_id),
-            generation=int(generation),
-            model_version=int(model_version),
-            weights_remote_path=remote_weights_path,
-            remote_result_dir=str(remote_result_dir),
-            task_index=int(idx),
-            num_roots=int(machine_roots),
-            history_hops_min=int(machine_hops_min),
-            history_hops_max=int(machine_hops_max),
-            history_seed=int(args.history_seed),
-            worker_model_device=str(args.worker_model_device),
+            machine_roots = int(machine_root_counts[idx])
+            machine_hops_min, machine_hops_max = machine_hop_ranges[idx]
+            task = _build_task(
+                machine=machine,
+                task_defaults=task_defaults,
+                session_id=str(args.session_id),
+                generation=int(generation),
+                model_version=int(model_version),
+                weights_remote_path=remote_weights_path,
+                remote_result_dir=str(remote_result_dir),
+                cycle_index=int(cycle_index),
+                task_index=int(idx),
+                num_roots=int(machine_roots),
+                start_root_id=int(next_root_id),
+                history_hops_min=int(machine_hops_min),
+                history_hops_max=int(machine_hops_max),
+                history_seed=int(args.history_seed),
+                worker_model_device=str(args.worker_model_device),
+            )
+            next_root_id += int(machine_roots)
+
+            local_task_path = paths.server_tasks_dir / args.session_id / task.task_id / "task.json"
+            local_result_dir = paths.received_dir / args.session_id / task.task_id
+            result = dispatch_task(
+                machine=machine,
+                task=task,
+                local_task_path=local_task_path,
+                local_weights_path=local_weights,
+                local_result_dir=local_result_dir,
+                remote_task_path=remote_task_path,
+                remote_weights_path=remote_weights_path,
+                remote_result_dir=str(remote_result_dir),
+                allocation_log_csv=paths.allocation_log_csv,
+                received_log_csv=paths.received_log_csv,
+                dataset_dir=dataset_dir,
+                logs_dir=logs_dir,
+                process_log_path=process_log_path,
+            )
+            results.append(result)
+        _log_line(
+            process_log_path,
+            f"[GV3 network server] collection cycle {int(cycle_index) + 1}/{int(cycles)} complete",
         )
 
-        local_task_path = paths.server_tasks_dir / args.session_id / task.task_id / "task.json"
-        local_result_dir = paths.received_dir / args.session_id / task.task_id
-        result = dispatch_task(
-            machine=machine,
-            task=task,
-            local_task_path=local_task_path,
-            local_weights_path=local_weights,
-            local_result_dir=local_result_dir,
-            remote_task_path=remote_task_path,
-            remote_weights_path=remote_weights_path,
-            remote_result_dir=str(remote_result_dir),
-            allocation_log_csv=paths.allocation_log_csv,
-            received_log_csv=paths.received_log_csv,
-            process_log_path=process_log_path,
-        )
-        results.append(result)
-
+    aggregate_stats = _aggregate_result_stats(results)
+    _log_network_collection_metrics(
+        eval_metrics_csv=eval_metrics_csv,
+        generation=int(generation),
+        model_version=int(model_version),
+        num_roots_required=int(total_roots_required),
+        stats=aggregate_stats,
+    )
     _log_line(
         process_log_path,
-        f"[GV3 network server] session complete: session_id={args.session_id}, tasks={len(results)}",
+        (
+            f"[GV3 network server] session complete: session_id={args.session_id}, tasks={len(results)}, "
+            f"roots_generated={int(aggregate_stats.get('num_roots_generated', 0))}, "
+            f"unique_roots={int(aggregate_stats.get('num_unique_roots', 0))}, "
+            f"train_samples={int(aggregate_stats.get('train_samples_total', 0))}, "
+            f"eval_samples={int(aggregate_stats.get('eval_samples_total', 0))}"
+        ),
     )
-    _log_line(process_log_path, json.dumps({"ok": True, "results": results}, indent=2, sort_keys=True))
+    _log_line(
+        process_log_path,
+        json.dumps(
+            {
+                "ok": True,
+                "generation": int(generation),
+                "roots_per_cycle": int(roots_per_cycle),
+                "sample_cycles_per_generation": int(cycles),
+                "total_roots_required": int(total_roots_required),
+                "aggregate_stats": aggregate_stats,
+                "results": results,
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+    )
 
 
 if __name__ == "__main__":

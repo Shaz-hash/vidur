@@ -147,7 +147,7 @@ def _execute_multiprocess_selfplay(task: NetworkSelfplayTask) -> dict[str, Any]:
     payloads = _build_selfplay_cycle_task_payloads(
         cfg,
         gen=int(task.generation),
-        cycle_index=0,
+        cycle_index=int(task.cycle_index),
         weights_path=Path(task.weights_path),
         gen_train_dir=train_dir,
         gen_eval_dir=eval_dir,
@@ -162,7 +162,7 @@ def _execute_multiprocess_selfplay(task: NetworkSelfplayTask) -> dict[str, Any]:
         ctx,
         cfg,
         gen=int(task.generation),
-        cycle_index=0,
+        cycle_index=int(task.cycle_index),
         task_payloads=payloads,
     )
     run_stats = _aggregate_worker_run_stats(worker_msgs)
@@ -204,6 +204,7 @@ def execute_selfplay_task(task: NetworkSelfplayTask) -> NetworkTaskResult:
             machine_name=task.machine_name,
             machine_ip=task.machine_ip,
             generation=int(task.generation),
+            cycle_index=int(task.cycle_index),
             model_version=int(task.model_version),
             received_at_utc=received_at,
             started_at_utc=started_at,
@@ -228,6 +229,7 @@ def execute_selfplay_task(task: NetworkSelfplayTask) -> NetworkTaskResult:
             machine_name=task.machine_name,
             machine_ip=task.machine_ip,
             generation=int(task.generation),
+            cycle_index=int(task.cycle_index),
             model_version=int(task.model_version),
             received_at_utc=received_at,
             started_at_utc=started_at,

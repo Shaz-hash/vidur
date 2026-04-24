@@ -12,6 +12,7 @@ class NetworkSelfplayTask:
     machine_name: str
     machine_ip: str
     generation: int
+    cycle_index: int
     model_version: int
     weights_path: str
     result_dir: str
@@ -71,6 +72,7 @@ class NetworkTaskResult:
     machine_name: str
     machine_ip: str
     generation: int
+    cycle_index: int
     model_version: int
     received_at_utc: str
     started_at_utc: str
