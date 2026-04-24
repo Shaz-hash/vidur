@@ -62,6 +62,7 @@ def _run(
     *,
     check: bool = True,
     process_log_path: Path | None = None,
+    log_output_to_process_log: bool = True,
 ) -> subprocess.CompletedProcess:
     cmd_line = "+ " + " ".join(shlex.quote(x) for x in cmd)
     _log_line(process_log_path, cmd_line)
@@ -78,7 +79,8 @@ def _run(
         output.append(line)
         sys.stdout.write(line)
         sys.stdout.flush()
-        _append_process_log(process_log_path, line)
+        if log_output_to_process_log:
+            _append_process_log(process_log_path, line)
     returncode = proc.wait()
     if check and returncode != 0:
         raise subprocess.CalledProcessError(returncode, cmd, output="".join(output))
@@ -91,8 +93,14 @@ def _ssh(
     *,
     check: bool = True,
     process_log_path: Path | None = None,
+    log_output_to_process_log: bool = True,
 ) -> subprocess.CompletedProcess:
-    return _run(["ssh", machine.ssh_host, remote_cmd], check=check, process_log_path=process_log_path)
+    return _run(
+        ["ssh", machine.ssh_host, remote_cmd],
+        check=check,
+        process_log_path=process_log_path,
+        log_output_to_process_log=log_output_to_process_log,
+    )
 
 
 def _rsync_to(
@@ -101,8 +109,13 @@ def _rsync_to(
     remote_path: str,
     *,
     process_log_path: Path | None = None,
+    log_output_to_process_log: bool = True,
 ) -> None:
-    _run(["rsync", "-az", str(local_path), f"{machine.ssh_host}:{remote_path}"], process_log_path=process_log_path)
+    _run(
+        ["rsync", "-az", str(local_path), f"{machine.ssh_host}:{remote_path}"],
+        process_log_path=process_log_path,
+        log_output_to_process_log=log_output_to_process_log,
+    )
 
 
 def _rsync_from(
@@ -111,11 +124,13 @@ def _rsync_from(
     local_path: Path,
     *,
     process_log_path: Path | None = None,
+    log_output_to_process_log: bool = True,
 ) -> None:
     local_path.mkdir(parents=True, exist_ok=True)
     _run(
         ["rsync", "-az", f"{machine.ssh_host}:{remote_path.rstrip('/')}/", f"{local_path}/"],
         process_log_path=process_log_path,
+        log_output_to_process_log=log_output_to_process_log,
     )
 
 
@@ -338,7 +353,13 @@ def dispatch_task(
 
     remote_status = "ok"
     remote_error = ""
-    completed = _ssh(machine, remote_cmd, check=False, process_log_path=process_log_path)
+    completed = _ssh(
+        machine,
+        remote_cmd,
+        check=False,
+        process_log_path=process_log_path,
+        log_output_to_process_log=False,
+    )
     if completed.returncode != 0:
         remote_status = "failed"
         remote_error = f"remote command exited with code {completed.returncode}"
@@ -405,6 +426,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--history-hops-max", type=int, default=defaults.history_hops_max)
     parser.add_argument("--history-seed", type=int, default=defaults.history_seed)
     parser.add_argument("--worker-model-device", default=defaults.worker_model_device)
+    parser.add_argument("--adv-iterations-per-root", type=int, default=defaults.adv_iterations_per_root)
+    parser.add_argument("--cont-iterations-per-root", type=int, default=defaults.cont_iterations_per_root)
     parser.add_argument("--eval-split-ratio", type=float, default=defaults.eval_split_ratio)
     parser.add_argument("--shard-size", type=int, default=defaults.shard_size)
     parser.add_argument("--output-dir", default=str(paths.output_dir))
@@ -417,6 +440,8 @@ def main() -> None:
     paths = replace(DEFAULT_NETWORK_CONFIG.paths, output_dir=Path(args.output_dir))
     task_defaults = replace(
         DEFAULT_NETWORK_CONFIG.task,
+        adv_iterations_per_root=int(args.adv_iterations_per_root),
+        cont_iterations_per_root=int(args.cont_iterations_per_root),
         eval_split_ratio=float(args.eval_split_ratio),
         shard_size=int(args.shard_size),
     )
@@ -442,6 +467,8 @@ def main() -> None:
             f"[GV3 network server] session starting: session_id={args.session_id}, "
             f"generation={int(generation)}, model_version={int(model_version)}, "
             f"machines={','.join(m.name for m in machines)}, "
+            f"adv_iterations_per_root={int(task_defaults.adv_iterations_per_root)}, "
+            f"cont_iterations_per_root={int(task_defaults.cont_iterations_per_root)}, "
             f"weights={local_weights}"
         ),
     )
