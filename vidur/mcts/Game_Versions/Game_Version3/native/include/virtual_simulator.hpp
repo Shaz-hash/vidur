@@ -145,6 +145,7 @@ public:
     void set_config(VirtualSimulatorConfig cfg);
 
     void set_prefill_profile(std::vector<int> tokens, std::vector<double> times);
+    double prefill_profile_lookup(int tokens) const;
     bool load_predictor_csv(const std::string& path);
 
     NativeBatchTimePredictorGV2& predictor();

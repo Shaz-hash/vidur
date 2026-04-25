@@ -206,6 +206,11 @@ SampledActionSet<AdversaryAction> GV2VirtualEnvironment::sample_adversary_action
     scfg.prefill_window_cap_tokens = cfg_.prefill_window_cap_tokens;
     scfg.max_decode_tokens_per_request = cfg_.max_decode_tokens_per_request;
     scfg.default_decode_slo_time = cfg_.decode_slo_time_default;
+    for (int tokens : scfg.allowed_prefill_tokens) {
+        if (scfg.prefill_slo_by_tokens.find(tokens) == scfg.prefill_slo_by_tokens.end()) {
+            scfg.prefill_slo_by_tokens[tokens] = std::max(0.0, virtual_sim_.prefill_profile_lookup(tokens));
+        }
+    }
 
     const double decision_tick = (state.stats.next_adv_tick >= 0.0)
         ? state.stats.next_adv_tick
@@ -237,6 +242,8 @@ SampledActionSet<ControllerAction> GV2VirtualEnvironment::sample_controller_acti
 
     ControllerSamplerConfig scfg = cfg_.controller_sampler;
     scfg.enforce_nonnegative_decode_credits = cfg_.enforce_nonnegative_decode_credits;
+    scfg.prefill_profile_tokens = virtual_sim_.cfg().prefill_profile_tokens;
+    scfg.prefill_profile_times = virtual_sim_.cfg().prefill_profile_times;
     return sample_controller_actions_gv2(tmp, scfg, std::max(0, tmp.stats.decode_credit_balance));
 }
 

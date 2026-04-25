@@ -55,7 +55,12 @@ struct ControllerSamplerConfig {
     bool strict_masking = true;
     double eps = 1e-9;
 
-    // LST proxy: eta = remaining_prefill / prefill_eta_tokens_per_sec.
+    // Python GV3 LST uses PrefillProfile.lookup(remaining_prefill).  When this
+    // profile is populated, native uses the same nearest-entry lookup.
+    std::vector<int> prefill_profile_tokens;
+    std::vector<double> prefill_profile_times;
+
+    // Fallback only, used when no profile was supplied.
     double prefill_eta_tokens_per_sec = 4096.0;
 
     // Average decode credit available (when nonnegative mode is enabled).

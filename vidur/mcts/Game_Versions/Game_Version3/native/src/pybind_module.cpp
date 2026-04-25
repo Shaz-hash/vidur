@@ -7,6 +7,7 @@
 #include "gv2_types.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <iomanip>
 #include <initializer_list>
@@ -20,6 +21,11 @@ namespace py = pybind11;
 using namespace mcts_native_gv2;
 
 namespace {
+
+constexpr int kPyMetaNextAdvTick = -9100001;
+constexpr int kPyMetaLastAdvTick = -9100002;
+constexpr int kPyMetaDecodeCreditBalance = -9100005;
+constexpr int kPyMetaMissedAdvSource = -9100006;
 
 std::vector<uint8_t> py_to_mask(const py::handle& obj) {
     std::vector<uint8_t> out;
@@ -467,6 +473,65 @@ T merged_get_or(
     return out;
 }
 
+bool dict_or_nested_try_get(
+    const py::dict& d,
+    const char* nested_key,
+    const char* key,
+    py::object* out) {
+    if (d.contains(key)) {
+        *out = py::reinterpret_borrow<py::object>(d[key]);
+        return true;
+    }
+    if (d.contains(nested_key) && py::isinstance<py::dict>(d[nested_key])) {
+        const py::dict nested = py::reinterpret_borrow<py::dict>(d[nested_key]);
+        if (nested.contains(key)) {
+            *out = py::reinterpret_borrow<py::object>(nested[key]);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool parse_python_request_counter(const py::dict& d, int* last_request_id) {
+    py::object counters;
+    if (!dict_or_nested_try_get(d, "simulator", "entity_counters", &counters)) return false;
+    if (counters.is_none() || !py::isinstance<py::dict>(counters)) return false;
+    const py::dict cd = py::reinterpret_borrow<py::dict>(counters);
+    for (auto item : cd) {
+        try {
+            const std::string key = py::cast<std::string>(item.first);
+            if (key != "Request") continue;
+            *last_request_id = py::cast<int>(item.second);
+            return true;
+        } catch (const std::exception&) {
+        }
+    }
+    return false;
+}
+
+void apply_python_gv3_meta(GameStats* out, double sim_time) {
+    const auto next_it = out->decode_next_deadline_by_id.find(kPyMetaNextAdvTick);
+    if (next_it != out->decode_next_deadline_by_id.end()) {
+        out->next_adv_tick = double(next_it->second);
+    }
+    const auto last_it = out->decode_next_deadline_by_id.find(kPyMetaLastAdvTick);
+    if (last_it != out->decode_next_deadline_by_id.end()) {
+        out->last_adv_tick = double(last_it->second);
+    }
+    const auto missed_it = out->decode_next_deadline_by_id.find(kPyMetaMissedAdvSource);
+    if (missed_it != out->decode_next_deadline_by_id.end()) {
+        out->missed_adv_source = int(std::llround(double(missed_it->second)));
+    }
+    const auto credit_it = out->decode_tokens_counted_by_id.find(kPyMetaDecodeCreditBalance);
+    if (credit_it != out->decode_tokens_counted_by_id.end()) {
+        out->decode_credit_balance = int(credit_it->second);
+        out->decode_credit_available = std::max(0, out->decode_credit_balance);
+    }
+    if (out->next_adv_tick >= 0.0) {
+        out->pending_adv_tick = out->next_adv_tick <= (sim_time + 1e-9);
+    }
+}
+
 void parse_stats_fields_into(
     const py::dict& d,
     const py::dict* stats_d,
@@ -655,6 +720,15 @@ RequestState parse_request_state_payload(const py::handle& obj) {
         d, nullptr, {"num_decode_tokens", "decode_tokens"}, r.num_decode_tokens);
     r.num_processed_decode_tokens = merged_get_or<int>(
         d, nullptr, {"num_processed_decode_tokens", "processed_decode_tokens"}, r.num_processed_decode_tokens);
+    if (!d.contains("num_processed_prefill_tokens") &&
+        !d.contains("processed_prefill_tokens") &&
+        !d.contains("num_processed_decode_tokens") &&
+        !d.contains("processed_decode_tokens") &&
+        d.contains("num_processed_tokens")) {
+        const int processed = std::max(0, py::cast<int>(d["num_processed_tokens"]));
+        r.num_processed_prefill_tokens = std::min(processed, std::max(0, r.num_prefill_tokens));
+        r.num_processed_decode_tokens = std::max(0, processed - std::max(0, r.num_prefill_tokens));
+    }
 
     r.prefill_slo_time = merged_get_or<double>(d, nullptr, {"prefill_slo_time", "prefill_slo"}, r.prefill_slo_time);
     r.decode_slo_time = merged_get_or<double>(d, nullptr, {"decode_slo_time", "decode_slo"}, r.decode_slo_time);
@@ -732,12 +806,18 @@ SimState parse_root_state_payload(const py::dict& d) {
         stats_ptr = &stats_d;
     }
 
-    s.sim_time = merged_get_or<double>(d, stats_ptr, {"sim_time"}, s.sim_time);
+    s.sim_time = merged_get_or<double>(d, stats_ptr, {"sim_time", "time"}, s.sim_time);
     s.decision_state_time = merged_get_or<double>(
         d, stats_ptr, {"decision_state_time"}, s.sim_time);
-    s.next_request_id = merged_get_or<int>(d, stats_ptr, {"next_request_id"}, s.next_request_id);
+    bool have_next_request_id = false;
+    int next_request_id = s.next_request_id;
+    if (merged_try_get<int>(d, stats_ptr, {"next_request_id"}, &next_request_id)) {
+        have_next_request_id = true;
+        s.next_request_id = next_request_id;
+    }
 
     parse_stats_fields_into(d, stats_ptr, &s.stats);
+    apply_python_gv3_meta(&s.stats, s.sim_time);
     parse_request_collection(d, &s.requests);
 
     std::unordered_map<int, std::size_t> rid_to_idx;
@@ -785,6 +865,17 @@ SimState parse_root_state_payload(const py::dict& d) {
         }
         sort_unique(s.stats.active_request_ids);
         sort_unique(s.stats.completed_request_ids);
+    }
+    if (!have_next_request_id) {
+        int last_request_id = -1;
+        if (parse_python_request_counter(d, &last_request_id)) {
+            s.next_request_id = std::max(0, last_request_id + 1);
+        } else {
+            for (const auto& r : s.requests) {
+                last_request_id = std::max(last_request_id, r.request_id);
+            }
+            s.next_request_id = std::max(0, last_request_id + 1);
+        }
     }
     return s;
 }

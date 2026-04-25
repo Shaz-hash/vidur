@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <limits>
 #include <numeric>
@@ -262,6 +263,26 @@ bool has_name(const std::unordered_map<std::string, PredictorTable>& tables, con
 bool request_is_active(const RequestState& r) {
     if (r.completed) return false;
     return r.prefill_active() || r.decode_active();
+}
+
+double nearest_profile_lookup(
+    int tokens,
+    const std::vector<int>& profile_tokens,
+    const std::vector<double>& profile_times) {
+    const std::size_t n = std::min(profile_tokens.size(), profile_times.size());
+    if (n == 0) return 0.0;
+    std::size_t best = 0;
+    long long best_dist = std::llabs(static_cast<long long>(profile_tokens[0]) -
+                                     static_cast<long long>(tokens));
+    for (std::size_t i = 1; i < n; ++i) {
+        const long long dist = std::llabs(static_cast<long long>(profile_tokens[i]) -
+                                          static_cast<long long>(tokens));
+        if (dist < best_dist) {
+            best = i;
+            best_dist = dist;
+        }
+    }
+    return profile_times[best];
 }
 
 }  // namespace
@@ -684,6 +705,13 @@ void VirtualSimulatorGV2::set_config(VirtualSimulatorConfig cfg) { cfg_ = std::m
 void VirtualSimulatorGV2::set_prefill_profile(std::vector<int> tokens, std::vector<double> times) {
     cfg_.prefill_profile_tokens = std::move(tokens);
     cfg_.prefill_profile_times = std::move(times);
+}
+
+double VirtualSimulatorGV2::prefill_profile_lookup(int tokens) const {
+    return nearest_profile_lookup(
+        tokens,
+        cfg_.prefill_profile_tokens,
+        cfg_.prefill_profile_times);
 }
 
 bool VirtualSimulatorGV2::load_predictor_csv(const std::string& path) {

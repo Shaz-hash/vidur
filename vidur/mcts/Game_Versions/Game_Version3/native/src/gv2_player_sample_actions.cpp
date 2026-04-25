@@ -4,6 +4,7 @@
 #include <array>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 
 namespace mcts_native_gv2 {
 
@@ -185,6 +186,26 @@ double prefill_slo_for_tokens(const AdversarySamplerConfig& cfg, int prefill_tok
     const auto it = cfg.prefill_slo_by_tokens.find(int(prefill_tokens));
     if (it != cfg.prefill_slo_by_tokens.end()) return std::max(0.0, double(it->second));
     return 0.1;
+}
+
+double prefill_eta_for_tokens(const ControllerSamplerConfig& cfg, int prefill_tokens) {
+    const std::size_t n = std::min(cfg.prefill_profile_tokens.size(), cfg.prefill_profile_times.size());
+    if (n > 0) {
+        std::size_t best = 0;
+        long long best_dist = std::llabs(static_cast<long long>(cfg.prefill_profile_tokens[0]) -
+                                         static_cast<long long>(prefill_tokens));
+        for (std::size_t i = 1; i < n; ++i) {
+            const long long dist = std::llabs(static_cast<long long>(cfg.prefill_profile_tokens[i]) -
+                                              static_cast<long long>(prefill_tokens));
+            if (dist < best_dist) {
+                best = i;
+                best_dist = dist;
+            }
+        }
+        return std::max(0.0, double(cfg.prefill_profile_times[best]));
+    }
+    return double(std::max(0, prefill_tokens)) /
+           std::max(1.0, cfg.prefill_eta_tokens_per_sec);
 }
 
 std::vector<int> eviction_targets(
@@ -562,10 +583,8 @@ SampledActionSet<ControllerAction> sample_controller_actions_gv2(
                     [&](int a, int c) {
                         const ReqView& va = req_views.at(a);
                         const ReqView& vc = req_views.at(c);
-                        const double eta_a = double(std::max(0, va.rem_prefill)) /
-                                             std::max(1.0, cfg.prefill_eta_tokens_per_sec);
-                        const double eta_c = double(std::max(0, vc.rem_prefill)) /
-                                             std::max(1.0, cfg.prefill_eta_tokens_per_sec);
+                        const double eta_a = prefill_eta_for_tokens(cfg, va.rem_prefill);
+                        const double eta_c = prefill_eta_for_tokens(cfg, vc.rem_prefill);
                         const double slack_a = (va.prefill_slo - std::max(0.0, state.sim_time - va.arrived_at)) - eta_a;
                         const double slack_c = (vc.prefill_slo - std::max(0.0, state.sim_time - vc.arrived_at)) - eta_c;
                         if (slack_a != slack_c) return slack_a < slack_c;
@@ -647,7 +666,7 @@ SampledActionSet<ControllerAction> sample_controller_actions_gv2(
                 }
 
                 if (valid && token_alloc.empty()) {
-                    valid = (budget == 0 && heur == canonical_heuristic && ev_rule == "evict_none");
+                    valid = false;
                 }
 
                 std::vector<int> selected_ids;
