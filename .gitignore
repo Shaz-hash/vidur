@@ -182,3 +182,6 @@ experiments/miscellaneous/request_length_trace_analysis.ipynb
 vidur/config_optimizer/config_explorer/config/config_llama3_8b.yml
 experiments/global_scheduler/get_uniform_trace.ipynb
 prefill_throughput_outputsimulator_output/backupMctsRootLogs/
+
+# GV3 native generated CMake builds
+vidur/mcts/Game_Versions/Game_Version3/native/build_*/

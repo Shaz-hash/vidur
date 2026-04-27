@@ -1,3 +1,0 @@
-/home/ubuntu/vidur/vidur/mcts/Game_Versions/Game_Version2/native/build_aws/CMakeFiles/mcts_native_gv2.dir
-/home/ubuntu/vidur/vidur/mcts/Game_Versions/Game_Version2/native/build_aws/CMakeFiles/edit_cache.dir
-/home/ubuntu/vidur/vidur/mcts/Game_Versions/Game_Version2/native/build_aws/CMakeFiles/rebuild_cache.dir
