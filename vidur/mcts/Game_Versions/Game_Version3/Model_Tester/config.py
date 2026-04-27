@@ -48,6 +48,8 @@ class ModelTesterConfig:
 
     # Outputs
     output_dir: str = _under_repo("simulator_output", "Game_Version3", "Model_Tester_Results")
+    write_arena_game_logs: bool = False
+    write_model_action_detail_logs: bool = False
 
     # History sampling
     history_seed: int = 2026
@@ -57,7 +59,7 @@ class ModelTesterConfig:
     history_hops_force_zero: bool = True  # ensures one game starts from initial state
 
     # Arena controls
-    arena_time_limit_sec: float = 8.0
+    arena_time_limit_sec: float = 10.0
     arena_max_controller_cleanup_steps: int = 1024
     arena_max_total_turns: int = 4096
 

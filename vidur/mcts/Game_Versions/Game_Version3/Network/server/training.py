@@ -54,6 +54,30 @@ def _default_log_line(message: str) -> None:
     print(message, flush=True)
 
 
+def _raise_if_nonfinite_metrics(*, metrics: dict[str, Any], context: str) -> None:
+    required_keys = {
+        "loss",
+        "policy_loss",
+        "value_loss",
+        "value_mse_error",
+        "value_mae_error",
+        "loss_for_selection",
+        "controller_value_mse_error",
+        "controller_value_mae_error",
+        "adversary_value_mse_error",
+        "adversary_value_mae_error",
+    }
+    bad: list[str] = []
+    for key, value in dict(metrics).items():
+        if str(key) not in required_keys:
+            continue
+        if isinstance(value, (int, float)):
+            if not math.isfinite(float(value)):
+                bad.append(str(key))
+    if bad:
+        raise RuntimeError(f"Non-finite training metric(s) in {context}: {', '.join(sorted(bad))}")
+
+
 def _network_training_cfg(
     *,
     dataset_dir: Path,
@@ -70,6 +94,7 @@ def _network_training_cfg(
     replay_capacity_samples: int,
     replay_max_cached_shards: int,
     replay_seed: int,
+    trainer_lr: float = 0.0,
 ) -> MultipleProcessTrainingConfig:
     base = DEFAULT_MULTIPROCESS_TRAINING_CONFIG
     cfg = replace(
@@ -98,6 +123,14 @@ def _network_training_cfg(
         cfg = replace(cfg, train_progress_print_every_steps=int(train_progress_every_steps))
     if int(train_num_threads) > 0:
         cfg = replace(cfg, train_num_threads=int(train_num_threads))
+    if float(trainer_lr) > 0.0:
+        cfg = replace(
+            cfg,
+            game_v2=replace(
+                cfg.game_v2,
+                trainer=replace(cfg.game_v2.trainer, lr=float(trainer_lr)),
+            ),
+        )
     cfg.validate()
     return cfg
 
@@ -144,6 +177,7 @@ def train_network_generation(
     replay_capacity_samples: int = 400_000,
     replay_max_cached_shards: int = 5_000,
     replay_seed: int = 2026,
+    trainer_lr: float = 0.0,
     log_line: LogLine | None = None,
 ) -> NetworkTrainingSummary:
     log = log_line or _default_log_line
@@ -165,6 +199,7 @@ def train_network_generation(
         replay_capacity_samples=int(replay_capacity_samples),
         replay_max_cached_shards=int(replay_max_cached_shards),
         replay_seed=int(replay_seed),
+        trainer_lr=float(trainer_lr),
     )
 
     _set_global_seeds(
@@ -275,6 +310,13 @@ def train_network_generation(
                 include_ids=False,
             )
             row = trainer.train_step(batch_by_player)
+            _raise_if_nonfinite_metrics(
+                metrics=row,
+                context=(
+                    f"gen={int(gen):06d}, global_step={int(global_step) + 1}/"
+                    f"{int(train_steps_this_gen)}"
+                ),
+            )
             train_rows.append(row)
             epoch_rows.append(row)
             progress_rows.append(row)
@@ -313,6 +355,7 @@ def train_network_generation(
         )
 
     train_metrics = _aggregate_metric_rows(train_rows)
+    _raise_if_nonfinite_metrics(metrics=train_metrics, context=f"gen={int(gen):06d} train aggregate")
 
     eval_samples = _load_generation_samples(eval_source_dir)
     log(
@@ -324,6 +367,7 @@ def train_network_generation(
         samples=eval_samples,
         batch_size=int(cfg.train_batch_size),
     )
+    _raise_if_nonfinite_metrics(metrics=eval_metrics, context=f"gen={int(gen):06d} eval aggregate")
     eval_prediction_rows = _build_eval_prediction_rows(
         trainer,
         samples=eval_samples,

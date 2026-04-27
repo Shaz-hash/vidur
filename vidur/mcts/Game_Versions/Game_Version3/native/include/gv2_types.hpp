@@ -248,6 +248,26 @@ struct SearchOutput {
     std::vector<IterEvent> iter_events;
 
     std::unordered_map<std::string, double> perf;
+
+    // Root tensors used by native inference/search. These mirror
+    // NativeInferInputsGV2 without depending on gv2_infer_runtime.hpp here.
+    std::vector<float> root_global_features;
+    std::vector<uint8_t> root_action_mask;
+    std::vector<float> root_prefill_req_features;
+    std::vector<float> root_decode_req_features;
+    std::vector<uint8_t> root_prefill_req_mask;
+    std::vector<uint8_t> root_decode_req_mask;
+    int root_prefill_req_n = 0;
+    int root_prefill_req_d = 0;
+    int root_decode_req_n = 0;
+    int root_decode_req_d = 0;
+    std::vector<float> root_req_features;
+    std::vector<uint8_t> root_req_mask;
+    int root_req_n = 0;
+    int root_req_d = 0;
+
+    int best_action_index = -1;
+    std::vector<double> root_action_values;
 };
 
 std::vector<double> normalize_masked(

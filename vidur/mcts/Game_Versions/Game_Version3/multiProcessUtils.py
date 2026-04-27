@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import logging
 import math
 import multiprocessing as mp
 import os
@@ -40,10 +41,17 @@ from .DNN.dnn_spec import make_dnn_spec
 from .DNN.value_models import AlphaZeroModel
 from .DNN.replay_write import ReplayWriter, ReplayWriterConfig
 from .DNN.selfPlay import SelfPlayRunner
+from .DNN.native_selfplay import run_native_selfplay_to_writers
 from .DNN.replay_buffer import BestModelReplayBuffer
 from .DNN.replay_dataset import collate_mixed_samples, load_manifest
 from .DNN.trainer import Trainer, TrainerConfig
 from .logger.evaluation_pipeline_logger import EvaluationMetricsLogger, EvalRootPredictionLogger
+
+
+def _suppress_noisy_selfplay_loggers() -> None:
+    logging.getLogger("vidur.execution_time_predictor.sklearn_execution_time_predictor").setLevel(
+        logging.WARNING
+    )
 
 
 def _set_global_seeds(seed: int, *, torch_deterministic: bool) -> None:
@@ -223,6 +231,14 @@ def _partition_roots_contiguous(total_roots: int, workers: int) -> list[tuple[in
     return out
 
 
+def _history_signature_key(sig: Any) -> Any:
+    if isinstance(sig, str):
+        return sig
+    if isinstance(sig, (list, tuple)):
+        return tuple(_history_signature_key(x) for x in sig)
+    return sig
+
+
 def _build_selfplay_cycle_task_payloads(
     cfg: MultipleProcessTrainingConfig,
     *,
@@ -386,6 +402,7 @@ def _make_selfplay_chunk_task(
         "eval_split_seed": int(interval_state["eval_split_seed_base"]) + int(chunk_seed_offset) * 31,
         "task_seed": int(interval_state["task_seed_base"]) + int(chunk_seed_offset) * 43,
         "history_seen_signatures": list(interval_state["completed_history_signatures"]),
+        "suppress_worker_progress_logs": bool(interval_state.get("suppress_worker_progress_logs", False)),
         "allow_duplicate_history_fallback": bool(interval_state["allow_duplicate_history_fallback"]),
         "shared_history_signatures": interval_state["shared_seen_proxy"],
         "shared_history_lock": interval_state["shared_lock_proxy"],
@@ -427,7 +444,7 @@ def _run_selfplay_cycle(
         shared_seen_proxy = manager.dict()
         initial_sigs = list(spec.get("history_seen_signatures", []) or [])
         for sig in initial_sigs:
-            shared_seen_proxy[tuple(sig)] = 1
+            shared_seen_proxy[_history_signature_key(sig)] = 1
         interval_states[int(interval_id)] = {
             **dict(spec),
             "interval_id": int(interval_id),
@@ -439,7 +456,7 @@ def _run_selfplay_cycle(
             "chunk_index": 0,
             "zero_progress_completions": 0,
             "exhausted": False,
-            "completed_history_signatures": set(tuple(sig) for sig in initial_sigs),
+            "completed_history_signatures": set(_history_signature_key(sig) for sig in initial_sigs),
             "shared_seen_proxy": shared_seen_proxy,
             "shared_lock_proxy": manager.Lock(),
             "allow_duplicate_history_fallback": bool(getattr(cfg, "history_allow_duplicate_root_fallback", False)),
@@ -579,7 +596,10 @@ def _run_selfplay_cycle(
             interval_state = interval_states[int(interval_id)]
             requested_roots = int(meta.get("requested_roots", dict(msg.get("run_stats", {}) or {}).get("num_roots_requested", 0)))
             run_stats = dict(msg.get("run_stats", {}) or {})
-            emitted_history_signatures = [tuple(sig) for sig in list(run_stats.get("history_signatures", []) or [])]
+            emitted_history_signatures = [
+                _history_signature_key(sig)
+                for sig in list(run_stats.get("history_signatures", []) or [])
+            ]
             unique_chunk_roots = int(len(emitted_history_signatures))
             interval_state["active_workers"] = max(0, int(interval_state["active_workers"]) - 1)
             interval_state["inflight_requested_roots"] = max(
@@ -862,7 +882,7 @@ def _load_generation_samples(dataset_dir: Path) -> list[dict]:
         if not manifest.exists():
             continue
 
-        for entry in load_manifest(manifest):
+        for entry in load_manifest(manifest, allow_empty=True):
             shard_path = Path(entry.path)
             if not shard_path.is_absolute():
                 shard_path = (proc_dir / shard_path).resolve()
@@ -888,13 +908,24 @@ def _scan_dataset_partition_stats(dataset_dir: Path) -> dict[str, Any]:
         if not manifest.exists():
             continue
 
-        for entry in load_manifest(manifest):
+        for entry in load_manifest(manifest, allow_empty=True):
             shard_path = Path(entry.path)
             if not shard_path.is_absolute():
                 shard_path = (proc_dir / shard_path).resolve()
-            shard = torch.load(shard_path, map_location="cpu")
+            try:
+                shard = torch.load(shard_path, map_location="cpu")
+            except Exception as exc:
+                print(
+                    f"[GV3 dataset scan] skipping unreadable shard: path={shard_path}, error={exc}",
+                    flush=True,
+                )
+                continue
             if not isinstance(shard, list):
-                raise TypeError(f"Expected list shard at {shard_path}, got {type(shard)}")
+                print(
+                    f"[GV3 dataset scan] skipping non-list shard: path={shard_path}, type={type(shard)}",
+                    flush=True,
+                )
+                continue
 
             for sample in shard:
                 stats["samples_total"] += 1
@@ -1029,6 +1060,7 @@ def _selfplay_worker_main(
     writer_eval = None
     mcts = None
     try:
+        _suppress_noisy_selfplay_loggers()
         _set_global_seeds(
             int(cfg.game_v2.reproducibility.global_seed) + int(worker_id),
             torch_deterministic=bool(cfg.game_v2.reproducibility.torch_deterministic),
@@ -1039,8 +1071,6 @@ def _selfplay_worker_main(
             torch.set_num_interop_threads(1)
         except Exception:
             pass
-
-        _, env, _, explore_cfg = _build_env_and_simulator(cfg, use_virtual_env=bool(cfg.use_virtual_env))
 
         spec = make_dnn_spec(cfg=cfg.game_v2)
         model = AlphaZeroModel(spec=spec).to(torch.device(cfg.model.device))
@@ -1087,6 +1117,62 @@ def _selfplay_worker_main(
                 shard_size=int(cfg.dataset.shard_size),
             )
         )
+
+        progress_prefix = (
+            f"[GV3 selfplay gen={int(gen):06d} cycle={int(cycle_index):02d} "
+            f"interval={int(interval_id):02d} chunk={int(chunk_index):03d} slot={int(worker_id):02d}]"
+        )
+        if bool(task.get("suppress_worker_progress_logs", False)):
+            progress_prefix = ""
+
+        if str(getattr(cfg, "environment_lang", "python")).lower() == "native":
+            if progress_prefix:
+                print(
+                    f"{progress_prefix} native self-play starting: roots={int(task['num_roots'])}, "
+                    f"hop_range=[{int(task['history_hops_min'])}, {int(task['history_hops_max'])}], "
+                    f"eval_ratio={float(task.get('eval_split_ratio', 0.0)):.3f}",
+                    flush=True,
+                )
+            run_stats = run_native_selfplay_to_writers(
+                cfg=cfg,
+                task=task,
+                model=model,
+                writer_train=writer_train,
+                writer_eval=writer_eval,
+            )
+            if writer_train is not None:
+                writer_train.close()
+                writer_train = None
+            if writer_eval is not None:
+                writer_eval.close()
+                writer_eval = None
+            if progress_prefix:
+                print(
+                    f"{progress_prefix} native self-play finished: "
+                    f"roots_generated={int(run_stats.get('num_roots_generated', 0))}, "
+                    f"unique_roots={int(run_stats.get('num_unique_roots', 0))}, "
+                    f"train_samples={int(run_stats.get('train_samples_total', 0))}, "
+                    f"eval_samples={int(run_stats.get('eval_samples_total', 0))}",
+                    flush=True,
+                )
+            result_q.put(
+                {
+                    "ok": True,
+                    "task_kind": "selfplay",
+                    "worker_id": int(interval_id),
+                    "worker_slot_id": int(worker_id),
+                    "interval_id": int(interval_id),
+                    "generation": int(gen),
+                    "cycle_index": int(cycle_index),
+                    "task_instance_id": int(task_instance_id),
+                    "out_dir_train": str(out_dir_train),
+                    "out_dir_eval": str(out_dir_eval),
+                    "run_stats": run_stats,
+                }
+            )
+            return
+
+        _, env, _, explore_cfg = _build_env_and_simulator(cfg, use_virtual_env=bool(cfg.use_virtual_env))
 
         logs_base = Path(cfg.logging.mcts_iter_log).parent
         logs_dir = logs_base / f"gen_{gen:06d}"
@@ -1143,10 +1229,7 @@ def _selfplay_worker_main(
             history_max_total_steps=int(task["history_max_total_steps"]),
             history_root_batch_size=int(task.get("history_root_batch_size", 64)),
             log_history_rows=bool(task["log_history_rows"]),
-            progress_prefix=(
-                f"[GV3 selfplay gen={int(gen):06d} cycle={int(cycle_index):02d} "
-                f"interval={int(interval_id):02d} chunk={int(chunk_index):03d} slot={int(worker_id):02d}]"
-            ),
+            progress_prefix=progress_prefix,
             model_version=int(task.get("model_version", 0)),
             eval_split_ratio=float(task.get("eval_split_ratio", 0.0)),
             eval_split_seed=int(task.get("eval_split_seed", 0)),

@@ -68,6 +68,7 @@ def _task_cfg(task: NetworkSelfplayTask) -> MultipleProcessTrainingConfig:
         selfplay_policy_temperature=float(task.selfplay_policy_temperature),
         action_seed_base=int(task.action_seed_base),
         use_virtual_env=bool(task.use_virtual_env),
+        environment_lang=str(task.environment_lang),
         worker_result_timeout_sec=int(task.worker_result_timeout_sec),
     )
 
@@ -91,13 +92,19 @@ def _resolve_worker_processes(task: NetworkSelfplayTask) -> int:
 
 
 def _resolve_max_concurrent_workers(task: NetworkSelfplayTask) -> int:
-    resolved_processes = _resolve_worker_processes(task)
+    interval_states = _resolve_worker_processes(task)
+    max_per_interval = max(1, int(task.max_workers_per_interval))
+    interval_capacity = max(1, int(interval_states) * int(max_per_interval))
+    root_capacity = max(1, int(task.num_roots))
+    hard_cap = max(1, min(int(interval_capacity), int(root_capacity)))
+
     explicit = int(task.max_concurrent_workers)
     if explicit > 0:
-        return max(1, min(explicit, resolved_processes))
+        return max(1, min(int(explicit), int(hard_cap)))
+
     cpu_count = int(os.cpu_count() or 1)
     requested = int(math.floor(float(cpu_count) * float(task.worker_cpu_fraction)))
-    return max(1, min(int(requested), resolved_processes))
+    return max(1, min(int(requested), int(hard_cap)))
 
 
 def _partition_inclusive_range(lo: int, hi: int, parts: int) -> list[tuple[int, int]]:
@@ -162,6 +169,9 @@ def _execute_multiprocess_selfplay(task: NetworkSelfplayTask) -> dict[str, Any]:
     )
     for payload in payloads:
         payload["model_version"] = int(task.model_version)
+        # Network workers already emit per-cycle summaries. Per-chunk worker
+        # progress logs are too noisy for alphaZeroParrallel.out at scale.
+        payload["suppress_worker_progress_logs"] = True
 
     ctx = mp.get_context("spawn")
     worker_msgs = _run_selfplay_cycle(

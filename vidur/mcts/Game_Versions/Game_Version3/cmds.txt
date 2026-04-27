@@ -74,3 +74,9 @@ cd /home/ubuntu/vidur && \
 PYTHONPATH=/home/ubuntu/vidur \
 /home/ubuntu/vidur/.venv/bin/python \
 -m vidur.mcts.Game_Versions.Game_Version3.Model_Tester.run
+
+
+cd /home/shazer/Desktop/Research/Vidur/vidur && \
+PYTHONPATH=/home/shazer/Desktop/Research/Vidur/vidur \
+/home/shazer/Desktop/Research/Vidur/vidur/.venv/bin/python3 \
+-m vidur.mcts.Game_Versions.Game_Version3.Model_Tester.run

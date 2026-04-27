@@ -70,6 +70,15 @@ def _masked_mean(x: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
     return (x * weights).sum(dim=1) / denom
 
 
+def _sanitize_model_features(x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    # All GV3 model features are normalized into [0, 1]. Native/padded masked
+    # rows can contain stale values; zero them before any encoder sees them.
+    x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+    if mask is not None:
+        x = x * mask.to(dtype=x.dtype).unsqueeze(-1)
+    return x
+
+
 class _FeatureMLP(nn.Module):
     def __init__(self, in_dim: int, out_dim: int) -> None:
         super().__init__()
@@ -246,6 +255,15 @@ class AlphaZeroModel(nn.Module):
             prefill_req_mask = torch.ones((bsz, self.n_prefill_req), dtype=torch.bool, device=device)
         if decode_req_mask is None:
             decode_req_mask = torch.ones((bsz, self.n_decode_req), dtype=torch.bool, device=device)
+
+        prefill_req_features = _sanitize_model_features(prefill_req_features, prefill_req_mask)
+        decode_req_features = _sanitize_model_features(decode_req_features, decode_req_mask)
+        global_features = torch.nan_to_num(
+            global_features,
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        ).clamp(0.0, 1.0)
 
         p_tok = self.prefill_encoder(prefill_req_features)
         d_tok = self.decode_encoder(decode_req_features)

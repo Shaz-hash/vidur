@@ -287,7 +287,12 @@ std::string controller_action_key(const ControllerAction& a) {
         if (i > 0) oss << "|";
         oss << alloc[i].first << ":" << alloc[i].second;
     }
-    oss << "|strategy:" << a.strategy;
+    std::string evict_rule = a.strategy;
+    constexpr const char* kGV2Prefix = "GV2|";
+    if (evict_rule.rfind(kGV2Prefix, 0) == 0) {
+        evict_rule = evict_rule.substr(std::char_traits<char>::length(kGV2Prefix));
+    }
+    oss << "|strategy:" << evict_rule;
     oss << "|mapping:" << a.mapping[0] << "," << a.mapping[1] << "," << a.mapping[2];
     return oss.str();
 }
@@ -365,6 +370,24 @@ std::unordered_set<int> live_request_ids(const SimState& s) {
     return ids;
 }
 
+void copy_root_infer_inputs(SearchOutput* out, const NativeInferInputsGV2& inputs) {
+    if (out == nullptr) return;
+    out->root_global_features = inputs.global_features;
+    out->root_action_mask = inputs.action_mask;
+    out->root_prefill_req_features = inputs.prefill_req_features;
+    out->root_decode_req_features = inputs.decode_req_features;
+    out->root_prefill_req_mask = inputs.prefill_req_mask;
+    out->root_decode_req_mask = inputs.decode_req_mask;
+    out->root_prefill_req_n = inputs.prefill_req_n;
+    out->root_prefill_req_d = inputs.prefill_req_d;
+    out->root_decode_req_n = inputs.decode_req_n;
+    out->root_decode_req_d = inputs.decode_req_d;
+    out->root_req_features = inputs.req_features;
+    out->root_req_mask = inputs.req_mask;
+    out->root_req_n = inputs.req_n;
+    out->root_req_d = inputs.req_d;
+}
+
 class SearchRunner {
 public:
     SearchRunner(
@@ -386,121 +409,20 @@ public:
         }
     }
 
+    SearchRunner(
+        const SearchInput& in,
+        const GV2VirtualEnvironment& env,
+        NativeTorchScriptInferRuntimeGV2& infer_runtime,
+        int model_version)
+        : in_(in),
+          env_(env),
+          infer_runtime_(infer_runtime),
+          model_version_(model_version),
+          rng_(static_cast<uint32_t>(std::max(0, in.seed))),
+          next_node_id_(std::max(1, in.root_node_id + 1)) {}
+
     SearchOutput run() {
-        using clock = std::chrono::steady_clock;
-        const auto t_total_begin = clock::now();
-
-        SearchOutput out;
-        out.contract_version = kGV2NativeContractVersion;
-        out.decision_state_time = in_.decision_state_time;
-        out.root_state_echo = in_.root_state;
-
-        auto root = std::make_unique<TreeNode>();
-        root->player = in_.root_player;
-        root->node_id = in_.root_node_id;
-        root->depth = in_.root_depth;
-        root->parent = nullptr;
-        root->sim_time = in_.root_state.sim_time;
-        root->state_cost = state_cost(in_.root_state);
-        root->has_snapshot = true;
-        root->cached_state = in_.root_state;
-
-        const auto t_root_expand_begin = clock::now();
-        SimState root_state_work = root->cached_state;
-        const auto root_expand = expand_node(root.get(), root_state_work);
-        const auto t_root_expand_end = clock::now();
-
-        const int root_valid_actions = std::get<2>(root_expand);
-        out.root_num_valid_actions = root_valid_actions;
-        out.root_state_cost = root->state_cost;
-        out.root_sim_time = root->sim_time;
-
-        const bool root_nn_called = std::get<1>(root_expand);
-        apply_root_dirichlet_noise(root.get(), root_nn_called, root_valid_actions);
-
-
-        // Root NN payload; for forced/terminal roots keep deterministic fallback.
-        if (root->has_nn_value) {
-            out.root_nn_value_controller = root->nn_value_controller;
-            out.root_nn_priors = root->nn_priors;
-            out.root_nn_priors_after_threshold = root->nn_priors_after_threshold;
-            out.root_nn_valid_mask = root->nn_valid_mask;
-        } else {
-            out.root_nn_value_controller = 0.0;
-            out.root_nn_valid_mask = root->nn_valid_mask.empty() ? in_.action_mask : root->nn_valid_mask;
-            if (out.root_nn_valid_mask.empty()) {
-                out.root_nn_valid_mask.assign(8, 1u);
-            }
-            out.root_nn_priors.assign(out.root_nn_valid_mask.size(), 0.0);
-            out.root_nn_priors_after_threshold = normalize_masked(out.root_nn_priors, out.root_nn_valid_mask);
-        }
-
-        out.action_alias_to_canonical = root->action_alias_to_canonical;
-        out.canonical_to_action_aliases = root->canonical_to_action_aliases;
-
-        const int iterations = std::max(0, in_.iterations);
-        for (int iter = 0; iter < iterations; ++iter) {
-            run_one_simulation(iter, root.get(), &out);
-        }
-
-        out.root_visits = root->visits;
-        out.root_value_sum = root->value_sum;
-        out.root_state_cost = root->state_cost;
-        out.root_sim_time = root->sim_time;
-
-        // Root children summaries
-        {
-            std::vector<int> child_indices;
-            child_indices.reserve(root->children.size());
-            for (const auto& kv : root->children) child_indices.push_back(kv.first);
-            std::sort(child_indices.begin(), child_indices.end());
-
-            out.children.reserve(child_indices.size());
-            for (int idx : child_indices) {
-                const auto it = root->children.find(idx);
-                if (it == root->children.end()) continue;
-                const TreeNode* c = it->second.get();
-
-                ChildSummary cs;
-                cs.index = idx;
-                cs.node_id = c->node_id;
-                cs.depth = c->depth;
-                cs.player = c->player;
-                cs.prior = c->prior;
-                cs.reward = c->reward;
-                cs.visits = c->visits;
-                cs.value_sum = c->value_sum;
-                cs.sim_time = c->sim_time;
-                cs.state_cost = c->state_cost;
-                cs.num_valid_actions = c->num_valid_actions;
-                if (c->has_parent_action) {
-                    cs.parent_action_json = c->parent_action_is_controller
-                        ? controller_action_to_json(c->parent_controller_action)
-                        : adversary_action_to_json(c->parent_adversary_action);
-                }
-                out.children.push_back(std::move(cs));
-            }
-        }
-
-        out.mcts_root_prior = compute_root_prior(*root, out.root_nn_valid_mask);
-
-        const auto t_total_end = clock::now();
-        out.perf["total_sec"] =
-            std::chrono::duration_cast<std::chrono::duration<double>>(t_total_end - t_total_begin).count();
-        out.perf["root_expand_sec"] =
-            std::chrono::duration_cast<std::chrono::duration<double>>(t_root_expand_end - t_root_expand_begin).count();
-        out.perf["selection_sec"] = perf_selection_sec_;
-        out.perf["restore_sec"] = perf_restore_sec_;
-        out.perf["forced_chain_sec"] = perf_forced_sec_;
-        out.perf["expand_sec"] = perf_expand_sec_;
-        out.perf["backprop_sec"] = perf_backprop_sec_;
-        out.perf["infer_total_sec"] = perf_infer_sec_;
-        out.perf["infer_calls"] = static_cast<double>(perf_infer_calls_);
-        out.perf["selection_steps"] = static_cast<double>(perf_selection_steps_);
-        out.perf["forced_steps"] = static_cast<double>(perf_forced_steps_);
-        out.perf["minmax_min"] = std::isfinite(min_max_.minimum) ? min_max_.minimum : 0.0;
-        out.perf["minmax_max"] = std::isfinite(min_max_.maximum) ? min_max_.maximum : 0.0;
-        return out;
+        return run_gv3_depth_one_search();
     }
 
 private:
@@ -510,6 +432,450 @@ private:
         int num_valid_actions = 0;
         int unique_actions = 0;
     };
+
+    struct QEval {
+        double q = 0.0;
+        double reward = 0.0;
+        double discount = 1.0;
+        double bootstrap = 0.0;
+        double leaf_cost = 0.0;
+        double leaf_time = 0.0;
+    };
+
+    static std::string next_player(const std::string& player) {
+        return (player == "adversary") ? "controller" : "adversary";
+    }
+
+    int action_space_size_for_player(const std::string& player) const {
+        if (player == "controller") {
+            return std::max(1, controller_action_space_size(in_.env_cfg.controller_sampler));
+        }
+        return std::max(1, adversary_action_space_size(in_.env_cfg.adversary_sampler));
+    }
+
+    std::vector<uint8_t> all_true_action_mask(const std::string& player) const {
+        return std::vector<uint8_t>(
+            static_cast<std::size_t>(action_space_size_for_player(player)),
+            uint8_t{1});
+    }
+
+    double bootstrap_value_from_model(const SimState& state, const std::string& player) {
+        if (model_version_ <= 0) return 0.0;
+        const std::vector<uint8_t> mask = all_true_action_mask(player);
+        const auto t_infer_begin = std::chrono::steady_clock::now();
+        NativeInferInputsGV2 inputs = build_infer_inputs(state, player, mask);
+        auto infer_out = infer_runtime_.infer_from_inputs(inputs, player, model_version_);
+        const auto t_infer_end = std::chrono::steady_clock::now();
+        perf_infer_sec_ +=
+            std::chrono::duration_cast<std::chrono::duration<double>>(t_infer_end - t_infer_begin).count();
+        perf_infer_calls_ += 1;
+        return infer_out.first;
+    }
+
+    QEval compose_q_from_state(
+        const SimState& leaf_state,
+        double parent_cost,
+        double parent_time,
+        const std::string& player_to_act) {
+        QEval out;
+        out.leaf_cost = state_cost(leaf_state);
+        out.reward = transition_reward(parent_cost, out.leaf_cost, in_);
+        out.leaf_time = leaf_state.sim_time;
+        out.discount = time_discount(out.leaf_time, parent_time, in_);
+        out.bootstrap = bootstrap_value_from_model(leaf_state, player_to_act);
+        out.q = out.reward + out.discount * out.bootstrap;
+        return out;
+    }
+
+    std::vector<int> valid_controller_indices(const SampledActionSet<ControllerAction>& sampled) const {
+        std::vector<int> out;
+        const int n = static_cast<int>(sampled.actions.size());
+        out.reserve(n);
+        for (int i = 0; i < n; ++i) {
+            if (i >= static_cast<int>(sampled.mask.size())) continue;
+            if (!sampled.mask[static_cast<std::size_t>(i)]) continue;
+            if (!sampled.actions[static_cast<std::size_t>(i)].valid) continue;
+            out.push_back(i);
+        }
+        return out;
+    }
+
+    std::vector<int> valid_adversary_indices(const SampledActionSet<AdversaryAction>& sampled) const {
+        std::vector<int> out;
+        const int n = static_cast<int>(sampled.actions.size());
+        out.reserve(n);
+        for (int i = 0; i < n; ++i) {
+            if (i >= static_cast<int>(sampled.mask.size())) continue;
+            if (!sampled.mask[static_cast<std::size_t>(i)]) continue;
+            if (!sampled.actions[static_cast<std::size_t>(i)].valid) continue;
+            out.push_back(i);
+        }
+        return out;
+    }
+
+    std::tuple<std::unordered_map<int, int>, std::unordered_map<int, std::vector<int>>, std::vector<int>>
+    canonicalize_controller_indices(
+        const SampledActionSet<ControllerAction>& sampled,
+        const std::vector<int>& valid_indices) const {
+        std::unordered_map<int, int> alias_to_canon;
+        std::unordered_map<int, std::vector<int>> canon_to_aliases;
+        std::vector<int> canonical_indices;
+        std::unordered_map<std::string, int> sig_to_canon;
+
+        alias_to_canon.reserve(valid_indices.size());
+        canon_to_aliases.reserve(valid_indices.size());
+        canonical_indices.reserve(valid_indices.size());
+        sig_to_canon.reserve(valid_indices.size());
+
+        for (int idx : valid_indices) {
+            const ControllerAction& act = sampled.actions[static_cast<std::size_t>(idx)];
+            const std::string sig = controller_action_key(act);
+            const auto it = sig_to_canon.find(sig);
+            if (it == sig_to_canon.end()) {
+                sig_to_canon.emplace(sig, idx);
+                alias_to_canon[idx] = idx;
+                canon_to_aliases[idx] = {idx};
+                canonical_indices.push_back(idx);
+            } else {
+                alias_to_canon[idx] = it->second;
+                canon_to_aliases[it->second].push_back(idx);
+            }
+        }
+        return {std::move(alias_to_canon), std::move(canon_to_aliases), std::move(canonical_indices)};
+    }
+
+    std::tuple<std::unordered_map<int, int>, std::unordered_map<int, std::vector<int>>, std::vector<int>>
+    canonicalize_adversary_indices(const std::vector<int>& valid_indices) const {
+        std::unordered_map<int, int> alias_to_canon;
+        std::unordered_map<int, std::vector<int>> canon_to_aliases;
+        std::vector<int> canonical_indices;
+        alias_to_canon.reserve(valid_indices.size());
+        canon_to_aliases.reserve(valid_indices.size());
+        canonical_indices.reserve(valid_indices.size());
+        for (int idx : valid_indices) {
+            alias_to_canon[idx] = idx;
+            canon_to_aliases[idx] = {idx};
+            canonical_indices.push_back(idx);
+        }
+        return {std::move(alias_to_canon), std::move(canon_to_aliases), std::move(canonical_indices)};
+    }
+
+    QEval evaluate_depth1_controller_action(
+        const SimState& decision_state,
+        double parent_cost,
+        double parent_time,
+        const ControllerAction& action) {
+        SimState leaf = decision_state;
+        env_.apply_controller_action_inplace(leaf, action);
+        return compose_q_from_state(leaf, parent_cost, parent_time, "adversary");
+    }
+
+    QEval evaluate_depth1_adversary_action(
+        const SimState& decision_state,
+        double parent_cost,
+        double parent_time,
+        const AdversaryAction& action) {
+        SimState leaf = decision_state;
+        env_.apply_adversary_action_inplace(leaf, action);
+        return compose_q_from_state(leaf, parent_cost, parent_time, "controller");
+    }
+
+    QEval evaluate_adversary_action_two_step(
+        const SimState& decision_state,
+        double parent_cost,
+        double parent_time,
+        const AdversaryAction& action) {
+        SimState adv_child = decision_state;
+        env_.apply_adversary_action_inplace(adv_child, action);
+
+        const auto controller_sampled = env_.sample_controller_actions(adv_child);
+        const std::vector<int> valid = valid_controller_indices(controller_sampled);
+        if (valid.empty()) {
+            return compose_q_from_state(adv_child, parent_cost, parent_time, "controller");
+        }
+
+        auto [alias_to_canon, canon_to_aliases, canonical_indices] =
+            canonicalize_controller_indices(controller_sampled, valid);
+        (void)alias_to_canon;
+        (void)canon_to_aliases;
+
+        std::optional<QEval> best;
+        int best_idx = -1;
+        for (int cidx : canonical_indices) {
+            SimState leaf = adv_child;
+            env_.apply_controller_action_inplace(
+                leaf,
+                controller_sampled.actions[static_cast<std::size_t>(cidx)]);
+            QEval q = compose_q_from_state(leaf, parent_cost, parent_time, "adversary");
+            if (!best.has_value() || q.q > best->q || (q.q == best->q && cidx < best_idx)) {
+                best = q;
+                best_idx = cidx;
+            }
+        }
+
+        if (!best.has_value()) {
+            return compose_q_from_state(adv_child, parent_cost, parent_time, "controller");
+        }
+        return *best;
+    }
+
+    void append_controller_child_summary(
+        SearchOutput* out,
+        int action_index,
+        int node_id,
+        const ControllerAction& action,
+        const QEval& q,
+        const std::string& child_player,
+        int child_depth,
+        bool is_best,
+        double prior) const {
+        ChildSummary cs;
+        cs.index = action_index;
+        cs.node_id = node_id;
+        cs.depth = child_depth;
+        cs.player = child_player;
+        cs.prior = prior;
+        cs.reward = q.reward;
+        cs.visits = is_best ? 1 : 0;
+        cs.value_sum = is_best ? q.q : 0.0;
+        cs.sim_time = q.leaf_time;
+        cs.state_cost = q.leaf_cost;
+        cs.num_valid_actions = 0;
+        cs.parent_action_json = controller_action_to_json(action);
+        out->children.push_back(std::move(cs));
+    }
+
+    void append_adversary_child_summary(
+        SearchOutput* out,
+        int action_index,
+        int node_id,
+        const AdversaryAction& action,
+        const QEval& q,
+        const std::string& child_player,
+        int child_depth,
+        bool is_best,
+        double prior) const {
+        ChildSummary cs;
+        cs.index = action_index;
+        cs.node_id = node_id;
+        cs.depth = child_depth;
+        cs.player = child_player;
+        cs.prior = prior;
+        cs.reward = q.reward;
+        cs.visits = is_best ? 1 : 0;
+        cs.value_sum = is_best ? q.q : 0.0;
+        cs.sim_time = q.leaf_time;
+        cs.state_cost = q.leaf_cost;
+        cs.num_valid_actions = 0;
+        cs.parent_action_json = adversary_action_to_json(action);
+        out->children.push_back(std::move(cs));
+    }
+
+    SearchOutput make_empty_depth_one_output(
+        const SimState& decision_state,
+        const std::vector<uint8_t>& valid_mask,
+        double root_cost,
+        double root_time,
+        double total_sec) const {
+        SearchOutput out;
+        out.contract_version = kGV2NativeContractVersion;
+        out.decision_state_time = decision_state.sim_time;
+        out.root_state_echo = in_.root_state;
+        out.root_visits = 1;
+        out.root_value_sum = 0.0;
+        out.root_state_cost = root_cost;
+        out.root_sim_time = root_time;
+        out.root_num_valid_actions = 0;
+        out.root_nn_value_controller = 0.0;
+        out.root_nn_valid_mask = valid_mask;
+        out.root_nn_priors.assign(valid_mask.size(), 0.0);
+        out.root_nn_priors_after_threshold.assign(valid_mask.size(), 0.0);
+        out.mcts_root_prior.assign(valid_mask.size(), 0.0);
+        out.perf["total_sec"] = total_sec;
+        out.perf["root_expand_sec"] = total_sec;
+        out.perf["infer_total_sec"] = perf_infer_sec_;
+        out.perf["infer_calls"] = static_cast<double>(perf_infer_calls_);
+        out.perf["gv3_depth_one"] = 1.0;
+        return out;
+    }
+
+    SearchOutput run_gv3_depth_one_search() {
+        using clock = std::chrono::steady_clock;
+        const auto t_total_begin = clock::now();
+
+        TreeNode root;
+        root.player = in_.root_player;
+        root.node_id = in_.root_node_id;
+        root.depth = in_.root_depth;
+        root.parent = nullptr;
+
+        const auto decision = decision_state_for_node(&root, in_.root_state);
+        const SimState decision_state = decision.first;
+        const double root_cost = state_cost(decision_state);
+        const double root_time = decision_state.sim_time;
+
+        std::vector<uint8_t> valid_mask;
+        std::vector<double> action_values;
+        std::vector<int> valid_indices;
+        std::unordered_map<int, int> alias_to_canon;
+        std::unordered_map<int, std::vector<int>> canon_to_aliases;
+        std::vector<int> canonical_indices;
+
+        std::vector<ControllerAction> controller_actions;
+        std::vector<AdversaryAction> adversary_actions;
+
+        if (root.player == "controller") {
+            const auto sampled = env_.sample_controller_actions(decision_state);
+            controller_actions = sampled.actions;
+            valid_mask = sampled.mask;
+            valid_indices = valid_controller_indices(sampled);
+            std::tie(alias_to_canon, canon_to_aliases, canonical_indices) =
+                canonicalize_controller_indices(sampled, valid_indices);
+        } else {
+            const auto forbidden = replay_forbidden_stop_ids(&root, decision_state, in_.root_state);
+            const auto sampled = env_.sample_adversary_actions(decision_state, forbidden);
+            adversary_actions = sampled.actions;
+            valid_mask = sampled.mask;
+            valid_indices = valid_adversary_indices(sampled);
+            std::tie(alias_to_canon, canon_to_aliases, canonical_indices) =
+                canonicalize_adversary_indices(valid_indices);
+        }
+
+        NativeInferInputsGV2 root_inputs = build_infer_inputs(decision_state, root.player, valid_mask);
+
+        const int n_actions = static_cast<int>(valid_mask.size());
+        action_values.assign(static_cast<std::size_t>(n_actions), -std::numeric_limits<double>::infinity());
+        std::unordered_map<int, QEval> canonical_q;
+        canonical_q.reserve(canonical_indices.size());
+
+        for (int cidx : canonical_indices) {
+            if (root.player == "controller") {
+                const ControllerAction& action = controller_actions[static_cast<std::size_t>(cidx)];
+                canonical_q[cidx] = evaluate_depth1_controller_action(
+                    decision_state,
+                    root_cost,
+                    root_time,
+                    action);
+            } else {
+                const AdversaryAction& action = adversary_actions[static_cast<std::size_t>(cidx)];
+                canonical_q[cidx] = evaluate_adversary_action_two_step(
+                    decision_state,
+                    root_cost,
+                    root_time,
+                    action);
+            }
+        }
+
+        for (const auto& kv : alias_to_canon) {
+            const int alias = kv.first;
+            const int canon = kv.second;
+            const auto it = canonical_q.find(canon);
+            if (alias >= 0 && alias < n_actions && it != canonical_q.end()) {
+                action_values[static_cast<std::size_t>(alias)] = it->second.q;
+            }
+        }
+
+        const auto t_eval_end = clock::now();
+        if (valid_indices.empty()) {
+            SearchOutput empty = make_empty_depth_one_output(
+                decision_state,
+                valid_mask,
+                root_cost,
+                root_time,
+                std::chrono::duration_cast<std::chrono::duration<double>>(t_eval_end - t_total_begin).count());
+            copy_root_infer_inputs(&empty, root_inputs);
+            empty.root_action_values = std::move(action_values);
+            return empty;
+        }
+
+        int best_idx = -1;
+        double best_value = std::numeric_limits<double>::infinity();
+        for (int idx : valid_indices) {
+            const double v = (idx >= 0 && idx < n_actions)
+                ? action_values[static_cast<std::size_t>(idx)]
+                : std::numeric_limits<double>::infinity();
+            if (best_idx < 0 || v < best_value || (v == best_value && idx < best_idx)) {
+                best_idx = idx;
+                best_value = v;
+            }
+        }
+        if (best_idx < 0) best_value = 0.0;
+
+        SearchOutput out;
+        out.contract_version = kGV2NativeContractVersion;
+        out.decision_state_time = decision_state.sim_time;
+        out.root_state_echo = in_.root_state;
+        out.root_visits = 1;
+        out.root_value_sum = std::isfinite(best_value) ? best_value : 0.0;
+        out.root_state_cost = root_cost;
+        out.root_sim_time = root_time;
+        out.root_num_valid_actions = static_cast<int>(valid_indices.size());
+        out.root_nn_value_controller = out.root_value_sum;
+        out.root_nn_valid_mask = valid_mask;
+        out.root_nn_priors.assign(valid_mask.size(), 0.0);
+        out.root_nn_priors_after_threshold.assign(valid_mask.size(), 0.0);
+        copy_root_infer_inputs(&out, root_inputs);
+        out.best_action_index = int(best_idx);
+        out.root_action_values = action_values;
+        out.action_alias_to_canonical = std::move(alias_to_canon);
+        out.canonical_to_action_aliases = std::move(canon_to_aliases);
+        out.mcts_root_prior.assign(valid_mask.size(), 0.0);
+        if (best_idx >= 0 && best_idx < static_cast<int>(out.mcts_root_prior.size())) {
+            out.mcts_root_prior[static_cast<std::size_t>(best_idx)] = 1.0;
+        }
+
+        int node_id = std::max(1, in_.root_node_id + 1);
+        for (int idx : valid_indices) {
+            const int canon = out.action_alias_to_canonical.count(idx) ? out.action_alias_to_canonical[idx] : idx;
+            const auto itq = canonical_q.find(canon);
+            QEval q = (itq == canonical_q.end()) ? QEval{} : itq->second;
+            q.q = (idx >= 0 && idx < n_actions) ? action_values[static_cast<std::size_t>(idx)] : q.q;
+            const bool is_best = idx == best_idx;
+            const double prior = (idx >= 0 && idx < static_cast<int>(out.mcts_root_prior.size()))
+                ? out.mcts_root_prior[static_cast<std::size_t>(idx)]
+                : 0.0;
+            if (root.player == "controller") {
+                append_controller_child_summary(
+                    &out,
+                    idx,
+                    node_id++,
+                    controller_actions[static_cast<std::size_t>(idx)],
+                    q,
+                    "adversary",
+                    in_.root_depth + 1,
+                    is_best,
+                    prior);
+            } else {
+                append_adversary_child_summary(
+                    &out,
+                    idx,
+                    node_id++,
+                    adversary_actions[static_cast<std::size_t>(idx)],
+                    q,
+                    "controller",
+                    in_.root_depth + 1,
+                    is_best,
+                    prior);
+            }
+        }
+
+        const auto t_total_end = clock::now();
+        out.perf["total_sec"] =
+            std::chrono::duration_cast<std::chrono::duration<double>>(t_total_end - t_total_begin).count();
+        out.perf["root_expand_sec"] =
+            std::chrono::duration_cast<std::chrono::duration<double>>(t_eval_end - t_total_begin).count();
+        out.perf["infer_total_sec"] = perf_infer_sec_;
+        out.perf["infer_calls"] = static_cast<double>(perf_infer_calls_);
+        out.perf["gv3_depth_one"] = 1.0;
+        out.perf["selection_sec"] = 0.0;
+        out.perf["restore_sec"] = 0.0;
+        out.perf["forced_chain_sec"] = 0.0;
+        out.perf["expand_sec"] = 0.0;
+        out.perf["backprop_sec"] = 0.0;
+        out.perf["selection_steps"] = 0.0;
+        out.perf["forced_steps"] = 0.0;
+        return out;
+    }
 
     const SearchInput& in_;
     GV2VirtualEnvironment env_;
@@ -564,8 +930,9 @@ private:
 
     NativeInferInputsGV2 build_infer_inputs(
         const SimState& state,
+        const std::string& player,
         const std::vector<uint8_t>& action_mask) const {
-        NativeFeatureBuildConfigGV2 feat_cfg;
+        NativeFeatureBuildConfigGV2 feat_cfg = in_.feature_cfg;
         if (in_.root_infer_inputs.prefill_req_n > 0) {
             feat_cfg.n_prefill_req = in_.root_infer_inputs.prefill_req_n;
         }
@@ -584,8 +951,9 @@ private:
             feat_cfg.d_global = static_cast<int>(in_.global_features.size());
         }
         feat_cfg.auto_drop_lateness_sec = std::max(1e-9, in_.env_cfg.auto_drop_lateness_sec);
-        feat_cfg.launch_ewma_norm_den = std::max(1, in_.env_cfg.max_requests_per_launch_window);
-        return infer_runtime_.build_inputs_from_state(state, action_mask, feat_cfg, &in_.root_infer_inputs);
+        feat_cfg.recent_launch_count_den = std::max(1.0, static_cast<double>(in_.env_cfg.max_requests_per_launch_window));
+        feat_cfg.recent_launch_prefill_den = std::max(1.0, static_cast<double>(in_.env_cfg.prefill_window_cap_tokens));
+        return infer_runtime_.build_inputs_from_state(state, player, action_mask, feat_cfg, &in_.root_infer_inputs);
     }
 
     std::pair<SimState, double> decision_state_for_node(TreeNode* node, const SimState& real_state) const {
@@ -891,7 +1259,7 @@ private:
             }
 
             const auto t_infer_begin = std::chrono::steady_clock::now();
-            NativeInferInputsGV2 infer_inputs = build_infer_inputs(decision_state, sampled.mask);
+            NativeInferInputsGV2 infer_inputs = build_infer_inputs(decision_state, node->player, sampled.mask);
             auto infer_out = infer_runtime_.infer_from_inputs(infer_inputs, node->player, model_version_);
             const auto t_infer_end = std::chrono::steady_clock::now();
             perf_infer_sec_ += std::chrono::duration_cast<std::chrono::duration<double>>(t_infer_end - t_infer_begin).count();
@@ -1025,7 +1393,7 @@ private:
         }
 
         const auto t_infer_begin = std::chrono::steady_clock::now();
-        NativeInferInputsGV2 infer_inputs = build_infer_inputs(decision_state, sampled.mask);
+        NativeInferInputsGV2 infer_inputs = build_infer_inputs(decision_state, node->player, sampled.mask);
         auto infer_out = infer_runtime_.infer_from_inputs(infer_inputs, node->player, model_version_);
         const auto t_infer_end = std::chrono::steady_clock::now();
         perf_infer_sec_ += std::chrono::duration_cast<std::chrono::duration<double>>(t_infer_end - t_infer_begin).count();
@@ -1600,6 +1968,15 @@ SearchOutput run_search_torchscript(
     NativeTorchScriptInferRuntimeGV2& infer_runtime,
     int model_version) {
     SearchRunner runner(in, infer_runtime, model_version);
+    return runner.run();
+}
+
+SearchOutput run_search_torchscript_with_env(
+    const SearchInput& in,
+    GV2VirtualEnvironment& env,
+    NativeTorchScriptInferRuntimeGV2& infer_runtime,
+    int model_version) {
+    SearchRunner runner(in, env, infer_runtime, model_version);
     return runner.run();
 }
 

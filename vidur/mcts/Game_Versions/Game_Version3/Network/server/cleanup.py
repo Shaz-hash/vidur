@@ -15,9 +15,17 @@ from ..common.files import utc_now_iso
 from ..network_config import (
     DEFAULT_NETWORK_CONFIG,
     NetworkMachineConfig,
+    namespace_path_defaults,
+    resolve_output_name,
     selected_machines,
 )
-from .orchestrator import load_machines
+
+
+def load_machines(path: Path) -> list[NetworkMachineConfig]:
+    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(raw, list):
+        raise TypeError(f"machines config must contain a list: {path}")
+    return [NetworkMachineConfig(**item) for item in raw]
 
 
 def _run(cmd: list[str], *, check: bool = True) -> subprocess.CompletedProcess:
@@ -95,12 +103,17 @@ def _ensure_within(path: Path, root: Path) -> Path:
     raise ValueError(f"refusing to delete path outside {resolved_root}: {resolved_path}")
 
 
-def _remote_dirs(row: dict[str, str], machine: NetworkMachineConfig) -> tuple[str, str]:
+def _remote_dirs(
+    row: dict[str, str],
+    machine: NetworkMachineConfig,
+    *,
+    remote_output_name: str,
+) -> tuple[str, str]:
     session_id = str(row.get("session_id", "")).strip()
     task_id = str(row.get("task_id", "")).strip()
     if not session_id or not task_id:
         raise ValueError(f"received log row is missing session_id/task_id: {row}")
-    remote_base = Path(machine.repo_dir) / "simulator_output" / "Game_Version3" / "network"
+    remote_base = Path(machine.repo_dir) / "simulator_output" / str(remote_output_name) / "network"
     remote_result_dir = remote_base / "results" / session_id / task_id
     remote_task_dir = remote_base / "tasks" / session_id / task_id
     return str(remote_result_dir), str(remote_task_dir)
@@ -141,6 +154,8 @@ def cleanup_consumed_generation_samples(
     machine_names: list[str] | None = None,
     output_dir: Path | None = None,
     machines_config: Path | None = None,
+    output_name: str | None = None,
+    remote_output_name: str | None = None,
     dry_run: bool = True,
 ) -> dict[str, Any]:
     if session_id is None and generation is None:
@@ -157,8 +172,19 @@ def cleanup_consumed_generation_samples(
         }
 
     paths = cfg.paths
-    if output_dir is not None:
+    if output_name is not None and output_dir is None:
+        paths = replace(paths, output_dir=namespace_path_defaults(output_name)["output_dir"])
+    elif output_dir is not None:
         paths = replace(paths, output_dir=Path(output_dir))
+    if remote_output_name is None:
+        if output_name is not None:
+            remote_output_name = output_name
+        elif output_dir is not None:
+            out_path = Path(output_dir)
+            remote_output_name = out_path.parent.name if out_path.name == "network" else out_path.name
+        else:
+            remote_output_name = "Game_Version3"
+    remote_output_name = resolve_output_name(remote_output_name)
     machines_path = Path(machines_config or paths.machines_json)
     machines = selected_machines(load_machines(machines_path), machine_names)
     received_rows = _read_received_rows(paths.received_log_csv)
@@ -173,7 +199,11 @@ def cleanup_consumed_generation_samples(
     results: list[dict[str, Any]] = []
     cleanup_at = utc_now_iso()
     for row, machine in selected:
-        remote_result_dir, remote_task_dir = _remote_dirs(row, machine)
+        remote_result_dir, remote_task_dir = _remote_dirs(
+            row,
+            machine,
+            remote_output_name=remote_output_name,
+        )
         local_result_dir = Path(row.get("result_dir", ""))
         if not local_result_dir.is_absolute():
             local_result_dir = paths.output_dir / local_result_dir
@@ -246,7 +276,17 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--model-version", type=int, default=None)
     parser.add_argument("--machine", action="append", default=None, help="Machine name/SSH host/IP to clean")
     parser.add_argument("--machines-config", default=str(defaults.machines_json))
-    parser.add_argument("--output-dir", default=str(defaults.output_dir))
+    parser.add_argument(
+        "--output-name",
+        default=None,
+        help="Simulator output namespace. Defaults to Game_Version3; use Game_Version3_Native for isolated native runs.",
+    )
+    parser.add_argument(
+        "--remote-output-name",
+        default=None,
+        help="Remote simulator output namespace. Defaults to --output-name, or Game_Version3.",
+    )
+    parser.add_argument("--output-dir", default=None)
     parser.add_argument("--dry-run", action="store_true", help="Preview cleanup without deleting files")
     parser.add_argument(
         "--confirm-delete",
@@ -264,8 +304,10 @@ def main() -> None:
         generation=args.generation,
         model_version=args.model_version,
         machine_names=args.machine,
-        output_dir=Path(args.output_dir),
+        output_dir=Path(args.output_dir) if args.output_dir else None,
         machines_config=Path(args.machines_config),
+        output_name=args.output_name,
+        remote_output_name=args.remote_output_name,
         dry_run=dry_run,
     )
     print(json.dumps(result, indent=2, sort_keys=True), flush=True)

@@ -56,14 +56,22 @@ class NetworkSelfplayTask:
     worker_result_timeout_sec: int = 7200
     model_device: str = "auto"
     use_virtual_env: bool = True
+    environment_lang: str = "python"
     allow_duplicate_history_fallback: bool = True
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        # Keep Python-path tasks backward-compatible with workers that have not
+        # pulled the native-switch field yet. Native tasks still require updated workers.
+        if str(data.get("environment_lang", "python")) == "python":
+            data.pop("environment_lang", None)
+        return data
 
     @classmethod
     def from_dict(cls, payload: Dict[str, Any]) -> "NetworkSelfplayTask":
-        return cls(**payload)
+        data = dict(payload)
+        data.setdefault("environment_lang", "python")
+        return cls(**data)
 
 
 @dataclass(frozen=True)

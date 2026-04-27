@@ -102,7 +102,7 @@ class BestModelReplayBuffer:
             if not manifest.exists():
                 continue
 
-            for entry in load_manifest(manifest):
+            for entry in load_manifest(manifest, allow_empty=True):
                 raw_added += self._append_shard(
                     path=self._canonical_path(entry.path),
                     num_samples=int(entry.num_samples),

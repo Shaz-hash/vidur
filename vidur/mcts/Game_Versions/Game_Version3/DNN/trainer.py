@@ -189,9 +189,29 @@ class Trainer:
         else:
             loss = self.cfg.policy_weight * policy_loss + self.cfg.value_weight * value_loss
 
+        if not bool(torch.isfinite(loss).item()):
+            raise RuntimeError(
+                "Non-finite training loss before backward: "
+                f"loss={float(loss.detach().cpu())}, "
+                f"value_loss={float(value_loss.detach().cpu())}, "
+                f"policy_loss={float(policy_loss.detach().cpu())}"
+            )
+
         loss.backward()
         if self.cfg.grad_clip_norm and self.cfg.grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip_norm)
+            try:
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.cfg.grad_clip_norm,
+                    error_if_nonfinite=True,
+                )
+            except TypeError:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.cfg.grad_clip_norm,
+                )
+                if not bool(torch.isfinite(grad_norm).item()):
+                    raise RuntimeError(f"Non-finite gradient norm before optimizer step: {grad_norm}")
         self.opt.step()
 
         self.step += 1

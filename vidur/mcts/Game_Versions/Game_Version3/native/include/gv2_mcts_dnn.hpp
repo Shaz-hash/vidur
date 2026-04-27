@@ -39,6 +39,7 @@ struct SearchInput {
     // Environment/simulator config (optional overrides).
     GV2EnvConfig env_cfg;
     VirtualSimulatorConfig sim_cfg;
+    NativeFeatureBuildConfigGV2 feature_cfg;
     std::string predictor_csv_path;
 
     std::vector<uint8_t> action_mask;
@@ -55,6 +56,12 @@ struct SearchInput {
 
 SearchOutput run_search_torchscript(
     const SearchInput& in,
+    NativeTorchScriptInferRuntimeGV2& infer_runtime,
+    int model_version);
+
+SearchOutput run_search_torchscript_with_env(
+    const SearchInput& in,
+    GV2VirtualEnvironment& env,
     NativeTorchScriptInferRuntimeGV2& infer_runtime,
     int model_version);
 

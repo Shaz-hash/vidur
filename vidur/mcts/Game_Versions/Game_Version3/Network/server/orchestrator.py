@@ -6,6 +6,8 @@ import shutil
 import shlex
 import subprocess
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -27,10 +29,22 @@ from ..network_config import (
     DEFAULT_NETWORK_CONFIG,
     NetworkMachineConfig,
     NetworkTaskDefaults,
+    namespace_path_defaults,
     repo_root,
+    resolve_output_name,
     selected_machines,
 )
+from .cleanup import cleanup_consumed_generation_samples
+from .dataset_integrity import validate_or_repair_proc_dir
 from .training import NetworkTrainingSummary, train_network_generation
+
+
+_CSV_LOG_LOCK = threading.Lock()
+
+
+def _append_csv_row_locked(path: Path, columns: list[str], row: dict[str, Any]) -> None:
+    with _CSV_LOG_LOCK:
+        append_csv_row(path, columns, row)
 
 
 def _safe_id(value: str) -> str:
@@ -239,6 +253,7 @@ def _build_task(
         worker_result_timeout_sec=int(task_defaults.worker_result_timeout_sec),
         model_device=str(worker_model_device),
         use_virtual_env=bool(task_defaults.use_virtual_env),
+        environment_lang=str(task_defaults.environment_lang),
         allow_duplicate_history_fallback=bool(task_defaults.allow_duplicate_history_fallback),
     )
 
@@ -336,6 +351,7 @@ def _copy_proc_dirs_to_generation(
         if dst_dir.exists():
             shutil.rmtree(dst_dir)
         shutil.copytree(proc_dir, dst_dir)
+        validate_or_repair_proc_dir(src_proc_dir=proc_dir, dst_proc_dir=dst_dir)
         copied += 1
     if copied:
         rewrite_manifest_paths_absolute(dst)
@@ -430,11 +446,12 @@ def dispatch_task(
     dataset_dir: Path,
     logs_dir: Path,
     process_log_path: Path | None,
+    remote_output_name: str,
 ) -> dict[str, Any]:
     sent_at = utc_now_iso()
     local_task_path.parent.mkdir(parents=True, exist_ok=True)
     write_json(local_task_path, task.to_dict())
-    append_csv_row(
+    _append_csv_row_locked(
         allocation_log_csv,
         ALLOCATION_COLUMNS,
         _allocation_row(task, sent_at, "sending"),
@@ -451,14 +468,14 @@ def dispatch_task(
     _ssh(machine, remote_mkdir, process_log_path=process_log_path)
     _rsync_to(machine, local_weights_path, remote_weights_path, process_log_path=process_log_path)
     _rsync_to(machine, local_task_path, remote_task_path, process_log_path=process_log_path)
-    append_csv_row(
+    _append_csv_row_locked(
         allocation_log_csv,
         ALLOCATION_COLUMNS,
         _allocation_row(task, sent_at, "sent"),
     )
 
     remote_process_log = (
-        Path(machine.repo_dir) / "simulator_output" / "Game_Version3" / "mcts_dnn_logs" / "alphaZeroParrallel.out"
+        Path(machine.repo_dir) / "simulator_output" / str(remote_output_name) / "mcts_dnn_logs" / "alphaZeroParrallel.out"
     )
     worker_cmd = (
         f"cd {shlex.quote(machine.repo_dir)} && "
@@ -467,11 +484,30 @@ def dispatch_task(
         "vidur.mcts.Game_Versions.Game_Version3.Network.client.run_task "
         f"--task {shlex.quote(remote_task_path)}"
     )
+    worker_inner = (
+        "set -o pipefail; "
+        f"({worker_cmd}) 2>&1 | tee -a {shlex.quote(str(remote_process_log))}; "
+        "exit ${PIPESTATUS[0]}"
+    )
     remote_inner = (
         "set -o pipefail; "
         f"mkdir -p {shlex.quote(str(remote_process_log.parent))}; "
-        f"({worker_cmd}) 2>&1 | tee -a {shlex.quote(str(remote_process_log))}; "
-        "status=${PIPESTATUS[0]}; "
+        "cleanup() { "
+        "status=$?; "
+        "trap - EXIT INT TERM HUP; "
+        "if [ -n \"${child_pid:-}\" ]; then "
+        "kill -TERM -- -\"$child_pid\" 2>/dev/null || true; "
+        "sleep 2; "
+        "kill -KILL -- -\"$child_pid\" 2>/dev/null || true; "
+        "fi; "
+        "exit $status; "
+        "}; "
+        "trap cleanup EXIT INT TERM HUP; "
+        f"setsid bash -lc {shlex.quote(worker_inner)} & "
+        "child_pid=$!; "
+        "wait \"$child_pid\"; "
+        "status=$?; "
+        "trap - EXIT INT TERM HUP; "
         "exit $status"
     )
     remote_cmd = f"bash -lc {shlex.quote(remote_inner)}"
@@ -511,7 +547,7 @@ def dispatch_task(
             logs_dir=logs_dir,
         )
 
-    append_csv_row(
+    _append_csv_row_locked(
         received_log_csv,
         RECEIVED_COLUMNS,
         _received_row(
@@ -555,7 +591,17 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--generation", type=int, default=defaults.generation)
     parser.add_argument("--num-generations", type=int, default=defaults.num_generations)
     parser.add_argument("--model-version", type=int, default=None)
-    parser.add_argument("--weights-path", default=str(paths.default_weights_path))
+    parser.add_argument("--weights-path", default=None)
+    parser.add_argument(
+        "--output-name",
+        default=None,
+        help="Simulator output namespace. Defaults to Game_Version3; use Game_Version3_Native for isolated native runs.",
+    )
+    parser.add_argument(
+        "--remote-output-name",
+        default=None,
+        help="Remote simulator output namespace. Defaults to --output-name, or Game_Version3.",
+    )
     parser.add_argument("--total-roots", type=int, default=defaults.total_roots_per_generation)
     parser.add_argument("--roots-per-cycle", type=int, default=defaults.roots_per_cycle)
     parser.add_argument("--sample-cycles-per-generation", type=int, default=defaults.sample_cycles_per_generation)
@@ -595,18 +641,34 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--replay-capacity-samples", type=int, default=defaults.local_replay_capacity_samples)
     parser.add_argument("--replay-max-cached-shards", type=int, default=defaults.local_replay_max_cached_shards)
     parser.add_argument("--replay-seed", type=int, default=defaults.local_replay_seed)
-    parser.add_argument("--output-dir", default=str(paths.output_dir))
-    parser.add_argument("--process-log-path", default=str(paths.process_log_path))
-    parser.add_argument("--dataset-dir", default=str(paths.dataset_dir))
-    parser.add_argument("--logs-dir", default=str(paths.logs_dir))
-    parser.add_argument("--eval-metrics-csv", default=str(paths.eval_metrics_csv))
-    parser.add_argument("--checkpoints-dir", default=str(paths.checkpoints_dir))
+    parser.add_argument("--trainer-lr", type=float, default=0.0)
+    parser.add_argument(
+        "--environment-lang",
+        choices=("python", "native"),
+        default=defaults.environment_lang,
+        help="Self-play implementation used inside remote worker processes.",
+    )
+    parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--process-log-path", default=None)
+    parser.add_argument("--dataset-dir", default=None)
+    parser.add_argument("--logs-dir", default=None)
+    parser.add_argument("--eval-metrics-csv", default=None)
+    parser.add_argument("--checkpoints-dir", default=None)
+    parser.add_argument(
+        "--print-summary-json",
+        action="store_true",
+        help="Print the full task/result JSON summary to stdout for debugging.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
-    paths = replace(DEFAULT_NETWORK_CONFIG.paths, output_dir=Path(args.output_dir))
+    output_name = resolve_output_name(args.output_name)
+    remote_output_name = resolve_output_name(args.remote_output_name or output_name)
+    ns_paths = namespace_path_defaults(output_name)
+    output_dir = Path(args.output_dir or ns_paths["output_dir"])
+    paths = replace(DEFAULT_NETWORK_CONFIG.paths, output_dir=output_dir)
     task_defaults = replace(
         DEFAULT_NETWORK_CONFIG.task,
         total_roots_per_generation=int(args.total_roots),
@@ -626,27 +688,28 @@ def main() -> None:
         worker_result_timeout_sec=int(args.worker_result_timeout_sec),
         eval_split_ratio=float(args.eval_split_ratio),
         shard_size=int(args.shard_size),
+        environment_lang=str(args.environment_lang),
     )
     generation = int(args.generation)
     model_version = int((generation + 1) if args.model_version is None else args.model_version)
-    local_weights = Path(args.weights_path).expanduser()
+    local_weights = Path(args.weights_path or ns_paths["default_weights_path"]).expanduser()
     if not local_weights.is_absolute():
         local_weights = repo_root() / local_weights
     if not local_weights.exists():
         raise FileNotFoundError(f"weights checkpoint not found: {local_weights}")
-    process_log_path = Path(args.process_log_path).expanduser()
+    process_log_path = Path(args.process_log_path or ns_paths["process_log_path"]).expanduser()
     if not process_log_path.is_absolute():
         process_log_path = repo_root() / process_log_path
-    dataset_dir = Path(args.dataset_dir).expanduser()
+    dataset_dir = Path(args.dataset_dir or ns_paths["dataset_dir"]).expanduser()
     if not dataset_dir.is_absolute():
         dataset_dir = repo_root() / dataset_dir
-    logs_dir = Path(args.logs_dir).expanduser()
+    logs_dir = Path(args.logs_dir or ns_paths["logs_dir"]).expanduser()
     if not logs_dir.is_absolute():
         logs_dir = repo_root() / logs_dir
-    eval_metrics_csv = Path(args.eval_metrics_csv).expanduser()
+    eval_metrics_csv = Path(args.eval_metrics_csv or ns_paths["eval_metrics_csv"]).expanduser()
     if not eval_metrics_csv.is_absolute():
         eval_metrics_csv = repo_root() / eval_metrics_csv
-    checkpoints_dir = Path(args.checkpoints_dir).expanduser()
+    checkpoints_dir = Path(args.checkpoints_dir or ns_paths["checkpoints_dir"]).expanduser()
     if not checkpoints_dir.is_absolute():
         checkpoints_dir = repo_root() / checkpoints_dir
 
@@ -686,6 +749,8 @@ def main() -> None:
             f"adv_iterations_per_root={int(task_defaults.adv_iterations_per_root)}, "
             f"cont_iterations_per_root={int(task_defaults.cont_iterations_per_root)}, "
             f"worker_cpu_fraction={float(task_defaults.worker_cpu_fraction):.3f}, "
+            f"environment_lang={task_defaults.environment_lang}, "
+            f"output_name={output_name}, remote_output_name={remote_output_name}, "
             f"weights={local_weights}"
         ),
     )
@@ -695,9 +760,10 @@ def main() -> None:
         machine_root_counts = _partition_counts(int(roots_per_cycle), len(machines))
         cycle_root_base = int(task_defaults.start_root_id) + int(cycle_index) * int(roots_per_cycle)
         next_root_id = int(cycle_root_base)
+        dispatch_specs: list[dict[str, Any]] = []
         for idx, machine in enumerate(machines):
             task_id_preview = f"{args.session_id}_c{int(cycle_index):03d}_{_safe_id(machine.name)}_{idx:03d}"
-            remote_base = Path(machine.repo_dir) / "simulator_output" / "Game_Version3" / "network"
+            remote_base = Path(machine.repo_dir) / "simulator_output" / str(remote_output_name) / "network"
             remote_task_dir = remote_base / "tasks" / args.session_id / task_id_preview
             remote_result_dir = remote_base / "results" / args.session_id / task_id_preview
             remote_task_path = str(remote_task_dir / "task.json")
@@ -727,23 +793,39 @@ def main() -> None:
 
             local_task_path = paths.server_tasks_dir / args.session_id / task.task_id / "task.json"
             local_result_dir = paths.received_dir / args.session_id / task.task_id
-            result = dispatch_task(
-                machine=machine,
-                task=task,
-                local_task_path=local_task_path,
-                local_weights_path=local_weights,
-                local_result_dir=local_result_dir,
-                remote_task_path=remote_task_path,
-                remote_weights_path=remote_weights_path,
-                remote_result_dir=str(remote_result_dir),
-                allocation_log_csv=paths.allocation_log_csv,
-                received_log_csv=paths.received_log_csv,
-                dataset_dir=dataset_dir,
-                logs_dir=logs_dir,
-                process_log_path=process_log_path,
+            dispatch_specs.append(
+                {
+                    "machine": machine,
+                    "task": task,
+                    "local_task_path": local_task_path,
+                    "local_weights_path": local_weights,
+                    "local_result_dir": local_result_dir,
+                    "remote_task_path": remote_task_path,
+                    "remote_weights_path": remote_weights_path,
+                    "remote_result_dir": str(remote_result_dir),
+                    "allocation_log_csv": paths.allocation_log_csv,
+                    "received_log_csv": paths.received_log_csv,
+                    "dataset_dir": dataset_dir,
+                    "logs_dir": logs_dir,
+                    "process_log_path": process_log_path,
+                    "remote_output_name": remote_output_name,
+                }
             )
-            results.append(result)
-        cycle_results = results[-len(machines) :]
+
+        _log_line(
+            process_log_path,
+            (
+                f"[GV3 network server] collection cycle {int(cycle_index) + 1}/{int(cycles)} dispatching: "
+                f"machines={len(dispatch_specs)}, roots={sum(int(spec['task'].num_roots) for spec in dispatch_specs)}"
+            )
+        )
+        cycle_results: list[dict[str, Any]] = []
+        with ThreadPoolExecutor(max_workers=max(1, len(dispatch_specs))) as executor:
+            futures = [executor.submit(dispatch_task, **spec) for spec in dispatch_specs]
+            for future in as_completed(futures):
+                cycle_results.append(future.result())
+        cycle_results.sort(key=lambda item: str(item.get("task_id", "")))
+        results.extend(cycle_results)
         cycle_stats = _aggregate_result_stats(cycle_results)
         _log_line(
             process_log_path,
@@ -779,6 +861,7 @@ def main() -> None:
             replay_capacity_samples=int(args.replay_capacity_samples),
             replay_max_cached_shards=int(args.replay_max_cached_shards),
             replay_seed=int(args.replay_seed),
+            trainer_lr=float(args.trainer_lr),
             log_line=lambda message: _log_line(process_log_path, message),
         )
     _log_line(
@@ -796,23 +879,43 @@ def main() -> None:
             )
         ),
     )
-    print(
-        json.dumps(
-            {
-                "ok": True,
-                "generation": int(generation),
-                "roots_per_cycle": int(roots_per_cycle),
-                "sample_cycles_per_generation": int(cycles),
-                "total_roots_required": int(total_roots_required),
-                "aggregate_stats": aggregate_stats,
-                "training_summary": training_summary.__dict__ if training_summary is not None else None,
-                "results": results,
-            },
-            indent=2,
-            sort_keys=True,
-        ),
-        flush=True,
-    )
+    if training_summary is not None:
+        cleanup_summary = cleanup_consumed_generation_samples(
+            session_id=str(args.session_id),
+            generation=int(generation),
+            model_version=int(model_version),
+            machine_names=list(args.machine or []),
+            output_dir=paths.output_dir,
+            machines_config=paths.machines_json,
+            remote_output_name=remote_output_name,
+            dry_run=False,
+        )
+        _log_line(
+            process_log_path,
+            (
+                f"[GV3 network server] cleanup complete: session_id={args.session_id}, "
+                f"selected={int(cleanup_summary.get('selected', 0))}, "
+                f"dry_run={bool(cleanup_summary.get('dry_run', True))}"
+            ),
+        )
+    if bool(args.print_summary_json):
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "generation": int(generation),
+                    "roots_per_cycle": int(roots_per_cycle),
+                    "sample_cycles_per_generation": int(cycles),
+                    "total_roots_required": int(total_roots_required),
+                    "aggregate_stats": aggregate_stats,
+                    "training_summary": training_summary.__dict__ if training_summary is not None else None,
+                    "results": results,
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            flush=True,
+        )
 
 
 if __name__ == "__main__":

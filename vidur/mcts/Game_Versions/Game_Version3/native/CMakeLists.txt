@@ -46,6 +46,7 @@ pybind11_add_module(mcts_native_gv2
     src/gv2_player_sample_actions.cpp
     src/gv2_virtual_environment.cpp
     src/gv2_mcts_dnn.cpp
+    src/gv3_native_selfplay.cpp
     src/gv2_infer_runtime.cpp
     src/gv2_logger.cpp
     src/virtual_simulator.cpp
@@ -89,4 +90,3 @@ set_target_properties(mcts_native_gv2 PROPERTIES
     BUILD_RPATH "${TORCH_LIBRARY_PATHS}"
     INSTALL_RPATH "${TORCH_LIBRARY_PATHS}"
 )
-

@@ -4,7 +4,7 @@ import argparse
 import subprocess
 import sys
 
-from ..network_config import DEFAULT_NETWORK_CONFIG
+from ..network_config import DEFAULT_NETWORK_CONFIG, namespace_path_defaults, resolve_output_name
 
 
 def _parse_args() -> tuple[argparse.Namespace, list[str]]:
@@ -22,7 +22,12 @@ def _parse_args() -> tuple[argparse.Namespace, list[str]]:
     )
     parser.add_argument("--session-prefix", default="gv3_network_experiment")
     parser.add_argument("--machine", action="append", default=None)
-    parser.add_argument("--weights-path", default=str(DEFAULT_NETWORK_CONFIG.paths.default_weights_path))
+    parser.add_argument(
+        "--output-name",
+        default=None,
+        help="Simulator output namespace. Defaults to Game_Version3; use Game_Version3_Native for isolated native runs.",
+    )
+    parser.add_argument("--weights-path", default=None)
     args, extra = parser.parse_known_args()
     if extra and extra[0] == "--":
         extra = extra[1:]
@@ -34,6 +39,8 @@ def main() -> None:
     start = int(args.start_generation)
     count = max(1, int(args.num_generations))
     machines = list(args.machine or [])
+    output_name = resolve_output_name(args.output_name)
+    weights_path = str(args.weights_path or namespace_path_defaults(output_name)["default_weights_path"])
 
     for gen in range(start, start + count):
         session_id = f"{args.session_prefix}_gen_{int(gen):06d}"
@@ -49,8 +56,10 @@ def main() -> None:
             "--model-version",
             str(int(model_version)),
             "--weights-path",
-            str(args.weights_path),
+            str(weights_path),
         ]
+        if args.output_name:
+            cmd.extend(["--output-name", str(output_name)])
         for machine in machines:
             cmd.extend(["--machine", str(machine)])
         cmd.extend(extra)

@@ -15,6 +15,30 @@ def gv3_output_dir() -> Path:
     return repo_root() / "simulator_output" / "Game_Version3"
 
 
+def resolve_output_name(value: str | None) -> str:
+    name = str(value or "Game_Version3").strip() or "Game_Version3"
+    if name in {".", ".."} or Path(name).name != name:
+        raise ValueError(f"output name must be a single directory name, got: {value!r}")
+    return name
+
+
+def output_dir_for_name(value: str | None) -> Path:
+    return repo_root() / "simulator_output" / resolve_output_name(value)
+
+
+def namespace_path_defaults(output_name: str | None) -> dict[str, Path]:
+    base = output_dir_for_name(output_name)
+    return {
+        "output_dir": base / "network",
+        "process_log_path": base / "mcts_dnn_logs" / "alphaZeroParrallel.out",
+        "dataset_dir": base / "mcts_dnn_dataset",
+        "logs_dir": base / "mcts_dnn_logs",
+        "eval_metrics_csv": base / "mcts_dnn_logs" / "eval_metrics.csv",
+        "checkpoints_dir": base / "mcts_dnn_checkpoints",
+        "default_weights_path": base / "mcts_dnn_checkpoints" / "best.pt",
+    }
+
+
 def _auto_torch_device() -> str:
     try:
         import torch
@@ -136,6 +160,7 @@ class NetworkTaskDefaults:
     local_replay_max_cached_shards: int = 5_000
     local_replay_seed: int = 2026
     use_virtual_env: bool = True
+    environment_lang: str = "python"
     worker_cpu_fraction: float = 0.70
     worker_processes: int = 0
     max_concurrent_workers: int = 0

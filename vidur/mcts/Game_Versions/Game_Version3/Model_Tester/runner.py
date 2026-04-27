@@ -428,7 +428,7 @@ def _prepare_base_state_for_game(
     bundle: _RunnerBundle,
     game_id: int,
     history_nontrivial_hops: int,
-    cycle_file_logger: ArenaGameCycleFileLogger,
+    cycle_file_logger: ArenaGameCycleFileLogger | None,
 ) -> Tuple[Any, Any, str, int]:
     runner = bundle.runner
     state = runner.env.initial_state()
@@ -480,7 +480,7 @@ def _prepare_base_state_for_game(
         )
         depth = int(cfg.start_root_depth)
 
-    if history_events:
+    if history_events and cycle_file_logger is not None:
         for cycle_label in (MODEL_ADV_VS_TRIVIAL_CTRL_LABEL, MODEL_ADV_VS_MODEL_CTRL_LABEL):
             for ev in history_events:
                 cycle_file_logger.write_step(
@@ -913,8 +913,16 @@ def run_model_vs_trivial_tester(cfg: ModelTesterConfig) -> Path:
             pass
 
     bundle = _build_bundle(cfg)
-    cycle_logger = ArenaGameCycleFileLogger(cfg.arena_games_dir_path())
-    model_action_detail_logger = ArenaModelActionDetailLogger(cfg.arena_games_dir_path())
+    cycle_logger = (
+        ArenaGameCycleFileLogger(cfg.arena_games_dir_path())
+        if bool(cfg.write_arena_game_logs)
+        else None
+    )
+    model_action_detail_logger = (
+        ArenaModelActionDetailLogger(cfg.arena_games_dir_path())
+        if bool(cfg.write_model_action_detail_logs)
+        else None
+    )
 
     history_hops = cfg.sample_history_hops()
     rows: List[Dict[str, Any]] = []
@@ -948,14 +956,15 @@ def run_model_vs_trivial_tester(cfg: ModelTesterConfig) -> Path:
                 cycle_file_logger=cycle_logger,
                 model_action_detail_logger=model_action_detail_logger,
             )
-            cycle_logger.write_cycle_end(
-                game_id=int(game_id),
-                cycle_label=MODEL_ADV_VS_TRIVIAL_CTRL_LABEL,
-                total_cost=float(cycle1["total_cost"]),
-                slo_violations=int(cycle1["slo_violations"]),
-                total_lateness=float(cycle1["total_lateness"]),
-                end_reason=str(cycle1.get("end_reason", "")),
-            )
+            if cycle_logger is not None:
+                cycle_logger.write_cycle_end(
+                    game_id=int(game_id),
+                    cycle_label=MODEL_ADV_VS_TRIVIAL_CTRL_LABEL,
+                    total_cost=float(cycle1["total_cost"]),
+                    slo_violations=int(cycle1["slo_violations"]),
+                    total_lateness=float(cycle1["total_lateness"]),
+                    end_reason=str(cycle1.get("end_reason", "")),
+                )
 
             cycle2 = _run_policy_cycle(
                 bundle=bundle,
@@ -973,14 +982,15 @@ def run_model_vs_trivial_tester(cfg: ModelTesterConfig) -> Path:
                 cycle_file_logger=cycle_logger,
                 model_action_detail_logger=model_action_detail_logger,
             )
-            cycle_logger.write_cycle_end(
-                game_id=int(game_id),
-                cycle_label=MODEL_ADV_VS_MODEL_CTRL_LABEL,
-                total_cost=float(cycle2["total_cost"]),
-                slo_violations=int(cycle2["slo_violations"]),
-                total_lateness=float(cycle2["total_lateness"]),
-                end_reason=str(cycle2.get("end_reason", "")),
-            )
+            if cycle_logger is not None:
+                cycle_logger.write_cycle_end(
+                    game_id=int(game_id),
+                    cycle_label=MODEL_ADV_VS_MODEL_CTRL_LABEL,
+                    total_cost=float(cycle2["total_cost"]),
+                    slo_violations=int(cycle2["slo_violations"]),
+                    total_lateness=float(cycle2["total_lateness"]),
+                    end_reason=str(cycle2.get("end_reason", "")),
+                )
 
             delta = float(cycle2["total_cost"]) - float(cycle1["total_cost"])
             if delta < -1e-9:
@@ -1007,11 +1017,15 @@ def run_model_vs_trivial_tester(cfg: ModelTesterConfig) -> Path:
                     "cycle2_end_reason": str(cycle2.get("end_reason", "")),
                     "cost_delta_cycle2_minus_cycle1": float(delta),
                     "better_cycle": str(better_cycle),
-                    "cycle1_log_file": str(
-                        cfg.arena_games_dir_path() / f"game_{int(game_id)}_{MODEL_ADV_VS_TRIVIAL_CTRL_LABEL}.csv"
+                    "cycle1_log_file": (
+                        str(cfg.arena_games_dir_path() / f"game_{int(game_id)}_{MODEL_ADV_VS_TRIVIAL_CTRL_LABEL}.csv")
+                        if cycle_logger is not None
+                        else ""
                     ),
-                    "cycle2_log_file": str(
-                        cfg.arena_games_dir_path() / f"game_{int(game_id)}_{MODEL_ADV_VS_MODEL_CTRL_LABEL}.csv"
+                    "cycle2_log_file": (
+                        str(cfg.arena_games_dir_path() / f"game_{int(game_id)}_{MODEL_ADV_VS_MODEL_CTRL_LABEL}.csv")
+                        if cycle_logger is not None
+                        else ""
                     ),
                 }
             )

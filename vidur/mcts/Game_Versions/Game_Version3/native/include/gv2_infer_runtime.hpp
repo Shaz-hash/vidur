@@ -37,32 +37,43 @@ struct NativeInferInputsGV2 {
 
 struct NativeFeatureBuildConfigGV2 {
     int n_prefill_req = 10;
-    int d_prefill_req = 5;
+    int d_prefill_req = 10;
     int n_decode_req = 50;
-    int d_decode_req = 5;
-    int d_global = 11;
+    int d_decode_req = 13;
+    int d_global = 24;
 
+    double prefill_total_den = 4096.0;
     double prefill_remaining_den = 4096.0;
+    double decode_total_den = 864.0;
     double decode_remaining_den = 864.0;
-    double age_den_sec = 2.0;
+    double decode_processed_den = 864.0;
+    double age_den_sec = 5.0;
     double lateness_den_sec = 2.0;
-    double slack_drop_den_sec = 2.0;
+    double slack_den_sec = 2.0;
+    double prefill_slo_den_sec = 2.0;
+    double decode_slo_den_sec = 0.2;
+    double objective_cost_den = 50.0;
+    double total_lateness_den = 50.0;
 
     double system_load_den = 120.0;
     double active_prefill_count_den = 20.0;
     double active_decode_count_den = 100.0;
+    double active_total_count_den = 120.0;
     double total_remaining_prefill_den = 81920.0;
+    double total_remaining_decode_den = 86400.0;
     double total_decode_generated_active_den = 86400.0;
     double violated_count_den = 100.0;
     double prefill_near_drop_den = 20.0;
     double decode_near_drop_den = 100.0;
+    double recent_launch_count_den = 7.0;
+    double recent_launch_prefill_den = 7168.0;
+    double decode_credit_den = 21600.0;
 
     double near_drop_lateness_low_sec = 0.5;
     double near_drop_lateness_high_sec = 1.5;
 
     double launch_ewma_alpha = 0.37;
     double launch_ewma_window_sec = 1.0;
-    int launch_ewma_norm_den = 7;
 
     int decode_sample_seed_offset = 1337;
     double auto_drop_lateness_sec = 2.0;
@@ -89,6 +100,7 @@ public:
         int model_version);
     NativeInferInputsGV2 build_inputs_from_state(
         const SimState& state,
+        const std::string& player,
         const std::vector<uint8_t>& action_mask,
         const NativeFeatureBuildConfigGV2& cfg,
         const NativeInferInputsGV2* template_inputs = nullptr) const;

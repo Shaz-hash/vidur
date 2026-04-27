@@ -133,6 +133,23 @@ double prefill_deadline_from_request(const RequestState& req) {
     return std::numeric_limits<double>::infinity();
 }
 
+std::optional<double> decode_deadline_from_request(const SimState& state, const RequestState& req) {
+    const auto it = state.stats.decode_next_deadline_by_id.find(req.request_id);
+    if (it != state.stats.decode_next_deadline_by_id.end() && it->second > 0.0) {
+        return it->second;
+    }
+    if (req.prefill_completed_at > 0.0 && req.decode_slo_time > 0.0) {
+        return req.prefill_completed_at + req.decode_slo_time;
+    }
+    return std::nullopt;
+}
+
+double stored_prefill_lateness(const SimState& state, const RequestState& req) {
+    const auto it = state.stats.per_request_prefill_lateness_by_id.find(req.request_id);
+    if (it == state.stats.per_request_prefill_lateness_by_id.end()) return 0.0;
+    return std::max(0.0, it->second);
+}
+
 double request_total_lateness(const SimState& state, const RequestState& req, double sim_time) {
     double pref = 0.0;
     auto itp = state.stats.per_request_prefill_lateness_by_id.find(req.request_id);
@@ -157,6 +174,17 @@ double request_total_lateness(const SimState& state, const RequestState& req, do
 
 double clip(double x, double lo, double hi) {
     return clamp_double(x, lo, hi);
+}
+
+double norm01(double x, double denom) {
+    if (denom <= 0.0) return 0.0;
+    return clip(x / denom, 0.0, 1.0);
+}
+
+double centered01(double x, double radius) {
+    if (radius <= 0.0) return 0.5;
+    const double clipped = clip(x, -radius, radius);
+    return (clipped + radius) / (2.0 * radius);
 }
 
 bool is_prefill_request(const RequestState& req) {
@@ -217,6 +245,7 @@ std::pair<std::string, std::string> NativeTorchScriptInferRuntimeGV2::parse_mode
 
 NativeInferInputsGV2 NativeTorchScriptInferRuntimeGV2::build_inputs_from_state(
     const SimState& state,
+    const std::string& player,
     const std::vector<uint8_t>& action_mask,
     const NativeFeatureBuildConfigGV2& cfg_in,
     const NativeInferInputsGV2* template_inputs) const {
@@ -233,10 +262,10 @@ NativeInferInputsGV2 NativeTorchScriptInferRuntimeGV2::build_inputs_from_state(
     }
 
     cfg.n_prefill_req = safe_pos_int(cfg.n_prefill_req, 10);
-    cfg.d_prefill_req = safe_pos_int(cfg.d_prefill_req, 5);
+    cfg.d_prefill_req = safe_pos_int(cfg.d_prefill_req, 10);
     cfg.n_decode_req = safe_pos_int(cfg.n_decode_req, 50);
-    cfg.d_decode_req = safe_pos_int(cfg.d_decode_req, 5);
-    cfg.d_global = safe_pos_int(cfg.d_global, 11);
+    cfg.d_decode_req = safe_pos_int(cfg.d_decode_req, 13);
+    cfg.d_global = safe_pos_int(cfg.d_global, 24);
 
     const double sim_time = state.sim_time;
 
@@ -253,6 +282,11 @@ NativeInferInputsGV2 NativeTorchScriptInferRuntimeGV2::build_inputs_from_state(
         if (is_prefill_request(req)) prefill_reqs.push_back(&req);
         if (is_decode_request(req)) decode_reqs.push_back(&req);
     }
+    const int num_active_all = static_cast<int>(prefill_reqs.size() + decode_reqs.size());
+    std::unordered_set<int> active_ids_all;
+    active_ids_all.reserve(static_cast<std::size_t>(num_active_all));
+    for (const auto* req : prefill_reqs) active_ids_all.insert(req->request_id);
+    for (const auto* req : decode_reqs) active_ids_all.insert(req->request_id);
 
     std::sort(prefill_reqs.begin(), prefill_reqs.end(), [&](const RequestState* a, const RequestState* b) {
         const double da = prefill_deadline_from_request(*a);
@@ -260,24 +294,30 @@ NativeInferInputsGV2 NativeTorchScriptInferRuntimeGV2::build_inputs_from_state(
         const double ta = std::isfinite(da) ? (da - sim_time) : std::numeric_limits<double>::infinity();
         const double tb = std::isfinite(db) ? (db - sim_time) : std::numeric_limits<double>::infinity();
         if (ta != tb) return ta < tb;
+        const double la = request_total_lateness(state, *a, sim_time);
+        const double lb = request_total_lateness(state, *b, sim_time);
+        if (la != lb) return la > lb;
         return a->request_id < b->request_id;
     });
 
-    if (static_cast<int>(decode_reqs.size()) > cfg.n_decode_req) {
-        int rid_sum = 0;
-        for (const auto* r : decode_reqs) rid_sum += r->request_id;
-        const std::uint32_t seed = static_cast<std::uint32_t>(
-            static_cast<long long>(sim_time * 1e6) ^
-            static_cast<long long>(rid_sum) ^
-            static_cast<long long>(state.stats.requests_generated) ^
-            static_cast<long long>(cfg.decode_sample_seed_offset));
-        std::mt19937 rng(seed);
-        std::shuffle(decode_reqs.begin(), decode_reqs.end(), rng);
-        decode_reqs.resize(static_cast<std::size_t>(cfg.n_decode_req));
-    }
-    std::sort(decode_reqs.begin(), decode_reqs.end(), [](const RequestState* a, const RequestState* b) {
+    std::sort(decode_reqs.begin(), decode_reqs.end(), [&](const RequestState* a, const RequestState* b) {
+        const bool av = a->violated || (violated_ids.find(a->request_id) != violated_ids.end());
+        const bool bv = b->violated || (violated_ids.find(b->request_id) != violated_ids.end());
+        if (av != bv) return av > bv;
+        const double la = request_total_lateness(state, *a, sim_time);
+        const double lb = request_total_lateness(state, *b, sim_time);
+        if (la != lb) return la > lb;
+        if (a->num_processed_decode_tokens != b->num_processed_decode_tokens) {
+            return a->num_processed_decode_tokens > b->num_processed_decode_tokens;
+        }
+        const int ar = a->remaining_decode();
+        const int br = b->remaining_decode();
+        if (ar != br) return ar > br;
         return a->request_id < b->request_id;
     });
+    if (static_cast<int>(decode_reqs.size()) > cfg.n_decode_req) {
+        decode_reqs.resize(static_cast<std::size_t>(cfg.n_decode_req));
+    }
 
     NativeInferInputsGV2 out;
     out.action_mask = action_mask;
@@ -287,7 +327,7 @@ NativeInferInputsGV2 NativeTorchScriptInferRuntimeGV2::build_inputs_from_state(
     out.decode_req_n = cfg.n_decode_req;
     out.decode_req_d = cfg.d_decode_req;
     out.req_n = cfg.n_prefill_req + cfg.n_decode_req;
-    out.req_d = cfg.d_prefill_req;
+    out.req_d = std::max(cfg.d_prefill_req, cfg.d_decode_req);
 
     out.prefill_req_features.assign(
         static_cast<std::size_t>(cfg.n_prefill_req) * static_cast<std::size_t>(cfg.d_prefill_req),
@@ -299,35 +339,68 @@ NativeInferInputsGV2 NativeTorchScriptInferRuntimeGV2::build_inputs_from_state(
     out.decode_req_mask.assign(static_cast<std::size_t>(cfg.n_decode_req), 0u);
 
     const double prefill_remaining_den = safe_den(cfg.prefill_remaining_den, 4096.0);
+    const double prefill_total_den = safe_den(cfg.prefill_total_den, 4096.0);
     const double decode_remaining_den = safe_den(cfg.decode_remaining_den, 864.0);
-    const double age_den = safe_den(cfg.age_den_sec, 2.0);
+    const double decode_total_den = safe_den(cfg.decode_total_den, 864.0);
+    const double decode_processed_den = safe_den(cfg.decode_processed_den, 864.0);
+    const double age_den = safe_den(cfg.age_den_sec, 5.0);
     const double late_den = safe_den(cfg.lateness_den_sec, 2.0);
-    const double slack_den = safe_den(cfg.slack_drop_den_sec, 2.0);
-    const double auto_drop = safe_den(cfg.auto_drop_lateness_sec, 2.0);
+    const double slack_den = safe_den(cfg.slack_den_sec, 2.0);
+    const double prefill_slo_den = safe_den(cfg.prefill_slo_den_sec, 2.0);
+    const double decode_slo_den = safe_den(cfg.decode_slo_den_sec, 0.2);
 
     const int n_prefill_fill = std::min<int>(cfg.n_prefill_req, static_cast<int>(prefill_reqs.size()));
     for (int i = 0; i < n_prefill_fill; ++i) {
         const RequestState& req = *prefill_reqs[static_cast<std::size_t>(i)];
-        const double rem = static_cast<double>(req.remaining_prefill());
+        const int total_prefill = std::max(0, req.num_prefill_tokens);
+        const int rem_prefill = req.remaining_prefill();
+        const int done_prefill = std::max(0, total_prefill - rem_prefill);
         const double age = std::max(0.0, sim_time - req.arrived_at);
-        const double late = request_total_lateness(state, req, sim_time);
+        const double late = stored_prefill_lateness(state, req);
+        const double deadline = prefill_deadline_from_request(req);
+        const double slack = std::isfinite(deadline) ? (deadline - sim_time) : 0.0;
+        const double prefill_slo = std::max(0.0, req.prefill_slo_time);
         const double violated = (req.violated || (violated_ids.find(req.request_id) != violated_ids.end())) ? 1.0 : 0.0;
+        const double processed_frac = (total_prefill <= 0)
+            ? 0.0
+            : clip(static_cast<double>(done_prefill) / static_cast<double>(std::max(1, total_prefill)), 0.0, 1.0);
 
-        out.prefill_req_features[flatten_offset(i, 0, cfg.d_prefill_req)] = static_cast<float>(rem / prefill_remaining_den);
+        out.prefill_req_features[flatten_offset(i, 0, cfg.d_prefill_req)] =
+            static_cast<float>(norm01(rem_prefill, prefill_remaining_den));
         if (cfg.d_prefill_req > 1) {
             out.prefill_req_features[flatten_offset(i, 1, cfg.d_prefill_req)] =
-                static_cast<float>(clip(age / age_den, 0.0, 2.0));
+                static_cast<float>(norm01(total_prefill, prefill_total_den));
         }
         if (cfg.d_prefill_req > 2) {
             out.prefill_req_features[flatten_offset(i, 2, cfg.d_prefill_req)] =
-                static_cast<float>(clip(late / late_den, 0.0, 2.0));
+                static_cast<float>(processed_frac);
         }
         if (cfg.d_prefill_req > 3) {
             out.prefill_req_features[flatten_offset(i, 3, cfg.d_prefill_req)] =
-                static_cast<float>(clip((auto_drop - late) / slack_den, -1.0, 1.0));
+                static_cast<float>(norm01(age, age_den));
         }
         if (cfg.d_prefill_req > 4) {
-            out.prefill_req_features[flatten_offset(i, 4, cfg.d_prefill_req)] = static_cast<float>(violated);
+            out.prefill_req_features[flatten_offset(i, 4, cfg.d_prefill_req)] =
+                static_cast<float>(norm01(late, late_den));
+        }
+        if (cfg.d_prefill_req > 5) {
+            out.prefill_req_features[flatten_offset(i, 5, cfg.d_prefill_req)] =
+                static_cast<float>(centered01(slack, slack_den));
+        }
+        if (cfg.d_prefill_req > 6) {
+            out.prefill_req_features[flatten_offset(i, 6, cfg.d_prefill_req)] =
+                static_cast<float>(norm01(prefill_slo, prefill_slo_den));
+        }
+        if (cfg.d_prefill_req > 7) {
+            out.prefill_req_features[flatten_offset(i, 7, cfg.d_prefill_req)] = static_cast<float>(violated);
+        }
+        if (cfg.d_prefill_req > 8) {
+            out.prefill_req_features[flatten_offset(i, 8, cfg.d_prefill_req)] =
+                static_cast<float>(late > cfg.near_drop_lateness_low_sec ? 1.0 : 0.0);
+        }
+        if (cfg.d_prefill_req > 9) {
+            out.prefill_req_features[flatten_offset(i, 9, cfg.d_prefill_req)] =
+                static_cast<float>(late >= cfg.near_drop_lateness_high_sec ? 1.0 : 0.0);
         }
         out.prefill_req_mask[static_cast<std::size_t>(i)] = 1u;
     }
@@ -335,53 +408,93 @@ NativeInferInputsGV2 NativeTorchScriptInferRuntimeGV2::build_inputs_from_state(
     const int n_decode_fill = std::min<int>(cfg.n_decode_req, static_cast<int>(decode_reqs.size()));
     for (int i = 0; i < n_decode_fill; ++i) {
         const RequestState& req = *decode_reqs[static_cast<std::size_t>(i)];
-        const double rem = static_cast<double>(req.remaining_decode());
+        const int total_decode = std::max(0, req.num_decode_tokens);
+        const int rem_decode = req.remaining_decode();
+        const int done_decode = std::max(0, total_decode - rem_decode);
         const double age = std::max(0.0, sim_time - req.arrived_at);
         const double late = request_total_lateness(state, req, sim_time);
+        const auto decode_deadline = decode_deadline_from_request(state, req);
+        const double decode_slack = decode_deadline.has_value() ? (*decode_deadline - sim_time) : 0.0;
+        const double decode_slo = std::max(0.0, req.decode_slo_time);
         const double violated = (req.violated || (violated_ids.find(req.request_id) != violated_ids.end())) ? 1.0 : 0.0;
+        const double processed_frac = (total_decode <= 0)
+            ? 0.0
+            : clip(static_cast<double>(done_decode) / static_cast<double>(std::max(1, total_decode)), 0.0, 1.0);
 
-        out.decode_req_features[flatten_offset(i, 0, cfg.d_decode_req)] = static_cast<float>(rem / decode_remaining_den);
+        out.decode_req_features[flatten_offset(i, 0, cfg.d_decode_req)] =
+            static_cast<float>(norm01(rem_decode, decode_remaining_den));
         if (cfg.d_decode_req > 1) {
             out.decode_req_features[flatten_offset(i, 1, cfg.d_decode_req)] =
-                static_cast<float>(clip(age / age_den, 0.0, 2.0));
+                static_cast<float>(norm01(total_decode, decode_total_den));
         }
         if (cfg.d_decode_req > 2) {
             out.decode_req_features[flatten_offset(i, 2, cfg.d_decode_req)] =
-                static_cast<float>(clip(late / late_den, 0.0, 2.0));
+                static_cast<float>(norm01(done_decode, decode_processed_den));
         }
         if (cfg.d_decode_req > 3) {
             out.decode_req_features[flatten_offset(i, 3, cfg.d_decode_req)] =
-                static_cast<float>(clip((auto_drop - late) / slack_den, -1.0, 1.0));
+                static_cast<float>(processed_frac);
         }
         if (cfg.d_decode_req > 4) {
-            out.decode_req_features[flatten_offset(i, 4, cfg.d_decode_req)] = static_cast<float>(violated);
+            out.decode_req_features[flatten_offset(i, 4, cfg.d_decode_req)] =
+                static_cast<float>(norm01(age, age_den));
+        }
+        if (cfg.d_decode_req > 5) {
+            out.decode_req_features[flatten_offset(i, 5, cfg.d_decode_req)] =
+                static_cast<float>(norm01(late, late_den));
+        }
+        if (cfg.d_decode_req > 6) {
+            out.decode_req_features[flatten_offset(i, 6, cfg.d_decode_req)] =
+                static_cast<float>(centered01(decode_slack, slack_den));
+        }
+        if (cfg.d_decode_req > 7) {
+            out.decode_req_features[flatten_offset(i, 7, cfg.d_decode_req)] =
+                static_cast<float>(norm01(decode_slo, decode_slo_den));
+        }
+        if (cfg.d_decode_req > 8) {
+            out.decode_req_features[flatten_offset(i, 8, cfg.d_decode_req)] = static_cast<float>(violated);
+        }
+        if (cfg.d_decode_req > 9) {
+            out.decode_req_features[flatten_offset(i, 9, cfg.d_decode_req)] =
+                static_cast<float>(late > cfg.near_drop_lateness_low_sec ? 1.0 : 0.0);
+        }
+        if (cfg.d_decode_req > 10) {
+            out.decode_req_features[flatten_offset(i, 10, cfg.d_decode_req)] =
+                static_cast<float>(late >= cfg.near_drop_lateness_high_sec ? 1.0 : 0.0);
+        }
+        if (cfg.d_decode_req > 11) {
+            out.decode_req_features[flatten_offset(i, 11, cfg.d_decode_req)] =
+                static_cast<float>(done_decode > 216 ? 1.0 : 0.0);
+        }
+        if (cfg.d_decode_req > 12) {
+            out.decode_req_features[flatten_offset(i, 12, cfg.d_decode_req)] =
+                static_cast<float>(done_decode > 512 ? 1.0 : 0.0);
         }
         out.decode_req_mask[static_cast<std::size_t>(i)] = 1u;
     }
 
     const int num_prefill = static_cast<int>(prefill_reqs.size());
     const int num_decode = static_cast<int>(decode_reqs.size());
+    const int num_active = num_active_all;
 
     int total_remaining_prefill = 0;
     for (const auto* req : prefill_reqs) total_remaining_prefill += std::max(0, req->remaining_prefill());
 
+    int total_remaining_decode = 0;
+    for (const auto* req : decode_reqs) total_remaining_decode += std::max(0, req->remaining_decode());
+
     int total_decode_generated_active = 0;
     for (const auto* req : decode_reqs) total_decode_generated_active += std::max(0, req->num_processed_decode_tokens);
 
-    std::unordered_set<int> active_ids;
-    active_ids.reserve(state.requests.size());
-    for (const auto& req : state.requests) {
-        if (!req.completed) active_ids.insert(req.request_id);
-    }
     int num_violated_active = 0;
-    for (int rid : active_ids) {
+    for (int rid : active_ids_all) {
         if (violated_ids.find(rid) != violated_ids.end()) ++num_violated_active;
     }
 
     int p_late_05_15 = 0;
     int p_late_15 = 0;
     for (const auto* req : prefill_reqs) {
-        const double late = request_total_lateness(state, *req, sim_time);
+        const double late = stored_prefill_lateness(state, *req);
         if (late > cfg.near_drop_lateness_low_sec && late < cfg.near_drop_lateness_high_sec) ++p_late_05_15;
         else if (late >= cfg.near_drop_lateness_high_sec) ++p_late_15;
     }
@@ -394,6 +507,8 @@ NativeInferInputsGV2 NativeTorchScriptInferRuntimeGV2::build_inputs_from_state(
         else if (late >= cfg.near_drop_lateness_high_sec) ++d_late_15;
     }
 
+    double launch_count = 0.0;
+    double launch_prefill = 0.0;
     double ewma = 0.0;
     const double ewma_alpha = safe_den(cfg.launch_ewma_alpha, 0.37);
     const double ewma_window = safe_den(cfg.launch_ewma_window_sec, 1.0);
@@ -402,16 +517,28 @@ NativeInferInputsGV2 NativeTorchScriptInferRuntimeGV2::build_inputs_from_state(
         for (const auto& e : state.stats.recent_launches) {
             const double dt = std::max(0.0, sim_time - e.timestamp);
             if (dt > ewma_window) continue;
-            ewma += static_cast<double>(std::max(0, e.count)) * std::exp(-ewma_alpha * dt);
+            const double cnt = static_cast<double>(std::max(0, e.count));
+            const double pref = static_cast<double>(std::max(0, e.prefill_tokens));
+            launch_count += cnt;
+            launch_prefill += pref;
+            ewma += cnt * std::exp(-ewma_alpha * dt);
         }
     } else {
         for (double ts : state.stats.recent_arrivals) {
             const double dt = std::max(0.0, sim_time - ts);
             if (dt > ewma_window) continue;
+            launch_count += 1.0;
             ewma += std::exp(-ewma_alpha * dt);
         }
     }
-    const double ewma_norm = ewma / static_cast<double>(std::max(1, cfg.launch_ewma_norm_den));
+
+    const double objective_cost = static_cast<double>(state.stats.slo_violations) +
+                                  static_cast<double>(state.stats.slo_lateness_sum);
+    const double decode_credit = std::max(0, state.stats.decode_credit_balance);
+    const double max_launch_count = safe_den(cfg.recent_launch_count_den, 7.0);
+    const double max_launch_prefill = safe_den(cfg.recent_launch_prefill_den, 7168.0);
+    const double remaining_launch_request_headroom = std::max(0.0, max_launch_count - launch_count);
+    const double remaining_launch_prefill_headroom = std::max(0.0, max_launch_prefill - launch_prefill);
 
     out.global_features.assign(static_cast<std::size_t>(cfg.d_global), 0.0f);
     auto set_global = [&](int idx, double v) {
@@ -419,17 +546,30 @@ NativeInferInputsGV2 NativeTorchScriptInferRuntimeGV2::build_inputs_from_state(
         out.global_features[static_cast<std::size_t>(idx)] = static_cast<float>(v);
     };
 
-    set_global(0, static_cast<double>(num_prefill + num_decode) / safe_den(cfg.system_load_den, 120.0));
-    set_global(1, static_cast<double>(num_prefill) / safe_den(cfg.active_prefill_count_den, 20.0));
-    set_global(2, static_cast<double>(num_decode) / safe_den(cfg.active_decode_count_den, 100.0));
-    set_global(3, static_cast<double>(total_remaining_prefill) / safe_den(cfg.total_remaining_prefill_den, 81920.0));
-    set_global(4, static_cast<double>(total_decode_generated_active) / safe_den(cfg.total_decode_generated_active_den, 86400.0));
-    set_global(5, static_cast<double>(num_violated_active) / safe_den(cfg.violated_count_den, 100.0));
-    set_global(6, static_cast<double>(p_late_05_15) / safe_den(cfg.prefill_near_drop_den, 20.0));
-    set_global(7, static_cast<double>(p_late_15) / safe_den(cfg.prefill_near_drop_den, 20.0));
-    set_global(8, static_cast<double>(d_late_05_15) / safe_den(cfg.decode_near_drop_den, 100.0));
-    set_global(9, static_cast<double>(d_late_15) / safe_den(cfg.decode_near_drop_den, 100.0));
-    set_global(10, ewma_norm);
+    set_global(0, player == "controller" ? 1.0 : 0.0);
+    set_global(1, player == "adversary" ? 1.0 : 0.0);
+    set_global(2, norm01(objective_cost, safe_den(cfg.objective_cost_den, 50.0)));
+    set_global(3, norm01(state.stats.slo_violations, safe_den(cfg.violated_count_den, 100.0)));
+    set_global(4, norm01(state.stats.slo_lateness_sum, safe_den(cfg.total_lateness_den, 50.0)));
+    set_global(5, norm01(num_prefill, safe_den(cfg.active_prefill_count_den, 20.0)));
+    set_global(6, norm01(num_decode, safe_den(cfg.active_decode_count_den, 100.0)));
+    set_global(7, norm01(num_active, safe_den(cfg.active_total_count_den, 120.0)));
+    set_global(8, norm01(total_remaining_prefill, safe_den(cfg.total_remaining_prefill_den, 81920.0)));
+    set_global(9, norm01(total_remaining_decode, safe_den(cfg.total_remaining_decode_den, 86400.0)));
+    set_global(10, norm01(total_decode_generated_active, safe_den(cfg.total_decode_generated_active_den, 86400.0)));
+    set_global(11, norm01(num_violated_active, safe_den(cfg.violated_count_den, 100.0)));
+    set_global(12, norm01(p_late_05_15, safe_den(cfg.prefill_near_drop_den, 20.0)));
+    set_global(13, norm01(p_late_15, safe_den(cfg.prefill_near_drop_den, 20.0)));
+    set_global(14, norm01(d_late_05_15, safe_den(cfg.decode_near_drop_den, 100.0)));
+    set_global(15, norm01(d_late_15, safe_den(cfg.decode_near_drop_den, 100.0)));
+    set_global(16, norm01(launch_count, max_launch_count));
+    set_global(17, norm01(launch_prefill, max_launch_prefill));
+    set_global(18, norm01(remaining_launch_request_headroom, max_launch_count));
+    set_global(19, norm01(remaining_launch_prefill_headroom, max_launch_prefill));
+    set_global(20, norm01(ewma, max_launch_count));
+    set_global(21, norm01(decode_credit, safe_den(cfg.decode_credit_den, 21600.0)));
+    set_global(22, num_prefill > 0 ? 1.0 : 0.0);
+    set_global(23, num_decode > 0 ? 1.0 : 0.0);
 
     out.req_features.assign(static_cast<std::size_t>(out.req_n) * static_cast<std::size_t>(out.req_d), 0.0f);
     out.req_mask.assign(static_cast<std::size_t>(out.req_n), 0u);

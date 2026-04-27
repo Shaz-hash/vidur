@@ -43,7 +43,7 @@ class ManifestEntry:
     feature_version: int
 
 
-def load_manifest(manifest_path: Path) -> List[ManifestEntry]:
+def load_manifest(manifest_path: Path, *, allow_empty: bool = False) -> List[ManifestEntry]:
     if not manifest_path.exists():
         raise FileNotFoundError(f"manifest not found: {manifest_path}")
 
@@ -63,7 +63,7 @@ def load_manifest(manifest_path: Path) -> List[ManifestEntry]:
                 )
             )
 
-    if not entries:
+    if not entries and not bool(allow_empty):
         raise ValueError(f"manifest is empty: {manifest_path}")
     return entries
 
@@ -198,6 +198,20 @@ def _stack_bool_optional(items: List[Optional[torch.Tensor]], width: int) -> Opt
     return out
 
 
+def _sanitize_feature_tensor(
+    x: torch.Tensor,
+    *,
+    mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    # Feature schemas are normalized into [0, 1]. Masked request rows must not
+    # carry stale/native padding values, because encoders see them before the
+    # attention padding mask is applied.
+    x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
+    if mask is not None:
+        x = x * mask.to(dtype=x.dtype).unsqueeze(-1)
+    return x
+
+
 def collate_player_samples(
     samples: Sequence[RootSample],
     *,
@@ -230,6 +244,16 @@ def collate_player_samples(
         prefill_req_mask = prefill_req_mask.to(device)
     if decode_req_mask is not None:
         decode_req_mask = decode_req_mask.to(device)
+
+    prefill_req_features = _sanitize_feature_tensor(
+        prefill_req_features,
+        mask=prefill_req_mask,
+    )
+    decode_req_features = _sanitize_feature_tensor(
+        decode_req_features,
+        mask=decode_req_mask,
+    )
+    global_features = _sanitize_feature_tensor(global_features)
 
     target_value = torch.stack([s["targets"]["value"] for s in samples], dim=0).to(device).view(-1)
 

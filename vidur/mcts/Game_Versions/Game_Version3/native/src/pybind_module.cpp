@@ -5,6 +5,7 @@
 #include "gv2_logger.hpp"
 #include "gv2_mcts_dnn.hpp"
 #include "gv2_types.hpp"
+#include "gv3_native_selfplay.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -963,6 +964,94 @@ py::dict sim_state_to_py_dict(const SimState& s) {
     return d;
 }
 
+py::dict root_input_fields_to_py(
+    const std::vector<float>& global_features,
+    const std::vector<uint8_t>& action_mask,
+    const std::vector<float>& prefill_req_features,
+    const std::vector<float>& decode_req_features,
+    const std::vector<uint8_t>& prefill_req_mask,
+    const std::vector<uint8_t>& decode_req_mask,
+    int prefill_req_n,
+    int prefill_req_d,
+    int decode_req_n,
+    int decode_req_d,
+    const std::vector<float>& req_features,
+    const std::vector<uint8_t>& req_mask,
+    int req_n,
+    int req_d) {
+    py::dict d;
+    d["global_features"] = global_features;
+    d["action_mask"] = action_mask;
+    d["prefill_req_features"] = prefill_req_features;
+    d["decode_req_features"] = decode_req_features;
+    d["prefill_req_mask"] = prefill_req_mask;
+    d["decode_req_mask"] = decode_req_mask;
+    d["prefill_req_n"] = prefill_req_n;
+    d["prefill_req_d"] = prefill_req_d;
+    d["decode_req_n"] = decode_req_n;
+    d["decode_req_d"] = decode_req_d;
+    d["req_features"] = req_features;
+    d["req_mask"] = req_mask;
+    d["req_n"] = req_n;
+    d["req_d"] = req_d;
+    return d;
+}
+
+py::dict search_root_inputs_to_py(const SearchOutput& out) {
+    return root_input_fields_to_py(
+        out.root_global_features,
+        out.root_action_mask,
+        out.root_prefill_req_features,
+        out.root_decode_req_features,
+        out.root_prefill_req_mask,
+        out.root_decode_req_mask,
+        out.root_prefill_req_n,
+        out.root_prefill_req_d,
+        out.root_decode_req_n,
+        out.root_decode_req_d,
+        out.root_req_features,
+        out.root_req_mask,
+        out.root_req_n,
+        out.root_req_d);
+}
+
+py::dict native_sample_to_py(const NativeRootSampleGV3& s) {
+    py::dict d;
+    d["feature_version"] = s.feature_version;
+    d["game_id"] = s.game_id;
+    d["root_id"] = s.root_id;
+    d["root_node_id"] = s.root_node_id;
+    d["root_depth"] = s.root_depth;
+    d["player"] = s.player;
+    d["inputs"] = root_input_fields_to_py(
+        s.global_features,
+        s.action_mask,
+        s.prefill_req_features,
+        s.decode_req_features,
+        s.prefill_req_mask,
+        s.decode_req_mask,
+        s.prefill_req_n,
+        s.prefill_req_d,
+        s.decode_req_n,
+        s.decode_req_d,
+        s.req_features,
+        s.req_mask,
+        s.req_n,
+        s.req_d);
+    py::dict targets;
+    targets["policy"] = s.policy;
+    targets["value"] = s.value;
+    d["targets"] = std::move(targets);
+    py::dict meta;
+    meta["best_action_index"] = s.best_action_index;
+    meta["used_bootstrap"] = s.used_bootstrap;
+    meta["model_version"] = s.model_version;
+    meta["history_hops"] = s.history_hops;
+    meta["is_eval"] = s.is_eval;
+    d["meta"] = std::move(meta);
+    return d;
+}
+
 int pick_default_action_space(const py::dict& cfg, const std::string& root_player) {
     if (root_player == "controller") {
         if (cfg.contains("controller_action_space_size")) {
@@ -974,6 +1063,75 @@ int pick_default_action_space(const py::dict& cfg, const std::string& root_playe
         }
     }
     return 8;
+}
+
+void apply_feature_cfg_payload(const py::dict& cfg, NativeFeatureBuildConfigGV2* out) {
+    if (out == nullptr) return;
+
+    auto get_int = [&](std::initializer_list<const char*> keys, int dflt) {
+        for (const char* k : keys) {
+            if (!cfg.contains(k)) continue;
+            try {
+                return py::cast<int>(cfg[k]);
+            } catch (const std::exception&) {
+            }
+        }
+        return dflt;
+    };
+    auto get_double = [&](std::initializer_list<const char*> keys, double dflt) {
+        for (const char* k : keys) {
+            if (!cfg.contains(k)) continue;
+            try {
+                return py::cast<double>(cfg[k]);
+            } catch (const std::exception&) {
+            }
+        }
+        return dflt;
+    };
+
+    out->n_prefill_req = get_int({"n_prefill_req"}, out->n_prefill_req);
+    out->d_prefill_req = get_int({"d_prefill_req"}, out->d_prefill_req);
+    out->n_decode_req = get_int({"n_decode_req"}, out->n_decode_req);
+    out->d_decode_req = get_int({"d_decode_req"}, out->d_decode_req);
+    out->d_global = get_int({"d_global"}, out->d_global);
+
+    out->prefill_total_den = get_double({"prefill_total_den"}, out->prefill_total_den);
+    out->prefill_remaining_den = get_double({"prefill_remaining_den"}, out->prefill_remaining_den);
+    out->decode_total_den = get_double({"decode_total_den"}, out->decode_total_den);
+    out->decode_remaining_den = get_double({"decode_remaining_den"}, out->decode_remaining_den);
+    out->decode_processed_den = get_double({"decode_processed_den"}, out->decode_processed_den);
+    out->age_den_sec = get_double({"age_den_sec"}, out->age_den_sec);
+    out->lateness_den_sec = get_double({"lateness_den_sec"}, out->lateness_den_sec);
+    out->slack_den_sec = get_double({"slack_den_sec"}, out->slack_den_sec);
+    out->prefill_slo_den_sec = get_double({"prefill_slo_den_sec"}, out->prefill_slo_den_sec);
+    out->decode_slo_den_sec = get_double({"decode_slo_den_sec"}, out->decode_slo_den_sec);
+    out->objective_cost_den = get_double({"objective_cost_den"}, out->objective_cost_den);
+    out->total_lateness_den = get_double({"total_lateness_den"}, out->total_lateness_den);
+
+    out->system_load_den = get_double({"system_load_den"}, out->system_load_den);
+    out->active_prefill_count_den = get_double({"active_prefill_count_den"}, out->active_prefill_count_den);
+    out->active_decode_count_den = get_double({"active_decode_count_den"}, out->active_decode_count_den);
+    out->active_total_count_den = get_double({"active_total_count_den"}, out->active_total_count_den);
+    out->total_remaining_prefill_den =
+        get_double({"total_remaining_prefill_den"}, out->total_remaining_prefill_den);
+    out->total_remaining_decode_den =
+        get_double({"total_remaining_decode_den"}, out->total_remaining_decode_den);
+    out->total_decode_generated_active_den =
+        get_double({"total_decode_generated_active_den"}, out->total_decode_generated_active_den);
+    out->violated_count_den = get_double({"violated_count_den"}, out->violated_count_den);
+    out->prefill_near_drop_den = get_double({"prefill_near_drop_den"}, out->prefill_near_drop_den);
+    out->decode_near_drop_den = get_double({"decode_near_drop_den"}, out->decode_near_drop_den);
+    out->recent_launch_count_den = get_double({"recent_launch_count_den"}, out->recent_launch_count_den);
+    out->recent_launch_prefill_den = get_double({"recent_launch_prefill_den"}, out->recent_launch_prefill_den);
+    out->decode_credit_den = get_double({"decode_credit_den"}, out->decode_credit_den);
+
+    out->near_drop_lateness_low_sec =
+        get_double({"near_drop_lateness_low_sec"}, out->near_drop_lateness_low_sec);
+    out->near_drop_lateness_high_sec =
+        get_double({"near_drop_lateness_high_sec"}, out->near_drop_lateness_high_sec);
+    out->launch_ewma_alpha = get_double({"launch_ewma_alpha"}, out->launch_ewma_alpha);
+    out->launch_ewma_window_sec = get_double({"launch_ewma_window_sec"}, out->launch_ewma_window_sec);
+    out->decode_sample_seed_offset = get_int({"decode_sample_seed_offset"}, out->decode_sample_seed_offset);
 }
 
 py::dict search_mcts_dnn_gv2_torchscript(
@@ -1010,6 +1168,7 @@ py::dict search_mcts_dnn_gv2_torchscript(
     in.seed = seed;
     in.log_events = log_events;
     in.profile = profile;
+    apply_feature_cfg_payload(cfg_payload, &in.feature_cfg);
 
     auto get_int = [&](std::initializer_list<const char*> keys, int dflt) {
         for (const char* k : keys) {
@@ -1436,6 +1595,9 @@ py::dict search_mcts_dnn_gv2_torchscript(
     result["root_nn_priors"] = out.root_nn_priors;
     result["root_nn_priors_after_threshold"] = out.root_nn_priors_after_threshold;
     result["root_nn_valid_mask"] = out.root_nn_valid_mask;
+    result["root_inputs"] = search_root_inputs_to_py(out);
+    result["best_action_index"] = out.best_action_index;
+    result["root_action_values"] = out.root_action_values;
 
     result["action_alias_to_canonical"] = py_alias_to_canonical;
     result["canonical_to_action_aliases"] = py_canonical_to_aliases;
@@ -1445,6 +1607,202 @@ py::dict search_mcts_dnn_gv2_torchscript(
     result["iter_events"] = py_iter_events;
     result["perf"] = py_perf;
 
+    return result;
+}
+
+py::dict generate_selfplay_gv3_torchscript(
+    NativeTorchScriptInferRuntimeGV2& infer_runtime,
+    int model_version,
+    py::dict initial_state_payload,
+    py::dict cfg_payload,
+    int game_id,
+    int num_roots,
+    int start_root_id,
+    int start_root_depth,
+    const std::string& start_player,
+    int feature_version,
+    int adv_iterations_per_root,
+    int cont_iterations_per_root,
+    int history_hops_min,
+    int history_hops_max,
+    int history_seed,
+    int history_max_total_steps,
+    int max_forced_hops_per_root,
+    double eval_split_ratio,
+    int eval_split_seed,
+    int action_seed_base,
+    bool allow_duplicate_history_fallback) {
+    auto get_int = [&](std::initializer_list<const char*> keys, int dflt) {
+        for (const char* k : keys) {
+            if (!cfg_payload.contains(k)) continue;
+            try {
+                return py::cast<int>(cfg_payload[k]);
+            } catch (const std::exception&) {
+            }
+        }
+        return dflt;
+    };
+    auto get_double = [&](std::initializer_list<const char*> keys, double dflt) {
+        for (const char* k : keys) {
+            if (!cfg_payload.contains(k)) continue;
+            try {
+                return py::cast<double>(cfg_payload[k]);
+            } catch (const std::exception&) {
+            }
+        }
+        return dflt;
+    };
+    auto get_bool = [&](std::initializer_list<const char*> keys, bool dflt) {
+        for (const char* k : keys) {
+            if (!cfg_payload.contains(k)) continue;
+            try {
+                return py::cast<bool>(cfg_payload[k]);
+            } catch (const std::exception&) {
+            }
+        }
+        return dflt;
+    };
+    auto get_str = [&](std::initializer_list<const char*> keys, const std::string& dflt) {
+        for (const char* k : keys) {
+            if (!cfg_payload.contains(k)) continue;
+            try {
+                return py::cast<std::string>(cfg_payload[k]);
+            } catch (const std::exception&) {
+            }
+        }
+        return dflt;
+    };
+
+    NativeSelfplayConfigGV3 cfg;
+    cfg.initial_state = parse_root_state_payload(initial_state_payload);
+    cfg.has_initial_state = true;
+    cfg.game_id = int(game_id);
+    cfg.num_roots = int(num_roots);
+    cfg.start_root_id = int(start_root_id);
+    cfg.start_root_depth = int(start_root_depth);
+    cfg.start_player = start_player.empty() ? std::string("adversary") : start_player;
+    cfg.feature_version = int(feature_version);
+    cfg.adv_iterations_per_root = int(adv_iterations_per_root);
+    cfg.cont_iterations_per_root = int(cont_iterations_per_root);
+    cfg.history_hops_min = int(history_hops_min);
+    cfg.history_hops_max = int(history_hops_max);
+    cfg.history_seed = int(history_seed);
+    cfg.history_max_total_steps = int(history_max_total_steps);
+    cfg.max_forced_hops_per_root = int(max_forced_hops_per_root);
+    cfg.eval_split_ratio = double(eval_split_ratio);
+    cfg.eval_split_seed = int(eval_split_seed);
+    cfg.action_seed_base = int(action_seed_base);
+    cfg.allow_duplicate_history_fallback = bool(allow_duplicate_history_fallback);
+    if (cfg_payload.contains("initial_history_signatures")) {
+        try {
+            for (auto item : py::cast<py::iterable>(cfg_payload["initial_history_signatures"])) {
+                cfg.initial_seen_signatures.push_back(py::cast<std::string>(item));
+            }
+        } catch (const std::exception&) {
+            cfg.initial_seen_signatures.clear();
+        }
+    }
+
+    SearchInput& tmpl = cfg.search_template;
+    tmpl.contract_version = kGV2NativeContractVersion;
+    tmpl.root_player = cfg.start_player;
+    tmpl.game_id = cfg.game_id;
+    tmpl.root_id = cfg.start_root_id;
+    tmpl.root_depth = cfg.start_root_depth;
+    tmpl.root_node_id = cfg.start_root_id;
+    tmpl.seed = cfg.action_seed_base;
+    tmpl.max_forced_hops = int(max_forced_hops_per_root);
+    tmpl.pb_c_base = get_double({"pb_c_base", "mcts_pb_c_base"}, tmpl.pb_c_base);
+    tmpl.pb_c_init = get_double({"pb_c_init", "mcts_pb_c_init"}, tmpl.pb_c_init);
+    tmpl.discount_factor = get_double({"discount_factor", "mcts_discount_factor"}, tmpl.discount_factor);
+    tmpl.prefill_step_time = get_double({"discount_time_denominator_sec", "prefill_step_time"}, tmpl.prefill_step_time);
+    tmpl.reward_knee = get_double({"reward_knee"}, tmpl.reward_knee);
+    tmpl.reward_max_penalty = get_double({"reward_max_penalty"}, tmpl.reward_max_penalty);
+    tmpl.reward_tail_alpha = get_double({"reward_tail_alpha"}, tmpl.reward_tail_alpha);
+    tmpl.reuse_root_infer_inputs = false;
+    tmpl.log_events = false;
+    tmpl.profile = false;
+    apply_feature_cfg_payload(cfg_payload, &tmpl.feature_cfg);
+
+    tmpl.env_cfg.adversary_tick_sec = get_double({"adversary_tick_sec"}, tmpl.env_cfg.adversary_tick_sec);
+    tmpl.env_cfg.launch_window_sec = get_double({"launch_window_sec"}, tmpl.env_cfg.launch_window_sec);
+    tmpl.env_cfg.max_requests_per_launch_window = get_int(
+        {"max_requests_per_launch_window"},
+        tmpl.env_cfg.max_requests_per_launch_window);
+    tmpl.env_cfg.prefill_window_cap_tokens = get_int(
+        {"prefill_window_cap_tokens"},
+        tmpl.env_cfg.prefill_window_cap_tokens);
+    tmpl.env_cfg.max_prefill_tokens_per_request = get_int(
+        {"max_prefill_tokens_per_request"},
+        tmpl.env_cfg.max_prefill_tokens_per_request);
+    tmpl.env_cfg.max_decode_tokens_per_request = get_int(
+        {"max_decode_tokens_per_request"},
+        tmpl.env_cfg.max_decode_tokens_per_request);
+    tmpl.env_cfg.min_decode_tokens_per_request = get_int(
+        {"min_decode_tokens_per_request"},
+        tmpl.env_cfg.min_decode_tokens_per_request);
+    tmpl.env_cfg.decode_slo_time_default = get_double(
+        {"decode_slo_time_default"},
+        tmpl.env_cfg.decode_slo_time_default);
+    tmpl.env_cfg.auto_drop_lateness_sec = get_double(
+        {"auto_drop_lateness_sec"},
+        tmpl.env_cfg.auto_drop_lateness_sec);
+    tmpl.env_cfg.drop_cost = get_double({"drop_cost"}, tmpl.env_cfg.drop_cost);
+    tmpl.env_cfg.controller_noop_prefill_only_jump_to_next_adv_tick = get_bool(
+        {"controller_noop_prefill_only_jump_to_next_adv_tick"},
+        tmpl.env_cfg.controller_noop_prefill_only_jump_to_next_adv_tick);
+    tmpl.env_cfg.enforce_nonnegative_decode_credits = get_bool(
+        {"enforce_nonnegative_decode_credits"},
+        tmpl.env_cfg.enforce_nonnegative_decode_credits);
+    tmpl.env_cfg.decode_credit_mint_per_prefill_complete = get_int(
+        {"decode_credit_mint_per_prefill_complete"},
+        tmpl.env_cfg.decode_credit_mint_per_prefill_complete);
+
+    tmpl.sim_cfg.adversary_tick_sec = tmpl.env_cfg.adversary_tick_sec;
+    if (cfg_payload.contains("prefill_profile_tokens")) {
+        tmpl.sim_cfg.prefill_profile_tokens = py_to_i32_vec(cfg_payload["prefill_profile_tokens"]);
+    }
+    if (cfg_payload.contains("prefill_profile_times")) {
+        tmpl.sim_cfg.prefill_profile_times = py_to_f64_vec(cfg_payload["prefill_profile_times"]);
+    }
+    tmpl.sim_cfg.fallback_total_time_sec = get_double(
+        {"fallback_total_time_sec"},
+        tmpl.sim_cfg.fallback_total_time_sec);
+    tmpl.sim_cfg.fallback_model_time_sec = get_double(
+        {"fallback_model_time_sec"},
+        tmpl.sim_cfg.fallback_model_time_sec);
+    tmpl.predictor_csv_path = get_str(
+        {"native_predictor_csv_path", "prefill_predictor_csv", "predictor_csv_path"},
+        tmpl.predictor_csv_path);
+
+    GV2VirtualEnvironment env(tmpl.env_cfg, tmpl.sim_cfg);
+    if (!tmpl.predictor_csv_path.empty()) {
+        (void)env.load_predictor_csv(tmpl.predictor_csv_path);
+    }
+    if (!tmpl.sim_cfg.prefill_profile_tokens.empty() &&
+        tmpl.sim_cfg.prefill_profile_tokens.size() == tmpl.sim_cfg.prefill_profile_times.size()) {
+        env.set_prefill_profile(tmpl.sim_cfg.prefill_profile_tokens, tmpl.sim_cfg.prefill_profile_times);
+    }
+
+    NativeSelfplayResultGV3 native_result = generate_native_selfplay_samples_gv3(
+        cfg,
+        env,
+        infer_runtime,
+        int(model_version));
+
+    py::list samples;
+    for (const auto& sample : native_result.samples) {
+        samples.append(native_sample_to_py(sample));
+    }
+    py::dict stats;
+    for (const auto& kv : native_result.stats) {
+        stats[kv.first.c_str()] = kv.second;
+    }
+
+    py::dict result;
+    result["samples"] = std::move(samples);
+    result["stats"] = std::move(stats);
+    result["history_signatures"] = native_result.history_signatures;
     return result;
 }
 
@@ -1543,5 +1901,31 @@ PYBIND11_MODULE(mcts_native_gv2, m) {
         py::arg("profile") = false,
         py::arg("iter_log_path") = "",
         py::arg("root_log_path") = ""
+    );
+
+    m.def(
+        "generate_selfplay_samples_torchscript",
+        &generate_selfplay_gv3_torchscript,
+        py::arg("infer_runtime"),
+        py::arg("model_version"),
+        py::arg("initial_state_payload"),
+        py::arg("cfg_payload"),
+        py::arg("game_id"),
+        py::arg("num_roots"),
+        py::arg("start_root_id"),
+        py::arg("start_root_depth"),
+        py::arg("start_player"),
+        py::arg("feature_version") = 1,
+        py::arg("adv_iterations_per_root") = 1,
+        py::arg("cont_iterations_per_root") = 1,
+        py::arg("history_hops_min") = 0,
+        py::arg("history_hops_max") = 0,
+        py::arg("history_seed") = 0,
+        py::arg("history_max_total_steps") = 20000,
+        py::arg("max_forced_hops_per_root") = 2000,
+        py::arg("eval_split_ratio") = 0.0,
+        py::arg("eval_split_seed") = 0,
+        py::arg("action_seed_base") = 0,
+        py::arg("allow_duplicate_history_fallback") = true
     );
 }
