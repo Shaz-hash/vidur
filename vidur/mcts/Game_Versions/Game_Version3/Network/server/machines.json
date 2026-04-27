@@ -33,5 +33,12 @@
     "public_ip": "3.234.217.253",
     "repo_dir": "/home/ubuntu/vidur",
     "python": "/home/ubuntu/vidur/.venv/bin/python"
+  },
+  {
+    "name": "aws-native-2-gv3",
+    "ssh_host": "aws-native-2-gv3",
+    "public_ip": "44.210.121.54",
+    "repo_dir": "/home/ubuntu/vidur",
+    "python": "/home/ubuntu/vidur/.venv/bin/python"
   }
 ]
