@@ -830,16 +830,13 @@ def _aggregate_metric_rows(rows: list[dict]) -> dict[str, float]:
     adversary_count = 0.0
 
     sum_loss = 0.0
-    sum_policy_loss = 0.0
     sum_value_loss = 0.0
     sum_value_mse = 0.0
     sum_value_mae = 0.0
 
-    sum_controller_policy_loss = 0.0
     sum_controller_value_loss = 0.0
     sum_controller_value_mse = 0.0
     sum_controller_value_mae = 0.0
-    sum_adversary_policy_loss = 0.0
     sum_adversary_value_loss = 0.0
     sum_adversary_value_mse = 0.0
     sum_adversary_value_mae = 0.0
@@ -852,21 +849,18 @@ def _aggregate_metric_rows(rows: list[dict]) -> dict[str, float]:
         if t > 0.0:
             total_count += t
             sum_loss += _safe_float(r.get("loss", float("nan"))) * t
-            sum_policy_loss += _safe_float(r.get("policy_loss", float("nan"))) * t
             sum_value_loss += _safe_float(r.get("value_loss", float("nan"))) * t
             sum_value_mse += _safe_float(r.get("value_mse_error", float("nan"))) * t
             sum_value_mae += _safe_float(r.get("value_mae_error", float("nan"))) * t
 
         if c > 0.0:
             controller_count += c
-            sum_controller_policy_loss += _safe_float(r.get("controller_policy_loss", float("nan"))) * c
             sum_controller_value_loss += _safe_float(r.get("controller_value_loss", float("nan"))) * c
             sum_controller_value_mse += _safe_float(r.get("controller_value_mse_error", float("nan"))) * c
             sum_controller_value_mae += _safe_float(r.get("controller_value_mae_error", float("nan"))) * c
 
         if a > 0.0:
             adversary_count += a
-            sum_adversary_policy_loss += _safe_float(r.get("adversary_policy_loss", float("nan"))) * a
             sum_adversary_value_loss += _safe_float(r.get("adversary_value_loss", float("nan"))) * a
             sum_adversary_value_mse += _safe_float(r.get("adversary_value_mse_error", float("nan"))) * a
             sum_adversary_value_mae += _safe_float(r.get("adversary_value_mae_error", float("nan"))) * a
@@ -876,15 +870,12 @@ def _aggregate_metric_rows(rows: list[dict]) -> dict[str, float]:
         "controller_samples_needed": int(round(controller_count)),
         "adversary_samples_needed": int(round(adversary_count)),
         "loss_for_selection": _weighted_avg(sum_loss, total_count),
-        "policy_loss": _weighted_avg(sum_policy_loss, total_count),
         "value_loss": _weighted_avg(sum_value_loss, total_count),
         "value_mse_error": _weighted_avg(sum_value_mse, total_count),
         "value_mae_error": _weighted_avg(sum_value_mae, total_count),
-        "controller_policy_loss": _weighted_avg(sum_controller_policy_loss, controller_count),
         "controller_value_loss": _weighted_avg(sum_controller_value_loss, controller_count),
         "controller_value_mse_error": _weighted_avg(sum_controller_value_mse, controller_count),
         "controller_value_mae_error": _weighted_avg(sum_controller_value_mae, controller_count),
-        "adversary_policy_loss": _weighted_avg(sum_adversary_policy_loss, adversary_count),
         "adversary_value_loss": _weighted_avg(sum_adversary_value_loss, adversary_count),
         "adversary_value_mse_error": _weighted_avg(sum_adversary_value_mse, adversary_count),
         "adversary_value_mae_error": _weighted_avg(sum_adversary_value_mae, adversary_count),
@@ -992,13 +983,12 @@ def _evaluate_samples(
 
     rows: list[dict] = []
     bsz = max(1, int(batch_size))
-    include_policy_tensors = not bool(trainer.cfg.value_only)
     for i in range(0, len(samples), bsz):
         chunk = samples[i : i + bsz]
         mixed = collate_mixed_samples(
             chunk,
             device=trainer.device,
-            include_policy_tensors=include_policy_tensors,
+            include_policy_tensors=False,
             include_legacy_fallback=False,
             include_ids=False,
         )
@@ -1366,14 +1356,11 @@ def run_parallel_self_improvement(cfg: MultipleProcessTrainingConfig) -> None:
         cfg=TrainerConfig(
             lr=float(trainer_h.lr),
             weight_decay=float(trainer_h.weight_decay),
-            policy_weight=float(trainer_h.policy_weight),
             value_weight=float(trainer_h.value_weight),
             value_loss_alpha=float(trainer_h.value_loss_alpha),
-            value_only=bool(trainer_h.value_only),
             grad_clip_norm=float(trainer_h.grad_clip_norm),
             checkpoint_every=int(trainer_h.checkpoint_every),
             eval_every=int(trainer_h.eval_every),
-            invalid_logit=float(trainer_h.invalid_logit),
         ),
         device=torch.device(cfg.model.device),
     )
@@ -1591,7 +1578,7 @@ def run_parallel_self_improvement(cfg: MultipleProcessTrainingConfig) -> None:
                     batch_by_player = collate_mixed_samples(
                         samples,
                         device=trainer.device,
-                        include_policy_tensors=not bool(trainer.cfg.value_only),
+                        include_policy_tensors=False,
                         include_legacy_fallback=False,
                         include_ids=False,
                     )
@@ -1687,11 +1674,8 @@ def run_parallel_self_improvement(cfg: MultipleProcessTrainingConfig) -> None:
                 phase="training",
                 samples_needed=int(train_metrics["samples_needed"]),
                 loss_for_selection=float(train_metrics["loss_for_selection"]),
-                policy_loss=float(train_metrics["policy_loss"]),
                 value_loss=float(train_metrics["value_loss"]),
-                controller_policy_loss=float(train_metrics["controller_policy_loss"]),
                 controller_value_loss=float(train_metrics["controller_value_loss"]),
-                adversary_policy_loss=float(train_metrics["adversary_policy_loss"]),
                 adversary_value_loss=float(train_metrics["adversary_value_loss"]),
                 value_mse_error=float(train_metrics["value_mse_error"]),
                 value_mae_error=float(train_metrics["value_mae_error"]),
@@ -1706,11 +1690,8 @@ def run_parallel_self_improvement(cfg: MultipleProcessTrainingConfig) -> None:
                 phase="eval",
                 samples_needed=int(eval_metrics["samples_needed"]),
                 loss_for_selection=float(eval_metrics["loss_for_selection"]),
-                policy_loss=float(eval_metrics["policy_loss"]),
                 value_loss=float(eval_metrics["value_loss"]),
-                controller_policy_loss=float(eval_metrics["controller_policy_loss"]),
                 controller_value_loss=float(eval_metrics["controller_value_loss"]),
-                adversary_policy_loss=float(eval_metrics["adversary_policy_loss"]),
                 adversary_value_loss=float(eval_metrics["adversary_value_loss"]),
                 value_mse_error=float(eval_metrics["value_mse_error"]),
                 value_mae_error=float(eval_metrics["value_mae_error"]),
