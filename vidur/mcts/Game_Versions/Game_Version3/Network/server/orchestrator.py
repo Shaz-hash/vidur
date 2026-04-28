@@ -35,7 +35,10 @@ from ..network_config import (
     selected_machines,
 )
 from .cleanup import cleanup_consumed_generation_samples
-from .dataset_integrity import validate_or_repair_proc_dir
+from .dataset_integrity import (
+    atomic_copy_proc_dir,
+    validate_or_repair_generation_from_received,
+)
 from .training import NetworkTrainingSummary, train_network_generation
 
 
@@ -348,10 +351,7 @@ def _copy_proc_dirs_to_generation(
             continue
         dst_name = f"proc_net_{task_tag}_{proc_dir.name[5:]}"
         dst_dir = dst / dst_name
-        if dst_dir.exists():
-            shutil.rmtree(dst_dir)
-        shutil.copytree(proc_dir, dst_dir)
-        validate_or_repair_proc_dir(src_proc_dir=proc_dir, dst_proc_dir=dst_dir)
+        atomic_copy_proc_dir(src_proc_dir=proc_dir, dst_proc_dir=dst_dir)
         copied += 1
     if copied:
         rewrite_manifest_paths_absolute(dst)
@@ -841,6 +841,21 @@ def main() -> None:
     aggregate_stats = _aggregate_result_stats(results)
     training_summary: NetworkTrainingSummary | None = None
     if not bool(args.skip_training):
+        repair_stats = validate_or_repair_generation_from_received(
+            generation=int(generation),
+            dataset_dir=dataset_dir,
+            received_root=paths.received_dir,
+            log_line=lambda message: _log_line(process_log_path, message),
+        )
+        _log_line(
+            process_log_path,
+            (
+                f"[GV3 gen={int(generation):06d}] dataset integrity check complete: "
+                f"validated_shards={int(repair_stats['validated_shards'])}, "
+                f"repaired_shards={int(repair_stats['repaired_shards'])}, "
+                f"samples={int(repair_stats['samples'])}"
+            ),
+        )
         training_summary = train_network_generation(
             generation=int(generation),
             model_version=int(model_version),

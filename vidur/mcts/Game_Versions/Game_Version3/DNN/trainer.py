@@ -32,6 +32,7 @@ class TrainerConfig:
     weight_decay: float = _T.weight_decay
     policy_weight: float = _T.policy_weight
     value_weight: float = _T.value_weight
+    value_loss_alpha: float = _T.value_loss_alpha
     value_only: bool = _T.value_only
     grad_clip_norm: float = _T.grad_clip_norm
     checkpoint_every: int = _T.checkpoint_every
@@ -72,14 +73,31 @@ class Trainer:
         # cross-entropy with distribution target
         return -(target_policy * log_probs).sum(dim=-1).mean()
 
-    def _value_loss(
+    def _value_abs_error_for_loss(
         self,
         value_raw: torch.Tensor,         # [B, 1]
         target_value: torch.Tensor,      # [B]
     ) -> torch.Tensor:
         pred_value = self.model.value_normalized_from_raw(value_raw).view(-1)
         target_norm = self.model.value_target_to_model(target_value).view(-1)
-        return F.smooth_l1_loss(pred_value, target_norm)
+        return torch.abs(pred_value - target_norm)
+
+    def _value_loss_from_abs_error(self, abs_error: torch.Tensor) -> torch.Tensor:
+        if abs_error.numel() <= 0:
+            raise RuntimeError("Empty value-error tensor")
+        alpha = float(self.cfg.value_loss_alpha)
+        if alpha <= 0.0:
+            raise RuntimeError("value_loss_alpha must be > 0")
+        return torch.logsumexp(abs_error.view(-1) * alpha, dim=0) / alpha
+
+    def _value_loss(
+        self,
+        value_raw: torch.Tensor,         # [B, 1]
+        target_value: torch.Tensor,      # [B]
+    ) -> torch.Tensor:
+        return self._value_loss_from_abs_error(
+            self._value_abs_error_for_loss(value_raw, target_value)
+        )
 
     def _value_errors(
         self,
@@ -103,6 +121,7 @@ class Trainer:
         total_value_mse = torch.tensor(0.0, device=self.device)
         total_value_mae = torch.tensor(0.0, device=self.device)
         total_count = 0
+        value_abs_errors: list[torch.Tensor] = []
 
         player_stats: Dict[str, Dict[str, float]] = {
             "controller": {
@@ -162,8 +181,10 @@ class Trainer:
                 if action_mask is None or target_policy is None:
                     raise RuntimeError("Policy tensors missing for non-value-only training batch")
                 p_loss = self._policy_loss(policy_logits, target_policy, action_mask)
-            v_loss = self._value_loss(value_raw, target_value)
+            v_abs_error = self._value_abs_error_for_loss(value_raw, target_value)
+            v_loss = self._value_loss_from_abs_error(v_abs_error)
             v_mse, v_mae = self._value_errors(value_raw, target_value)
+            value_abs_errors.append(v_abs_error)
 
             player_stats[player]["policy_loss"] = float(p_loss.detach().cpu())
             player_stats[player]["value_loss"] = float(v_loss.detach().cpu())
@@ -181,7 +202,7 @@ class Trainer:
             raise RuntimeError("Empty mixed batch (no controller or adversary samples)")
 
         policy_loss = total_policy / total_count
-        value_loss = total_value / total_count
+        value_loss = self._value_loss_from_abs_error(torch.cat(value_abs_errors, dim=0))
         value_mse_error = total_value_mse / total_count
         value_mae_error = total_value_mae / total_count
         if bool(self.cfg.value_only):
@@ -244,6 +265,7 @@ class Trainer:
         total_value_mse = 0.0
         total_value_mae = 0.0
         total_count = 0
+        value_abs_errors: list[torch.Tensor] = []
 
         player_stats: Dict[str, Dict[str, float]] = {
             "controller": {
@@ -302,10 +324,12 @@ class Trainer:
                 if action_mask is None or target_policy is None:
                     raise RuntimeError("Policy tensors missing for non-value-only eval batch")
                 p_loss = self._policy_loss(policy_logits, target_policy, action_mask).item()
-            v_loss = self._value_loss(value_raw, target_value).item()
+            v_abs_error = self._value_abs_error_for_loss(value_raw, target_value)
+            v_loss = self._value_loss_from_abs_error(v_abs_error).item()
             v_mse_t, v_mae_t = self._value_errors(value_raw, target_value)
             v_mse = float(v_mse_t.item())
             v_mae = float(v_mae_t.item())
+            value_abs_errors.append(v_abs_error)
 
             player_stats[player]["policy_loss"] = float(p_loss)
             player_stats[player]["value_loss"] = float(v_loss)
@@ -322,7 +346,7 @@ class Trainer:
             raise RuntimeError("Empty eval batch")
 
         policy_loss = total_policy / total_count
-        value_loss = total_value / total_count
+        value_loss = float(self._value_loss_from_abs_error(torch.cat(value_abs_errors, dim=0)).item())
         value_mse_error = total_value_mse / total_count
         value_mae_error = total_value_mae / total_count
         if bool(self.cfg.value_only):

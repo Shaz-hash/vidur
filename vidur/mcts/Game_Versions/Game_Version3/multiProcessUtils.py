@@ -1350,6 +1350,7 @@ def run_parallel_self_improvement(cfg: MultipleProcessTrainingConfig) -> None:
             weight_decay=float(trainer_h.weight_decay),
             policy_weight=float(trainer_h.policy_weight),
             value_weight=float(trainer_h.value_weight),
+            value_loss_alpha=float(trainer_h.value_loss_alpha),
             value_only=bool(trainer_h.value_only),
             grad_clip_norm=float(trainer_h.grad_clip_norm),
             checkpoint_every=int(trainer_h.checkpoint_every),

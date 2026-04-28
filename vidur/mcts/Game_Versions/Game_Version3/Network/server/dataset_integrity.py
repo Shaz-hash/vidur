@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import uuid
+import fcntl
 from pathlib import Path
 from typing import Callable
 
@@ -26,12 +28,73 @@ def _load_replay_shard(path: Path) -> int:
 
 def _atomic_copy_file(src: Path, dst: Path) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dst.with_name(f".{dst.name}.tmp.{os.getpid()}")
+    tmp = dst.with_name(f".{dst.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
     try:
-        shutil.copy2(src, tmp)
+        with src.open("rb") as fsrc, tmp.open("wb") as fdst:
+            shutil.copyfileobj(fsrc, fdst, length=16 * 1024 * 1024)
+            fdst.flush()
+            os.fsync(fdst.fileno())
+        shutil.copystat(src, tmp, follow_symlinks=True)
         os.replace(tmp, dst)
     finally:
         tmp.unlink(missing_ok=True)
+
+
+def atomic_copy_proc_dir(*, src_proc_dir: Path, dst_proc_dir: Path) -> dict[str, int]:
+    """
+    Copy one received proc directory into the canonical dataset layout using a
+    staged directory and atomic file replacement for every file. The staged copy
+    is validated before it replaces the final proc directory.
+    """
+    src_proc_dir = Path(src_proc_dir)
+    dst_proc_dir = Path(dst_proc_dir)
+    if not src_proc_dir.exists():
+        raise FileNotFoundError(f"source proc dir not found: {src_proc_dir}")
+
+    tmp_dir = dst_proc_dir.with_name(f".{dst_proc_dir.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        for src_path in sorted(src_proc_dir.rglob("*")):
+            rel_path = src_path.relative_to(src_proc_dir)
+            dst_path = tmp_dir / rel_path
+            if src_path.is_dir():
+                dst_path.mkdir(parents=True, exist_ok=True)
+                continue
+            if not src_path.is_file():
+                continue
+            _atomic_copy_file(src_path, dst_path)
+
+        stats = validate_or_repair_proc_dir(src_proc_dir=src_proc_dir, dst_proc_dir=tmp_dir)
+        dst_proc_dir.parent.mkdir(parents=True, exist_ok=True)
+
+        # Multiple task-copy threads can race when a restarted session mirrors a
+        # proc dir already present from an interrupted run. Serialize the final
+        # rename per canonical destination and keep the old copy until the new
+        # staged directory is ready.
+        lock_path = dst_proc_dir.with_name(f".{dst_proc_dir.name}.lock")
+        backup_dir: Path | None = None
+        with lock_path.open("w") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                if dst_proc_dir.exists():
+                    backup_dir = dst_proc_dir.with_name(
+                        f".{dst_proc_dir.name}.old.{os.getpid()}.{uuid.uuid4().hex}"
+                    )
+                    os.replace(dst_proc_dir, backup_dir)
+                os.replace(tmp_dir, dst_proc_dir)
+                if backup_dir is not None and backup_dir.exists():
+                    shutil.rmtree(backup_dir)
+            except Exception:
+                if backup_dir is not None and backup_dir.exists() and not dst_proc_dir.exists():
+                    os.replace(backup_dir, dst_proc_dir)
+                raise
+        return stats
+    finally:
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir)
 
 
 def validate_or_repair_shard(*, src: Path | None, dst: Path) -> dict[str, int]:

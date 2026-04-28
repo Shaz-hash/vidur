@@ -311,6 +311,7 @@ class TrainerHyperParams:
     weight_decay: float = 1e-4
     policy_weight: float = 0.0
     value_weight: float = 1.0
+    value_loss_alpha: float = 10.0
     value_only: bool = True
     grad_clip_norm: float = 5.0
     checkpoint_every: int = 200
@@ -324,6 +325,8 @@ class TrainerHyperParams:
             raise ValueError("trainer.weight_decay must be >= 0")
         if self.policy_weight < 0.0 or self.value_weight < 0.0:
             raise ValueError("trainer loss weights must be >= 0")
+        if self.value_loss_alpha <= 0.0:
+            raise ValueError("trainer.value_loss_alpha must be > 0")
         if self.grad_clip_norm < 0.0:
             raise ValueError("trainer.grad_clip_norm must be >= 0")
 
