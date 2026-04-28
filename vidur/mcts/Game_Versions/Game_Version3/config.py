@@ -307,11 +307,11 @@ class FeatureConfig:
 
 @dataclass(frozen=True)
 class TrainerHyperParams:
-    lr: float = 1e-4
+    lr: float = 2e-5
     weight_decay: float = 1e-4
     policy_weight: float = 0.0
     value_weight: float = 1.0
-    value_loss_alpha: float = 40.0
+    value_loss_alpha: float = 50.0
     value_only: bool = True
     grad_clip_norm: float = 5.0
     checkpoint_every: int = 200
@@ -575,7 +575,7 @@ class MultipleProcessTrainingConfig:
 
     train_steps_per_generation: int = 136
     train_batch_size: int = 256
-    train_target_epochs_per_generation: float = 20.0
+    train_target_epochs_per_generation: float = 10.0
     train_progress_print_every_steps: int = 100
     train_num_threads: int = field(default_factory=_default_train_num_threads)
 
