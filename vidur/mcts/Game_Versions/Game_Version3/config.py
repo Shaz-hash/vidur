@@ -311,7 +311,7 @@ class TrainerHyperParams:
     weight_decay: float = 1e-4
     policy_weight: float = 0.0
     value_weight: float = 1.0
-    value_loss_alpha: float = 10.0
+    value_loss_alpha: float = 40.0
     value_only: bool = True
     grad_clip_norm: float = 5.0
     checkpoint_every: int = 200
