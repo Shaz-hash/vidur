@@ -34,8 +34,6 @@ class NetworkSelfplayTask:
     history_hops_max: int
     history_hop_interval_width: int
     history_seed: int
-    sample_from_mcts_policy: bool
-    selfplay_policy_temperature: float
     action_seed_base: int
     max_forced_hops_per_root: int
     history_max_total_steps: int

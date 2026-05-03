@@ -483,7 +483,6 @@ class RunGroup:
     root_id: int = 0
     root_depth: int = 0
     root_player: str = "adversary"
-    iterations: int = 4000
     feature_version: int = 1
 
 
@@ -566,6 +565,8 @@ class MultipleProcessTrainingConfig:
     roots_per_generation: int = 40000
     sample_cycles_per_generation: int = 8
 
+    # Native self-play still has an iteration budget. Python GV3 self-play uses
+    # depth-one value backup and does not consume these fields.
     adv_iterations_per_root: int = 4000
     cont_iterations_per_root: int = 4000
     max_batch_size: int = 256
@@ -593,8 +594,6 @@ class MultipleProcessTrainingConfig:
     eval_split_ratio: float = 0.1
     eval_split_seed_base: int = 0
 
-    sample_from_mcts_policy: bool = True
-    selfplay_policy_temperature: float = 2.0 # increase the temperature for more exploration in the sampled actions from the mcts policy during self-play, which can lead to more diverse training data and potentially better generalization of the trained model. Tune this parameter based on the desired level of exploration vs exploitation in the self-play data generation.
     action_seed_base: int = 4 ## used for the dirichlet noise + potential future stochasticity in action sampling in root creation for training
 
     replay_capacity_samples: int = 400000
@@ -685,7 +684,9 @@ class MultipleProcessTrainingConfig:
         if self.sample_cycles_per_generation <= 0:
             raise ValueError("sample_cycles_per_generation must be > 0")
 
-        if self.adv_iterations_per_root <= 0 or self.cont_iterations_per_root <= 0:
+        if self.environment_lang == "native" and (
+            self.adv_iterations_per_root <= 0 or self.cont_iterations_per_root <= 0
+        ):
             raise ValueError("adv_iterations_per_root and cont_iterations_per_root must be > 0")
         if self.max_batch_size <= 0:
             raise ValueError("max_batch_size must be > 0")
@@ -745,8 +746,6 @@ class MultipleProcessTrainingConfig:
             raise ValueError("logging.flush_every must be > 0")
         if self.dataset.shard_size <= 0:
             raise ValueError("dataset.shard_size must be > 0")
-        if self.run.iterations <= 0:
-            raise ValueError("run.iterations must be > 0")
         if self.run.feature_version <= 0:
             raise ValueError("run.feature_version must be > 0")
 

@@ -61,6 +61,13 @@ class VidurGameStats:
     # Used for the Adversary to track arrivals within the  prefill reqs containing batches
     last_prefill_batch_time: Optional[float] = None
 
+    # These feilds are needed for ensuring the proper discounts for the edge case where the controller applies action but time progresses due to no prefill in the system to the next tick
+    transition_discount_time: Optional[float] = None
+    transition_final_time: Optional[float] = None
+    transition_fast_forward_time: float = 0.0
+
+
+
     def clone(self) -> "VidurGameStats":
         return VidurGameStats(
             requests_generated=self.requests_generated,
@@ -79,6 +86,9 @@ class VidurGameStats:
             stopped_decode_request_ids=set(self.stopped_decode_request_ids),
             active_request_ids=set(self.active_request_ids),
             last_prefill_batch_time=self.last_prefill_batch_time,
+            transition_discount_time=self.transition_discount_time,
+            transition_final_time=self.transition_final_time,
+            transition_fast_forward_time=self.transition_fast_forward_time,
         )
 
 ## Essentially checkpoints the state so it can return back to it to run a different simulation

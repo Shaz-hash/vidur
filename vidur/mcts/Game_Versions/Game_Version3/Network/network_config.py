@@ -141,8 +141,6 @@ class NetworkTaskDefaults:
     eval_split_seed: int = 0
     action_seed_base: int = 4
     task_seed_base: int = 0
-    sample_from_mcts_policy: bool = True
-    selfplay_policy_temperature: float = 2.0
     max_forced_hops_per_root: int = 1024
     history_max_total_steps: int = 20000
     log_history_rows: bool = True

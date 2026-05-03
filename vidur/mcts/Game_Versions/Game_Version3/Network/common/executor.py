@@ -64,8 +64,6 @@ def _task_cfg(task: NetworkSelfplayTask) -> MultipleProcessTrainingConfig:
         log_history_rows=bool(task.log_history_rows),
         eval_split_ratio=float(task.eval_split_ratio),
         eval_split_seed_base=int(task.eval_split_seed),
-        sample_from_mcts_policy=bool(task.sample_from_mcts_policy),
-        selfplay_policy_temperature=float(task.selfplay_policy_temperature),
         action_seed_base=int(task.action_seed_base),
         use_virtual_env=bool(task.use_virtual_env),
         environment_lang=str(task.environment_lang),

@@ -452,24 +452,58 @@ class VirtualVidurMCTSEnvironment:
         )
 
     
+    def _clear_transition_timing(self, state: VidurMCTSState) -> None:
+        state.stats.transition_discount_time = None
+        state.stats.transition_final_time = None
+        state.stats.transition_fast_forward_time = 0.0
+
+    def _set_transition_timing(
+        self,
+        state: VidurMCTSState,
+        *,
+        discount_time: float,
+        final_time: float,
+    ) -> None:
+        state.stats.transition_discount_time = float(discount_time)
+        state.stats.transition_final_time = float(final_time)
+        state.stats.transition_fast_forward_time = max(
+            0.0,
+            float(final_time) - float(discount_time),
+        )
+
     def apply_adversary_action_only(
         self, state: VidurMCTSState, action: AdversaryAction, *, inplace: bool = False
     ) -> VidurMCTSState:
         target_state = state if inplace else state.fork()
+        self._clear_transition_timing(target_state)
         self._apply_adversary_action(target_state, action)
         self._drain_arrivals(target_state.simulator)
+        action_time = float(target_state.simulator._time)
+        self._set_transition_timing(
+            target_state,
+            discount_time=action_time,
+            final_time=action_time,
+        )
         return target_state
 
     def apply_controller_action_only(
         self, state: VidurMCTSState, action: ControllerAction, *, inplace: bool = False
     ) -> VidurMCTSState:
         new_state = state if inplace else state.fork()
+        self._clear_transition_timing(new_state)
+
         tick_before = float(self._v2_next_adv_tick(new_state))
         self._drain_arrivals(new_state.simulator)
 
         # If adversary tick is pending (missed or exact), controller must no-op.
         if self._v2_has_pending_adv_tick(new_state):
             self._update_requests_and_stats(new_state, batch_exec=None)
+            action_time = float(new_state.simulator._time)
+            self._set_transition_timing(
+                new_state,
+                discount_time=action_time,
+                final_time=action_time,
+            )
             return new_state
 
         # Apply eviction branch first (Head-1 controller decision).
@@ -479,8 +513,14 @@ class VirtualVidurMCTSEnvironment:
         active_ids = new_state.stats.active_request_ids
         if not active_ids:
             self._update_requests_and_stats(new_state, batch_exec=None)
+            action_end_time = float(new_state.simulator._time)
             self._maybe_fast_forward_decode_only_to_next_adv_second(new_state)
             time_after_final = float(new_state.simulator._time)
+            self._set_transition_timing(
+                new_state,
+                discount_time=action_end_time,
+                final_time=time_after_final,
+            )
             miss_src = 2 if (time_after_final > tick_before + self._EPS) else 0
             self._v2_set_missed_adv_source(new_state, miss_src)
             return new_state
@@ -526,6 +566,8 @@ class VirtualVidurMCTSEnvironment:
             }
 
         self._update_requests_and_stats(new_state, batch_exec=batch_exec)
+        action_end_time = float(new_state.simulator._time)
+
         time_after_controller = float(new_state.simulator._time)
         miss_src = 1 if (time_after_controller > tick_before + self._EPS) else 0
 
@@ -581,6 +623,13 @@ class VirtualVidurMCTSEnvironment:
 
 
         time_after_final = float(new_state.simulator._time)
+
+        self._set_transition_timing(
+            new_state,
+            discount_time=action_end_time,
+            final_time=time_after_final,
+        )
+
         if miss_src == 0 and (time_after_final > tick_before + self._EPS):
             miss_src = 2
 

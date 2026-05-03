@@ -26,6 +26,7 @@ class _HistoryFrontierNode:
     player: str
     depth: int
     history_hops: int
+    log_node_id: int | None = None
     pre_controller_snapshot: Any | None = None
     pre_controller_stats: Any | None = None
     untried_action_indices: list[int] = field(default_factory=list)
@@ -45,6 +46,10 @@ class _HistoryRootBatchSession:
     rng: random.Random
     anchor_budget: int
     max_iterations: int
+    game_id: int = 0
+    trace_root_id: int = 0
+    next_log_node_id: int = 0
+    history_trace_logger: Any | None = None
     emitted_roots: int = 0
     anchors_built: int = 0
     iterations: int = 0
@@ -165,6 +170,8 @@ class HistoryRootGenerator:
         n_valid: int,
         phase: str,
         state_after: VidurMCTSState,
+        iter_loggers: Sequence[Any] | None = None,
+        root_loggers: Sequence[Any] | None = None,
     ) -> None:
         violations, lateness_sum = self.env.evaluate_objective(state_after)
         objective_cost = float(violations) + float(lateness_sum)
@@ -215,7 +222,18 @@ class HistoryRootGenerator:
                         out[int(rid)] = queued_at + slo
                     adv_deadlines_json = json.dumps(out)
 
-        for _ilog in (self.iter_logger, self.iter_logger_native):
+        active_iter_loggers = (
+            (self.iter_logger, self.iter_logger_native)
+            if iter_loggers is None
+            else tuple(iter_loggers)
+        )
+        active_root_loggers = (
+            (self.root_logger, self.root_logger_native)
+            if root_loggers is None
+            else tuple(root_loggers)
+        )
+
+        for _ilog in active_iter_loggers:
             if _ilog is None:
                 continue
             _ilog.log_expand(
@@ -244,7 +262,7 @@ class HistoryRootGenerator:
                 phase=f"history-{phase}",
             )
 
-        for _rlog in (self.root_logger, self.root_logger_native):
+        for _rlog in active_root_loggers:
             if _rlog is None:
                 continue
             _rlog.log_root(
@@ -592,6 +610,7 @@ class HistoryRootGenerator:
         player: str,
         depth: int,
         history_hops: int,
+        log_node_id: int | None,
         pre_controller_snapshot: Any | None,
         pre_controller_stats: Any | None,
     ) -> _HistoryFrontierNode:
@@ -602,10 +621,48 @@ class HistoryRootGenerator:
             player=str(player),
             depth=int(depth),
             history_hops=int(history_hops),
+            log_node_id=None if log_node_id is None else int(log_node_id),
             pre_controller_snapshot=pre_controller_snapshot,
             pre_controller_stats=pre_controller_stats,
             untried_action_indices=[],
         )
+
+    def _log_history_trace_step(
+        self,
+        *,
+        session: _HistoryRootBatchSession | None,
+        parent_node_id: int | None,
+        depth_before: int,
+        player_acted: str,
+        next_player: str,
+        action_index: int,
+        action: object,
+        n_valid: int,
+        state_after: VidurMCTSState,
+    ) -> int | None:
+        if session is None or session.history_trace_logger is None:
+            return parent_node_id
+
+        node_id = int(session.next_log_node_id)
+        session.next_log_node_id = int(session.next_log_node_id) + 1
+        self._log_step(
+            game_id=int(session.game_id),
+            root_id=int(session.trace_root_id),
+            root_depth=int(depth_before),
+            node_depth=int(depth_before) + 1,
+            node_id=int(node_id),
+            parent_node_id=parent_node_id,
+            player_acted=str(player_acted),
+            next_player=str(next_player),
+            action_index=int(action_index),
+            action=action,
+            n_valid=int(n_valid),
+            phase=self._phase_label(str(player_acted), action, int(n_valid)),
+            state_after=state_after,
+            iter_loggers=(session.history_trace_logger,),
+            root_loggers=(),
+        )
+        return int(node_id)
 
     def _apply_with_parent_context(
         self,
@@ -640,10 +697,13 @@ class HistoryRootGenerator:
         pre_controller_snapshot: Any | None,
         pre_controller_stats: Any | None,
         max_forced_steps: int,
-    ) -> tuple[VidurMCTSState, str, int, Any | None, Any | None, int]:
+        session: _HistoryRootBatchSession | None = None,
+        log_parent_id: int | None = None,
+    ) -> tuple[VidurMCTSState, str, int, Any | None, Any | None, int, int | None]:
         forced = 0
         pending_snap = pre_controller_snapshot
         pending_stats = pre_controller_stats
+        last_log_node_id = log_parent_id
 
         while forced < int(max_forced_steps):
             actions_by_index, valid, _mask = self._actions_valid(state, player)
@@ -655,6 +715,8 @@ class HistoryRootGenerator:
             if action is None:
                 break
 
+            acted = player
+            depth_before = int(depth)
             state, player, pending_snap, pending_stats = self._apply_with_parent_context(
                 state,
                 player,
@@ -662,8 +724,19 @@ class HistoryRootGenerator:
             )
             depth = int(depth) + 1
             forced += 1
+            last_log_node_id = self._log_history_trace_step(
+                session=session,
+                parent_node_id=last_log_node_id,
+                depth_before=int(depth_before),
+                player_acted=str(acted),
+                next_player=str(player),
+                action_index=int(idx),
+                action=action,
+                n_valid=len(valid),
+                state_after=state,
+            )
 
-        return state, player, int(depth), pending_snap, pending_stats, int(forced)
+        return state, player, int(depth), pending_snap, pending_stats, int(forced), last_log_node_id
 
     def _roll_to_target_hops(
         self,
@@ -674,12 +747,14 @@ class HistoryRootGenerator:
         target_hops: int,
         rng: random.Random,
         max_total_steps: int,
+        session: _HistoryRootBatchSession | None = None,
     ) -> _HistoryFrontierNode:
         state = initial_state.fork(flag=False)
         player = str(start_player)
         depth = int(start_depth)
         hops = 0
         steps = 0
+        log_node_id: int | None = None
         pre_ctrl_snapshot = None
         pre_ctrl_stats = None
 
@@ -691,13 +766,15 @@ class HistoryRootGenerator:
             if remaining <= 0:
                 break
 
-            state, player, depth, pre_ctrl_snapshot, pre_ctrl_stats, forced = self._advance_to_branching_with_context(
+            state, player, depth, pre_ctrl_snapshot, pre_ctrl_stats, forced, log_node_id = self._advance_to_branching_with_context(
                 state,
                 player,
                 depth,
                 pre_controller_snapshot=pre_ctrl_snapshot,
                 pre_controller_stats=pre_ctrl_stats,
                 max_forced_steps=min(2000, int(remaining)),
+                session=session,
+                log_parent_id=log_node_id,
             )
             steps += int(forced)
             if steps >= step_cap:
@@ -718,6 +795,8 @@ class HistoryRootGenerator:
             if action is None:
                 break
 
+            acted = player
+            depth_before = int(depth)
             state, player, pre_ctrl_snapshot, pre_ctrl_stats = self._apply_with_parent_context(
                 state,
                 player,
@@ -725,18 +804,31 @@ class HistoryRootGenerator:
             )
             depth = int(depth) + 1
             steps += 1
+            log_node_id = self._log_history_trace_step(
+                session=session,
+                parent_node_id=log_node_id,
+                depth_before=int(depth_before),
+                player_acted=str(acted),
+                next_player=str(player),
+                action_index=int(idx),
+                action=action,
+                n_valid=len(valid),
+                state_after=state,
+            )
             if is_nontrivial:
                 hops += 1
 
         remaining = max(0, step_cap - steps)
         if remaining > 0:
-            state, player, depth, pre_ctrl_snapshot, pre_ctrl_stats, _forced = self._advance_to_branching_with_context(
+            state, player, depth, pre_ctrl_snapshot, pre_ctrl_stats, _forced, log_node_id = self._advance_to_branching_with_context(
                 state,
                 player,
                 depth,
                 pre_controller_snapshot=pre_ctrl_snapshot,
                 pre_controller_stats=pre_ctrl_stats,
                 max_forced_steps=min(2000, int(remaining)),
+                session=session,
+                log_parent_id=log_node_id,
             )
 
         return self._frontier_node_from_state(
@@ -744,6 +836,7 @@ class HistoryRootGenerator:
             player=str(player),
             depth=int(depth),
             history_hops=int(hops),
+            log_node_id=log_node_id,
             pre_controller_snapshot=pre_ctrl_snapshot,
             pre_controller_stats=pre_ctrl_stats,
         )
@@ -802,6 +895,7 @@ class HistoryRootGenerator:
         node: _HistoryFrontierNode,
         action_index: int,
         max_total_steps: int,
+        session: _HistoryRootBatchSession | None = None,
     ) -> _HistoryFrontierNode | None:
         parent = self._restore_frontier_state(node)
         actions_by_index, valid, _mask = self._actions_valid(parent, node.player)
@@ -814,6 +908,7 @@ class HistoryRootGenerator:
         if action is None:
             return None
 
+        depth_before = int(node.depth)
         child, next_player, pre_ctrl_snapshot, pre_ctrl_stats = self._apply_with_parent_context(
             parent,
             node.player,
@@ -822,14 +917,27 @@ class HistoryRootGenerator:
 
         child_depth = int(node.depth) + 1
         child_hops = int(node.history_hops) + 1
+        log_node_id = self._log_history_trace_step(
+            session=session,
+            parent_node_id=node.log_node_id,
+            depth_before=int(depth_before),
+            player_acted=str(node.player),
+            next_player=str(next_player),
+            action_index=int(idx),
+            action=action,
+            n_valid=len(valid),
+            state_after=child,
+        )
 
-        child, next_player, child_depth, pre_ctrl_snapshot, pre_ctrl_stats, _forced = self._advance_to_branching_with_context(
+        child, next_player, child_depth, pre_ctrl_snapshot, pre_ctrl_stats, _forced, log_node_id = self._advance_to_branching_with_context(
             child,
             next_player,
             child_depth,
             pre_controller_snapshot=pre_ctrl_snapshot,
             pre_controller_stats=pre_ctrl_stats,
             max_forced_steps=min(2000, max(1, int(max_total_steps))),
+            session=session,
+            log_parent_id=log_node_id,
         )
 
         return self._frontier_node_from_state(
@@ -837,6 +945,7 @@ class HistoryRootGenerator:
             player=str(next_player),
             depth=int(child_depth),
             history_hops=int(child_hops),
+            log_node_id=log_node_id,
             pre_controller_snapshot=pre_ctrl_snapshot,
             pre_controller_stats=pre_ctrl_stats,
         )
@@ -857,6 +966,7 @@ class HistoryRootGenerator:
             "root_depth": int(node.depth),
             "root_id": int(root_id),
             "root_node_id_override": None,
+            "history_log_node_id": node.log_node_id,
             "pre_controller_snapshot": pre_ctrl_snapshot,
             "pre_controller_stats": pre_ctrl_stats,
             "history_hops": int(node.history_hops),
@@ -871,6 +981,7 @@ class HistoryRootGenerator:
         start_depth: int,
         num_roots: int,
         start_root_id: int,
+        game_id: int,
         nontrivial_hops: int,
         seed: int,
         max_total_steps: int,
@@ -878,6 +989,7 @@ class HistoryRootGenerator:
         max_history_hops: Optional[int],
         max_children_per_expand: Optional[int],
         initial_seen_signatures: Optional[Sequence[tuple[Any, ...]]],
+        history_trace_logger: Any | None = None,
     ) -> _HistoryRootBatchSession:
         target_roots = max(0, int(num_roots))
         min_hops = int(nontrivial_hops if min_history_hops is None else min_history_hops)
@@ -898,6 +1010,10 @@ class HistoryRootGenerator:
             rng=random.Random(int(seed)),
             anchor_budget=max(4, int(target_roots) * 3),
             max_iterations=max(200, int(target_roots) * 50),
+            game_id=int(game_id),
+            trace_root_id=int(start_root_id),
+            next_log_node_id=0,
+            history_trace_logger=history_trace_logger,
             seen_signatures=set(initial_seen_signatures or ()),
         )
 
@@ -960,6 +1076,7 @@ class HistoryRootGenerator:
             target_hops=int(session.min_history_hops),
             rng=session.rng,
             max_total_steps=int(session.max_total_steps),
+            session=session,
         )
         session.anchors_built += 1
         session.iterations += 1
@@ -994,6 +1111,7 @@ class HistoryRootGenerator:
                 node=node,
                 action_index=action_index,
                 max_total_steps=int(session.max_total_steps),
+                session=session,
             )
             session.iterations += 1
             if child is None:
@@ -1028,6 +1146,7 @@ class HistoryRootGenerator:
             target_hops=int(fallback_hops),
             rng=session.rng,
             max_total_steps=int(session.max_total_steps),
+            session=session,
         )
 
     def generate_roots_batch_iter(
@@ -1051,8 +1170,8 @@ class HistoryRootGenerator:
         shared_seen_signatures: Any | None = None,
         shared_seen_lock: Any | None = None,
         allow_duplicate_fallback: bool = True,
+        history_trace_logger: Any | None = None,
     ) -> Iterator[list[dict[str, Any]]]:
-        del game_id
         del log_history
 
         session = self._create_root_batch_session(
@@ -1061,6 +1180,7 @@ class HistoryRootGenerator:
             start_depth=int(start_depth),
             num_roots=int(num_roots),
             start_root_id=int(start_root_id),
+            game_id=int(game_id),
             nontrivial_hops=int(nontrivial_hops),
             seed=int(seed),
             max_total_steps=int(max_total_steps),
@@ -1068,6 +1188,7 @@ class HistoryRootGenerator:
             max_history_hops=max_history_hops,
             max_children_per_expand=max_children_per_expand,
             initial_seen_signatures=initial_seen_signatures,
+            history_trace_logger=history_trace_logger,
         )
         session.shared_seen_signatures = shared_seen_signatures
         session.shared_seen_lock = shared_seen_lock
@@ -1110,6 +1231,7 @@ class HistoryRootGenerator:
         shared_seen_signatures: Any | None = None,
         shared_seen_lock: Any | None = None,
         allow_duplicate_fallback: bool = True,
+        history_trace_logger: Any | None = None,
     ) -> list[dict[str, Any]]:
         roots: list[dict[str, Any]] = []
         for batch in self.generate_roots_batch_iter(
@@ -1131,6 +1253,7 @@ class HistoryRootGenerator:
             shared_seen_signatures=shared_seen_signatures,
             shared_seen_lock=shared_seen_lock,
             allow_duplicate_fallback=bool(allow_duplicate_fallback),
+            history_trace_logger=history_trace_logger,
         ):
             roots.extend(batch)
         return roots

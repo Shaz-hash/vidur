@@ -5,7 +5,7 @@ import math
 import random
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Union, Tuple
 
 import torch
 
@@ -144,14 +144,15 @@ class VidurMCTS:
 
 
     def _state_cost(self, state: VidurMCTSState) -> float:
-        violations, avg_lateness = self._env.evaluate_objective(state)
-        return float(violations) + float(avg_lateness)
+        violations, total_lateness = self._env.evaluate_objective(state)
+        return float(violations) + float(total_lateness)
 
+    # TODO : Use this function in the search_dnn_depth1 & compose_q_from_state
     def _seed_node_runtime_from_state(self, node: MCTSNode, state: VidurMCTSState) -> None:
         node.state_cost = float(self._state_cost(state))
         node.sim_time = float(getattr(state.simulator, "_time", 0.0))
 
-    # TODO: pass this via the config and experiment with different reward shaping functions
+    # TODO: pass this via the config and experiment with different reward shaping functions & Change the value reward knee and reward max penalty from config to bigger values
     def _transition_reward(self, parent_cost: float, child_cost: float) -> float:
         delta = max(0.0, float(child_cost) - float(parent_cost))
 
@@ -184,10 +185,6 @@ class VidurMCTS:
         """
         discount = gamma ^ ((t_child_time - t_parent_branch) / prefill_time(step_tokens))
         """
-        # gamma = float(getattr(self._cfg, "discount_factor", 0.98))
-        # denom = max(float(getattr(self, "_prefill_step_time", 0.0388862329)), 1e-9)
-        # dt = max(0.0, float(t_child_time) - float(t_parent_branch))
-        # return gamma ** (dt / denom)
         gamma = float(getattr(self._cfg, "discount_factor", 0.98))
         denom = max(float(getattr(self, "_discount_time_denom", getattr(self, "_prefill_step_time", 0.015725797204323228))), 1e-9)
         dt = max(0.0, float(t_child_time) - float(t_parent_branch))
@@ -218,7 +215,7 @@ class VidurMCTS:
     """
 
     def _is_missed_adv_tick(self, state: VidurMCTSState) -> Tuple[bool, Optional[float]]:
-        # GV2-specific hook (safe no-op for other envs)
+        # GV2/3-specific hook (safe no-op for other envs)
         next_tick_fn = getattr(self._env, "_v2_next_adv_tick", None)
         if not callable(next_tick_fn):
             return False, None
@@ -249,7 +246,7 @@ class VidurMCTS:
         if not flag:
             return state, None
 
-        # Finding the true source for the Adv missed action i.e. either thru controller or Adv.
+        # Finding the true source for the Adv missed action i.e. either thru controller's meaningful action or just doing a FF decode .
         get_src = getattr(self._env, "_v2_missed_adv_source", None)
         miss_src = int(get_src(state)) if callable(get_src) else 1
 
@@ -342,6 +339,7 @@ class VidurMCTS:
             self._scratch_state = self._env.initial_state()  # creates Simulator(...) once
 
         # Reuse the same simulator instance; restore in-place.
+        # TODO : Do we really need these two modes ?
         sim = self._scratch_state.simulator
         if (
             isinstance(snapshot, dict)
@@ -364,6 +362,7 @@ class VidurMCTS:
     def _store_node_snapshot(self, node: MCTSNode, state: VidurMCTSState) -> None:
         # node.cached_sim_snapshot = state.simulator.snapshot_state()
         # node.cached_stats = state.stats.clone()
+        # TODO : Do we really need these 2 modes or not ?
         sim = state.simulator
         if hasattr(sim, "snapshot_state_fast"):
             node.cached_sim_snapshot = sim.snapshot_state_fast()
@@ -426,6 +425,8 @@ class VidurMCTS:
     def _next_player(self, player: str) -> str:
         return "controller" if player == "adversary" else "adversary"
 
+
+    # TODO: This is the duplication of the existing function above,  _store_node_snapshot, remove one mode of it
     def _snapshot_state_and_stats(self, state: VidurMCTSState) -> tuple[Any, Any]:
         sim = state.simulator
         if hasattr(sim, "snapshot_state_fast"):
@@ -466,7 +467,11 @@ class VidurMCTS:
         leaf_cost = float(self._state_cost(leaf_state))
         reward = float(self._transition_reward(parent_cost, leaf_cost))
         leaf_time = float(leaf_state.simulator._time)
-        discount = float(self._time_discount(leaf_time, parent_time))
+        discount_time = getattr(leaf_state.stats, "transition_discount_time", None)
+        if discount_time is None:
+            discount_time = leaf_time
+
+        discount = float(self._time_discount(float(discount_time), parent_time))
 
         bootstrap = self._bootstrap_value_from_model(
             dnn_model=dnn_model,
@@ -780,10 +785,15 @@ class VidurMCTS:
 
 
         for alias_idx, canon_idx in alias_to_canon.items():
-            q = canonical_q.get(canon_idx, float("-inf"))
+            missing_q = float("inf") if root.player == "adversary" else float("-inf")
+            q = canonical_q.get(canon_idx, missing_q)
             action_values[alias_idx] = float(q)
 
-        best_idx = min(valid_indices, key=lambda i: (action_values[i], i))
+        best_idx = self._select_depth1_best_action_index(
+            root_player=str(root.player),
+            valid_indices=valid_indices,
+            action_values=action_values,
+        )
         best_val = float(action_values[best_idx])
 
         root.visits = 1
@@ -805,12 +815,31 @@ class VidurMCTS:
             used_bootstrap=used_bootstrap,
         )
 
+    @staticmethod
+    def _select_depth1_best_action_index(
+        *,
+        root_player: str,
+        valid_indices: Sequence[int],
+        action_values: Sequence[float],
+    ) -> int:
+        valid = [int(i) for i in valid_indices]
+        if not valid:
+            raise ValueError("_select_depth1_best_action_index requires at least one valid action")
+
+        player = str(root_player)
+        if player == "controller":
+            # Q is controller-valued. Controller should maximize it.
+            return max(valid, key=lambda i: (float(action_values[i]), -int(i)))
+        if player == "adversary":
+            # Adversary chooses the action with minimum controller value.
+            return min(valid, key=lambda i: (float(action_values[i]), int(i)))
+        raise ValueError(f"unknown root_player={root_player!r}")
+
     def search_dnn(
         self,
         dnn_model: Any,
         rootState: VidurMCTSState,
         root_player: str,
-        iterations: int,
         *,
         game_id: int,
         root_id: int,
@@ -821,7 +850,7 @@ class VidurMCTS:
         root_phase: str = "train_root",
         cycle_label: str = "",
     ) -> DepthOneSearchResult:
-        del iterations, root_phase, cycle_label
+        del root_phase, cycle_label
         if not bool(one_step_value_mode):
             raise RuntimeError("GV3 mctsDNN now supports only one_step_value_mode=True")
         return self._search_dnn_depth1(

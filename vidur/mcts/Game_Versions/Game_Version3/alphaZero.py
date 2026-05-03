@@ -218,7 +218,6 @@ class RunGroup:
     root_id: int = 0
     root_depth: int = 0
     root_player: str = "adversary"  # or "controller"
-    iterations: int = 10
     feature_version: int = 1
 
 
@@ -307,7 +306,6 @@ def main() -> None:
             root_id=0,
             root_depth=0,
             root_player="adversary",
-            iterations=4000,
             feature_version=1,
         ),
     )
@@ -321,8 +319,6 @@ def main() -> None:
     ## MODEL TRAINING PARMS FOR SELF-IMPROVEMENT LOOP:
     num_generations = 1
     roots_per_generation = 1
-    adv_iterations_per_root = 4000
-    cont_iterations_per_root = 4000
     # train_steps_per_generation = 200   
     max_batch_size = 256
     train_log_csv = Path("simulator_output/mcts_dnn_logs/train_metrics.csv")
@@ -377,7 +373,6 @@ def main() -> None:
         #         root_id=cfg.run.root_id,
         #         root_depth=cfg.run.root_depth,
         #         root_player=cfg.run.root_player,
-        #         iterations=cfg.run.iterations,
         #         feature_version=cfg.run.feature_version,
         #     )
         # )
@@ -385,7 +380,6 @@ def main() -> None:
         # runner.run_n_roots(
         #     game_id=cfg.run.game_id,
         #     num_roots=10,                 # how many root positions to collect
-        #     iterations_per_root=cfg.run.iterations,     # MCTS sims per root
         #     start_root_id=cfg.run.root_id,
         #     start_root_depth=cfg.run.root_depth,
         #     start_player=cfg.run.root_player,  # usually "adversary"
@@ -404,7 +398,6 @@ def main() -> None:
         #         root_id=cfg.run.root_id,
         #         root_depth=cfg.run.root_depth,
         #         root_player=cfg.run.root_player,
-        #         iterations=cfg.run.iterations,
         #         feature_version=cfg.run.feature_version,
         #     )
         # )
@@ -413,8 +406,6 @@ def main() -> None:
         runner.run_n_roots(
             game_id=cfg.run.game_id,
             num_roots=1,
-            adv_iterations_per_root=int(cfg.run.iterations),
-            cont_iterations_per_root=int(cfg.run.iterations),
             max_batch_size=int(max_batch_size),
             start_root_id=cfg.run.root_id,
             start_root_depth=int(cfg.run.root_depth),
@@ -430,8 +421,6 @@ def main() -> None:
         #     model=model,
         #     num_generations=num_generations,
         #     roots_per_generation=roots_per_generation,
-        #     adv_iterations_per_root=adv_iterations_per_root,
-        #     cont_iterations_per_root=cont_iterations_per_root,
         #     history_nontrivial_hops=history_nontrivial_hops,
         #     max_batch_size=max_batch_size,
         #     train_steps_per_generation=train_steps_per_generation,

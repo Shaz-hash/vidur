@@ -1815,6 +1815,21 @@ def test_controller_prefill_allocation_validity_gv2(
                 trace_id,
             )
 
+        remaining_prefill = max(
+            0,
+            int(getattr(rs, "remaining_prefill", getattr(rs, "rem_prefill", 0))),
+        )
+        if amt > remaining_prefill:
+            _fail(
+                "test_controller_prefill_allocation_validity_gv2",
+                (
+                    f"prefill allocation exceeds remaining prefill for rid={rid}: "
+                    f"alloc={amt}, remaining={remaining_prefill}"
+                ),
+                row,
+                trace_id,
+            )
+
         if amt > int(_GV2_CFG.request.max_prefill_tokens_per_request):
             _fail(
                 "test_controller_prefill_allocation_validity_gv2",
@@ -1848,11 +1863,7 @@ def test_controller_prefill_allocation_validity_gv2(
                 trace_id,
             )
 
-    # 2) If no prefill allocations, no further checks required.
-    if not prefill_alloc:
-        return
-
-    # 3) Prefill total must be bounded by token budget.
+    # 2) Prefill total must be bounded by token budget.
     prefill_total = int(sum(int(v) for v in prefill_alloc.values()))
     token_total = int(sum(int(v) for v in token_alloc.values()))
     if prefill_total > token_total:
@@ -1862,6 +1873,79 @@ def test_controller_prefill_allocation_validity_gv2(
             row,
             trace_id,
         )
+
+    # 3) Every decode allocation must target a known decode-ready request and
+    # must not exceed remaining decode work.
+    for rid_raw, amt_raw in decode_alloc.items():
+        rid = int(rid_raw)
+        amt = int(amt_raw)
+        if amt <= 0:
+            _fail(
+                "test_controller_prefill_allocation_validity_gv2",
+                f"decode allocation for rid={rid} has non-positive amt={amt}",
+                row,
+                trace_id,
+            )
+
+        rs = ctx.requests.get(rid)
+        if rs is None:
+            _fail(
+                "test_controller_prefill_allocation_validity_gv2",
+                f"decode allocation targets unknown rid={rid}",
+                row,
+                trace_id,
+            )
+
+        if bool(getattr(rs, "completed", False)):
+            _fail(
+                "test_controller_prefill_allocation_validity_gv2",
+                f"decode allocation targets completed rid={rid}",
+                row,
+                trace_id,
+            )
+
+        tok_amt = int(token_alloc.get(rid, 0))
+        if tok_amt <= 0:
+            _fail(
+                "test_controller_prefill_allocation_validity_gv2",
+                f"decode allocation rid={rid} missing in token_allocations",
+                row,
+                trace_id,
+            )
+        if amt > tok_amt:
+            _fail(
+                "test_controller_prefill_allocation_validity_gv2",
+                f"decode allocation rid={rid} exceeds token allocation: decode={amt}, token={tok_amt}",
+                row,
+                trace_id,
+            )
+
+        remaining_prefill = max(
+            0,
+            int(getattr(rs, "remaining_prefill", getattr(rs, "rem_prefill", 0))),
+        )
+        if remaining_prefill > 0:
+            _fail(
+                "test_controller_prefill_allocation_validity_gv2",
+                (
+                    f"decode allocation targets request before prefill is complete: "
+                    f"rid={rid}, remaining_prefill={remaining_prefill}"
+                ),
+                row,
+                trace_id,
+            )
+
+        remaining_decode = _gv2_req_rem_decode(rs)
+        if amt > remaining_decode:
+            _fail(
+                "test_controller_prefill_allocation_validity_gv2",
+                (
+                    f"decode allocation exceeds remaining decode for rid={rid}: "
+                    f"alloc={amt}, remaining={remaining_decode}"
+                ),
+                row,
+                trace_id,
+            )
 
 
 def test_controller_time_delta(

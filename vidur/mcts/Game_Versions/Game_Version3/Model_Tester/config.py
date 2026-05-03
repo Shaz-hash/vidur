@@ -20,7 +20,7 @@ def _under_repo(*parts: str) -> str:
 @dataclass(frozen=True)
 class TrivialControllerPolicyConfig:
     heuristic: str = "SJF"
-    budget_tokens: int = 512
+    budget_tokens: int = 128
     eviction_rule: str = "evict_none"
 
 
@@ -32,7 +32,7 @@ class TrivialAdversaryPolicyConfig:
 @dataclass(frozen=True)
 class ModelTesterConfig:
     # Experiment scope
-    num_games: int = 4
+    num_games: int = 70
     game_id_start: int = 12_000_000
     start_player: str = "adversary"
     start_root_depth: int = 0
@@ -48,7 +48,7 @@ class ModelTesterConfig:
 
     # Outputs
     output_dir: str = _under_repo("simulator_output", "Game_Version3", "Model_Tester_Results")
-    write_arena_game_logs: bool = False
+    write_arena_game_logs: bool = True
     write_model_action_detail_logs: bool = False
 
     # History sampling

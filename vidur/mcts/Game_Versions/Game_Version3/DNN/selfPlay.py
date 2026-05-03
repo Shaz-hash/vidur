@@ -44,7 +44,6 @@ class SingleRootRun:
     root_id: int = 0
     root_depth: int = 0
     root_player: str = "adversary"
-    iterations: int = 1
     feature_version: int = 1
     root_node_id_override: int | None = None
     model_version: int = 0
@@ -460,7 +459,6 @@ class SelfPlayRunner:
             dnn_model=self.model,
             rootState=search_state,
             root_player=cfg.root_player,
-            iterations=cfg.iterations,
             game_id=cfg.game_id,
             root_id=cfg.root_id,
             root_node_id_override=cfg.root_node_id_override,
@@ -525,16 +523,12 @@ class SelfPlayRunner:
         *,
         game_id: int,
         num_roots: int,
-        adv_iterations_per_root: int = 1,
-        cont_iterations_per_root: int = 1,
         max_batch_size: int = 72,
         start_root_id: int = 0,
         start_root_depth: int = 0,
         start_player: str = "adversary",
         feature_version: int = 1,
         initial_state: Optional[VidurMCTSState] = None,
-        sample_from_mcts_policy: bool = False,
-        selfplay_policy_temperature: float = 0.0,
         action_seed_base: int = 0,
         history_nontrivial_hops: Optional[int] = None,
         history_hops_min: Optional[int] = None,
@@ -553,8 +547,6 @@ class SelfPlayRunner:
         shared_history_lock: Any | None = None,
         allow_duplicate_history_fallback: bool = True,
     ) -> VidurMCTSState:
-        del sample_from_mcts_policy
-        del selfplay_policy_temperature
         del action_seed_base
         del max_batch_size
 
@@ -637,15 +629,12 @@ class SelfPlayRunner:
                         pre_controller_stats=pr.pre_controller_stats,
                     )
 
-                iters = int(adv_iterations_per_root if root_player == "adversary" else cont_iterations_per_root)
-
                 res = self.run_single_root(
                     SingleRootRun(
                         game_id=int(game_id),
                         root_id=int(root_id),
                         root_depth=int(root_depth),
                         root_player=str(root_player),
-                        iterations=int(iters),
                         feature_version=int(feature_version),
                         root_node_id_override=pr.root_node_id_override,
                         model_version=int(model_version),
@@ -676,7 +665,7 @@ class SelfPlayRunner:
                     mcts_value_controller=float(res.mcts_value),
                     meta={
                         "best_action_index": int(res.best_idx),
-                        "num_simulations": int(iters),
+                        "search_mode": "depth1_value_backup",
                         "used_bootstrap": bool(res.used_bootstrap),
                         "model_version": int(model_version),
                         "history_hops": int(pr.history_hops),
