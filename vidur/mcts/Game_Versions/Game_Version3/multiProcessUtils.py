@@ -1222,6 +1222,7 @@ def _selfplay_worker_main(
             history_root_batch_size=int(task.get("history_root_batch_size", 64)),
             log_history_rows=bool(task["log_history_rows"]),
             progress_prefix=progress_prefix,
+            generation=int(task.get("generation", 0)),
             model_version=int(task.get("model_version", 0)),
             eval_split_ratio=float(task.get("eval_split_ratio", 0.0)),
             eval_split_seed=int(task.get("eval_split_seed", 0)),

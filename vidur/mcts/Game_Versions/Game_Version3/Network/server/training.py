@@ -30,6 +30,7 @@ from ...multiProcessUtils import (
     _set_runtime_cpu_thread_env,
     _set_torch_intraop_threads,
 )
+from .dataset_integrity import source_shard_from_received, validate_or_repair_shard
 from ..network_config import resolve_device
 
 
@@ -156,6 +157,43 @@ def _make_trainer(cfg: MultipleProcessTrainingConfig) -> Trainer:
     )
 
 
+def _make_replay_shard_repair_fn(
+    *,
+    received_root: Path | None,
+    generation: int,
+    log: LogLine,
+) -> Callable[[Path, Exception], bool] | None:
+    if received_root is None:
+        return None
+
+    received_root = Path(received_root)
+
+    def _repair(path: Path, load_error: Exception) -> bool:
+        source_shard = source_shard_from_received(
+            canonical_shard=Path(path),
+            received_root=received_root,
+        )
+        if source_shard is None:
+            log(
+                f"[GV3 gen={int(generation):06d}] replay shard repair unavailable: "
+                f"path={path}, load_error={type(load_error).__name__}: {load_error}"
+            )
+            return False
+
+        repair_stats = validate_or_repair_shard(src=source_shard, dst=Path(path))
+        log(
+            f"[GV3 gen={int(generation):06d}] replay shard load repair retry: "
+            f"path={path}, source={source_shard}, "
+            f"validated_shards={int(repair_stats.get('validated_shards', 0))}, "
+            f"repaired_shards={int(repair_stats.get('repaired_shards', 0))}, "
+            f"samples={int(repair_stats.get('samples', 0))}, "
+            f"load_error={type(load_error).__name__}: {load_error}"
+        )
+        return True
+
+    return _repair
+
+
 def train_network_generation(
     *,
     generation: int,
@@ -178,6 +216,7 @@ def train_network_generation(
     replay_max_cached_shards: int = 5_000,
     replay_seed: int = 2026,
     trainer_lr: float = 0.0,
+    received_root: Path | None = None,
     log_line: LogLine | None = None,
 ) -> NetworkTrainingSummary:
     log = log_line or _default_log_line
@@ -227,6 +266,11 @@ def train_network_generation(
         capacity_samples=int(cfg.replay_capacity_samples),
         max_cached_shards=int(cfg.replay_max_cached_shards),
         seed=int(cfg.replay_seed) + int(gen),
+        repair_shard_after_load_error=_make_replay_shard_repair_fn(
+            received_root=Path(received_root) if received_root is not None else None,
+            generation=int(gen),
+            log=log,
+        ),
     )
 
     gen_dataset_dir = Path(dataset_dir) / f"gen_{int(gen):06d}"

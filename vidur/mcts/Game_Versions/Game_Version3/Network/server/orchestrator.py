@@ -875,6 +875,7 @@ def main() -> None:
             replay_max_cached_shards=int(args.replay_max_cached_shards),
             replay_seed=int(args.replay_seed),
             trainer_lr=float(args.trainer_lr),
+            received_root=paths.received_dir,
             log_line=lambda message: _log_line(process_log_path, message),
         )
     _log_line(

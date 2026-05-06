@@ -153,6 +153,7 @@ def _details_for_root(
                 adv_action=action,
                 dnn_model=model,
                 model_version=int(model_version),
+                use_model_bootstrap=True,
             )
         else:
             q_tuple = mcts._evaluate_depth1_action_q(
@@ -164,6 +165,7 @@ def _details_for_root(
                 action=action,
                 dnn_model=model,
                 model_version=int(model_version),
+                use_model_bootstrap=True,
             )
         canonical_values[int(cidx)] = q_tuple
 

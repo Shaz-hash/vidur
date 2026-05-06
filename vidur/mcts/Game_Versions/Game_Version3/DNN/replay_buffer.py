@@ -8,12 +8,15 @@ import random
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Deque, List
+from typing import Callable, Deque, List
 import re
 import torch
 
 from .replay_dataset import load_manifest
 from .replay_write import RootSample
+
+
+ShardRepairFn = Callable[[Path, Exception], bool]
 
 
 @dataclass
@@ -41,10 +44,12 @@ class BestModelReplayBuffer:
         capacity_samples: int = 12_000,
         max_cached_shards: int = 8,
         seed: int = 0,
+        repair_shard_after_load_error: ShardRepairFn | None = None,
     ) -> None:
         self.capacity_samples = int(capacity_samples)
         self.max_cached_shards = int(max_cached_shards)
         self._rng = random.Random(int(seed))
+        self._repair_shard_after_load_error = repair_shard_after_load_error
 
         self._windows: Deque[_ShardWindow] = deque()
         self._total_samples: int = 0
@@ -257,9 +262,33 @@ class BestModelReplayBuffer:
             self._cache.move_to_end(path, last=True)
             return cached
 
-        shard = torch.load(path, map_location="cpu")
-        if not isinstance(shard, list):
-            raise TypeError(f"Shard must contain list[RootSample], got {type(shard)} at {path}")
+        try:
+            shard = self._load_shard_uncached(path)
+        except Exception as first_exc:
+            repair_fn = self._repair_shard_after_load_error
+            if repair_fn is None:
+                raise first_exc
+
+            try:
+                repaired_or_validated = bool(repair_fn(path, first_exc))
+            except Exception as repair_exc:
+                raise RuntimeError(
+                    f"Replay shard load failed and repair failed: path={path}; "
+                    f"load_error={type(first_exc).__name__}: {first_exc}; "
+                    f"repair_error={type(repair_exc).__name__}: {repair_exc}"
+                ) from repair_exc
+
+            if not repaired_or_validated:
+                raise first_exc
+
+            try:
+                shard = self._load_shard_uncached(path)
+            except Exception as retry_exc:
+                raise RuntimeError(
+                    f"Replay shard still failed after repair retry: path={path}; "
+                    f"first_error={type(first_exc).__name__}: {first_exc}; "
+                    f"retry_error={type(retry_exc).__name__}: {retry_exc}"
+                ) from retry_exc
 
         self._cache[path] = shard
         self._cache.move_to_end(path, last=True)
@@ -267,6 +296,18 @@ class BestModelReplayBuffer:
         while len(self._cache) > self.max_cached_shards:
             self._cache.popitem(last=False)
 
+        return shard
+
+    def _load_shard_uncached(self, path: Path) -> List[RootSample]:
+        try:
+            shard = torch.load(path, map_location="cpu")
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to load replay shard: path={path}; "
+                f"error={type(exc).__name__}: {exc}"
+            ) from exc
+        if not isinstance(shard, list):
+            raise TypeError(f"Shard must contain list[RootSample], got {type(shard)} at {path}")
         return shard
 
     @staticmethod

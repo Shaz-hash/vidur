@@ -155,7 +155,7 @@ class NetworkTaskDefaults:
     local_train_progress_print_every_steps: int = 100
     local_train_num_threads: int = 0
     local_replay_capacity_samples: int = 400_000
-    local_replay_max_cached_shards: int = 5_000
+    local_replay_max_cached_shards: int = 8_000
     local_replay_seed: int = 2026
     use_virtual_env: bool = True
     environment_lang: str = "python"
@@ -163,7 +163,7 @@ class NetworkTaskDefaults:
     worker_processes: int = 0
     max_concurrent_workers: int = 0
     max_workers_per_interval: int = 3
-    selfplay_dynamic_chunk_roots: int = 128
+    selfplay_dynamic_chunk_roots: int = 64
     selfplay_zero_progress_interval_patience: int = 4
     selfplay_launch_rss_limit_gb: float = 120.0
     selfplay_launch_poll_sec: float = 2.0

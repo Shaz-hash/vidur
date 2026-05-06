@@ -442,8 +442,9 @@ class VidurMCTS:
         child_state: VidurMCTSState,
         next_player: str,
         model_version: int,
+        use_model_bootstrap: bool,
     ) -> float:
-        if int(model_version) <= 0:
+        if (not bool(use_model_bootstrap)) or int(model_version) <= 0:
             return 0.0
         v, _ = self._nn_value_and_priors(
             dnn_model=dnn_model,
@@ -463,6 +464,7 @@ class VidurMCTS:
         next_player: str,
         dnn_model: Any,
         model_version: int,
+        use_model_bootstrap: bool,
     ) -> tuple[float, float, float, float, float, float]:
         leaf_cost = float(self._state_cost(leaf_state))
         reward = float(self._transition_reward(parent_cost, leaf_cost))
@@ -478,6 +480,7 @@ class VidurMCTS:
             child_state=leaf_state,
             next_player=next_player,
             model_version=int(model_version),
+            use_model_bootstrap=bool(use_model_bootstrap),
         )
 
         q = float(reward + discount * bootstrap)
@@ -533,6 +536,7 @@ class VidurMCTS:
         adv_action: AdversaryAction,
         dnn_model: Any,
         model_version: int,
+        use_model_bootstrap: bool,
     ) -> tuple[float, float, float, float, float, float]:
         # Step 1: apply adversary action. This should not advance time.
         adv_child_state = self._scratch_restore(decision_snapshot, decision_stats)
@@ -564,6 +568,7 @@ class VidurMCTS:
                 next_player="controller",
                 dnn_model=dnn_model,
                 model_version=int(model_version),
+                use_model_bootstrap=bool(use_model_bootstrap),
             )
 
         _, _, controller_canonical_indices = self._canonicalize_action_indices(
@@ -588,6 +593,7 @@ class VidurMCTS:
                 controller_leaf_state,
                 ctrl_action,
                 inplace=True,
+                fast_forward=False,
             )
 
             q_tuple = self._compose_q_from_state(
@@ -597,6 +603,7 @@ class VidurMCTS:
                 next_player="adversary",
                 dnn_model=dnn_model,
                 model_version=int(model_version),
+                use_model_bootstrap=bool(use_model_bootstrap),
             )
 
             q = float(q_tuple[0])
@@ -619,6 +626,7 @@ class VidurMCTS:
                 next_player="controller",
                 dnn_model=dnn_model,
                 model_version=int(model_version),
+                use_model_bootstrap=bool(use_model_bootstrap),
             )
 
         return best_controller_tuple
@@ -636,13 +644,14 @@ class VidurMCTS:
         action: Union[AdversaryAction, ControllerAction],
         dnn_model: Any,
         model_version: int,
+        use_model_bootstrap: bool,
     ) -> tuple[float, float, float, float, float, float]:
         state = self._scratch_restore(decision_snapshot, decision_stats)
 
         if parent_player == "adversary":
             state = self._env.apply_adversary_action_only(state, action, inplace=True)
         else:
-            state = self._env.apply_controller_action_only(state, action, inplace=True)
+            state = self._env.apply_controller_action_only(state, action, inplace=True, fast_forward=False)
 
         next_player = self._next_player(parent_player)
         return self._compose_q_from_state(
@@ -652,6 +661,7 @@ class VidurMCTS:
             next_player=next_player,
             dnn_model=dnn_model,
             model_version=int(model_version),
+            use_model_bootstrap=bool(use_model_bootstrap),
         )
 
 
@@ -667,6 +677,7 @@ class VidurMCTS:
         root_player: str,
         *,
         model_version: int,
+        use_model_bootstrap: bool,
         game_id: int,
         root_id: int,
         root_node_id_override: int | None,
@@ -712,7 +723,7 @@ class VidurMCTS:
         valid_indices = [i for i, ok in enumerate(valid_mask) if ok and actions_by_index[i] is not None]
         root.num_valid_actions = int(len(valid_indices))
         next_player = self._next_player(root.player)
-        used_bootstrap = bool(int(model_version) > 0)
+        used_bootstrap = bool(use_model_bootstrap)
 
         if not valid_indices:
             root.visits = 1
@@ -768,6 +779,7 @@ class VidurMCTS:
                     adv_action=action,
                     dnn_model=dnn_model,
                     model_version=int(model_version),
+                    use_model_bootstrap=bool(use_model_bootstrap),
                 )
             else:
                 q, reward, _disc, _boot, child_cost, child_time = self._evaluate_depth1_action_q(
@@ -779,6 +791,7 @@ class VidurMCTS:
                     action=action,
                     dnn_model=dnn_model,
                     model_version=int(model_version),
+                    use_model_bootstrap=bool(use_model_bootstrap),
                 )
 
             canonical_q[cidx] = float(q)
@@ -846,6 +859,7 @@ class VidurMCTS:
         root_node_id_override: int | None,
         root_depth: int,
         model_version: int = 0,
+        use_model_bootstrap: bool | None = None,
         one_step_value_mode: bool = True,
         root_phase: str = "train_root",
         cycle_label: str = "",
@@ -853,11 +867,14 @@ class VidurMCTS:
         del root_phase, cycle_label
         if not bool(one_step_value_mode):
             raise RuntimeError("GV3 mctsDNN now supports only one_step_value_mode=True")
+        if use_model_bootstrap is None:
+            use_model_bootstrap = bool(int(model_version) > 0)
         return self._search_dnn_depth1(
             dnn_model=dnn_model,
             rootState=rootState,
             root_player=root_player,
             model_version=int(model_version),
+            use_model_bootstrap=bool(use_model_bootstrap),
             game_id=int(game_id),
             root_id=int(root_id),
             root_node_id_override=root_node_id_override,

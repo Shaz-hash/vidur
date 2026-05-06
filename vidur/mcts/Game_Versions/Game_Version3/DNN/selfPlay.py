@@ -47,6 +47,7 @@ class SingleRootRun:
     feature_version: int = 1
     root_node_id_override: int | None = None
     model_version: int = 0
+    use_model_bootstrap: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -454,6 +455,11 @@ class SelfPlayRunner:
     def run_single_root(self, cfg: SingleRootRun, root_state: Optional[VidurMCTSState] = None) -> RootSearchResult:
         state = root_state or self.env.initial_state()
         search_state = state.fork(flag=False)
+        use_model_bootstrap = (
+            bool(cfg.use_model_bootstrap)
+            if cfg.use_model_bootstrap is not None
+            else bool(int(cfg.model_version) > 0)
+        )
 
         out = self.mcts.search_dnn(
             dnn_model=self.model,
@@ -464,6 +470,7 @@ class SelfPlayRunner:
             root_node_id_override=cfg.root_node_id_override,
             root_depth=cfg.root_depth,
             model_version=int(cfg.model_version),
+            use_model_bootstrap=bool(use_model_bootstrap),
             one_step_value_mode=True,
         )
 
@@ -493,7 +500,7 @@ class SelfPlayRunner:
                 best_idx=-1,
                 root_node_id=-1,
                 mcts_value=0.0,
-                used_bootstrap=bool(int(cfg.model_version) > 0),
+                used_bootstrap=bool(use_model_bootstrap),
             )
 
         _, mask = self._sample_actions_readonly(state, cfg.root_player)
@@ -510,7 +517,7 @@ class SelfPlayRunner:
             best_idx=int(best_idx),
             root_node_id=int(getattr(root, "node_id", -1)),
             mcts_value=float(mcts_value),
-            used_bootstrap=bool(int(cfg.model_version) > 0),
+            used_bootstrap=bool(use_model_bootstrap),
         )
 
     def _pick_writer(self, *, is_eval: bool) -> ReplayWriter:
@@ -539,6 +546,7 @@ class SelfPlayRunner:
         log_history_rows: Optional[bool] = None,
         history_root_batch_size: int = 64,
         progress_prefix: str = "",
+        generation: int | None = None,
         model_version: int = 0,
         eval_split_ratio: float = 0.0,
         eval_split_seed: int = 0,
@@ -573,6 +581,8 @@ class SelfPlayRunner:
         controller_eval_samples = 0
         adversary_train_samples = 0
         adversary_eval_samples = 0
+        bootstrap_generation = int(model_version) if generation is None else int(generation)
+        use_model_bootstrap = bool(int(bootstrap_generation) > 0)
 
         last_state = initial_state if initial_state is not None else self.env.initial_state()
         progress_tag = str(progress_prefix).strip()
@@ -580,7 +590,8 @@ class SelfPlayRunner:
             print(
                 f"{progress_tag} self-play starting: roots={int(num_roots)}, "
                 f"hop_range=[{int(hist_hops_min)}, {int(hist_hops_max)}], "
-                f"root_batch_size={int(history_root_batch_size)}, eval_ratio={float(split_ratio):.3f}",
+                f"root_batch_size={int(history_root_batch_size)}, eval_ratio={float(split_ratio):.3f}, "
+                f"use_model_bootstrap={bool(use_model_bootstrap)}",
                 flush=True,
             )
 
@@ -638,6 +649,7 @@ class SelfPlayRunner:
                         feature_version=int(feature_version),
                         root_node_id_override=pr.root_node_id_override,
                         model_version=int(model_version),
+                        use_model_bootstrap=bool(use_model_bootstrap),
                     ),
                     root_state=search_root_state,
                 )
@@ -667,6 +679,8 @@ class SelfPlayRunner:
                         "best_action_index": int(res.best_idx),
                         "search_mode": "depth1_value_backup",
                         "used_bootstrap": bool(res.used_bootstrap),
+                        "bootstrap_generation": int(bootstrap_generation),
+                        "use_model_bootstrap": bool(use_model_bootstrap),
                         "model_version": int(model_version),
                         "history_hops": int(pr.history_hops),
                     },
@@ -726,6 +740,8 @@ class SelfPlayRunner:
             "history_hops_min": int(hist_hops_min),
             "history_hops_max": int(hist_hops_max),
             "eval_split_ratio": float(split_ratio),
+            "generation": int(bootstrap_generation),
+            "use_model_bootstrap": bool(use_model_bootstrap),
             "history_signatures": emitted_history_signatures,
             "num_history_roots_emitted": int(len(emitted_history_signatures)),
         }

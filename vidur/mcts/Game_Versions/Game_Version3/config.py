@@ -50,6 +50,8 @@ def _default_sim_cli_args() -> Tuple[str, ...]:
         "--random_forest_execution_time_predictor_config_prediction_max_batch_size", "256",
         "--random_forest_execution_time_predictor_config_prediction_max_prefill_chunk_size", "4096",
         "--random_forest_execution_time_predictor_config_cache_dir", _under_vidur("cache"),
+        "--random_forest_execution_time_predictor_config_cache_mode", "require_cache",
+        "--random_forest_execution_time_predictor_config_num_training_job_threads", "1",
         "--no-snapshot_rng_state",
     )
 
@@ -557,7 +559,7 @@ class MultipleProcessTrainingConfig:
     num_processes: int = 60
     max_concurrent_selfplay_workers: int = 60
     max_workers_per_interval: int = 3
-    selfplay_dynamic_chunk_roots: int = 128
+    selfplay_dynamic_chunk_roots: int = 64
     selfplay_zero_progress_interval_patience: int = 4
     selfplay_launch_rss_limit_gb: float = 120.0
     selfplay_launch_poll_sec: float = 2.0
@@ -597,10 +599,10 @@ class MultipleProcessTrainingConfig:
     action_seed_base: int = 4 ## used for the dirichlet noise + potential future stochasticity in action sampling in root creation for training
 
     replay_capacity_samples: int = 400000
-    replay_max_cached_shards: int = 5000
+    replay_max_cached_shards: int = 8000
     replay_preload_all_shards_on_reuse: bool = True
     replay_preload_all_shards_each_generation: bool = True
-    replay_preload_max_shards: int = 5000
+    replay_preload_max_shards: int = 8000
     replay_seed: int = 2026
 
     checkpoints_dir: str = _under_vidur("simulator_output", "Game_Version3", "mcts_dnn_checkpoints")

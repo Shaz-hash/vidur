@@ -487,7 +487,7 @@ class VirtualVidurMCTSEnvironment:
         return target_state
 
     def apply_controller_action_only(
-        self, state: VidurMCTSState, action: ControllerAction, *, inplace: bool = False
+        self, state: VidurMCTSState, action: ControllerAction, *, inplace: bool = False, fast_forward: bool = True,
     ) -> VidurMCTSState:
         new_state = state if inplace else state.fork()
         self._clear_transition_timing(new_state)
@@ -514,16 +514,22 @@ class VirtualVidurMCTSEnvironment:
         if not active_ids:
             self._update_requests_and_stats(new_state, batch_exec=None)
             action_end_time = float(new_state.simulator._time)
-            self._maybe_fast_forward_decode_only_to_next_adv_second(new_state)
+
+            if fast_forward:
+                self._maybe_fast_forward_decode_only_to_next_adv_second(new_state)
+
             time_after_final = float(new_state.simulator._time)
             self._set_transition_timing(
                 new_state,
                 discount_time=action_end_time,
                 final_time=time_after_final,
             )
+
             miss_src = 2 if (time_after_final > tick_before + self._EPS) else 0
             self._v2_set_missed_adv_source(new_state, miss_src)
             return new_state
+
+
 
         decode_credit_limit = (
             self._v2_decode_credit_balance(new_state)
@@ -593,33 +599,33 @@ class VirtualVidurMCTSEnvironment:
         # transition-time advancement, also considering the case if Controller is no-op while there are prefills active, advance to next tick
         is_strict_noop = self._is_controller_strict_noop(action)
 
-        if not self._v2_has_active_prefill(new_state):
-            self._maybe_fast_forward_decode_only_to_next_adv_second(new_state)
-        elif (
-            bool(getattr(self._gv2_cfg.timing, "controller_noop_prefill_only_jump_to_next_adv_tick", True))
-            and is_strict_noop
-            and not self._v2_has_active_decode(new_state)
-        ):
-            next_tick = float(self._v2_next_adv_tick(new_state))
-            now = float(new_state.simulator._time)
-            if now + self._EPS < next_tick:
-                old_t = now
-                new_t = next_tick
-                new_state.simulator._set_time(new_t)
-                self._record_internal_event(
-                    new_state,
-                    phase="internal:jump_to_adv_tick",
-                    start_time=old_t,
-                    end_time=new_t,
-                    reason="controller_noop_prefill_only_jump_to_tick",
-                    request_ids=[],
-                    num_tokens=[],
-                    stage_total_time=max(0.0, new_t - old_t),
-                    decode_credit_before=int(self._v2_decode_credit_balance_raw(new_state)),
-                    decode_credit_after=int(self._v2_decode_credit_balance_raw(new_state)),
-                )
-                # refresh stats/objective at the advanced time
-                self._update_requests_and_stats(new_state, batch_exec=None)
+        if fast_forward:
+            if not self._v2_has_active_prefill(new_state):
+                self._maybe_fast_forward_decode_only_to_next_adv_second(new_state)
+            elif (
+                bool(getattr(self._gv2_cfg.timing, "controller_noop_prefill_only_jump_to_next_adv_tick", True))
+                and is_strict_noop
+                and not self._v2_has_active_decode(new_state)
+            ):
+                next_tick = float(self._v2_next_adv_tick(new_state))
+                now = float(new_state.simulator._time)
+                if now + self._EPS < next_tick:
+                    old_t = now
+                    new_t = next_tick
+                    new_state.simulator._set_time(new_t)
+                    self._record_internal_event(
+                        new_state,
+                        phase="internal:jump_to_adv_tick",
+                        start_time=old_t,
+                        end_time=new_t,
+                        reason="controller_noop_prefill_only_jump_to_tick",
+                        request_ids=[],
+                        num_tokens=[],
+                        stage_total_time=max(0.0, new_t - old_t),
+                        decode_credit_before=int(self._v2_decode_credit_balance_raw(new_state)),
+                        decode_credit_after=int(self._v2_decode_credit_balance_raw(new_state)),
+                    )
+                    self._update_requests_and_stats(new_state, batch_exec=None)
 
 
         time_after_final = float(new_state.simulator._time)

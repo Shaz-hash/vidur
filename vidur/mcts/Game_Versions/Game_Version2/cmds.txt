@@ -56,3 +56,18 @@ mkdir -p simulator_output/Game_Version2/mcts_dnn_logs && \
 nohup env PYTHONPATH=/home/ubuntu/vidur /home/ubuntu/vidur/.venv/bin/python -u -m vidur.mcts.Game_Versions.Game_Version2.alphaZero_parrallel \
   > simulator_output/Game_Version2/mcts_dnn_logs/alphaZeroParrallel.out 2>&1 < /dev/null & \
 echo $! > simulator_output/Game_Version2/mcts_dnn_logs/alphaZeroParrallel.pid
+
+
+multiprocessing
+cd /home/shazer/Desktop/Research/Vidur/vidur
+
+nohup env PYTHONPATH=/home/shazer/Desktop/Research/Vidur/vidur \
+/home/shazer/Desktop/Research/Vidur/vidur/.venv/bin/python3 -u -m \
+vidur.mcts.Game_Versions.Game_Version3.Network.server.run_experiment \
+  --start-generation 0 \
+  --num-generations 40 \
+  --session-prefix gv3_350k_aws \
+  --machine aws-gpu-AlphaGoZero \
+  --weights-path simulator_output/Game_Version3/mcts_dnn_checkpoints/best.pt \
+  --local-training-device cuda \
+  >> simulator_output/Game_Version3/mcts_dnn_logs/alphaZeroParrallel.out 2>&1 &

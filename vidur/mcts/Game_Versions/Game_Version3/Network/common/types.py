@@ -47,7 +47,7 @@ class NetworkSelfplayTask:
     worker_processes: int = 0
     max_concurrent_workers: int = 0
     max_workers_per_interval: int = 1
-    selfplay_dynamic_chunk_roots: int = 128
+    selfplay_dynamic_chunk_roots: int = 64
     selfplay_zero_progress_interval_patience: int = 4
     selfplay_launch_rss_limit_gb: float = 120.0
     selfplay_launch_poll_sec: float = 2.0

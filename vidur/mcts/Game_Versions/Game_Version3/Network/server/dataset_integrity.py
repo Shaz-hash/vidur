@@ -166,6 +166,35 @@ def _source_proc_from_received(
     return None
 
 
+def source_shard_from_received(*, canonical_shard: Path, received_root: Path) -> Path | None:
+    """
+    Return the matching network/received shard for a canonical dataset shard.
+
+    Canonical shards are stored as:
+      mcts_dnn_dataset/gen_XXXX/{train,eval}/proc_net_<task_id>_<proc_suffix>/replay_*.pt
+
+    Received shards are stored as:
+      network/received/<session_id>/<task_id>/{train,eval}/proc_<proc_suffix>/replay_*.pt
+    """
+    canonical_shard = Path(canonical_shard)
+    canonical_proc_dir = canonical_shard.parent
+    partition = canonical_proc_dir.parent.name
+    if partition not in {"train", "eval"}:
+        return None
+
+    source_proc = _source_proc_from_received(
+        canonical_proc_dir=canonical_proc_dir,
+        received_root=Path(received_root),
+        partition=partition,
+    )
+    if source_proc is None:
+        return None
+    source_shard = source_proc / canonical_shard.name
+    if source_shard.exists():
+        return source_shard
+    return None
+
+
 def validate_or_repair_generation_from_received(
     *,
     generation: int,

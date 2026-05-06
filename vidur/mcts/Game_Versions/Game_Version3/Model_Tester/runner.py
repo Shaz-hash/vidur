@@ -271,16 +271,29 @@ def _select_model_depth1_action(
         if action is None:
             continue
 
-        q_tuple = bundle.mcts._evaluate_depth1_action_q(
-            decision_snapshot=decision_snapshot,
-            decision_stats=decision_stats,
-            parent_player=str(player),
-            parent_cost=float(parent_cost),
-            parent_time=float(parent_time),
-            action=action,
-            dnn_model=model,
-            model_version=int(cfg.bootstrap_model_version),
-        )
+        if str(player) == "adversary":
+            q_tuple = bundle.mcts._evaluate_adversary_action_q_two_step(
+                decision_snapshot=decision_snapshot,
+                decision_stats=decision_stats,
+                parent_cost=float(parent_cost),
+                parent_time=float(parent_time),
+                adv_action=action,
+                dnn_model=model,
+                model_version=int(cfg.bootstrap_model_version),
+                use_model_bootstrap=True,
+            )
+        else:
+            q_tuple = bundle.mcts._evaluate_depth1_action_q(
+                decision_snapshot=decision_snapshot,
+                decision_stats=decision_stats,
+                parent_player=str(player),
+                parent_cost=float(parent_cost),
+                parent_time=float(parent_time),
+                action=action,
+                dnn_model=model,
+                model_version=int(cfg.bootstrap_model_version),
+                use_model_bootstrap=True,
+            )
         q = float(q_tuple[0])
         reward, discount, bootstrap, child_cost = (
             float(q_tuple[1]),

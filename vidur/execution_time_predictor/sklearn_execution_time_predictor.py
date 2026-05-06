@@ -216,6 +216,14 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         #     print("pred table", k, "MB=", _sizeof_mb(v))
 
     @staticmethod
+    def _stable_profile_input_path(path: str) -> str:
+        normalized = os.path.normpath(str(path))
+        marker = f"{os.sep}data{os.sep}profiling{os.sep}"
+        if marker in normalized:
+            return f"data/profiling/{normalized.split(marker, 1)[1].replace(os.sep, '/')}"
+        return normalized
+
+    @staticmethod
     # def _lookup_with_fallback(
     #     table: Dict[Tuple[int, ...], float], key: Tuple[int, ...]
     # ) -> float:
@@ -821,13 +829,6 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
             )
 
             if not os.path.exists(cache_file):
-                if (
-                    self._config.cache_mode
-                    == ExecutionTimePredictorCacheMode.REQUIRE_CACHE
-                ):
-                    raise Exception(
-                        f"Model {model_name} not found in cache but is required. Please train the model first."
-                    )
                 return
 
             logger.debug(f"Found model {model_name} predictions in cache")
@@ -1347,11 +1348,11 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
             "use_gated_mlp": self._model_config.use_gated_mlp,
             "vocab_size": self._model_config.vocab_size,
             # Profiling data files
-            "compute_input_file": self._compute_input_file,
-            "attention_input_file": self._attention_input_file,
-            "all_reduce_input_file": self._all_reduce_input_file,
-            "send_recv_input_file": self._send_recv_input_file,
-            "cpu_overhead_input_file": self._cpu_overhead_input_file,
+            "compute_input_file": self._stable_profile_input_path(self._compute_input_file),
+            "attention_input_file": self._stable_profile_input_path(self._attention_input_file),
+            "all_reduce_input_file": self._stable_profile_input_path(self._all_reduce_input_file),
+            "send_recv_input_file": self._stable_profile_input_path(self._send_recv_input_file),
+            "cpu_overhead_input_file": self._stable_profile_input_path(self._cpu_overhead_input_file),
             # Predictor config
             "k_fold_cv_splits": self._config.k_fold_cv_splits,
             "kv_cache_prediction_granularity": self._config.kv_cache_prediction_granularity,
