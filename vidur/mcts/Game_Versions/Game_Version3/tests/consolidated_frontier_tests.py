@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import random
 from dataclasses import replace
 from pathlib import Path
@@ -11,22 +10,25 @@ import torch
 
 from ..DNN.dnn_spec import make_dnn_spec
 from ..DNN.history_root import HistoryRootGenerator
-from ..DNN.infer import build_model_inputs
 from ..DNN.selfPlay import SelfPlayRunner, SingleRootRun
 from ..DNN.value_models import AlphaZeroModel
 from ..config import DEFAULT_MULTIPROCESS_TRAINING_CONFIG
 from ..logger.mctsDNN_logger import DNNMCTSIterationLogger
 from ..mctsDNN import VidurMCTS
 from ..multiProcessUtils import _build_env_and_simulator, _load_weights_into_model, _set_global_seeds
-from .feature_conversion_tests import (
-    DECODE_FEATURE_LABELS,
-    GLOBAL_FEATURE_LABELS,
-    PREFILL_FEATURE_LABELS,
-    _expected_features,
-    _json,
-    _make_action_mask_fn,
-    _max_abs_diff,
-    _tensor_row,
+from .feature_conversion_tests import _make_action_mask_fn
+from .frontier_feature_trace_logger import (
+    build_frontier_state_row,
+    build_production_feature_row,
+    compare_feature_rows,
+    read_csv,
+    write_csv,
+)
+from .frontier_feature_trace_tests import (
+    COMPARE_FIELDS,
+    FEATURE_FIELDS,
+    FRONTIER_FIELDS,
+    _expand_final_root_iter_csv,
 )
 from .history_node_tests import (
     _json_dumps,
@@ -54,15 +56,6 @@ def _default_output_dir() -> Path:
 
 def _default_checkpoint_path() -> Path:
     return _repo_root() / "simulator_output" / "Game_Version3" / "mcts_dnn_checkpoints" / "best.pt"
-
-
-def _write_plain_csv(path: Path, fieldnames: list[str], rows: list[dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({key: row.get(key, "") for key in fieldnames})
 
 
 def _generate_frontiers(
@@ -243,6 +236,7 @@ def _run_depth1_selection_check(
                 "root_player": root_player,
                 "root_depth": root_depth,
                 "history_hops": history_hops,
+                "history_log_node_id": record.get("history_log_node_id"),
                 "root_state": root_state.fork(flag=False),
             }
         )
@@ -319,242 +313,95 @@ def _run_depth1_selection_check(
     }
 
 
-def _run_feature_conversion_check(
+def _run_frontier_feature_trace_check(
     *,
     root_records: list[dict[str, Any]],
     env: Any,
     cfg: Any,
     output_dir: Path,
     tolerance: float,
+    source_trace_csv: Path,
 ) -> dict[str, Any]:
-    summary_csv = output_dir / "consolidated_feature_summary.csv"
-    prefill_csv = output_dir / "consolidated_feature_prefill.csv"
-    decode_csv = output_dir / "consolidated_feature_decode.csv"
-    global_csv = output_dir / "consolidated_feature_global.csv"
+    frontier_csv = output_dir / "consolidated_feature_frontiers.csv"
+    feature_csv = output_dir / "consolidated_frontier_feature.csv"
+    compare_csv = output_dir / "consolidated_frontier_feature_compare.csv"
+    final_trace_csv = output_dir / "consolidated_feature_final_root_iter.csv"
 
-    summary_rows: list[dict[str, Any]] = []
-    prefill_rows: list[dict[str, Any]] = []
-    decode_rows: list[dict[str, Any]] = []
-    global_rows: list[dict[str, Any]] = []
-    failures: list[int] = []
+    frontier_rows: list[dict[str, Any]] = []
+    feature_rows: list[dict[str, Any]] = []
     action_mask_fn = _make_action_mask_fn(env)
 
     for record in root_records:
         root_id = int(record["root_id"])
         root_player = str(record["root_player"])
+        root_depth = int(record["root_depth"])
+        history_hops = int(record["history_hops"])
         root_state = record["root_state"]
+        history_log_node_id = record.get("history_log_node_id")
 
-        inputs = build_model_inputs(
-            root_state,
-            root_player,
-            torch.device("cpu"),
-            build_action_mask_flag=True,
-            action_mask_fn=action_mask_fn,
-        )
-        expected = _expected_features(env, root_state, root_player, cfg.game_v2)
-
-        p_diff = _max_abs_diff(inputs.prefill_req_features, expected["prefill_req_features"])
-        d_diff = _max_abs_diff(inputs.decode_req_features, expected["decode_req_features"])
-        g_diff = _max_abs_diff(inputs.global_features, expected["global_features"])
-        p_mask_match = bool(torch.equal(inputs.prefill_req_mask.cpu(), expected["prefill_req_mask"].cpu()))
-        d_mask_match = bool(torch.equal(inputs.decode_req_mask.cpu(), expected["decode_req_mask"].cpu()))
-        action_mask_expected = action_mask_fn(
-            root_state,
-            root_player,
-            int(inputs.action_mask.shape[-1]),
-            torch.device("cpu"),
-        )
-        action_mask_match = bool(torch.equal(inputs.action_mask.cpu(), action_mask_expected.cpu()))
-        legacy_feat_expected = torch.cat(
-            [
-                torch.nn.functional.pad(
-                    expected["prefill_req_features"],
-                    (0, int(inputs.req_features.shape[-1]) - int(expected["prefill_req_features"].shape[-1])),
-                ),
-                torch.nn.functional.pad(
-                    expected["decode_req_features"],
-                    (0, int(inputs.req_features.shape[-1]) - int(expected["decode_req_features"].shape[-1])),
-                ),
-            ],
-            dim=1,
-        )
-        legacy_mask_expected = torch.cat([expected["prefill_req_mask"], expected["decode_req_mask"]], dim=1)
-        legacy_feat_diff = _max_abs_diff(inputs.req_features, legacy_feat_expected)
-        legacy_mask_match = bool(torch.equal(inputs.req_mask.cpu(), legacy_mask_expected.cpu()))
-        passed = (
-            p_diff <= float(tolerance)
-            and d_diff <= float(tolerance)
-            and g_diff <= float(tolerance)
-            and legacy_feat_diff <= float(tolerance)
-            and p_mask_match
-            and d_mask_match
-            and action_mask_match
-            and legacy_mask_match
-        )
-        if not passed:
-            failures.append(root_id)
-
-        counts = expected["counts"]
-        summary_rows.append(
-            {
-                "root_id": root_id,
-                "root_player": root_player,
-                "root_depth": int(record["root_depth"]),
-                "history_hops": int(record["history_hops"]),
-                "sim_time": float(getattr(root_state.simulator, "_time", 0.0)),
-                "num_prefill": int(counts["num_prefill"]),
-                "num_decode": int(counts["num_decode"]),
-                "num_active": int(counts["num_active"]),
-                "slo_violations": int(counts["slo_violations"]),
-                "objective_cost": float(counts["objective_cost"]),
-                "prefill_max_abs_diff": p_diff,
-                "decode_max_abs_diff": d_diff,
-                "global_max_abs_diff": g_diff,
-                "legacy_max_abs_diff": legacy_feat_diff,
-                "prefill_mask_match": str(p_mask_match).lower(),
-                "decode_mask_match": str(d_mask_match).lower(),
-                "action_mask_match": str(action_mask_match).lower(),
-                "legacy_mask_match": str(legacy_mask_match).lower(),
-                "passed": str(passed).lower(),
-            }
-        )
-
-        for item in expected["prefill_debug"]:
-            slot = int(item["slot"])
-            actual_vec = _tensor_row(inputs.prefill_req_features[0, slot])
-            expected_vec = _tensor_row(expected["prefill_req_features"][0, slot])
-            prefill_rows.append(
-                {
-                    "root_id": root_id,
-                    "slot": slot,
-                    "request_id": int(item["request_id"]),
-                    "root_player": root_player,
-                    "sim_time": float(getattr(root_state.simulator, "_time", 0.0)),
-                    "labels_json": _json(PREFILL_FEATURE_LABELS),
-                    "actual_features_json": _json(actual_vec),
-                    "expected_features_json": _json(expected_vec),
-                    "max_abs_diff": max(abs(a - b) for a, b in zip(actual_vec, expected_vec)),
-                }
+        frontier_rows.append(
+            build_frontier_state_row(
+                env=env,
+                state=root_state,
+                root_id=root_id,
+                root_player=root_player,
+                root_depth=root_depth,
+                history_hops=history_hops,
+                history_log_node_id=history_log_node_id,
             )
-
-        for item in expected["decode_debug"]:
-            slot = int(item["slot"])
-            actual_vec = _tensor_row(inputs.decode_req_features[0, slot])
-            expected_vec = _tensor_row(expected["decode_req_features"][0, slot])
-            decode_rows.append(
-                {
-                    "root_id": root_id,
-                    "slot": slot,
-                    "request_id": int(item["request_id"]),
-                    "root_player": root_player,
-                    "sim_time": float(getattr(root_state.simulator, "_time", 0.0)),
-                    "labels_json": _json(DECODE_FEATURE_LABELS),
-                    "actual_features_json": _json(actual_vec),
-                    "expected_features_json": _json(expected_vec),
-                    "max_abs_diff": max(abs(a - b) for a, b in zip(actual_vec, expected_vec)),
-                }
+        )
+        feature_rows.append(
+            build_production_feature_row(
+                env=env,
+                state=root_state,
+                root_id=root_id,
+                root_player=root_player,
+                root_depth=root_depth,
+                history_hops=history_hops,
+                action_mask_fn=action_mask_fn,
             )
+        )
 
-        actual_global = _tensor_row(inputs.global_features[0])
-        expected_global = _tensor_row(expected["global_features"][0])
-        for idx, (actual_value, expected_value) in enumerate(zip(actual_global, expected_global)):
-            global_rows.append(
-                {
-                    "root_id": root_id,
-                    "root_player": root_player,
-                    "sim_time": float(getattr(root_state.simulator, "_time", 0.0)),
-                    "feature_index": int(idx),
-                    "feature_label": GLOBAL_FEATURE_LABELS[int(idx)],
-                    "actual_value": float(actual_value),
-                    "expected_value": float(expected_value),
-                    "abs_diff": abs(float(actual_value) - float(expected_value)),
-                }
-            )
+    write_csv(frontier_csv, FRONTIER_FIELDS, frontier_rows)
+    write_csv(feature_csv, FEATURE_FIELDS, feature_rows)
+    _expand_final_root_iter_csv(
+        shared_trace_csv=source_trace_csv,
+        final_trace_csv=final_trace_csv,
+        frontier_rows=frontier_rows,
+    )
+    final_trace_chains, final_trace_adv_actions = _validate_trace_csv(final_trace_csv)
 
-    feature_summary_fields = [
-        "root_id",
-        "root_player",
-        "root_depth",
-        "history_hops",
-        "sim_time",
-        "num_prefill",
-        "num_decode",
-        "num_active",
-        "slo_violations",
-        "objective_cost",
-        "prefill_max_abs_diff",
-        "decode_max_abs_diff",
-        "global_max_abs_diff",
-        "legacy_max_abs_diff",
-        "prefill_mask_match",
-        "decode_mask_match",
-        "action_mask_match",
-        "legacy_mask_match",
-        "passed",
-    ]
-    _write_plain_csv(summary_csv, feature_summary_fields, summary_rows)
-    _write_plain_csv(
-        prefill_csv,
-        [
-            "root_id",
-            "slot",
-            "request_id",
-            "root_player",
-            "sim_time",
-            "labels_json",
-            "actual_features_json",
-            "expected_features_json",
-            "max_abs_diff",
-        ],
-        prefill_rows,
+    compare_rows, failures = compare_feature_rows(
+        frontier_rows=read_csv(frontier_csv),
+        feature_rows=read_csv(feature_csv),
+        cfg=cfg.game_v2,
+        tolerance=float(tolerance),
     )
-    _write_plain_csv(
-        decode_csv,
-        [
-            "root_id",
-            "slot",
-            "request_id",
-            "root_player",
-            "sim_time",
-            "labels_json",
-            "actual_features_json",
-            "expected_features_json",
-            "max_abs_diff",
-        ],
-        decode_rows,
-    )
-    _write_plain_csv(
-        global_csv,
-        [
-            "root_id",
-            "root_player",
-            "sim_time",
-            "feature_index",
-            "feature_label",
-            "actual_value",
-            "expected_value",
-            "abs_diff",
-        ],
-        global_rows,
-    )
+    write_csv(compare_csv, COMPARE_FIELDS, compare_rows)
 
     if failures:
-        raise RuntimeError(f"feature conversion failed for root_ids={failures[:20]} (wrote {summary_csv})")
+        raise RuntimeError(
+            f"frontier trace feature invariant failed for root_ids={failures[:20]} "
+            f"(wrote {compare_csv})"
+        )
+
+    max_feature_diff = max((float(row["max_feature_diff"]) for row in compare_rows), default=0.0)
 
     return {
-        "feature_roots": len(summary_rows),
-        "feature_prefill_rows": len(prefill_rows),
-        "feature_decode_rows": len(decode_rows),
-        "feature_summary_csv": summary_csv,
-        "feature_prefill_csv": prefill_csv,
-        "feature_decode_csv": decode_csv,
-        "feature_global_csv": global_csv,
+        "feature_roots": len(compare_rows),
+        "feature_max_diff": max_feature_diff,
+        "feature_trace_chains": int(final_trace_chains),
+        "feature_trace_adv_actions": int(final_trace_adv_actions),
+        "feature_frontier_csv": frontier_csv,
+        "feature_csv": feature_csv,
+        "feature_compare_csv": compare_csv,
+        "feature_final_trace_csv": final_trace_csv,
     }
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run consolidated GV3 frontier, Bellman selection, and feature-conversion tests."
+        description="Run consolidated GV3 frontier, Bellman selection, and trace-derived feature tests."
     )
     parser.add_argument("--num-roots", type=int, default=32)
     parser.add_argument("--history-hops-min", type=int, default=0)
@@ -617,12 +464,13 @@ def main() -> None:
         model_version=int(args.model_version),
     )
 
-    feature_report = _run_feature_conversion_check(
+    feature_report = _run_frontier_feature_trace_check(
         root_records=depth_report["root_states_for_feature_checks"],
         env=env,
         cfg=cfg,
         output_dir=output_dir,
         tolerance=float(args.feature_tolerance),
+        source_trace_csv=trace_csv,
     )
 
     print(
@@ -630,13 +478,17 @@ def main() -> None:
         f"frontiers={history_report['frontiers']}, "
         f"trace_chains={history_report['trace_chains']}, "
         f"depth1_roots={depth_report['depth1_roots']}, "
-        f"feature_roots={feature_report['feature_roots']}"
+        f"feature_roots={feature_report['feature_roots']}, "
+        f"feature_max_diff={feature_report['feature_max_diff']:.3g}"
     )
     print(f"history_trace_csv={trace_csv}")
     print(f"frontier_csv={frontier_csv}")
     print(f"depth1_search_csv={depth_report['search_csv']}")
     print(f"depth1_details_csv={depth_report['details_csv']}")
-    print(f"feature_summary_csv={feature_report['feature_summary_csv']}")
+    print(f"feature_frontier_csv={feature_report['feature_frontier_csv']}")
+    print(f"feature_csv={feature_report['feature_csv']}")
+    print(f"feature_compare_csv={feature_report['feature_compare_csv']}")
+    print(f"feature_final_trace_csv={feature_report['feature_final_trace_csv']}")
 
 
 if __name__ == "__main__":

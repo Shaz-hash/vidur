@@ -770,8 +770,88 @@ void GV2VirtualEnvironment::refresh_request_and_stats_post_step(
     stats.pending_adv_tick = has_pending_adv_tick(state);
 }
 
+bool GV2VirtualEnvironment::maybe_fast_forward_decode_only_to_next_adv_tick(
+    SimState& state,
+    DecodeCreditLedger* ledger) const {
+    bool progressed_any = false;
+    constexpr int kMaxLoops = 10000;
+
+    for (int loops = 0; loops < kMaxLoops; ++loops) {
+        if (has_pending_adv_tick(state)) return progressed_any;
+        if (has_active_prefill(state)) return progressed_any;
+
+        std::vector<int> decode_ids;
+        decode_ids.reserve(state.requests.size());
+        const int cap = std::max(1, cfg_.max_decode_tokens_per_request);
+        for (const auto& req : state.requests) {
+            if (req.completed) continue;
+            if (!req.prefill_done()) continue;
+            if (req.remaining_decode() <= 0) continue;
+            if (req.num_processed_decode_tokens >= cap) continue;
+            decode_ids.push_back(req.request_id);
+        }
+        std::sort(decode_ids.begin(), decode_ids.end());
+
+        if (cfg_.enforce_nonnegative_decode_credits) {
+            const int bal = (ledger != nullptr)
+                ? std::max(0, ledger->available_balance(true))
+                : std::max(0, state.stats.decode_credit_balance);
+            if (bal <= 0) {
+                decode_ids.clear();
+            } else if (static_cast<int>(decode_ids.size()) > bal) {
+                decode_ids.resize(static_cast<std::size_t>(bal));
+            }
+        }
+
+        if (decode_ids.empty()) {
+            const double next_tick = next_adv_tick_state(state);
+            if (state.sim_time + cfg_.eps < next_tick) {
+                state.sim_time = next_tick;
+                progressed_any = true;
+                refresh_request_and_stats_post_step(state, ledger);
+            }
+            return progressed_any;
+        }
+
+        ControllerAction decode_action;
+        decode_action.token_budget = static_cast<int>(decode_ids.size());
+        decode_action.selected_request_ids = decode_ids;
+        decode_action.strategy = "GV2|decode_only_ff";
+        decode_action.valid = true;
+        for (int rid : decode_ids) {
+            decode_action.token_allocations[rid] = 1;
+            decode_action.decode_allocations[rid] = 1;
+        }
+
+        const int decode_credit_limit = cfg_.enforce_nonnegative_decode_credits
+            ? ((ledger != nullptr)
+                ? std::max(0, ledger->available_balance(true))
+                : std::max(0, state.stats.decode_credit_balance))
+            : std::numeric_limits<int>::max();
+        ControllerBatchPlan plan = virtual_sim_.build_controller_batch_plan(
+            state,
+            decode_action,
+            cfg_.enforce_nonnegative_decode_credits,
+            decode_credit_limit);
+        if (plan.predictor_reqs.empty()) {
+            return progressed_any;
+        }
+
+        const double batch_start = state.sim_time;
+        (void)virtual_sim_.execute_controller_batch_timing(state, plan);
+        const double batch_end = state.sim_time;
+        apply_batch_progress(state, plan, batch_start, batch_end, ledger);
+        refresh_request_and_stats_post_step(state, ledger);
+        progressed_any = true;
+    }
+
+    return progressed_any;
+}
+
 void GV2VirtualEnvironment::apply_adversary_action_inplace(SimState& state, const AdversaryAction& action) const {
     init_clock_if_needed(state);
+    state.stats.transition_discount_time = state.sim_time;
+    state.stats.transition_final_time = state.sim_time;
 
     double time_now = state.sim_time;
     const double tick = current_adv_tick(state);
@@ -784,6 +864,8 @@ void GV2VirtualEnvironment::apply_adversary_action_inplace(SimState& state, cons
             ? std::max(0, state.stats.decode_credit_balance)
             : state.stats.decode_credit_balance;
         state.stats.pending_adv_tick = has_pending_adv_tick(state);
+        state.stats.transition_discount_time = state.sim_time;
+        state.stats.transition_final_time = state.sim_time;
         return;
     }
 
@@ -875,17 +957,27 @@ void GV2VirtualEnvironment::apply_adversary_action_inplace(SimState& state, cons
         ? std::max(0, state.stats.decode_credit_balance)
         : state.stats.decode_credit_balance;
     state.stats.pending_adv_tick = has_pending_adv_tick(state);
+    state.stats.transition_discount_time = state.sim_time;
+    state.stats.transition_final_time = state.sim_time;
 }
 
-void GV2VirtualEnvironment::apply_controller_action_inplace(SimState& state, const ControllerAction& action) const {
+void GV2VirtualEnvironment::apply_controller_action_inplace(
+    SimState& state,
+    const ControllerAction& action,
+    bool fast_forward) const {
     init_clock_if_needed(state);
     const double tick_before = next_adv_tick_state(state);
+    state.stats.transition_discount_time = state.sim_time;
+    state.stats.transition_final_time = state.sim_time;
 
     DecodeCreditLedger ledger(state.stats.decode_credit_balance);
     ledger.load_from_stats(state.stats);
 
     if (has_pending_adv_tick(state)) {
         refresh_request_and_stats_post_step(state, &ledger);
+        const double action_time = state.sim_time;
+        state.stats.transition_discount_time = action_time;
+        state.stats.transition_final_time = action_time;
         return;
     }
 
@@ -893,10 +985,16 @@ void GV2VirtualEnvironment::apply_controller_action_inplace(SimState& state, con
 
     if (state.stats.active_request_ids.empty()) {
         refresh_request_and_stats_post_step(state, &ledger);
-        (void)virtual_sim_.maybe_fast_forward_decode_only_to_next_adv_tick(state);
-        refresh_request_and_stats_post_step(state, &ledger);
+        const double action_end_time = state.sim_time;
 
-        const int miss_src = (state.sim_time > tick_before + cfg_.eps) ? 2 : 0;
+        if (fast_forward) {
+            (void)maybe_fast_forward_decode_only_to_next_adv_tick(state, &ledger);
+        }
+        const double final_time = state.sim_time;
+        state.stats.transition_discount_time = action_end_time;
+        state.stats.transition_final_time = final_time;
+
+        const int miss_src = (final_time > tick_before + cfg_.eps) ? 2 : 0;
         state.stats.missed_adv_source = miss_src;
         return;
     }
@@ -922,23 +1020,26 @@ void GV2VirtualEnvironment::apply_controller_action_inplace(SimState& state, con
 
     int miss_src = (batch_end > tick_before + cfg_.eps) ? 1 : 0;
 
-    if (!has_active_prefill(state)) {
-        const bool jumped = virtual_sim_.maybe_fast_forward_decode_only_to_next_adv_tick(state);
-        if (jumped) {
-            refresh_request_and_stats_post_step(state, &ledger);
-        }
-    } else if (
-        cfg_.controller_noop_prefill_only_jump_to_next_adv_tick &&
-        is_controller_strict_noop(action) &&
-        !has_active_decode(state)) {
-        const double next_tick = next_adv_tick_state(state);
-        if (state.sim_time + cfg_.eps < next_tick) {
-            state.sim_time = next_tick;
-            refresh_request_and_stats_post_step(state, &ledger);
+    if (fast_forward) {
+        if (!has_active_prefill(state)) {
+            (void)maybe_fast_forward_decode_only_to_next_adv_tick(state, &ledger);
+        } else if (
+            cfg_.controller_noop_prefill_only_jump_to_next_adv_tick &&
+            is_controller_strict_noop(action) &&
+            !has_active_decode(state)) {
+            const double next_tick = next_adv_tick_state(state);
+            if (state.sim_time + cfg_.eps < next_tick) {
+                state.sim_time = next_tick;
+                refresh_request_and_stats_post_step(state, &ledger);
+            }
         }
     }
 
-    if (miss_src == 0 && state.sim_time > tick_before + cfg_.eps) {
+    const double final_time = state.sim_time;
+    state.stats.transition_discount_time = batch_end;
+    state.stats.transition_final_time = final_time;
+
+    if (miss_src == 0 && final_time > tick_before + cfg_.eps) {
         miss_src = 2;
     }
     state.stats.missed_adv_source = miss_src;

@@ -50,6 +50,7 @@ struct SearchInput {
     double decision_state_time = 0.0;
     std::string root_phase = "train_root";
     std::string cycle_label;
+    bool use_model_bootstrap = true;
     bool log_events = true;
     bool profile = false;
 };

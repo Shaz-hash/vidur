@@ -557,6 +557,10 @@ void parse_stats_fields_into(
         d, stats_d, {"next_adv_tick"}, out->next_adv_tick);
     out->missed_adv_source = merged_get_or<int>(
         d, stats_d, {"missed_adv_source"}, out->missed_adv_source);
+    out->transition_discount_time = merged_get_or<double>(
+        d, stats_d, {"transition_discount_time"}, out->transition_discount_time);
+    out->transition_final_time = merged_get_or<double>(
+        d, stats_d, {"transition_final_time"}, out->transition_final_time);
 
     {
         bool have = false;
@@ -949,6 +953,8 @@ py::dict game_stats_to_py_dict(const GameStats& s) {
     d["last_adv_tick"] = s.last_adv_tick;
     d["next_adv_tick"] = s.next_adv_tick;
     d["missed_adv_source"] = s.missed_adv_source;
+    d["transition_discount_time"] = s.transition_discount_time;
+    d["transition_final_time"] = s.transition_final_time;
     return d;
 }
 
@@ -1132,6 +1138,111 @@ void apply_feature_cfg_payload(const py::dict& cfg, NativeFeatureBuildConfigGV2*
     out->launch_ewma_alpha = get_double({"launch_ewma_alpha"}, out->launch_ewma_alpha);
     out->launch_ewma_window_sec = get_double({"launch_ewma_window_sec"}, out->launch_ewma_window_sec);
     out->decode_sample_seed_offset = get_int({"decode_sample_seed_offset"}, out->decode_sample_seed_offset);
+}
+
+void apply_execution_predictor_payload(const py::dict& cfg, GV2VirtualEnvironment* env) {
+    if (env == nullptr) return;
+    if (!cfg.contains("execution_predictor_component_tables")) return;
+    if (!py::isinstance<py::dict>(cfg["execution_predictor_component_tables"])) return;
+
+    PredictorRuntimeConfig runtime_cfg;
+    if (cfg.contains("execution_predictor_runtime_config") &&
+        py::isinstance<py::dict>(cfg["execution_predictor_runtime_config"])) {
+        const py::dict rc = py::reinterpret_borrow<py::dict>(cfg["execution_predictor_runtime_config"]);
+        auto get_i = [&](const char* key, int dflt) {
+            if (!rc.contains(key)) return dflt;
+            try {
+                return py::cast<int>(rc[key]);
+            } catch (const std::exception&) {
+                return dflt;
+            }
+        };
+        auto get_d = [&](const char* key, double dflt) {
+            if (!rc.contains(key)) return dflt;
+            try {
+                return py::cast<double>(rc[key]);
+            } catch (const std::exception&) {
+                return dflt;
+            }
+        };
+        auto get_b = [&](const char* key, bool dflt) {
+            if (!rc.contains(key)) return dflt;
+            try {
+                return py::cast<bool>(rc[key]);
+            } catch (const std::exception&) {
+                return dflt;
+            }
+        };
+        runtime_cfg.num_layers_per_pipeline_stage =
+            get_i("num_layers_per_pipeline_stage", runtime_cfg.num_layers_per_pipeline_stage);
+        runtime_cfg.tensor_parallel_size =
+            get_i("tensor_parallel_size", runtime_cfg.tensor_parallel_size);
+        runtime_cfg.num_pipeline_stages =
+            get_i("num_pipeline_stages", runtime_cfg.num_pipeline_stages);
+        runtime_cfg.post_attn_norm =
+            get_b("post_attn_norm", runtime_cfg.post_attn_norm);
+        runtime_cfg.skip_cpu_overhead_modeling =
+            get_b("skip_cpu_overhead_modeling", runtime_cfg.skip_cpu_overhead_modeling);
+        runtime_cfg.attention_prefill_batching_overhead_fraction =
+            get_d("attention_prefill_batching_overhead_fraction",
+                  runtime_cfg.attention_prefill_batching_overhead_fraction);
+        runtime_cfg.attention_decode_batching_overhead_fraction =
+            get_d("attention_decode_batching_overhead_fraction",
+                  runtime_cfg.attention_decode_batching_overhead_fraction);
+        runtime_cfg.nccl_cpu_launch_overhead_ms =
+            get_d("nccl_cpu_launch_overhead_ms", runtime_cfg.nccl_cpu_launch_overhead_ms);
+        runtime_cfg.nccl_cpu_skew_overhead_per_device_ms =
+            get_d("nccl_cpu_skew_overhead_per_device_ms",
+                  runtime_cfg.nccl_cpu_skew_overhead_per_device_ms);
+    }
+
+    auto& predictor = env->virtual_simulator().predictor();
+    predictor.clear_component_tables();
+    predictor.set_runtime_config(runtime_cfg);
+
+    const py::dict tables = py::reinterpret_borrow<py::dict>(cfg["execution_predictor_component_tables"]);
+    for (auto item : tables) {
+        std::string name;
+        try {
+            name = py::cast<std::string>(item.first);
+        } catch (const std::exception&) {
+            continue;
+        }
+        if (!py::isinstance<py::dict>(item.second)) continue;
+        const py::dict td = py::reinterpret_borrow<py::dict>(item.second);
+        auto get_i = [&](const char* key, int dflt) {
+            if (!td.contains(key)) return dflt;
+            try {
+                return py::cast<int>(td[key]);
+            } catch (const std::exception&) {
+                return dflt;
+            }
+        };
+        auto get_s = [&](const char* key, const std::string& dflt) {
+            if (!td.contains(key)) return dflt;
+            try {
+                return py::cast<std::string>(td[key]);
+            } catch (const std::exception&) {
+                return dflt;
+            }
+        };
+
+        std::vector<int> shape;
+        std::vector<double> values;
+        if (td.contains("shape")) shape = py_to_i32_vec(td["shape"]);
+        if (td.contains("values")) values = py_to_f64_vec(td["values"]);
+        if (name.empty() || shape.empty() || values.empty()) continue;
+
+        predictor.set_component_table(
+            name,
+            get_s("kind", ""),
+            get_i("max_tokens", 0),
+            get_i("max_batch_size", 0),
+            get_i("kv_gran", 1),
+            get_i("prefill_gran", 1),
+            std::move(shape),
+            std::move(values));
+    }
 }
 
 py::dict search_mcts_dnn_gv2_torchscript(
@@ -1365,6 +1476,7 @@ py::dict search_mcts_dnn_gv2_torchscript(
     in.sim_cfg.fallback_model_time_sec = get_double(
         {"fallback_model_time_sec"},
         in.sim_cfg.fallback_model_time_sec);
+    in.use_model_bootstrap = get_bool({"use_model_bootstrap"}, in.use_model_bootstrap);
 
     if (log_events && (!iter_log_path.empty() || !root_log_path.empty())) {
         const std::string config_json_path = default_native_config_json_path(iter_log_path, root_log_path);
@@ -1374,7 +1486,17 @@ py::dict search_mcts_dnn_gv2_torchscript(
         }
     }
 
-    SearchOutput out = run_search_torchscript(in, infer_runtime, model_version);
+    GV2VirtualEnvironment env(in.env_cfg, in.sim_cfg);
+    if (!in.predictor_csv_path.empty()) {
+        (void)env.load_predictor_csv(in.predictor_csv_path);
+    }
+    if (!in.sim_cfg.prefill_profile_tokens.empty() &&
+        in.sim_cfg.prefill_profile_tokens.size() == in.sim_cfg.prefill_profile_times.size()) {
+        env.set_prefill_profile(in.sim_cfg.prefill_profile_tokens, in.sim_cfg.prefill_profile_times);
+    }
+    apply_execution_predictor_payload(cfg_payload, &env);
+
+    SearchOutput out = run_search_torchscript_with_env(in, env, infer_runtime, model_version);
 
     if (log_events) {
         const int native_flush_every = get_int({"native_log_flush_every"}, 1);
@@ -1598,6 +1720,13 @@ py::dict search_mcts_dnn_gv2_torchscript(
     result["root_inputs"] = search_root_inputs_to_py(out);
     result["best_action_index"] = out.best_action_index;
     result["root_action_values"] = out.root_action_values;
+    result["root_action_rewards"] = out.root_action_rewards;
+    result["root_action_discounts"] = out.root_action_discounts;
+    result["root_action_bootstraps"] = out.root_action_bootstraps;
+    result["root_action_reprs"] = out.root_action_reprs;
+    result["root_action_leaf_prefill_counts"] = out.root_action_leaf_prefill_counts;
+    result["root_action_leaf_decode_counts"] = out.root_action_leaf_decode_counts;
+    result["root_action_leaf_decode_credit_balances"] = out.root_action_leaf_decode_credit_balances;
 
     result["action_alias_to_canonical"] = py_alias_to_canonical;
     result["canonical_to_action_aliases"] = py_canonical_to_aliases;
@@ -1693,6 +1822,19 @@ py::dict generate_selfplay_gv3_torchscript(
     cfg.eval_split_seed = int(eval_split_seed);
     cfg.action_seed_base = int(action_seed_base);
     cfg.allow_duplicate_history_fallback = bool(allow_duplicate_history_fallback);
+    cfg.use_model_bootstrap = get_bool({"use_model_bootstrap"}, cfg.use_model_bootstrap);
+    cfg.history_trace_log_path = get_str(
+        {"native_history_trace_log_path", "history_trace_log_path"},
+        cfg.history_trace_log_path);
+    cfg.frontier_log_path = get_str(
+        {"native_frontier_log_path", "frontier_log_path"},
+        cfg.frontier_log_path);
+    cfg.depth1_search_log_path = get_str(
+        {"native_depth1_search_log_path", "depth1_search_log_path"},
+        cfg.depth1_search_log_path);
+    cfg.depth1_details_log_path = get_str(
+        {"native_depth1_details_log_path", "depth1_details_log_path"},
+        cfg.depth1_details_log_path);
     if (cfg_payload.contains("initial_history_signatures")) {
         try {
             for (auto item : py::cast<py::iterable>(cfg_payload["initial_history_signatures"])) {
@@ -1771,6 +1913,7 @@ py::dict generate_selfplay_gv3_torchscript(
     tmpl.sim_cfg.fallback_model_time_sec = get_double(
         {"fallback_model_time_sec"},
         tmpl.sim_cfg.fallback_model_time_sec);
+    tmpl.use_model_bootstrap = get_bool({"use_model_bootstrap"}, tmpl.use_model_bootstrap);
     tmpl.predictor_csv_path = get_str(
         {"native_predictor_csv_path", "prefill_predictor_csv", "predictor_csv_path"},
         tmpl.predictor_csv_path);
@@ -1783,6 +1926,7 @@ py::dict generate_selfplay_gv3_torchscript(
         tmpl.sim_cfg.prefill_profile_tokens.size() == tmpl.sim_cfg.prefill_profile_times.size()) {
         env.set_prefill_profile(tmpl.sim_cfg.prefill_profile_tokens, tmpl.sim_cfg.prefill_profile_times);
     }
+    apply_execution_predictor_payload(cfg_payload, &env);
 
     NativeSelfplayResultGV3 native_result = generate_native_selfplay_samples_gv3(
         cfg,

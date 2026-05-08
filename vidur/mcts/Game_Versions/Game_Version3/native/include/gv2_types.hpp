@@ -92,6 +92,8 @@ struct GameStats {
     double last_adv_tick = -1.0;
     double next_adv_tick = -1.0;
     int missed_adv_source = 0;
+    double transition_discount_time = -1.0;
+    double transition_final_time = -1.0;
 
     // Requests whose prefill lateness already transitioned to finalized.
     std::vector<int> prefill_lateness_finalized_ids;
@@ -268,6 +270,13 @@ struct SearchOutput {
 
     int best_action_index = -1;
     std::vector<double> root_action_values;
+    std::vector<double> root_action_rewards;
+    std::vector<double> root_action_discounts;
+    std::vector<double> root_action_bootstraps;
+    std::vector<std::string> root_action_reprs;
+    std::vector<int> root_action_leaf_prefill_counts;
+    std::vector<int> root_action_leaf_decode_counts;
+    std::vector<int> root_action_leaf_decode_credit_balances;
 };
 
 std::vector<double> normalize_masked(

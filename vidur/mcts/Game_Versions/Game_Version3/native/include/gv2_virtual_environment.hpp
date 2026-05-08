@@ -56,7 +56,10 @@ public:
     SampledActionSet<ControllerAction> sample_controller_actions(const SimState& state) const;
 
     void apply_adversary_action_inplace(SimState& state, const AdversaryAction& action) const;
-    void apply_controller_action_inplace(SimState& state, const ControllerAction& action) const;
+    void apply_controller_action_inplace(
+        SimState& state,
+        const ControllerAction& action,
+        bool fast_forward = true) const;
 
     static std::pair<int, double> evaluate_objective(const SimState& state);
 
@@ -100,6 +103,10 @@ private:
         DecodeCreditLedger* ledger) const;
 
     void refresh_request_and_stats_post_step(
+        SimState& state,
+        DecodeCreditLedger* ledger) const;
+
+    bool maybe_fast_forward_decode_only_to_next_adv_tick(
         SimState& state,
         DecodeCreditLedger* ledger) const;
 

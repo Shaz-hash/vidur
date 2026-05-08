@@ -67,6 +67,7 @@ def _task_cfg(task: NetworkSelfplayTask) -> MultipleProcessTrainingConfig:
         action_seed_base=int(task.action_seed_base),
         use_virtual_env=bool(task.use_virtual_env),
         environment_lang=str(task.environment_lang),
+        native_torchscript_dir=str(Path(task.logs_dir) / "torchscript"),
         worker_result_timeout_sec=int(task.worker_result_timeout_sec),
     )
 

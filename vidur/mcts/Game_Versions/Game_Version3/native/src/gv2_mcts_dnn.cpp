@@ -440,6 +440,9 @@ private:
         double bootstrap = 0.0;
         double leaf_cost = 0.0;
         double leaf_time = 0.0;
+        int leaf_prefill_count = 0;
+        int leaf_decode_count = 0;
+        int leaf_decode_credit_balance = 0;
     };
 
     static std::string next_player(const std::string& player) {
@@ -460,7 +463,7 @@ private:
     }
 
     double bootstrap_value_from_model(const SimState& state, const std::string& player) {
-        if (model_version_ <= 0) return 0.0;
+        if (!in_.use_model_bootstrap || model_version_ <= 0) return 0.0;
         const std::vector<uint8_t> mask = all_true_action_mask(player);
         const auto t_infer_begin = std::chrono::steady_clock::now();
         NativeInferInputsGV2 inputs = build_infer_inputs(state, player, mask);
@@ -481,7 +484,15 @@ private:
         out.leaf_cost = state_cost(leaf_state);
         out.reward = transition_reward(parent_cost, out.leaf_cost, in_);
         out.leaf_time = leaf_state.sim_time;
-        out.discount = time_discount(out.leaf_time, parent_time, in_);
+        for (const auto& req : leaf_state.requests) {
+            if (req.prefill_active()) ++out.leaf_prefill_count;
+            if (req.decode_active()) ++out.leaf_decode_count;
+        }
+        out.leaf_decode_credit_balance = leaf_state.stats.decode_credit_balance;
+        const double discount_time = (leaf_state.stats.transition_discount_time >= 0.0)
+            ? leaf_state.stats.transition_discount_time
+            : leaf_state.sim_time;
+        out.discount = time_discount(discount_time, parent_time, in_);
         out.bootstrap = bootstrap_value_from_model(leaf_state, player_to_act);
         out.q = out.reward + out.discount * out.bootstrap;
         return out;
@@ -566,7 +577,7 @@ private:
         double parent_time,
         const ControllerAction& action) {
         SimState leaf = decision_state;
-        env_.apply_controller_action_inplace(leaf, action);
+        env_.apply_controller_action_inplace(leaf, action, false);
         return compose_q_from_state(leaf, parent_cost, parent_time, "adversary");
     }
 
@@ -605,7 +616,8 @@ private:
             SimState leaf = adv_child;
             env_.apply_controller_action_inplace(
                 leaf,
-                controller_sampled.actions[static_cast<std::size_t>(cidx)]);
+                controller_sampled.actions[static_cast<std::size_t>(cidx)],
+                false);
             QEval q = compose_q_from_state(leaf, parent_cost, parent_time, "adversary");
             if (!best.has_value() || q.q > best->q || (q.q == best->q && cidx < best_idx)) {
                 best = q;
@@ -745,8 +757,31 @@ private:
 
         const int n_actions = static_cast<int>(valid_mask.size());
         action_values.assign(static_cast<std::size_t>(n_actions), -std::numeric_limits<double>::infinity());
+        std::vector<double> action_rewards(static_cast<std::size_t>(n_actions), 0.0);
+        std::vector<double> action_discounts(static_cast<std::size_t>(n_actions), 0.0);
+        std::vector<double> action_bootstraps(static_cast<std::size_t>(n_actions), 0.0);
+        std::vector<std::string> action_reprs(static_cast<std::size_t>(n_actions));
+        std::vector<int> action_leaf_prefill_counts(static_cast<std::size_t>(n_actions), 0);
+        std::vector<int> action_leaf_decode_counts(static_cast<std::size_t>(n_actions), 0);
+        std::vector<int> action_leaf_decode_credit_balances(static_cast<std::size_t>(n_actions), 0);
         std::unordered_map<int, QEval> canonical_q;
         canonical_q.reserve(canonical_indices.size());
+
+        if (root.player == "controller") {
+            for (int idx : valid_indices) {
+                if (idx >= 0 && idx < static_cast<int>(controller_actions.size())) {
+                    action_reprs[static_cast<std::size_t>(idx)] =
+                        controller_action_to_repr(controller_actions[static_cast<std::size_t>(idx)]);
+                }
+            }
+        } else {
+            for (int idx : valid_indices) {
+                if (idx >= 0 && idx < static_cast<int>(adversary_actions.size())) {
+                    action_reprs[static_cast<std::size_t>(idx)] =
+                        adversary_action_to_repr(adversary_actions[static_cast<std::size_t>(idx)]);
+                }
+            }
+        }
 
         for (int cidx : canonical_indices) {
             if (root.player == "controller") {
@@ -772,6 +807,13 @@ private:
             const auto it = canonical_q.find(canon);
             if (alias >= 0 && alias < n_actions && it != canonical_q.end()) {
                 action_values[static_cast<std::size_t>(alias)] = it->second.q;
+                action_rewards[static_cast<std::size_t>(alias)] = it->second.reward;
+                action_discounts[static_cast<std::size_t>(alias)] = it->second.discount;
+                action_bootstraps[static_cast<std::size_t>(alias)] = it->second.bootstrap;
+                action_leaf_prefill_counts[static_cast<std::size_t>(alias)] = it->second.leaf_prefill_count;
+                action_leaf_decode_counts[static_cast<std::size_t>(alias)] = it->second.leaf_decode_count;
+                action_leaf_decode_credit_balances[static_cast<std::size_t>(alias)] =
+                    it->second.leaf_decode_credit_balance;
             }
         }
 
@@ -785,16 +827,30 @@ private:
                 std::chrono::duration_cast<std::chrono::duration<double>>(t_eval_end - t_total_begin).count());
             copy_root_infer_inputs(&empty, root_inputs);
             empty.root_action_values = std::move(action_values);
+            empty.root_action_rewards = std::move(action_rewards);
+            empty.root_action_discounts = std::move(action_discounts);
+            empty.root_action_bootstraps = std::move(action_bootstraps);
+            empty.root_action_reprs = std::move(action_reprs);
+            empty.root_action_leaf_prefill_counts = std::move(action_leaf_prefill_counts);
+            empty.root_action_leaf_decode_counts = std::move(action_leaf_decode_counts);
+            empty.root_action_leaf_decode_credit_balances = std::move(action_leaf_decode_credit_balances);
             return empty;
         }
 
         int best_idx = -1;
-        double best_value = std::numeric_limits<double>::infinity();
+        double best_value = (root.player == "controller")
+            ? -std::numeric_limits<double>::infinity()
+            : std::numeric_limits<double>::infinity();
         for (int idx : valid_indices) {
             const double v = (idx >= 0 && idx < n_actions)
                 ? action_values[static_cast<std::size_t>(idx)]
-                : std::numeric_limits<double>::infinity();
-            if (best_idx < 0 || v < best_value || (v == best_value && idx < best_idx)) {
+                : ((root.player == "controller")
+                    ? -std::numeric_limits<double>::infinity()
+                    : std::numeric_limits<double>::infinity());
+            const bool better = (root.player == "controller")
+                ? (v > best_value || (v == best_value && idx < best_idx))
+                : (v < best_value || (v == best_value && idx < best_idx));
+            if (best_idx < 0 || better) {
                 best_idx = idx;
                 best_value = v;
             }
@@ -817,6 +873,13 @@ private:
         copy_root_infer_inputs(&out, root_inputs);
         out.best_action_index = int(best_idx);
         out.root_action_values = action_values;
+        out.root_action_rewards = action_rewards;
+        out.root_action_discounts = action_discounts;
+        out.root_action_bootstraps = action_bootstraps;
+        out.root_action_reprs = action_reprs;
+        out.root_action_leaf_prefill_counts = action_leaf_prefill_counts;
+        out.root_action_leaf_decode_counts = action_leaf_decode_counts;
+        out.root_action_leaf_decode_credit_balances = action_leaf_decode_credit_balances;
         out.action_alias_to_canonical = std::move(alias_to_canon);
         out.canonical_to_action_aliases = std::move(canon_to_aliases);
         out.mcts_root_prior.assign(valid_mask.size(), 0.0);

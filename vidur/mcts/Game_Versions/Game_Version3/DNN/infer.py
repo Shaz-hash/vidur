@@ -130,6 +130,31 @@ def _build_request_lookup(simulator) -> Dict[int, object]:
 
     return lookup
 
+
+def _filter_request_lookup_for_state(
+    lookup: Dict[int, object],
+    state: VidurMCTSState,
+) -> Dict[int, object]:
+    """
+    GV3's active request set lives in state.stats.active_request_ids.
+    Scheduler registries can retain fork/restore bookkeeping objects that are
+    no longer active game requests, so model features must filter through the
+    game-state active set.
+    """
+    stats = getattr(state, "stats", None)
+    if stats is None or not hasattr(stats, "active_request_ids"):
+        return lookup
+
+    active_ids = {
+        _safe_int(rid, -1)
+        for rid in (getattr(stats, "active_request_ids", set()) or set())
+    }
+    return {
+        rid: req
+        for rid, req in lookup.items()
+        if _safe_int(rid, -1) in active_ids
+    }
+
 def _clip(x: float, lo: float, hi: float) -> float:
     return lo if x < lo else hi if x > hi else x
 
@@ -327,7 +352,7 @@ def build_model_inputs(
     sim_time = _safe_float(getattr(sim, "_time", 0.0), 0.0)
     stats = getattr(state, "stats", None)
 
-    lookup = _build_request_lookup(sim)
+    lookup = _filter_request_lookup_for_state(_build_request_lookup(sim), state)
     reqs = list(lookup.values())
 
     prefill_reqs = [r for r in reqs if _is_prefill_request(r)]
@@ -593,7 +618,6 @@ def _infer_debug_dump(
             f.write(text)
     else:
         print(text)
-
 
 
 

@@ -41,6 +41,73 @@ def _read_prefill_profile(path: str | Path) -> tuple[list[int], list[float]]:
     return tokens, times
 
 
+def _execution_predictor_payload(source: Any) -> dict[str, Any]:
+    """Return native-loadable sklearn predictor tables from a simulator/predictor.
+
+    Native timing must mirror Python timing for Bellman target parity.  The
+    sklearn predictor stores dense prediction caches as memmaps; those arrays
+    are small enough for GV3 and can be passed through pybind once per task.
+    """
+    predictor = getattr(source, "_execution_time_predictor", source)
+    predictions = getattr(predictor, "_predictions", None)
+    if not predictions:
+        return {}
+
+    component_tables: dict[str, dict[str, Any]] = {}
+    for name, table in dict(predictions).items():
+        mmap = getattr(table, "mmap", None)
+        if mmap is None:
+            continue
+        component_tables[str(name)] = {
+            "kind": str(getattr(table, "kind", "")),
+            "max_tokens": int(getattr(table, "max_tokens", 0)),
+            "max_batch_size": int(getattr(table, "max_batch_size", 0)),
+            "kv_gran": int(getattr(table, "kv_gran", 1)),
+            "prefill_gran": int(getattr(table, "prefill_gran", 1)),
+            "shape": [int(x) for x in tuple(getattr(mmap, "shape", ()))],
+            "values": [float(x) for x in mmap.reshape(-1).tolist()],
+        }
+
+    if not component_tables:
+        return {}
+
+    pred_cfg = getattr(predictor, "_config", None)
+    replica_cfg = getattr(predictor, "_replica_config", None)
+    model_cfg = getattr(predictor, "_model_config", None)
+    runtime_cfg = {
+        "num_layers_per_pipeline_stage": int(
+            getattr(predictor, "_num_layers_per_pipeline_stage", 1)
+        ),
+        "tensor_parallel_size": int(getattr(replica_cfg, "tensor_parallel_size", 1)),
+        "num_pipeline_stages": int(getattr(replica_cfg, "num_pipeline_stages", 1)),
+        "post_attn_norm": bool(getattr(model_cfg, "post_attn_norm", True)),
+        "skip_cpu_overhead_modeling": bool(
+            getattr(pred_cfg, "skip_cpu_overhead_modeling", False)
+        ),
+        "attention_prefill_batching_overhead_fraction": float(
+            getattr(predictor, "_attention_prefill_batching_overhead_fraction", 0.0)
+        ),
+        "attention_decode_batching_overhead_fraction": float(
+            getattr(predictor, "_attention_decode_batching_overhead_fraction", 0.0)
+        ),
+        "nccl_cpu_launch_overhead_ms": float(
+            getattr(pred_cfg, "nccl_cpu_launch_overhead_ms", 0.0)
+        ),
+        "nccl_cpu_skew_overhead_per_device_ms": float(
+            getattr(pred_cfg, "nccl_cpu_skew_overhead_per_device_ms", 0.0)
+        ),
+    }
+    return {
+        "execution_predictor_runtime_config": runtime_cfg,
+        "execution_predictor_component_tables": component_tables,
+    }
+
+
+def attach_execution_predictor_payload(payload: dict[str, Any], source: Any) -> dict[str, Any]:
+    payload.update(_execution_predictor_payload(source))
+    return payload
+
+
 class _FixedPlayerTorchScriptWrapper(nn.Module):
     def __init__(self, model: nn.Module, player: str) -> None:
         super().__init__()
@@ -146,6 +213,12 @@ def _cfg_payload(
     gv2 = cfg.game_v2
     features = gv2.features
     profile_tokens, profile_times = _read_prefill_profile(gv2.legacy_mcts.prefill_profile_path)
+    # Python GV3 uses PrefillProfile.load_or_generate(..., slowdown=...) for
+    # adversary prefill SLO lookup and controller LST ETA.  The CSV stores raw
+    # predictor timings, so the native payload must carry the slowed values.
+    slowdown = float(gv2.legacy_mcts.prefill_slowdown or 1.0)
+    if slowdown != 1.0:
+        profile_times = [float(t) * slowdown for t in profile_times]
     search = gv2.mcts_search
 
     payload = {
@@ -154,6 +227,8 @@ def _cfg_payload(
         "n_decode_req": int(features.n_decode_req),
         "d_decode_req": int(features.d_decode_req),
         "d_global": int(features.d_global),
+        "controller_action_space_size": int(DEFAULT_DNN_SPEC.num_actions_controller),
+        "adversary_action_space_size": int(DEFAULT_DNN_SPEC.num_actions_adversary),
         "prefill_total_den": float(features.prefill_total_den),
         "prefill_remaining_den": float(features.prefill_remaining_den),
         "decode_total_den": float(features.decode_total_den),
@@ -325,9 +400,11 @@ def run_native_selfplay_to_writers(
     import vidur.mcts.mcts_native_gv2 as native
 
     model_version = int(task.get("model_version", 0))
+    bootstrap_generation = int(task.get("generation", model_version))
+    use_model_bootstrap = bool(int(bootstrap_generation) > 0 and int(model_version) > 0)
     torchscript_spec = ""
     runtime = native.NativeTorchScriptInferRuntimeGV2(str(cfg.model.device))
-    if model_version > 0:
+    if use_model_bootstrap:
         torchscript_spec = export_torchscript_pair(
             model=model,
             model_version=model_version,
@@ -346,6 +423,19 @@ def run_native_selfplay_to_writers(
         torchscript_model_spec=torchscript_spec,
         initial_history_signatures=initial_history_signatures,
     )
+    cfg_payload["use_model_bootstrap"] = bool(use_model_bootstrap)
+    for task_key, payload_key in (
+        ("native_history_trace_log_path", "native_history_trace_log_path"),
+        ("history_trace_log_path", "native_history_trace_log_path"),
+        ("native_frontier_log_path", "native_frontier_log_path"),
+        ("frontier_log_path", "native_frontier_log_path"),
+        ("native_depth1_search_log_path", "native_depth1_search_log_path"),
+        ("depth1_search_log_path", "native_depth1_search_log_path"),
+        ("native_depth1_details_log_path", "native_depth1_details_log_path"),
+        ("depth1_details_log_path", "native_depth1_details_log_path"),
+    ):
+        if task.get(task_key):
+            cfg_payload[payload_key] = str(task[task_key])
     native_out = native.generate_selfplay_samples_torchscript(
         runtime,
         model_version,

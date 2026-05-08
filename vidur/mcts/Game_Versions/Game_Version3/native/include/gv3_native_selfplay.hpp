@@ -69,6 +69,12 @@ struct NativeSelfplayConfigGV3 {
     double eval_split_ratio = 0.0;
     int eval_split_seed = 0;
     int action_seed_base = 0;
+    bool use_model_bootstrap = true;
+
+    std::string history_trace_log_path;
+    std::string frontier_log_path;
+    std::string depth1_search_log_path;
+    std::string depth1_details_log_path;
 };
 
 struct NativeSelfplayResultGV3 {
