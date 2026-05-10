@@ -350,6 +350,8 @@ struct SelectionResult {
     TreeNode* child = nullptr;
 };
 
+constexpr double kActionSelectionTieEps = 1e-5;
+
 std::pair<bool, double> is_missed_adv_tick(const SimState& state, const GV2EnvConfig& cfg) {
     const double tick = (cfg.adversary_tick_sec > 0.0) ? cfg.adversary_tick_sec : 0.2;
     double next_tick = state.stats.next_adv_tick;
@@ -445,6 +447,14 @@ private:
         int leaf_decode_credit_balance = 0;
     };
 
+    struct PendingBootstrap {
+        int group_id = -1;
+        int tie_index = -1;
+        SimState leaf_state;
+        std::string player_to_act;
+        QEval q;
+    };
+
     static std::string next_player(const std::string& player) {
         return (player == "adversary") ? "controller" : "adversary";
     }
@@ -462,24 +472,39 @@ private:
             uint8_t{1});
     }
 
-    double bootstrap_value_from_model(const SimState& state, const std::string& player) {
-        if (!in_.use_model_bootstrap || model_version_ <= 0) return 0.0;
-        const std::vector<uint8_t> mask = all_true_action_mask(player);
-        const auto t_infer_begin = std::chrono::steady_clock::now();
-        NativeInferInputsGV2 inputs = build_infer_inputs(state, player, mask);
-        auto infer_out = infer_runtime_.infer_from_inputs(inputs, player, model_version_);
-        const auto t_infer_end = std::chrono::steady_clock::now();
-        perf_infer_sec_ +=
-            std::chrono::duration_cast<std::chrono::duration<double>>(t_infer_end - t_infer_begin).count();
-        perf_infer_calls_ += 1;
-        return infer_out.first;
+    static bool better_max_value(double candidate, double current, int candidate_idx, int current_idx) {
+        if (current_idx < 0) return true;
+        if (candidate > current + kActionSelectionTieEps) return true;
+        if (std::abs(candidate - current) <= kActionSelectionTieEps && candidate_idx < current_idx) {
+            return true;
+        }
+        return false;
+    }
+
+    static bool better_min_value(double candidate, double current, int candidate_idx, int current_idx) {
+        if (current_idx < 0) return true;
+        if (candidate < current - kActionSelectionTieEps) return true;
+        if (std::abs(candidate - current) <= kActionSelectionTieEps && candidate_idx < current_idx) {
+            return true;
+        }
+        return false;
+    }
+
+    static bool better_for_player(
+        const std::string& player,
+        double candidate,
+        double current,
+        int candidate_idx,
+        int current_idx) {
+        return (player == "controller")
+            ? better_max_value(candidate, current, candidate_idx, current_idx)
+            : better_min_value(candidate, current, candidate_idx, current_idx);
     }
 
     QEval compose_q_from_state(
         const SimState& leaf_state,
         double parent_cost,
-        double parent_time,
-        const std::string& player_to_act) {
+        double parent_time) const {
         QEval out;
         out.leaf_cost = state_cost(leaf_state);
         out.reward = transition_reward(parent_cost, out.leaf_cost, in_);
@@ -493,9 +518,59 @@ private:
             ? leaf_state.stats.transition_discount_time
             : leaf_state.sim_time;
         out.discount = time_discount(discount_time, parent_time, in_);
-        out.bootstrap = bootstrap_value_from_model(leaf_state, player_to_act);
-        out.q = out.reward + out.discount * out.bootstrap;
+        out.bootstrap = 0.0;
+        out.q = out.reward;
         return out;
+    }
+
+    void apply_batched_bootstrap(std::vector<PendingBootstrap>* pending) {
+        if (pending == nullptr || pending->empty()) return;
+        if (!in_.use_model_bootstrap || model_version_ <= 0) {
+            for (PendingBootstrap& item : *pending) {
+                item.q.bootstrap = 0.0;
+                item.q.q = item.q.reward;
+            }
+            return;
+        }
+
+        constexpr std::size_t kMaxBootstrapBatch = 512;
+        for (const std::string player : {"controller", "adversary"}) {
+            std::vector<std::size_t> selected;
+            selected.reserve(pending->size());
+            for (std::size_t i = 0; i < pending->size(); ++i) {
+                if ((*pending)[i].player_to_act == player) selected.push_back(i);
+            }
+            if (selected.empty()) continue;
+
+            const std::vector<uint8_t> mask = all_true_action_mask(player);
+            std::size_t pos = 0;
+            while (pos < selected.size()) {
+                const std::size_t end = std::min(selected.size(), pos + kMaxBootstrapBatch);
+                std::vector<NativeInferInputsGV2> batch;
+                batch.reserve(end - pos);
+                const auto t_infer_begin = std::chrono::steady_clock::now();
+                for (std::size_t j = pos; j < end; ++j) {
+                    const PendingBootstrap& item = (*pending)[selected[j]];
+                    batch.push_back(build_infer_inputs(item.leaf_state, player, mask));
+                }
+                const std::vector<double> values =
+                    infer_runtime_.infer_values_from_inputs_batch(batch, player, model_version_);
+                const auto t_infer_end = std::chrono::steady_clock::now();
+                perf_infer_sec_ +=
+                    std::chrono::duration_cast<std::chrono::duration<double>>(t_infer_end - t_infer_begin).count();
+                perf_infer_calls_ += 1;
+
+                if (values.size() != batch.size()) {
+                    throw std::runtime_error("batched bootstrap returned wrong number of values");
+                }
+                for (std::size_t k = 0; k < values.size(); ++k) {
+                    PendingBootstrap& item = (*pending)[selected[pos + k]];
+                    item.q.bootstrap = values[k];
+                    item.q.q = item.q.reward + item.q.discount * item.q.bootstrap;
+                }
+                pos = end;
+            }
+        }
     }
 
     std::vector<int> valid_controller_indices(const SampledActionSet<ControllerAction>& sampled) const {
@@ -578,7 +653,16 @@ private:
         const ControllerAction& action) {
         SimState leaf = decision_state;
         env_.apply_controller_action_inplace(leaf, action, false);
-        return compose_q_from_state(leaf, parent_cost, parent_time, "adversary");
+        PendingBootstrap item;
+        item.group_id = 0;
+        item.tie_index = 0;
+        item.player_to_act = "adversary";
+        item.q = compose_q_from_state(leaf, parent_cost, parent_time);
+        item.leaf_state = std::move(leaf);
+        std::vector<PendingBootstrap> pending;
+        pending.push_back(std::move(item));
+        apply_batched_bootstrap(&pending);
+        return pending.front().q;
     }
 
     QEval evaluate_depth1_adversary_action(
@@ -588,7 +672,16 @@ private:
         const AdversaryAction& action) {
         SimState leaf = decision_state;
         env_.apply_adversary_action_inplace(leaf, action);
-        return compose_q_from_state(leaf, parent_cost, parent_time, "controller");
+        PendingBootstrap item;
+        item.group_id = 0;
+        item.tie_index = 0;
+        item.player_to_act = "controller";
+        item.q = compose_q_from_state(leaf, parent_cost, parent_time);
+        item.leaf_state = std::move(leaf);
+        std::vector<PendingBootstrap> pending;
+        pending.push_back(std::move(item));
+        apply_batched_bootstrap(&pending);
+        return pending.front().q;
     }
 
     QEval evaluate_adversary_action_two_step(
@@ -602,7 +695,16 @@ private:
         const auto controller_sampled = env_.sample_controller_actions(adv_child);
         const std::vector<int> valid = valid_controller_indices(controller_sampled);
         if (valid.empty()) {
-            return compose_q_from_state(adv_child, parent_cost, parent_time, "controller");
+            PendingBootstrap item;
+            item.group_id = 0;
+            item.tie_index = -1;
+            item.player_to_act = "controller";
+            item.q = compose_q_from_state(adv_child, parent_cost, parent_time);
+            item.leaf_state = std::move(adv_child);
+            std::vector<PendingBootstrap> pending;
+            pending.push_back(std::move(item));
+            apply_batched_bootstrap(&pending);
+            return pending.front().q;
         }
 
         auto [alias_to_canon, canon_to_aliases, canonical_indices] =
@@ -610,25 +712,41 @@ private:
         (void)alias_to_canon;
         (void)canon_to_aliases;
 
-        std::optional<QEval> best;
-        int best_idx = -1;
+        std::vector<PendingBootstrap> pending;
+        pending.reserve(canonical_indices.size());
         for (int cidx : canonical_indices) {
             SimState leaf = adv_child;
             env_.apply_controller_action_inplace(
                 leaf,
                 controller_sampled.actions[static_cast<std::size_t>(cidx)],
                 false);
-            QEval q = compose_q_from_state(leaf, parent_cost, parent_time, "adversary");
-            if (!best.has_value() || q.q > best->q || (q.q == best->q && cidx < best_idx)) {
-                best = q;
-                best_idx = cidx;
-            }
+            PendingBootstrap item;
+            item.group_id = 0;
+            item.tie_index = cidx;
+            item.player_to_act = "adversary";
+            item.q = compose_q_from_state(leaf, parent_cost, parent_time);
+            item.leaf_state = std::move(leaf);
+            pending.push_back(std::move(item));
         }
 
-        if (!best.has_value()) {
-            return compose_q_from_state(adv_child, parent_cost, parent_time, "controller");
+        apply_batched_bootstrap(&pending);
+        const PendingBootstrap* best = nullptr;
+        for (const PendingBootstrap& item : pending) {
+            if (best == nullptr || better_max_value(item.q.q, best->q.q, item.tie_index, best->tie_index)) {
+                best = &item;
+            }
         }
-        return *best;
+        if (best != nullptr) return best->q;
+
+        PendingBootstrap item;
+        item.group_id = 0;
+        item.tie_index = -1;
+        item.player_to_act = "controller";
+        item.q = compose_q_from_state(adv_child, parent_cost, parent_time);
+        item.leaf_state = std::move(adv_child);
+        pending.push_back(std::move(item));
+        apply_batched_bootstrap(&pending);
+        return pending.back().q;
     }
 
     void append_controller_child_summary(
@@ -783,21 +901,95 @@ private:
             }
         }
 
-        for (int cidx : canonical_indices) {
-            if (root.player == "controller") {
-                const ControllerAction& action = controller_actions[static_cast<std::size_t>(cidx)];
-                canonical_q[cidx] = evaluate_depth1_controller_action(
-                    decision_state,
-                    root_cost,
-                    root_time,
-                    action);
-            } else {
-                const AdversaryAction& action = adversary_actions[static_cast<std::size_t>(cidx)];
-                canonical_q[cidx] = evaluate_adversary_action_two_step(
-                    decision_state,
-                    root_cost,
-                    root_time,
-                    action);
+        std::vector<PendingBootstrap> pending_bootstrap;
+        if (root.player == "controller") {
+            pending_bootstrap.reserve(canonical_indices.size());
+            for (int cidx : canonical_indices) {
+                SimState leaf = decision_state;
+                env_.apply_controller_action_inplace(
+                    leaf,
+                    controller_actions[static_cast<std::size_t>(cidx)],
+                    false);
+
+                PendingBootstrap item;
+                item.group_id = cidx;
+                item.tie_index = cidx;
+                item.player_to_act = "adversary";
+                item.q = compose_q_from_state(leaf, root_cost, root_time);
+                item.leaf_state = std::move(leaf);
+                pending_bootstrap.push_back(std::move(item));
+            }
+
+            apply_batched_bootstrap(&pending_bootstrap);
+            for (const PendingBootstrap& item : pending_bootstrap) {
+                canonical_q[item.group_id] = item.q;
+            }
+        } else {
+            std::unordered_map<int, std::vector<std::size_t>> pending_by_adversary_action;
+            pending_by_adversary_action.reserve(canonical_indices.size());
+
+            for (int aidx : canonical_indices) {
+                SimState adv_child = decision_state;
+                env_.apply_adversary_action_inplace(
+                    adv_child,
+                    adversary_actions[static_cast<std::size_t>(aidx)]);
+
+                const auto controller_sampled = env_.sample_controller_actions(adv_child);
+                const std::vector<int> valid = valid_controller_indices(controller_sampled);
+                if (valid.empty()) {
+                    PendingBootstrap item;
+                    item.group_id = aidx;
+                    item.tie_index = -1;
+                    item.player_to_act = "controller";
+                    item.q = compose_q_from_state(adv_child, root_cost, root_time);
+                    item.leaf_state = std::move(adv_child);
+
+                    const std::size_t pending_index = pending_bootstrap.size();
+                    pending_bootstrap.push_back(std::move(item));
+                    pending_by_adversary_action[aidx].push_back(pending_index);
+                    continue;
+                }
+
+                auto controller_canon = canonicalize_controller_indices(controller_sampled, valid);
+                const std::vector<int>& controller_canonical_indices = std::get<2>(controller_canon);
+                for (int cidx : controller_canonical_indices) {
+                    SimState leaf = adv_child;
+                    env_.apply_controller_action_inplace(
+                        leaf,
+                        controller_sampled.actions[static_cast<std::size_t>(cidx)],
+                        false);
+
+                    PendingBootstrap item;
+                    item.group_id = aidx;
+                    item.tie_index = cidx;
+                    item.player_to_act = "adversary";
+                    item.q = compose_q_from_state(leaf, root_cost, root_time);
+                    item.leaf_state = std::move(leaf);
+
+                    const std::size_t pending_index = pending_bootstrap.size();
+                    pending_bootstrap.push_back(std::move(item));
+                    pending_by_adversary_action[aidx].push_back(pending_index);
+                }
+            }
+
+            apply_batched_bootstrap(&pending_bootstrap);
+            for (int aidx : canonical_indices) {
+                const auto it = pending_by_adversary_action.find(aidx);
+                if (it == pending_by_adversary_action.end() || it->second.empty()) {
+                    continue;
+                }
+
+                const PendingBootstrap* best = nullptr;
+                for (std::size_t pending_index : it->second) {
+                    const PendingBootstrap& item = pending_bootstrap[pending_index];
+                    if (best == nullptr ||
+                        better_max_value(item.q.q, best->q.q, item.tie_index, best->tie_index)) {
+                        best = &item;
+                    }
+                }
+                if (best != nullptr) {
+                    canonical_q[aidx] = best->q;
+                }
             }
         }
 
@@ -847,10 +1039,7 @@ private:
                 : ((root.player == "controller")
                     ? -std::numeric_limits<double>::infinity()
                     : std::numeric_limits<double>::infinity());
-            const bool better = (root.player == "controller")
-                ? (v > best_value || (v == best_value && idx < best_idx))
-                : (v < best_value || (v == best_value && idx < best_idx));
-            if (best_idx < 0 || better) {
+            if (better_for_player(root.player, v, best_value, idx, best_idx)) {
                 best_idx = idx;
                 best_value = v;
             }

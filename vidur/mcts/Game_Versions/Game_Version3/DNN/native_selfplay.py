@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import os
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -193,7 +194,9 @@ def export_torchscript_pair(
             if path.exists():
                 continue
             wrapper = _FixedPlayerTorchScriptWrapper(model, player).eval()
-            traced = torch.jit.trace(wrapper, example, strict=False)
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=torch.jit.TracerWarning)
+                traced = torch.jit.trace(wrapper, example, strict=False)
             traced = torch.jit.freeze(traced.eval())
             tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
             traced.save(str(tmp))

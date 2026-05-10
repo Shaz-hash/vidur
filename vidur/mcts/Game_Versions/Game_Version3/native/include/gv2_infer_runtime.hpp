@@ -98,6 +98,10 @@ public:
         const NativeInferInputsGV2& inputs,
         const std::string& player,
         int model_version);
+    std::vector<double> infer_values_from_inputs_batch(
+        const std::vector<NativeInferInputsGV2>& inputs,
+        const std::string& player,
+        int model_version);
     NativeInferInputsGV2 build_inputs_from_state(
         const SimState& state,
         const std::string& player,
@@ -122,6 +126,9 @@ private:
         const std::vector<uint8_t>& action_mask);
 
     double decode_value_from_tensor(const torch::Tensor& value_raw) const;
+    std::vector<double> decode_values_from_tensor_batch(
+        const torch::Tensor& value_raw,
+        std::size_t batch_size) const;
 
     std::string device_str_;
     c10::Device device_;

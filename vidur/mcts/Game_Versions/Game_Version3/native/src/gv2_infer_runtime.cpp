@@ -764,6 +764,55 @@ double NativeTorchScriptInferRuntimeGV2::decode_value_from_tensor(const torch::T
     return v_min_ + expected_bin * v_step_;
 }
 
+std::vector<double> NativeTorchScriptInferRuntimeGV2::decode_values_from_tensor_batch(
+    const torch::Tensor& value_raw,
+    std::size_t batch_size) const {
+    std::vector<double> out(batch_size, 0.0);
+    if (batch_size == 0) return out;
+
+    torch::Tensor t = value_raw.detach()
+                          .to(torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat64))
+                          .contiguous();
+
+    if (t.numel() == 0) return out;
+
+    if (t.dim() == 0 || batch_size == 1) {
+        out[0] = decode_value_from_tensor(t);
+        return out;
+    }
+
+    const int64_t b = static_cast<int64_t>(batch_size);
+    if (t.size(0) == b) {
+        torch::Tensor flat = t.reshape({b, -1}).contiguous();
+        for (int64_t i = 0; i < b; ++i) {
+            out[static_cast<std::size_t>(i)] = decode_value_from_tensor(flat[i]);
+        }
+        return out;
+    }
+
+    torch::Tensor flat = t.reshape({-1}).contiguous();
+    const int64_t total = flat.numel();
+    if (total == b) {
+        const double* p = flat.data_ptr<double>();
+        for (int64_t i = 0; i < b; ++i) {
+            const double value_norm = -sigmoid_stable(p[i]);
+            out[static_cast<std::size_t>(i)] = denormalize_value_model_scalar(value_norm, v_min_);
+        }
+        return out;
+    }
+    if (total > 0 && total % b == 0) {
+        const int64_t width = total / b;
+        torch::Tensor rows = flat.reshape({b, width}).contiguous();
+        for (int64_t i = 0; i < b; ++i) {
+            out[static_cast<std::size_t>(i)] = decode_value_from_tensor(rows[i]);
+        }
+        return out;
+    }
+
+    throw std::runtime_error(
+        "decode_values_from_tensor_batch: value tensor shape is incompatible with batch size");
+}
+
 std::pair<double, std::vector<double>> NativeTorchScriptInferRuntimeGV2::infer_from_inputs(
     const std::vector<float>& global_features,
     const std::vector<uint8_t>& action_mask,
@@ -937,6 +986,209 @@ std::pair<double, std::vector<double>> NativeTorchScriptInferRuntimeGV2::infer_f
     const double value = decode_value_from_tensor(value_raw);
 
     return {value, priors};
+}
+
+std::vector<double> NativeTorchScriptInferRuntimeGV2::infer_values_from_inputs_batch(
+    const std::vector<NativeInferInputsGV2>& inputs,
+    const std::string& player,
+    int model_version) {
+    if (inputs.empty()) return {};
+    if (player != "controller" && player != "adversary") {
+        throw std::runtime_error("infer_values_from_inputs_batch: invalid player '" + player + "'");
+    }
+
+    std::shared_ptr<ModelPair> pair;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        const auto it = models_.find(model_version);
+        if (it == models_.end()) {
+            throw std::runtime_error(
+                "infer_values_from_inputs_batch: model version " + std::to_string(model_version) + " not loaded");
+        }
+        pair = it->second;
+    }
+
+    torch::jit::script::Module& module =
+        (player == "controller") ? pair->controller : pair->adversary;
+
+    const NativeInferInputsGV2& first = inputs.front();
+    if (first.action_mask.empty()) {
+        throw std::runtime_error("infer_values_from_inputs_batch: action_mask cannot be empty");
+    }
+
+    const int64_t batch = static_cast<int64_t>(inputs.size());
+    const int64_t gdim = std::max<int64_t>(1, static_cast<int64_t>(first.global_features.size()));
+    const int64_t adim = static_cast<int64_t>(first.action_mask.size());
+
+    const bool has_split =
+        first.prefill_req_n > 0 &&
+        first.prefill_req_d > 0 &&
+        first.decode_req_n > 0 &&
+        first.decode_req_d > 0 &&
+        static_cast<int>(first.prefill_req_features.size()) ==
+            first.prefill_req_n * first.prefill_req_d &&
+        static_cast<int>(first.decode_req_features.size()) ==
+            first.decode_req_n * first.decode_req_d;
+
+    const bool has_req =
+        first.req_n > 0 &&
+        first.req_d > 0 &&
+        static_cast<int>(first.req_features.size()) == first.req_n * first.req_d;
+
+    for (std::size_t i = 0; i < inputs.size(); ++i) {
+        const NativeInferInputsGV2& in = inputs[i];
+        if (static_cast<int64_t>(in.global_features.size()) != gdim) {
+            throw std::runtime_error("infer_values_from_inputs_batch: inconsistent global feature width");
+        }
+        if (static_cast<int64_t>(in.action_mask.size()) != adim) {
+            throw std::runtime_error("infer_values_from_inputs_batch: inconsistent action mask width");
+        }
+        if (has_split) {
+            if (in.prefill_req_n != first.prefill_req_n ||
+                in.prefill_req_d != first.prefill_req_d ||
+                in.decode_req_n != first.decode_req_n ||
+                in.decode_req_d != first.decode_req_d ||
+                in.prefill_req_features.size() != first.prefill_req_features.size() ||
+                in.decode_req_features.size() != first.decode_req_features.size() ||
+                in.prefill_req_mask.size() != first.prefill_req_mask.size() ||
+                in.decode_req_mask.size() != first.decode_req_mask.size()) {
+                throw std::runtime_error("infer_values_from_inputs_batch: inconsistent split feature shape");
+            }
+        }
+        if (has_req) {
+            if (in.req_n != first.req_n ||
+                in.req_d != first.req_d ||
+                in.req_features.size() != first.req_features.size() ||
+                in.req_mask.size() != first.req_mask.size()) {
+                throw std::runtime_error("infer_values_from_inputs_batch: inconsistent req feature shape");
+            }
+        }
+    }
+
+    torch::Tensor global_cpu = torch::zeros(
+        {batch, gdim},
+        torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32));
+    {
+        float* dst = global_cpu.data_ptr<float>();
+        for (int64_t b = 0; b < batch; ++b) {
+            const auto& src = inputs[static_cast<std::size_t>(b)].global_features;
+            if (!src.empty()) {
+                std::memcpy(dst + b * gdim, src.data(), src.size() * sizeof(float));
+            }
+        }
+    }
+    torch::Tensor global_t = global_cpu.to(device_);
+
+    torch::Tensor action_mask_cpu_u8 = torch::zeros(
+        {batch, adim},
+        torch::TensorOptions().device(torch::kCPU).dtype(torch::kUInt8));
+    {
+        uint8_t* dst = action_mask_cpu_u8.data_ptr<uint8_t>();
+        for (int64_t b = 0; b < batch; ++b) {
+            const auto& src = inputs[static_cast<std::size_t>(b)].action_mask;
+            std::memcpy(dst + b * adim, src.data(), src.size() * sizeof(uint8_t));
+        }
+    }
+    torch::Tensor action_mask_t = action_mask_cpu_u8.to(device_).to(torch::kBool);
+
+    auto make_f32_3d_batch = [&](auto get_flat, int n, int d) -> torch::Tensor {
+        const int64_t nn = std::max<int64_t>(1, n);
+        const int64_t dd = std::max<int64_t>(1, d);
+        torch::Tensor cpu = torch::zeros(
+            {batch, nn, dd},
+            torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32));
+        float* dst = cpu.data_ptr<float>();
+        for (int64_t b = 0; b < batch; ++b) {
+            const std::vector<float>& src = get_flat(inputs[static_cast<std::size_t>(b)]);
+            if (!src.empty()) {
+                std::memcpy(dst + b * nn * dd, src.data(), src.size() * sizeof(float));
+            }
+        }
+        return cpu.to(device_);
+    };
+
+    auto make_u8_2d_batch = [&](auto get_mask, int n, bool default_true) -> torch::Tensor {
+        const int64_t nn = std::max<int64_t>(1, n);
+        torch::Tensor cpu = torch::zeros(
+            {batch, nn},
+            torch::TensorOptions().device(torch::kCPU).dtype(torch::kUInt8));
+        uint8_t* dst = cpu.data_ptr<uint8_t>();
+        for (int64_t b = 0; b < batch; ++b) {
+            uint8_t* row = dst + b * nn;
+            const std::vector<uint8_t>& src = get_mask(inputs[static_cast<std::size_t>(b)]);
+            if (!src.empty()) {
+                std::memcpy(row, src.data(), src.size() * sizeof(uint8_t));
+            } else if (default_true) {
+                std::fill(row, row + nn, static_cast<uint8_t>(1));
+            }
+        }
+        return cpu.to(device_).to(torch::kBool);
+    };
+
+    torch::Tensor prefill_req_features_t = make_f32_3d_batch(
+        [](const NativeInferInputsGV2& in) -> const std::vector<float>& { return in.prefill_req_features; },
+        has_split ? first.prefill_req_n : 1,
+        has_split ? first.prefill_req_d : 1);
+    torch::Tensor decode_req_features_t = make_f32_3d_batch(
+        [](const NativeInferInputsGV2& in) -> const std::vector<float>& { return in.decode_req_features; },
+        has_split ? first.decode_req_n : 1,
+        has_split ? first.decode_req_d : 1);
+    torch::Tensor prefill_req_mask_t = make_u8_2d_batch(
+        [](const NativeInferInputsGV2& in) -> const std::vector<uint8_t>& { return in.prefill_req_mask; },
+        has_split ? first.prefill_req_n : 1,
+        true);
+    torch::Tensor decode_req_mask_t = make_u8_2d_batch(
+        [](const NativeInferInputsGV2& in) -> const std::vector<uint8_t>& { return in.decode_req_mask; },
+        has_split ? first.decode_req_n : 1,
+        true);
+
+    torch::Tensor req_features_t = make_f32_3d_batch(
+        [](const NativeInferInputsGV2& in) -> const std::vector<float>& { return in.req_features; },
+        has_req ? first.req_n : 1,
+        has_req ? first.req_d : 1);
+    torch::Tensor req_mask_t = make_u8_2d_batch(
+        [](const NativeInferInputsGV2& in) -> const std::vector<uint8_t>& { return in.req_mask; },
+        has_req ? first.req_n : 1,
+        true);
+
+    c10::IValue out_iv;
+    std::string last_err;
+    torch::InferenceMode infer_mode_guard(true);
+    torch::NoGradGuard no_grad_guard;
+
+    auto try_forward = [&](std::initializer_list<torch::jit::IValue> args) -> bool {
+        try {
+            std::vector<torch::jit::IValue> v;
+            v.reserve(args.size());
+            for (const auto& x : args) v.push_back(x);
+            out_iv = module.forward(v);
+            return true;
+        } catch (const std::exception& e) {
+            last_err = e.what();
+            return false;
+        }
+    };
+
+    bool ok = false;
+    if (has_split) {
+        ok = try_forward(
+            {prefill_req_features_t, decode_req_features_t, global_t, prefill_req_mask_t,
+             decode_req_mask_t, action_mask_t});
+        if (!ok) ok = try_forward({prefill_req_features_t, decode_req_features_t, global_t, action_mask_t});
+        if (!ok) ok = try_forward({prefill_req_features_t, decode_req_features_t, global_t});
+    }
+    if (!ok) ok = try_forward({req_features_t, global_t, req_mask_t, action_mask_t});
+    if (!ok) ok = try_forward({req_features_t, global_t, action_mask_t});
+    if (!ok) ok = try_forward({req_features_t, global_t});
+    if (!ok) ok = try_forward({global_t, action_mask_t});
+    if (!ok) ok = try_forward({global_t});
+    if (!ok) {
+        throw std::runtime_error(
+            "TorchScript batch forward failed for all supported signatures. Last error: " + last_err);
+    }
+
+    auto [_policy_logits, value_raw] = parse_forward_output(out_iv);
+    return decode_values_from_tensor_batch(value_raw, inputs.size());
 }
 
 const std::string& NativeTorchScriptInferRuntimeGV2::device() const { return device_str_; }
