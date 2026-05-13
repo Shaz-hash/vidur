@@ -81,6 +81,13 @@ class DepthOneSearchResult:
     valid_mask: List[bool]
     used_bootstrap: bool
 
+    ## For only logging purpose for now 
+    best_reward: float = 0.0
+    best_discount: float = 1.0
+    best_bootstrap: float = 0.0
+    best_child_cost: float = 0.0
+    best_child_time: float = 0.0
+
 
 
 class VidurMCTS:
@@ -742,6 +749,13 @@ class VidurMCTS:
                 action_values=action_values,
                 valid_mask=valid_mask,
                 used_bootstrap=used_bootstrap,
+
+                best_reward=0.0,
+                best_discount=1.0,
+                best_bootstrap=0.0,
+                best_child_cost=float(root_cost),
+                best_child_time=float(root_time),
+
             )
 
         # controller dedup (evaluate canonical only, then fan out to aliases)
@@ -764,6 +778,7 @@ class VidurMCTS:
             decision_snapshot, decision_stats = self._snapshot_state_and_stats(decision_state)
 
         canonical_q: Dict[int, float] = {}
+        canonical_q_tuple: Dict[int, tuple[float, float, float, float, float, float]] = {}
 
         for cidx in canonical_indices:
             action = actions_by_index[cidx]
@@ -771,7 +786,7 @@ class VidurMCTS:
                 continue
 
             if root.player == "adversary":
-                q, reward, _disc, _boot, child_cost, child_time = self._evaluate_adversary_action_q_two_step(
+                q_tuple = self._evaluate_adversary_action_q_two_step(
                     decision_snapshot=decision_snapshot,
                     decision_stats=decision_stats,
                     parent_cost=root_cost,
@@ -782,7 +797,7 @@ class VidurMCTS:
                     use_model_bootstrap=bool(use_model_bootstrap),
                 )
             else:
-                q, reward, _disc, _boot, child_cost, child_time = self._evaluate_depth1_action_q(
+                q_tuple = self._evaluate_depth1_action_q(
                     decision_snapshot=decision_snapshot,
                     decision_stats=decision_stats,
                     parent_player=root.player,
@@ -794,7 +809,9 @@ class VidurMCTS:
                     use_model_bootstrap=bool(use_model_bootstrap),
                 )
 
+            q, _reward, _disc, _boot, _child_cost, _child_time = q_tuple
             canonical_q[cidx] = float(q)
+            canonical_q_tuple[cidx] = q_tuple
 
 
         for alias_idx, canon_idx in alias_to_canon.items():
@@ -807,6 +824,19 @@ class VidurMCTS:
             valid_indices=valid_indices,
             action_values=action_values,
         )
+
+        best_canon_idx = alias_to_canon.get(int(best_idx), int(best_idx))
+        best_tuple = canonical_q_tuple.get(best_canon_idx)
+        if best_tuple is None:
+            best_reward = 0.0
+            best_discount = 1.0
+            best_bootstrap = 0.0
+            best_child_cost = root_cost
+            best_child_time = root_time
+        else:
+            _q, best_reward, best_discount, best_bootstrap, best_child_cost, best_child_time = best_tuple
+
+
         best_val = float(action_values[best_idx])
 
         root.visits = 1
@@ -826,7 +856,13 @@ class VidurMCTS:
             action_values=action_values,
             valid_mask=valid_mask,
             used_bootstrap=used_bootstrap,
+            best_reward=float(best_reward),
+            best_discount=float(best_discount),
+            best_bootstrap=float(best_bootstrap),
+            best_child_cost=float(best_child_cost),
+            best_child_time=float(best_child_time),
         )
+
 
     @staticmethod
     def _select_depth1_best_action_index(
