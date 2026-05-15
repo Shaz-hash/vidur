@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Optional, Protocol, Tuple
+from typing import Any, Callable, Optional, Protocol, Tuple
 
 import torch
 
@@ -28,6 +28,11 @@ class ModelInputs:
     # Optional legacy aliases
     req_features: Optional[torch.Tensor] = None
     req_mask: Optional[torch.Tensor] = None
+
+    # Optional raw-state payload for ModelSearchBed bootstrap hooks. Existing
+    # production models ignore these fields.
+    simulator_snapshot: Optional[Any] = None
+    stats_snapshot: Optional[Any] = None
 
 
 class DNNModel(Protocol):

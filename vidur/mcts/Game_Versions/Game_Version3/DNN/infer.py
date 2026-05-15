@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import math
 import random
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -41,6 +42,7 @@ import torch.nn.functional as Fnn
 from ....environment import VidurMCTSState
 from ..config import DEFAULT_GAME_V2_CONFIG
 from .dnn_spec import DEFAULT_DNN_SPEC
+from .model_search_nn import HorizonValueNet, records_to_feature_tensor
 from .types import ModelInputs
 
 
@@ -525,6 +527,12 @@ def build_model_inputs(
     )
     req_mask_legacy = torch.cat([prefill_mask, decode_mask], dim=1)
 
+    if hasattr(sim, "snapshot_state"):
+        simulator_snapshot = sim.snapshot_state()
+    else:
+        simulator_snapshot = sim.snapshot_state_fast()
+    stats_snapshot = stats.clone() if hasattr(stats, "clone") else stats
+
     return ModelInputs(
         prefill_req_features=prefill_feat,
         decode_req_features=decode_feat,
@@ -534,6 +542,8 @@ def build_model_inputs(
         action_mask=action_mask,
         req_features=req_features_legacy,
         req_mask=req_mask_legacy,
+        simulator_snapshot=simulator_snapshot,
+        stats_snapshot=stats_snapshot,
     )
 
 
@@ -620,12 +630,179 @@ def _infer_debug_dump(
         print(text)
 
 
+def _model_search_extra(cfg, key: str, default):
+    extra = getattr(cfg, "extra_config", {}) or {}
+    if isinstance(extra, dict):
+        return extra.get(key, default)
+    return default
 
 
+def _cached_model_search_features(model, split_name: str, expected_count: int):
+    cache = getattr(model, "_model_search_cached_features", None)
+    if not isinstance(cache, dict):
+        return None
+    split = str(split_name)
+    key = "eval" if split.startswith("eval") else "train" if split.startswith("train") else split
+    features = cache.get(key)
+    if isinstance(features, torch.Tensor) and int(features.shape[0]) == int(expected_count):
+        return features
+    return None
 
 
+def _predict_feature_tensor(
+    *,
+    model: HorizonValueNet,
+    features: torch.Tensor,
+    device: torch.device,
+    batch_size: int,
+) -> list[float]:
+    model.eval()
+    preds: list[torch.Tensor] = []
+    batch_size = max(1, int(batch_size))
+    for start in range(0, int(features.shape[0]), batch_size):
+        batch = features[start : start + batch_size].to(device, non_blocking=True)
+        preds.append(model(batch).detach().cpu())
+    if not preds:
+        return []
+    return torch.cat(preds, dim=0).view(-1).tolist()
 
 
+@torch.no_grad()
+def predict_model_search_values(
+    *,
+    model,
+    records: list[dict],
+    cfg,
+    state_loader,
+    split_name: str,
+):
+    """Predict ModelSearchBed controller values with the NN search model."""
+
+    if not isinstance(model, HorizonValueNet):
+        raise TypeError(f"expected HorizonValueNet, got {type(model)!r}")
+
+    del state_loader
+    original_device = next(model.parameters()).device
+    requested_device = _model_search_extra(
+        cfg,
+        "eval_device",
+        _model_search_extra(cfg, "device", str(original_device)),
+    )
+    target_device = torch.device(requested_device)
+    batch_size = int(_model_search_extra(cfg, "eval_batch_size", 16384))
+    features = _cached_model_search_features(model, split_name, len(records))
+    if features is None:
+        features = records_to_feature_tensor(records)
+    if original_device != target_device:
+        model = model.to(target_device)
+    try:
+        return _predict_feature_tensor(
+            model=model,
+            features=features,
+            device=target_device,
+            batch_size=batch_size,
+        )
+    finally:
+        if next(model.parameters()).device != original_device:
+            model.to(original_device)
 
 
+@torch.no_grad()
+def predict_model_search_values_from_records(
+    *,
+    model,
+    records: list[dict],
+    device: torch.device | str | None = None,
+    batch_size: int = 4096,
+) -> list[float]:
+    """Batched ModelSearchBed value prediction for raw snapshot/stat records."""
 
+    if not isinstance(model, HorizonValueNet):
+        raise TypeError(f"expected HorizonValueNet, got {type(model)!r}")
+
+    model_device = next(model.parameters()).device
+    target_device = torch.device(device) if device is not None else model_device
+    if model_device != target_device:
+        model = model.to(target_device)
+
+    features = records_to_feature_tensor(records)
+    try:
+        return _predict_feature_tensor(
+            model=model,
+            features=features,
+            device=target_device,
+            batch_size=batch_size,
+        )
+    finally:
+        if next(model.parameters()).device != model_device:
+            model.to(model_device)
+
+
+@torch.no_grad()
+def predict_model_search_values_from_features(
+    *,
+    model,
+    features: torch.Tensor,
+    device: torch.device | str | None = None,
+    batch_size: int = 4096,
+) -> list[float]:
+    """Batched ModelSearchBed value prediction for precomputed features."""
+
+    if not isinstance(model, HorizonValueNet):
+        raise TypeError(f"expected HorizonValueNet, got {type(model)!r}")
+
+    model_device = next(model.parameters()).device
+    target_device = torch.device(device) if device is not None else model_device
+    if model_device != target_device:
+        model = model.to(target_device)
+
+    try:
+        return _predict_feature_tensor(
+            model=model,
+            features=features.float(),
+            device=target_device,
+            batch_size=batch_size,
+        )
+    finally:
+        if next(model.parameters()).device != model_device:
+            model.to(model_device)
+
+
+@torch.no_grad()
+def predict_model_search_value_from_inputs(
+    *,
+    model,
+    inputs: ModelInputs,
+    player: str,
+    device: torch.device | None = None,
+) -> float:
+    """Predict one controller-perspective bootstrap value from MCTS inputs.
+
+    `mctsDNN` only passes `ModelInputs` to the model. For ModelSearchBed models
+    we attach the child simulator snapshot and stats inside `build_model_inputs`
+    so the same state-derived feature path used during training can be reused
+    during Bellman bootstrapping.
+    """
+
+    if not isinstance(model, HorizonValueNet):
+        raise TypeError(f"expected HorizonValueNet, got {type(model)!r}")
+    if inputs.simulator_snapshot is None or inputs.stats_snapshot is None:
+        raise ValueError("ModelSearchBed bootstrap inputs are missing simulator/stat snapshots")
+
+    del player
+    record = {
+        "simulator_snapshot": inputs.simulator_snapshot,
+        "stats": inputs.stats_snapshot,
+        "root_player": "controller",
+        "root_depth": 0,
+        "history_hops": 0,
+        "target_value": 0.0,
+    }
+    return float(
+        predict_model_search_values_from_records(
+            model=model,
+            records=[record],
+            device=device,
+            batch_size=1,
+        )[0]
+    )
