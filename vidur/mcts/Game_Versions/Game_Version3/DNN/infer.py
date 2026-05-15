@@ -620,9 +620,110 @@ def _infer_debug_dump(
         print(text)
 
 
+def predict_model_search_values(
+    *,
+    model,
+    records,
+    cfg,
+    state_loader,
+    split_name: str,
+):
+    """Classical ModelSearchBed inference hook.
+
+    Learned classical models predict from state-only features in the stored
+    root record. The optional symbolic backend is diagnostic only and
+    reconstructs the GV3 state to recompute the one-step Bellman value.
+    """
+
+    del cfg
+    from ..ModelSearchBed.classical_value_model import (
+        LearnedClassicalControllerValueModel,
+        SymbolicBellmanControllerValueModel,
+        predict_learned_classical_values,
+        predict_symbolic_bellman_values,
+    )
+
+    record_list = list(records)
+    if isinstance(model, LearnedClassicalControllerValueModel):
+        return predict_learned_classical_values(
+            model=model,
+            records=record_list,
+            split_name=str(split_name),
+            state_loader=state_loader,
+        )
+    if isinstance(model, SymbolicBellmanControllerValueModel):
+        return predict_symbolic_bellman_values(
+            model=model,
+            records=record_list,
+            state_loader=state_loader,
+        )
+    raise TypeError(f"unsupported classical ModelSearchBed model: {type(model)!r}")
 
 
+def predict_model_search_value_from_inputs(
+    *,
+    model,
+    inputs,
+    player: str,
+    device=None,
+) -> float:
+    """Return one controller-perspective bootstrap value from `ModelInputs`."""
 
+    from ..ModelSearchBed.classical_value_model import (
+        LearnedClassicalControllerValueModel,
+        predict_learned_classical_value_from_inputs,
+    )
+
+    if isinstance(model, LearnedClassicalControllerValueModel):
+        return predict_learned_classical_value_from_inputs(
+            model=model,
+            inputs=inputs,
+            player=str(player),
+            device=device,
+        )
+
+    infer_fn = getattr(model, "infer_from_inputs", None)
+    if callable(infer_fn):
+        value, _priors = infer_fn(inputs, str(player), device=device)
+        return float(value)
+
+    raise TypeError(f"unsupported bootstrap model for ModelInputs: {type(model)!r}")
+
+
+def predict_model_search_values_from_inputs_batch(
+    *,
+    model,
+    inputs_list,
+    players=None,
+    device=None,
+) -> list[float]:
+    """Return controller-perspective values for a batch of child `ModelInputs`."""
+
+    del players, device
+    from ..ModelSearchBed.classical_value_model import (
+        LearnedClassicalControllerValueModel,
+        predict_learned_classical_values_from_inputs_batch,
+    )
+
+    items = list(inputs_list)
+    if isinstance(model, LearnedClassicalControllerValueModel):
+        return predict_learned_classical_values_from_inputs_batch(
+            model=model,
+            inputs_list=items,
+        )
+
+    out: list[float] = []
+    for inputs in items:
+        out.append(
+            float(
+                predict_model_search_value_from_inputs(
+                    model=model,
+                    inputs=inputs,
+                    player="controller",
+                )
+            )
+        )
+    return out
 
 
 

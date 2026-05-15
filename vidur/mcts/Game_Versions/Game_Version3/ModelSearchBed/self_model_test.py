@@ -561,6 +561,9 @@ def build_candidate_gv3_model(cfg: SelfModelTestConfig) -> Any:
 def count_trainable_parameters(model: Any) -> int:
     """Return the number of trainable parameters in the candidate model."""
 
+    attr = getattr(model, "trainable_params", None)
+    if attr is not None:
+        return int(attr)
     params_fn = getattr(model, "parameters", None)
     if not callable(params_fn):
         return 0

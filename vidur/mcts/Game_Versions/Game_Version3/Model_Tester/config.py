@@ -39,6 +39,7 @@ class ModelTesterConfig:
     feature_version: int = 1
 
     # Model under test
+    model_kind: str = "torch_checkpoint"  # "torch_checkpoint" | "classical_joblib"
     model_checkpoint_path: str = _under_repo(
         "simulator_output",
         "Game_Version3",
@@ -177,9 +178,17 @@ class ModelTesterConfig:
         if self.feature_version <= 0:
             raise ValueError("feature_version must be > 0")
 
+        if self.model_kind not in {"torch_checkpoint", "classical_joblib"}:
+            raise ValueError("model_kind must be 'torch_checkpoint' or 'classical_joblib'")
+
         model_path = Path(self.model_checkpoint_path)
         if not model_path.exists():
             raise FileNotFoundError(f"model_checkpoint_path does not exist: {model_path}")
+        if self.model_kind == "classical_joblib":
+            if model_path.suffix != ".joblib":
+                raise ValueError("classical_joblib model_checkpoint_path must point to a .joblib file")
+            if self.environment_lang != "python":
+                raise ValueError("classical_joblib tester runs must use environment_lang='python'")
 
         if self.arena_time_limit_sec <= 0.0:
             raise ValueError("arena_time_limit_sec must be > 0")

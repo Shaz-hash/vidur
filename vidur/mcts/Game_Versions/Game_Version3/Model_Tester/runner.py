@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 
+import joblib
 import torch
 
 from ....game_types import AdversaryAction, ControllerAction
@@ -41,7 +42,7 @@ class _RunnerBundle:
     env: Any
     explore_cfg: Any
     spec: Any
-    model: AlphaZeroModel
+    model: Any
     mcts: VidurMCTS
     runner: SelfPlayRunner
     native_runtime: Any | None
@@ -97,8 +98,15 @@ def _build_bundle(cfg: ModelTesterConfig) -> _RunnerBundle:
     )
 
     spec = make_dnn_spec(cfg=pipeline_cfg.game_v2)
-    model = AlphaZeroModel(spec=spec).to(torch.device(pipeline_cfg.model.device))
-    _load_weights_into_model(model, Path(cfg.model_checkpoint_path))
+    if str(cfg.model_kind) == "classical_joblib":
+        model = joblib.load(Path(cfg.model_checkpoint_path))
+        if not callable(getattr(model, "infer_from_inputs", None)):
+            raise TypeError(
+                "classical_joblib model must implement infer_from_inputs(inputs, player, device=...)"
+            )
+    else:
+        model = AlphaZeroModel(spec=spec).to(torch.device(pipeline_cfg.model.device))
+        _load_weights_into_model(model, Path(cfg.model_checkpoint_path))
 
     mcts = VidurMCTS(
         env=env,
@@ -110,7 +118,7 @@ def _build_bundle(cfg: ModelTesterConfig) -> _RunnerBundle:
     )
 
     native_runtime = None
-    if bool(getattr(explore_cfg, "native_mcts_enabled", False)):
+    if bool(getattr(explore_cfg, "native_mcts_enabled", False)) and str(cfg.model_kind) != "classical_joblib":
         from .... import mcts_native_gv2 as _mcts_native_gv2
 
         native_runtime = _mcts_native_gv2.NativeTorchScriptInferRuntimeGV2(
@@ -250,7 +258,7 @@ def _select_model_depth1_action(
     bundle: _RunnerBundle,
     cfg: ModelTesterConfig,
     expanded: _ExpandedActionSpace,
-    model: AlphaZeroModel,
+    model: Any,
 ) -> tuple[AdversaryAction | ControllerAction | None, Dict[str, Any]]:
     player = str(expanded.player)
     valid_indices = list(expanded.valid_indices)
@@ -398,7 +406,7 @@ def _select_cycle_action(
     player: str,
     pending_adv_pre_ctrl_snapshot: Any | None,
     pending_adv_pre_ctrl_stats: Any | None,
-    model: AlphaZeroModel,
+    model: Any,
     adversary_policy: str,
     controller_policy: str,
 ) -> tuple[str, AdversaryAction | ControllerAction | None, Dict[str, Any]]:
@@ -538,7 +546,7 @@ def _run_policy_cycle(
     base_depth: int,
     game_id: int,
     root_id_base: int,
-    model: AlphaZeroModel,
+    model: Any,
     cycle_label: str,
     adversary_policy: str,
     controller_policy: str,
@@ -880,6 +888,7 @@ def _write_results_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
     fields = [
         "game_id",
         "history_hops",
+        "model_kind",
         "model_checkpoint",
         "cycle1_label",
         "cycle1_slo_violations",
@@ -1033,6 +1042,7 @@ def run_model_vs_trivial_tester(cfg: ModelTesterConfig) -> Path:
                     {
                         "game_id": int(game_id),
                         "history_hops": int(hops),
+                        "model_kind": str(cfg.model_kind),
                         "model_checkpoint": str(cfg.model_checkpoint_path),
                         "cycle1_label": MODEL_ADV_VS_TRIVIAL_CTRL_LABEL,
                         "cycle1_slo_violations": int(cycle1["slo_violations"]),

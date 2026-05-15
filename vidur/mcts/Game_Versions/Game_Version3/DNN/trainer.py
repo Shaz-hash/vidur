@@ -371,3 +371,41 @@ class Trainer:
             self.save_checkpoint(best_path)
             return True
         return False
+
+
+def train_model_search(
+    *,
+    train_records: list[dict[str, Any]],
+    eval_records: list[dict[str, Any]],
+    cfg: Any,
+    state_loader: Any,
+    output_dir: Path,
+) -> dict[str, Any]:
+    """Classical ModelSearchBed hook.
+
+    The default path fits a learned, non-neural controller value surrogate from
+    state-only features. The symbolic Bellman recomputation backend is retained
+    only as an explicit diagnostic option:
+
+        --extra-config-json '{"classical_backend": "symbolic_bellman"}'
+    """
+
+    from ..ModelSearchBed.classical_value_model import (
+        train_learned_classical_model,
+        train_symbolic_bellman_model,
+    )
+
+    extra_cfg = getattr(cfg, "extra_config", {}) or {}
+    if str(extra_cfg.get("classical_backend", "")).strip() == "symbolic_bellman":
+        return train_symbolic_bellman_model(
+            train_records=train_records,
+            eval_records=eval_records,
+            output_dir=output_dir,
+        )
+    return train_learned_classical_model(
+        train_records=train_records,
+        eval_records=eval_records,
+        cfg=cfg,
+        output_dir=output_dir,
+        state_loader=state_loader,
+    )
