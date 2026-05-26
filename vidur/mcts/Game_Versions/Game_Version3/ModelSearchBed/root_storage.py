@@ -102,6 +102,7 @@ class RootStorageConfig:
     allow_partial_results: bool = False
     shared_seen_signatures: Any | None = None
     shared_seen_lock: Any | None = None
+    exclude_signature_dataset_dirs: tuple[Path, ...] = ()
     progress_every: int = 1000
 
 
@@ -349,6 +350,7 @@ def build_storage_config(
     allow_partial_results: bool = False,
     shared_seen_signatures: Any | None = None,
     shared_seen_lock: Any | None = None,
+    exclude_signature_dataset_dirs: Iterable[str | Path] = (),
     progress_every: int = 1000,
 ) -> RootStorageConfig:
     """Create a validated config for local root-state storage.
@@ -433,6 +435,9 @@ def build_storage_config(
         allow_partial_results=bool(allow_partial_results),
         shared_seen_signatures=shared_seen_signatures,
         shared_seen_lock=shared_seen_lock,
+        exclude_signature_dataset_dirs=tuple(
+            Path(path).expanduser() for path in exclude_signature_dataset_dirs
+        ),
         progress_every=int(progress_every),
     )
 
@@ -481,6 +486,37 @@ def _history_signature_key(sig: Any) -> Any:
     if isinstance(sig, (list, tuple)):
         return tuple(_history_signature_key(x) for x in sig)
     return sig
+
+
+def load_history_signature_keys_from_dataset(dataset_dir: str | Path) -> set[Any]:
+    """Load normalized history signatures from a stored root dataset.
+
+    This streams shard-by-shard so pre-seeding uniqueness from a large dataset
+    does not materialize all simulator snapshots at once.
+    """
+
+    root_dir = Path(dataset_dir).expanduser()
+    manifest = root_dir / "manifest.jsonl"
+    if not manifest.exists():
+        raise FileNotFoundError(f"manifest not found: {manifest}")
+
+    out: set[Any] = set()
+    with manifest.open("r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            entry = json.loads(line)
+            shard_path = root_dir / str(entry["shard_path"])
+            try:
+                records = torch.load(shard_path, map_location="cpu", weights_only=False)
+            except TypeError:
+                records = torch.load(shard_path, map_location="cpu")
+            for record in records:
+                sig = record.get("history_signature", None)
+                if sig is not None:
+                    out.add(_history_signature_key(sig))
+            del records
+    return out
 
 
 def _row_parent_id(row: dict[str, Any]) -> int | None:
@@ -544,6 +580,13 @@ def generate_candidate_root_batches(
     next_root_id = int(cfg.start_root_id)
     batch_index = 0
     seen_signatures: set[Any] = set()
+    if (
+        bool(cfg.deduplicate_history_signatures)
+        and cfg.shared_seen_signatures is None
+        and cfg.exclude_signature_dataset_dirs
+    ):
+        for dataset_dir in cfg.exclude_signature_dataset_dirs:
+            seen_signatures.update(load_history_signature_keys_from_dataset(dataset_dir))
     seen_signature_order: deque[Any] = deque()
     use_shared_dedup = (
         bool(cfg.deduplicate_history_signatures)
@@ -1021,6 +1064,9 @@ def write_storage_summary(
     cfg_payload["output_dir"] = str(cfg.output_dir)
     cfg_payload["shared_seen_signatures"] = None
     cfg_payload["shared_seen_lock"] = None
+    cfg_payload["exclude_signature_dataset_dirs"] = [
+        str(path) for path in cfg.exclude_signature_dataset_dirs
+    ]
     summary = {
         "schema_version": int(SCHEMA_VERSION),
         "config": cfg_payload,
@@ -1201,7 +1247,9 @@ def generate_and_store_roots_multiprocess(cfg: RootStorageConfig) -> RootStorage
 
     Each process owns a disjoint root-id interval and its own random seed. The
     parent process merges worker outputs into the final manifest and shards.
-    Global history-signature deduplication is intentionally not enforced here.
+    When exclude_signature_dataset_dirs is set, all intervals share one
+    signature table pre-seeded from those datasets so the new roots are unique
+    relative to the existing store.
     """
 
     import multiprocessing as mp
@@ -1219,6 +1267,28 @@ def generate_and_store_roots_multiprocess(cfg: RootStorageConfig) -> RootStorage
 
     ctx = mp.get_context("spawn")
     manager = mp.Manager()
+    global_shared_seen = None
+    global_shared_lock = None
+    if cfg.exclude_signature_dataset_dirs:
+        if not bool(cfg.deduplicate_history_signatures):
+            raise ValueError(
+                "exclude_signature_dataset_dirs requires deduplicate_history_signatures=True"
+            )
+        global_shared_seen = manager.dict()
+        global_shared_lock = manager.Lock()
+        excluded_count = 0
+        for dataset_dir in cfg.exclude_signature_dataset_dirs:
+            keys = load_history_signature_keys_from_dataset(dataset_dir)
+            excluded_count += len(keys)
+            for key in keys:
+                global_shared_seen[key] = 1
+            del keys
+        print(
+            "[root_storage parent] "
+            f"preseeded excluded history signatures={int(excluded_count)} "
+            f"from {len(cfg.exclude_signature_dataset_dirs)} dataset(s)",
+            flush=True,
+        )
     stats = RootStorageStats()
     target_selected = int(math.ceil(float(cfg.num_roots) * float(cfg.min_nonzero_target_ratio)))
     candidate_ratio = float(cfg.max_candidate_roots) / float(max(1, int(cfg.num_roots)))
@@ -1239,8 +1309,12 @@ def generate_and_store_roots_multiprocess(cfg: RootStorageConfig) -> RootStorage
                 target_selected=int(
                     math.ceil(float(target_roots) * float(cfg.min_nonzero_target_ratio))
                 ),
-                shared_seen_signatures=manager.dict(),
-                shared_seen_lock=manager.Lock(),
+                shared_seen_signatures=(
+                    global_shared_seen if global_shared_seen is not None else manager.dict()
+                ),
+                shared_seen_lock=(
+                    global_shared_lock if global_shared_lock is not None else manager.Lock()
+                ),
             )
         )
         roots_remaining -= int(target_roots)
@@ -1585,6 +1659,15 @@ def parse_args() -> RootStorageConfig:
         ),
     )
     parser.add_argument("--max-processes-per-interval", type=int, default=4)
+    parser.add_argument(
+        "--exclude-signature-dataset-dir",
+        action="append",
+        default=[],
+        help=(
+            "Existing root dataset whose history signatures should be rejected "
+            "during this generation run. May be supplied multiple times."
+        ),
+    )
     parser.add_argument("--progress-every", type=int, default=1000)
     args = parser.parse_args()
     return build_storage_config(
@@ -1614,6 +1697,7 @@ def parse_args() -> RootStorageConfig:
         num_processes=args.num_processes,
         worker_roots_per_task=args.worker_roots_per_task,
         max_processes_per_interval=args.max_processes_per_interval,
+        exclude_signature_dataset_dirs=args.exclude_signature_dataset_dir,
         progress_every=args.progress_every,
     )
 
