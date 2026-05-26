@@ -2,7 +2,7 @@
 
 ## Worktree Contract
 
-Familarise/Refresh yourself with how the GV3 game runs : by reading this : /home/shazer/Desktop/Research/Vidur/vidur/vidur/mcts/Game_Versions/Game_Version3/readMe.md
+Familarise/Refresh yourself with how the GV3 game runs : by reading this : /home/shazer/Desktop/Research/Vidur/vidur/vidur/Game_Version3/readMe.md
 
 You are assigned to this worktree only:
 
@@ -68,7 +68,7 @@ features only.
 Start from GV3 `global_features` as built by:
 
 ```text
-vidur/mcts/Game_Versions/Game_Version3/DNN/infer.py:build_model_inputs
+vidur/Game_Version3/DNN/infer.py:build_model_inputs
 ```
 
 Do **not** include:
