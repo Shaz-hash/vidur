@@ -21,7 +21,7 @@ import json
 import multiprocessing as mp
 import os
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -313,8 +313,14 @@ def _predict_bootstrap_inputs_batch(
     inputs_list: Sequence[Any],
     players: Sequence[str],
     child_batch_size: int,
+    action_feature_rows: Sequence[Sequence[float]] | None = None,
 ) -> list[float]:
-    """Predict bootstrap values for child states in vectorized chunks."""
+    """Predict bootstrap values for child states in vectorized chunks.
+
+    When `action_feature_rows` is provided (one row per inputs entry), the
+    NN backend uses them as action-conditional augmentation. Other backends
+    ignore them.
+    """
 
     hook = getattr(infer_module, "predict_model_search_values_from_inputs_batch", None)
     adapter = BootstrapModelAdapter(model)
@@ -324,13 +330,28 @@ def _predict_bootstrap_inputs_batch(
         end = min(len(inputs_list), start + batch_size)
         chunk_inputs = list(inputs_list[start:end])
         chunk_players = list(players[start:end])
+        chunk_action_rows = (
+            list(action_feature_rows[start:end])
+            if action_feature_rows is not None
+            else None
+        )
         if callable(hook):
-            values = hook(
-                model=model,
-                inputs_list=chunk_inputs,
-                players=chunk_players,
-                device=torch.device("cpu"),
-            )
+            try:
+                values = hook(
+                    model=model,
+                    inputs_list=chunk_inputs,
+                    players=chunk_players,
+                    device=torch.device("cpu"),
+                    action_feature_rows=chunk_action_rows,
+                )
+            except TypeError:
+                # Older hook signature without action_feature_rows.
+                values = hook(
+                    model=model,
+                    inputs_list=chunk_inputs,
+                    players=chunk_players,
+                    device=torch.device("cpu"),
+                )
             out.extend(float(x) for x in values)
         else:
             for inputs, player in zip(chunk_inputs, chunk_players):
@@ -359,6 +380,41 @@ def _compute_controller_targets_for_chunk(
     child_inputs: list[Any] = []
     child_players: list[str] = []
     child_jobs: list[tuple[int, int, float, float, float, float]] = []
+    child_action_rows: list[list[float]] = []
+    # Action features for child states keep the bootstrap distribution
+    # consistent with the training distribution. The NN backend trains on
+    # cliff+action features and would receive zero-padded action features
+    # at bootstrap if we don't compute them here. Lazily import to avoid a
+    # hard dep when other backends are in use.
+    bc_extra = getattr(state_loader, "_bellman_extra_config", {}) or {}
+    # Two independent flags:
+    #   nn_use_action_features    -> training uses action features (always cheap, cached)
+    #   nn_bootstrap_action_features -> bootstrap also computes action features per
+    #     child (expensive: O(N^2) sim steps per record). Default OFF since the
+    #     mask-augmentation training already handles the "action features missing"
+    #     case at bootstrap.
+    use_action_features_at_bootstrap = bool(
+        bc_extra.get("nn_bootstrap_action_features", False)
+    ) and str(bc_extra.get("classical_backend", "")) == "neural"
+    if use_action_features_at_bootstrap:
+        from .action_features import (
+            DEFAULT_TOP_K_ACTIONS,
+            extract_action_features_from_state,
+        )
+        from ....game_types import AdversaryAction
+
+        action_top_k = int(bc_extra.get("nn_action_top_k", DEFAULT_TOP_K_ACTIONS))
+        # If True, advance the post-controller leaf state by a noop adversary
+        # action so the resulting state is controller-to-act and matches the
+        # training distribution of action-feature rows.
+        bootstrap_advance_noop_adversary = bool(
+            bc_extra.get("nn_bootstrap_advance_noop_adversary", True)
+        )
+    else:
+        extract_action_features_from_state = None  # type: ignore
+        AdversaryAction = None  # type: ignore
+        action_top_k = 0
+        bootstrap_advance_noop_adversary = False
 
     for local_index, record in enumerate(records):
         state = state_loader(record)
@@ -439,6 +495,41 @@ def _compute_controller_targets_for_chunk(
                 torch.device("cpu"),
                 build_action_mask_flag=False,
             )
+            if use_action_features_at_bootstrap and extract_action_features_from_state is not None:
+                # Snapshot leaf BEFORE action features modify scratch state.
+                leaf_snap = leaf_stats = None
+                try:
+                    leaf_snap, leaf_stats = mcts._snapshot_state_and_stats(leaf_state)
+                    # Optionally advance one noop adversary action so the
+                    # state is controller-to-act and matches the action-
+                    # feature training distribution. AdversaryAction is
+                    # imported above when this branch is taken.
+                    feature_state = leaf_state
+                    if bootstrap_advance_noop_adversary and AdversaryAction is not None:
+                        try:
+                            noop = AdversaryAction(requests=[], stop_decode_ids=[])
+                            feature_state = mcts._env.apply_adversary_action_only(
+                                leaf_state, noop, inplace=True
+                            )
+                        except Exception:
+                            feature_state = leaf_state
+                    act_row, _act_names = extract_action_features_from_state(
+                        feature_state,
+                        mcts=mcts,
+                        env=mcts._env,
+                        top_k=int(action_top_k),
+                    )
+                except Exception as exc:
+                    act_row = []
+                    print(f"[bellman_convergence] action feature extraction failed: {exc!r}", flush=True)
+                finally:
+                    if leaf_snap is not None and leaf_stats is not None:
+                        try:
+                            _ = mcts._scratch_restore(leaf_snap, leaf_stats)
+                        except Exception:
+                            pass
+            else:
+                act_row = []
             child_jobs.append(
                 (
                     int(local_index),
@@ -451,12 +542,14 @@ def _compute_controller_targets_for_chunk(
             )
             child_inputs.append(inputs)
             child_players.append(next_player)
+            child_action_rows.append(act_row)
 
     bootstrap_values = _predict_bootstrap_inputs_batch(
         model=bootstrap_model,
         inputs_list=child_inputs,
         players=child_players,
         child_batch_size=int(child_batch_size),
+        action_feature_rows=(child_action_rows if use_action_features_at_bootstrap else None),
     )
     if len(bootstrap_values) != len(child_jobs):
         raise RuntimeError(
@@ -786,6 +879,17 @@ def train_model(
         output_dir=model_dir,
         model_name=f"{cfg.model_name_prefix}_v{int(model_version)}",
     )
+    # If the previous iteration produced an NN state dict, warm-start the
+    # next iteration's network from it. This dramatically reduces
+    # per-iteration variance in the trained model and accelerates
+    # convergence of the same-version Bellman residual.
+    if int(model_version) > 1:
+        prev_dir = cfg.output_dir / f"Model_Version{int(model_version) - 1}"
+        prev_state = prev_dir / "neural_value_state_dict.pt"
+        if prev_state.exists():
+            extra = dict(model_cfg.extra_config or {})
+            extra["nn_warm_start_state_dict_path"] = str(prev_state)
+            model_cfg = replace(model_cfg, extra_config=extra)
     train_labeled = records_with_targets(train_records, train_targets)
     eval_labeled = records_with_targets(eval_records, eval_targets)
     artifacts = train_candidate_model(

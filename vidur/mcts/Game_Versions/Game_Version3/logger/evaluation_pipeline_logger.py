@@ -65,6 +65,7 @@ class ArenaGameCycleFileLogger:
         "prefill_remaining_by_id",
         "selection_mode",          # NEW
         "valid_action_count",      # NEW
+        "canonical_action_count",
         "iterations_requested",    # NEW
         "iterations_used",         # NEW
         "chosen_q_value",
@@ -72,6 +73,8 @@ class ArenaGameCycleFileLogger:
         "chosen_discount",
         "chosen_bootstrap",
         "chosen_child_cost",
+        "model_value_at_state",
+        "mcts_root_value",
         "candidate_ranking_mode",
         "candidate_top5_action_reprs",
         "candidate_top5_q_values",
@@ -79,6 +82,12 @@ class ArenaGameCycleFileLogger:
         "candidate_top5_discounts",
         "candidate_top5_bootstraps",
         "candidate_top5_child_costs",
+        "candidate_top5_visits",
+        "candidate_top5_priors",
+        "candidate_top5_mcts_probs",
+        "policy_prior_temperature",
+        "mcts_action_temperature",
+        "mcts_action_sample_count",
         "end_reason",
     ]
 
@@ -126,6 +135,7 @@ class ArenaGameCycleFileLogger:
         prefill_remaining_by_id: dict[int, int] | None = None,
         selection_mode: str | None = None,          # NEW
         valid_action_count: int | None = None,      # NEW
+        canonical_action_count: int | None = None,
         iterations_requested: int | None = None,    # NEW
         iterations_used: int | None = None,         # NEW
         chosen_q_value: float | None = None,
@@ -133,6 +143,8 @@ class ArenaGameCycleFileLogger:
         chosen_discount: float | None = None,
         chosen_bootstrap: float | None = None,
         chosen_child_cost: float | None = None,
+        model_value_at_state: float | None = None,
+        mcts_root_value: float | None = None,
         candidate_ranking_mode: str | None = None,
         candidate_top5_action_reprs: list[str] | None = None,
         candidate_top5_q_values: list[float] | None = None,
@@ -140,6 +152,12 @@ class ArenaGameCycleFileLogger:
         candidate_top5_discounts: list[float] | None = None,
         candidate_top5_bootstraps: list[float] | None = None,
         candidate_top5_child_costs: list[float] | None = None,
+        candidate_top5_visits: list[int] | None = None,
+        candidate_top5_priors: list[float] | None = None,
+        candidate_top5_mcts_probs: list[float] | None = None,
+        policy_prior_temperature: float | None = None,
+        mcts_action_temperature: float | None = None,
+        mcts_action_sample_count: int | None = None,
         end_reason: str = "",
     ) -> None:
         path = self._path_for_cycle(game_id=game_id, cycle_label=cycle_label)
@@ -166,6 +184,7 @@ class ArenaGameCycleFileLogger:
                 "prefill_remaining_by_id": "" if prefill_remaining_by_id is None else json.dumps({int(k): int(v) for k, v in prefill_remaining_by_id.items()}, sort_keys=True),
                 "selection_mode": "" if selection_mode is None else str(selection_mode),                        # NEW
                 "valid_action_count": "" if valid_action_count is None else int(valid_action_count),            # NEW
+                "canonical_action_count": "" if canonical_action_count is None else int(canonical_action_count),
                 "iterations_requested": "" if iterations_requested is None else int(iterations_requested),      # NEW
                 "iterations_used": "" if iterations_used is None else int(iterations_used),                     # NEW
                 "chosen_q_value": "" if chosen_q_value is None else float(chosen_q_value),
@@ -173,6 +192,8 @@ class ArenaGameCycleFileLogger:
                 "chosen_discount": "" if chosen_discount is None else float(chosen_discount),
                 "chosen_bootstrap": "" if chosen_bootstrap is None else float(chosen_bootstrap),
                 "chosen_child_cost": "" if chosen_child_cost is None else float(chosen_child_cost),
+                "model_value_at_state": "" if model_value_at_state is None else float(model_value_at_state),
+                "mcts_root_value": "" if mcts_root_value is None else float(mcts_root_value),
                 "candidate_ranking_mode": "" if candidate_ranking_mode is None else str(candidate_ranking_mode),
                 "candidate_top5_action_reprs": "" if candidate_top5_action_reprs is None else json.dumps([str(x) for x in candidate_top5_action_reprs]),
                 "candidate_top5_q_values": "" if candidate_top5_q_values is None else json.dumps([float(x) for x in candidate_top5_q_values]),
@@ -180,6 +201,12 @@ class ArenaGameCycleFileLogger:
                 "candidate_top5_discounts": "" if candidate_top5_discounts is None else json.dumps([float(x) for x in candidate_top5_discounts]),
                 "candidate_top5_bootstraps": "" if candidate_top5_bootstraps is None else json.dumps([float(x) for x in candidate_top5_bootstraps]),
                 "candidate_top5_child_costs": "" if candidate_top5_child_costs is None else json.dumps([float(x) for x in candidate_top5_child_costs]),
+                "candidate_top5_visits": "" if candidate_top5_visits is None else json.dumps([int(x) for x in candidate_top5_visits]),
+                "candidate_top5_priors": "" if candidate_top5_priors is None else json.dumps([float(x) for x in candidate_top5_priors]),
+                "candidate_top5_mcts_probs": "" if candidate_top5_mcts_probs is None else json.dumps([float(x) for x in candidate_top5_mcts_probs]),
+                "policy_prior_temperature": "" if policy_prior_temperature is None else float(policy_prior_temperature),
+                "mcts_action_temperature": "" if mcts_action_temperature is None else float(mcts_action_temperature),
+                "mcts_action_sample_count": "" if mcts_action_sample_count is None else int(mcts_action_sample_count),
                 "end_reason": str(end_reason),
             },
         )
@@ -220,6 +247,7 @@ class ArenaGameCycleFileLogger:
                 "prefill_remaining_by_id": "",
                 "selection_mode": "",
                 "valid_action_count": "",
+                "canonical_action_count": "",
                 "iterations_requested": "",
                 "iterations_used": "",
                 "chosen_q_value": "",
@@ -227,6 +255,8 @@ class ArenaGameCycleFileLogger:
                 "chosen_discount": "",
                 "chosen_bootstrap": "",
                 "chosen_child_cost": "",
+                "model_value_at_state": "",
+                "mcts_root_value": "",
                 "candidate_ranking_mode": "",
                 "candidate_top5_action_reprs": "",
                 "candidate_top5_q_values": "",
@@ -234,6 +264,12 @@ class ArenaGameCycleFileLogger:
                 "candidate_top5_discounts": "",
                 "candidate_top5_bootstraps": "",
                 "candidate_top5_child_costs": "",
+                "candidate_top5_visits": "",
+                "candidate_top5_priors": "",
+                "candidate_top5_mcts_probs": "",
+                "policy_prior_temperature": "",
+                "mcts_action_temperature": "",
+                "mcts_action_sample_count": "",
                 "end_reason": str(end_reason),
             },
         )
@@ -254,6 +290,8 @@ class ArenaModelActionDetailLogger:
         "discount",
         "bootstrap_value",
         "child_cost",
+        "mcts_child_visits",
+        "mcts_child_node_id",
     ]
 
     def __init__(self, games_dir: Path) -> None:
@@ -296,6 +334,8 @@ class ArenaModelActionDetailLogger:
                         "discount": float(row.get("discount", 0.0)),
                         "bootstrap_value": float(row.get("bootstrap_value", 0.0)),
                         "child_cost": float(row.get("child_cost", 0.0)),
+                        "mcts_child_visits": int(row.get("mcts_child_visits", 0) or 0),
+                        "mcts_child_node_id": row.get("mcts_child_node_id", ""),
                     }
                 )
 

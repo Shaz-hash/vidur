@@ -515,7 +515,8 @@ class VirtualVidurMCTSEnvironment:
             self._update_requests_and_stats(new_state, batch_exec=None)
             action_end_time = float(new_state.simulator._time)
 
-            if fast_forward:
+            pending_after_controller = self._v2_has_pending_adv_tick(new_state)
+            if fast_forward and not pending_after_controller:
                 self._maybe_fast_forward_decode_only_to_next_adv_second(new_state)
 
             time_after_final = float(new_state.simulator._time)
@@ -575,7 +576,8 @@ class VirtualVidurMCTSEnvironment:
         action_end_time = float(new_state.simulator._time)
 
         time_after_controller = float(new_state.simulator._time)
-        miss_src = 1 if (time_after_controller > tick_before + self._EPS) else 0
+        controller_crossed_adv_tick = time_after_controller > tick_before + self._EPS
+        miss_src = 1 if controller_crossed_adv_tick else 0
 
 
         if batch_exec is not None:
@@ -599,7 +601,8 @@ class VirtualVidurMCTSEnvironment:
         # transition-time advancement, also considering the case if Controller is no-op while there are prefills active, advance to next tick
         is_strict_noop = self._is_controller_strict_noop(action)
 
-        if fast_forward:
+        pending_after_controller = controller_crossed_adv_tick or self._v2_has_pending_adv_tick(new_state)
+        if fast_forward and not pending_after_controller:
             if not self._v2_has_active_prefill(new_state):
                 self._maybe_fast_forward_decode_only_to_next_adv_second(new_state)
             elif (

@@ -217,6 +217,22 @@ class VidurMCTS:
         return (alloc, evict_rule, mapping)
 
 
+    def _adversary_action_key(self, action: AdversaryAction) -> tuple:
+        request_specs = tuple(
+            sorted(
+                (
+                    int(req.prefill_tokens),
+                    int(req.decode_tokens),
+                    float(req.prefill_slo),
+                    float(req.decode_slo),
+                )
+                for req in (action.requests or [])
+            )
+        )
+        stop_decode_ids = tuple(sorted(set(int(x) for x in (action.stop_decode_ids or []))))
+        return (request_specs, stop_decode_ids)
+
+
     """
         These functions are used for the case when Adversary missed its turn due to the controller's action which progressed the time :
     """
@@ -526,10 +542,25 @@ class VidurMCTS:
                     alias_to_canon[idx] = canon
                     canon_to_aliases[canon].append(idx)
         else:
+            sig_to_canon: Dict[tuple, int] = {}
             for idx in valid_indices:
-                alias_to_canon[idx] = idx
-                canon_to_aliases[idx] = [idx]
-                canonical_indices.append(idx)
+                act = actions_by_index[idx]
+                if not isinstance(act, AdversaryAction):
+                    alias_to_canon[idx] = idx
+                    canon_to_aliases.setdefault(idx, []).append(idx)
+                    canonical_indices.append(idx)
+                    continue
+
+                sig = self._adversary_action_key(act)
+                canon = sig_to_canon.get(sig)
+                if canon is None:
+                    sig_to_canon[sig] = idx
+                    alias_to_canon[idx] = idx
+                    canon_to_aliases[idx] = [idx]
+                    canonical_indices.append(idx)
+                else:
+                    alias_to_canon[idx] = canon
+                    canon_to_aliases[canon].append(idx)
 
         return alias_to_canon, canon_to_aliases, canonical_indices
 

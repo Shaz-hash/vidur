@@ -1,0 +1,25 @@
+{
+  "dataset_dir": "/home/ubuntu/vidur/simulator_output/GV3_Agent/model_search_roots_controller_350k_abs1_ratio40",
+  "eval_ratio": 0.2,
+  "extra_config": {
+    "bootstrap_batch_roots": 128,
+    "bootstrap_child_batch_size": 8192,
+    "bootstrap_clip_max": 0.0,
+    "bootstrap_clip_min": -5.0,
+    "classical_backend": "cliff_aware",
+    "cliff_feature_cache_dir": "/home/ubuntu/vidur-classical-search/simulator_output/GV3_Agent/BellmanConvergence/_cliff_feature_cache_full",
+    "cliff_feature_chunk_records": 2048,
+    "cliff_feature_num_processes": 64,
+    "cliff_worker_threads": 1,
+    "max_trainable_params": 150000,
+    "n_jobs": 24,
+    "target_worker_threads": 1
+  },
+  "model_name_prefix": "cliff_aware_full",
+  "num_roots": 292713,
+  "num_versions": 50,
+  "output_dir": "/home/ubuntu/vidur-classical-search/simulator_output/GV3_Agent/BellmanConvergence/cliff_aware_full_50v",
+  "root_player_filter": "controller",
+  "split_seed": 12345,
+  "target_num_processes": 64
+}

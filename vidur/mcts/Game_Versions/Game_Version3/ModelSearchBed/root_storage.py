@@ -737,6 +737,25 @@ def _build_root_decision_state_for_adversary(
     return decision_state
 
 
+def refresh_root_objective_stats(env: Any, state: Any) -> None:
+    """Synchronize SLO/lateness counters before storing/scoring a root.
+
+    Root generation can stop at a decision frontier where simulator time has
+    advanced past request deadlines, but stats.slo_* has not been refreshed yet.
+    The Bellman target uses stats.slo_violations + stats.slo_lateness_sum, so
+    we must refresh before evaluating parent cost.
+    """
+
+    update_stats = getattr(env, "_update_stats", None)
+    if callable(update_stats):
+        update_stats(state)
+        return
+
+    update_requests = getattr(env, "_update_requests_and_stats", None)
+    if callable(update_requests):
+        update_requests(state, batch_exec=None)
+
+
 def evaluate_first_layer_target(
     cfg: RootStorageConfig,
     mcts: Any,
@@ -762,6 +781,8 @@ def evaluate_first_layer_target(
             pre_controller_snapshot=root.pre_controller_snapshot,
             pre_controller_stats=root.pre_controller_stats,
         )
+
+    refresh_root_objective_stats(mcts._env, search_state)
 
     if hasattr(search_state.simulator, "snapshot_state"):
         model_state_snapshot = search_state.simulator.snapshot_state()

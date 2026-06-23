@@ -851,6 +851,14 @@ def run_trace(
 
         if row.player_acted == "adversary":
             created_ids = sorted(int(k) for k in row.adv_deadlines_by_id.keys())
+            deadline_by_id_for_row = dict(row.adv_deadlines_by_id)
+            if not created_ids and adversary_requests:
+                inferred_start = int(ctx.max_seen_request_id) + 1
+                created_ids = list(range(inferred_start, inferred_start + len(adversary_requests)))
+                deadline_by_id_for_row = {
+                    int(rid): float(decision_tick) + float(req.get("prefill_slo", 0.0))
+                    for rid, req in zip(created_ids, adversary_requests)
+                }
             adv_actions_checked += int(len(adversary_requests) > 0)
 
             test_adversary_prefill_token_bounds(
@@ -862,7 +870,7 @@ def run_trace(
                 decision_tick=decision_tick,
                 created_ids=created_ids,
                 adversary_requests=adversary_requests,
-                deadline_by_id=row.adv_deadlines_by_id,
+                deadline_by_id=deadline_by_id_for_row,
                 trace_id=trace_id,
             )
             test_adversary_interval_and_update_arrival(
@@ -911,7 +919,7 @@ def run_trace(
                 pf = int(req.get("prefill_tokens", 0))
                 pf_slo = float(req.get("prefill_slo", 0.0))
                 dd_slo = float(req.get("decode_slo", 0.05))
-                deadline = float(row.adv_deadlines_by_id.get(rid, decision_tick + pf_slo))
+                deadline = float(deadline_by_id_for_row.get(rid, decision_tick + pf_slo))
                 ctx.requests[rid] = RequestState(
                     rid=rid,
                     prefill_tokens_total=pf,
@@ -982,6 +990,17 @@ def run_trace(
         for rid in (completed_ids | dropped_ids | stopped_ids):
             if rid in ctx.requests:
                 ctx.requests[rid].completed = True
+
+        test_logged_live_ids_match_reconstructed_gv2(
+            ctx,
+            row,
+            current_active_ids=active_ids,
+            current_waiting_ids=set(int(x) for x in row.state_waiting_ids),
+            current_completed_ids=completed_ids,
+            current_dropped_ids=dropped_ids,
+            current_stopped_ids=stopped_ids,
+            trace_id=trace_id,
+        )
 
         # Sync decode progression from row snapshot (captures internal decode FF batches).
         counted_now = dict(row.state_decode_tokens_counted_by_id or {})
@@ -1230,6 +1249,64 @@ def test_normalized_prior_sums(row: "Row", trace_id: str) -> None:
 
     if not any(p > PRIOR_POS_EPS for p in norm_prior):
         _fail("test_normalized_prior_sums", "normalized_prior has no positive entries", row, trace_id)
+
+
+def test_logged_live_ids_match_reconstructed_gv2(
+    ctx: "TraceContext",
+    row: "Row",
+    *,
+    current_active_ids: Set[int],
+    current_waiting_ids: Set[int],
+    current_completed_ids: Set[int],
+    current_dropped_ids: Set[int],
+    current_stopped_ids: Set[int],
+    trace_id: str,
+) -> None:
+    phase = (row.phase or "").strip().lower()
+    if phase.startswith("internal:"):
+        return
+
+    finalized = (
+        set(int(x) for x in current_completed_ids)
+        | set(int(x) for x in current_dropped_ids)
+        | set(int(x) for x in current_stopped_ids)
+    )
+    expected_live_ids = {
+        int(rid)
+        for rid, rs in ctx.requests.items()
+        if not bool(getattr(rs, "completed", False))
+    }
+    expected_live_ids -= finalized
+
+    active_now = set(int(x) for x in current_active_ids)
+    if active_now != expected_live_ids:
+        _fail(
+            "test_logged_active_ids_match_reconstructed_live_gv2",
+            (
+                f"state_active_ids mismatch: "
+                f"expected_live={sorted(expected_live_ids)} "
+                f"logged_active={sorted(active_now)} "
+                f"missing={sorted(expected_live_ids - active_now)} "
+                f"extra={sorted(active_now - expected_live_ids)}"
+            ),
+            row,
+            trace_id,
+        )
+
+    waiting_now = set(int(x) for x in current_waiting_ids)
+    if waiting_now and waiting_now != expected_live_ids:
+        _fail(
+            "test_logged_waiting_ids_match_reconstructed_live_gv2",
+            (
+                f"state_waiting_ids mismatch: "
+                f"expected_live={sorted(expected_live_ids)} "
+                f"logged_waiting={sorted(waiting_now)} "
+                f"missing={sorted(expected_live_ids - waiting_now)} "
+                f"extra={sorted(waiting_now - expected_live_ids)}"
+            ),
+            row,
+            trace_id,
+        )
 
 
 def test_adversary_request_ids_sequential(

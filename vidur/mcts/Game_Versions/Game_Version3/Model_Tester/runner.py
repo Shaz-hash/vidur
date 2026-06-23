@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import csv
 import gc
+import multiprocessing as mp
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
@@ -33,6 +35,30 @@ from .trivial_adversary import make_noop_adversary_action, select_trivial_advers
 
 MODEL_ADV_VS_TRIVIAL_CTRL_LABEL = "model_adv_depth1_vs_trivial_ctrl"
 MODEL_ADV_VS_MODEL_CTRL_LABEL = "model_adv_depth1_vs_model_ctrl_depth1"
+
+# Optional hook used by experiment wrappers to attach arena context to model
+# selection without changing the default Model_Tester behavior.
+_model_action_selection_context_hook = None
+_agz_transition_record_hook = None
+_agz_cycle_end_hook = None
+
+
+def _notify_model_action_selection_context(**kwargs: Any) -> None:
+    hook = globals().get("_model_action_selection_context_hook", None)
+    if callable(hook):
+        hook(**kwargs)
+
+
+def _notify_agz_transition_record(**kwargs: Any) -> None:
+    hook = globals().get("_agz_transition_record_hook", None)
+    if callable(hook):
+        hook(**kwargs)
+
+
+def _notify_agz_cycle_end(**kwargs: Any) -> None:
+    hook = globals().get("_agz_cycle_end_hook", None)
+    if callable(hook):
+        hook(**kwargs)
 
 
 @dataclass(frozen=True)
@@ -104,6 +130,16 @@ def _build_bundle(cfg: ModelTesterConfig) -> _RunnerBundle:
             raise TypeError(
                 "classical_joblib model must implement infer_from_inputs(inputs, player, device=...)"
             )
+        # Some classical wrappers (e.g. V4HGBWrapper) need the raw
+        # simulator_snapshot+stats attached to ModelInputs. The wrapper's
+        # __setstate__ already flips the flag in worker processes; do it on
+        # the parent too so any pre-spawn build_model_inputs() call here also
+        # carries the side channel. No-op for wrappers that don't need it.
+        feat_cfg = getattr(model, "feature_config", None)
+        if isinstance(feat_cfg, dict) and str(feat_cfg.get("name", "")) == "v4_state_local":
+            from ..DNN.infer import enable_inputs_extras
+
+            enable_inputs_extras()
     else:
         model = AlphaZeroModel(spec=spec).to(torch.device(pipeline_cfg.model.device))
         _load_weights_into_model(model, Path(cfg.model_checkpoint_path))
@@ -409,6 +445,11 @@ def _select_cycle_action(
     model: Any,
     adversary_policy: str,
     controller_policy: str,
+    context_game_id: int | None = None,
+    context_cycle_label: str = "",
+    context_phase: str = "",
+    context_turn: int | None = None,
+    context_depth: int | None = None,
 ) -> tuple[str, AdversaryAction | ControllerAction | None, Dict[str, Any]]:
     player, expanded = _align_player_to_valid_actions(
         bundle=bundle,
@@ -420,6 +461,14 @@ def _select_cycle_action(
 
     if str(player) == "adversary":
         if str(adversary_policy) == "model_depth1":
+            _notify_model_action_selection_context(
+                game_id=context_game_id,
+                cycle_label=str(context_cycle_label),
+                phase=str(context_phase),
+                turn=context_turn,
+                depth=context_depth,
+                player=str(player),
+            )
             action, info = _select_model_depth1_action(
                 bundle=bundle,
                 cfg=cfg,
@@ -434,6 +483,14 @@ def _select_cycle_action(
             )
     else:
         if str(controller_policy) == "model_depth1":
+            _notify_model_action_selection_context(
+                game_id=context_game_id,
+                cycle_label=str(context_cycle_label),
+                phase=str(context_phase),
+                turn=context_turn,
+                depth=context_depth,
+                player=str(player),
+            )
             action, info = _select_model_depth1_action(
                 bundle=bundle,
                 cfg=cfg,
@@ -574,6 +631,9 @@ def _run_policy_cycle(
             turns < int(cfg.arena_max_total_turns)
             and float(state.simulator._time) < deadline_t
         ):
+            turn_before = int(turns)
+            depth_before = int(depth)
+            phase_name = "arena_step"
             player, action, selection_info = _select_cycle_action(
                 bundle=bundle,
                 cfg=cfg,
@@ -584,6 +644,11 @@ def _run_policy_cycle(
                 model=model,
                 adversary_policy=str(adversary_policy),
                 controller_policy=str(controller_policy),
+                context_game_id=int(game_id),
+                context_cycle_label=str(cycle_label),
+                context_phase=str(phase_name),
+                context_turn=int(turn_before),
+                context_depth=int(depth_before),
             )
             if action is None:
                 end_reason = "no_valid_action"
@@ -591,9 +656,6 @@ def _run_policy_cycle(
 
             sim_before = float(state.simulator._time)
             player_before = str(player)
-            depth_before = int(depth)
-            turn_before = int(turns)
-            phase_name = "arena_step"
 
             pre_controller_snapshot = None
             pre_controller_stats = None
@@ -664,6 +726,7 @@ def _run_policy_cycle(
                     **state_log,
                     selection_mode=str(selection_info.get("selection_mode", "")),
                     valid_action_count=int(selection_info.get("valid_action_count", 0)),
+                    canonical_action_count=selection_info.get("canonical_action_count"),
                     iterations_requested=int(selection_info.get("iterations_requested", 0)),
                     iterations_used=int(selection_info.get("iterations_used", 0)),
                     chosen_q_value=selection_info.get("chosen_q_value"),
@@ -671,6 +734,8 @@ def _run_policy_cycle(
                     chosen_discount=selection_info.get("chosen_discount"),
                     chosen_bootstrap=selection_info.get("chosen_bootstrap"),
                     chosen_child_cost=selection_info.get("chosen_child_cost"),
+                    model_value_at_state=selection_info.get("model_value_at_state"),
+                    mcts_root_value=selection_info.get("mcts_root_value"),
                     candidate_ranking_mode=selection_info.get("candidate_ranking_mode"),
                     candidate_top5_action_reprs=selection_info.get("candidate_top5_action_reprs"),
                     candidate_top5_q_values=selection_info.get("candidate_top5_q_values"),
@@ -678,7 +743,25 @@ def _run_policy_cycle(
                     candidate_top5_discounts=selection_info.get("candidate_top5_discounts"),
                     candidate_top5_bootstraps=selection_info.get("candidate_top5_bootstraps"),
                     candidate_top5_child_costs=selection_info.get("candidate_top5_child_costs"),
+                    candidate_top5_visits=selection_info.get("candidate_top5_visits"),
+                    candidate_top5_priors=selection_info.get("candidate_top5_priors"),
+                    candidate_top5_mcts_probs=selection_info.get("candidate_top5_mcts_probs"),
+                    policy_prior_temperature=selection_info.get("policy_prior_temperature"),
+                    mcts_action_temperature=selection_info.get("mcts_action_temperature"),
+                    mcts_action_sample_count=selection_info.get("mcts_action_sample_count"),
                 )
+            _notify_agz_transition_record(
+                game_id=int(game_id),
+                cycle_label=str(cycle_label),
+                phase=str(phase_name),
+                turn=int(turn_before),
+                depth=int(depth_before),
+                player=str(player_before),
+                sim_time_before=float(sim_before),
+                sim_time_after=float(state.simulator._time),
+                total_cost_after=float(step_cost),
+                selection_info=dict(selection_info or {}),
+            )
 
         if not end_reason and float(state.simulator._time) >= deadline_t:
             end_reason = "time_limit"
@@ -739,6 +822,14 @@ def _run_policy_cycle(
                 pending_adv_pre_ctrl_stats=pending_adv_pre_ctrl_stats,
             )
             if str(controller_policy) == "model_depth1":
+                _notify_model_action_selection_context(
+                    game_id=int(game_id),
+                    cycle_label=str(cycle_label),
+                    phase=str(phase_name),
+                    turn=int(turn_before),
+                    depth=int(depth_before),
+                    player="controller",
+                )
                 action, selection_info = _select_model_depth1_action(
                     bundle=bundle,
                     cfg=cfg,
@@ -814,6 +905,7 @@ def _run_policy_cycle(
                     **state_log,
                     selection_mode=str(selection_info.get("selection_mode", "")),
                     valid_action_count=int(selection_info.get("valid_action_count", 0)),
+                    canonical_action_count=selection_info.get("canonical_action_count"),
                     iterations_requested=int(selection_info.get("iterations_requested", 0)),
                     iterations_used=int(selection_info.get("iterations_used", 0)),
                     chosen_q_value=selection_info.get("chosen_q_value"),
@@ -821,6 +913,8 @@ def _run_policy_cycle(
                     chosen_discount=selection_info.get("chosen_discount"),
                     chosen_bootstrap=selection_info.get("chosen_bootstrap"),
                     chosen_child_cost=selection_info.get("chosen_child_cost"),
+                    model_value_at_state=selection_info.get("model_value_at_state"),
+                    mcts_root_value=selection_info.get("mcts_root_value"),
                     candidate_ranking_mode=selection_info.get("candidate_ranking_mode"),
                     candidate_top5_action_reprs=selection_info.get("candidate_top5_action_reprs"),
                     candidate_top5_q_values=selection_info.get("candidate_top5_q_values"),
@@ -828,7 +922,25 @@ def _run_policy_cycle(
                     candidate_top5_discounts=selection_info.get("candidate_top5_discounts"),
                     candidate_top5_bootstraps=selection_info.get("candidate_top5_bootstraps"),
                     candidate_top5_child_costs=selection_info.get("candidate_top5_child_costs"),
+                    candidate_top5_visits=selection_info.get("candidate_top5_visits"),
+                    candidate_top5_priors=selection_info.get("candidate_top5_priors"),
+                    candidate_top5_mcts_probs=selection_info.get("candidate_top5_mcts_probs"),
+                    policy_prior_temperature=selection_info.get("policy_prior_temperature"),
+                    mcts_action_temperature=selection_info.get("mcts_action_temperature"),
+                    mcts_action_sample_count=selection_info.get("mcts_action_sample_count"),
                 )
+            _notify_agz_transition_record(
+                game_id=int(game_id),
+                cycle_label=str(cycle_label),
+                phase=str(phase_name),
+                turn=int(turn_before),
+                depth=int(depth_before),
+                player=str(player_before),
+                sim_time_before=float(sim_before),
+                sim_time_after=float(state.simulator._time),
+                total_cost_after=float(step_cost),
+                selection_info=dict(selection_info or {}),
+            )
 
         if not end_reason:
             if float(state.simulator._time) >= deadline_t:
@@ -840,6 +952,21 @@ def _run_policy_cycle(
 
         viol, lateness = runner.env.evaluate_objective(state)
         total_cost = float(viol) + float(lateness)
+
+        _notify_agz_cycle_end(
+            game_id=int(game_id),
+            cycle_label=str(cycle_label),
+            cfg=cfg,
+            bundle=bundle,
+            state=state,
+            turns=int(turns),
+            depth=int(depth),
+            sim_time=float(state.simulator._time),
+            total_cost=float(total_cost),
+            slo_violations=int(viol),
+            total_lateness=float(lateness),
+            end_reason=str(end_reason),
+        )
 
         root_logger = getattr(runner.mcts, "_root_logger", None)
         if root_logger is not None:
@@ -912,6 +1039,239 @@ def _write_results_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
             w.writerow({k: row.get(k, "") for k in fields})
 
 
+def _play_one_game(
+    *,
+    cfg: ModelTesterConfig,
+    bundle: _RunnerBundle,
+    game_id: int,
+    history_hops: int,
+    cycle_logger: Any | None,
+    model_action_detail_logger: Any | None,
+) -> Dict[str, Any]:
+    """Run one history -> cycle1 (trivial ctrl) -> cycle2 (model ctrl) game."""
+
+    base_snapshot = None
+    base_stats = None
+    cycle1 = None
+    cycle2 = None
+    try:
+        base_snapshot, base_stats, base_player, base_depth = _prepare_base_state_for_game(
+            cfg=cfg,
+            bundle=bundle,
+            game_id=int(game_id),
+            history_nontrivial_hops=int(history_hops),
+            cycle_file_logger=cycle_logger,
+        )
+
+        only_model_ctrl = bool(getattr(cfg, "only_model_ctrl_cycle", False))
+
+        if only_model_ctrl:
+            cycle1 = None
+        else:
+            cycle1 = _run_policy_cycle(
+                bundle=bundle,
+                cfg=cfg,
+                base_snapshot=base_snapshot,
+                base_stats=base_stats,
+                base_player=str(base_player),
+                base_depth=int(base_depth),
+                game_id=int(game_id),
+                root_id_base=0,
+                model=bundle.model,
+                cycle_label=MODEL_ADV_VS_TRIVIAL_CTRL_LABEL,
+                adversary_policy="model_depth1",
+                controller_policy="trivial",
+                cycle_file_logger=cycle_logger,
+                model_action_detail_logger=model_action_detail_logger,
+            )
+            if cycle_logger is not None:
+                cycle_logger.write_cycle_end(
+                    game_id=int(game_id),
+                    cycle_label=MODEL_ADV_VS_TRIVIAL_CTRL_LABEL,
+                    total_cost=float(cycle1["total_cost"]),
+                    slo_violations=int(cycle1["slo_violations"]),
+                    total_lateness=float(cycle1["total_lateness"]),
+                    end_reason=str(cycle1.get("end_reason", "")),
+                )
+
+        if bool(getattr(cfg, "skip_model_ctrl_cycle", False)):
+            cycle2 = None
+            delta = 0.0
+            better_cycle = MODEL_ADV_VS_TRIVIAL_CTRL_LABEL
+        else:
+            cycle2 = _run_policy_cycle(
+                bundle=bundle,
+                cfg=cfg,
+                base_snapshot=base_snapshot,
+                base_stats=base_stats,
+                base_player=str(base_player),
+                base_depth=int(base_depth),
+                game_id=int(game_id),
+                root_id_base=1_000_000,
+                model=bundle.model,
+                cycle_label=MODEL_ADV_VS_MODEL_CTRL_LABEL,
+                adversary_policy="model_depth1",
+                controller_policy="model_depth1",
+                cycle_file_logger=cycle_logger,
+                model_action_detail_logger=model_action_detail_logger,
+            )
+            if cycle_logger is not None:
+                cycle_logger.write_cycle_end(
+                    game_id=int(game_id),
+                    cycle_label=MODEL_ADV_VS_MODEL_CTRL_LABEL,
+                    total_cost=float(cycle2["total_cost"]),
+                    slo_violations=int(cycle2["slo_violations"]),
+                    total_lateness=float(cycle2["total_lateness"]),
+                    end_reason=str(cycle2.get("end_reason", "")),
+                )
+
+            if cycle1 is None:
+                delta = 0.0
+                better_cycle = MODEL_ADV_VS_MODEL_CTRL_LABEL
+            else:
+                delta = float(cycle2["total_cost"]) - float(cycle1["total_cost"])
+            if cycle1 is not None and delta < -1e-9:
+                better_cycle = MODEL_ADV_VS_MODEL_CTRL_LABEL
+            elif cycle1 is not None and delta > 1e-9:
+                better_cycle = MODEL_ADV_VS_TRIVIAL_CTRL_LABEL
+            elif cycle1 is not None:
+                better_cycle = "tie"
+
+        return {
+            "game_id": int(game_id),
+            "history_hops": int(history_hops),
+            "model_kind": str(cfg.model_kind),
+            "model_checkpoint": str(cfg.model_checkpoint_path),
+            "cycle1_label": MODEL_ADV_VS_TRIVIAL_CTRL_LABEL,
+            "cycle1_slo_violations": int(cycle1["slo_violations"]) if cycle1 is not None else 0,
+            "cycle1_total_lateness": float(cycle1["total_lateness"]) if cycle1 is not None else 0.0,
+            "cycle1_total_cost": float(cycle1["total_cost"]) if cycle1 is not None else 0.0,
+            "cycle1_end_reason": str(cycle1.get("end_reason", "")) if cycle1 is not None else "",
+            "cycle2_label": MODEL_ADV_VS_MODEL_CTRL_LABEL if cycle2 is not None else "",
+            "cycle2_slo_violations": int(cycle2["slo_violations"]) if cycle2 is not None else 0,
+            "cycle2_total_lateness": float(cycle2["total_lateness"]) if cycle2 is not None else 0.0,
+            "cycle2_total_cost": float(cycle2["total_cost"]) if cycle2 is not None else 0.0,
+            "cycle2_end_reason": str(cycle2.get("end_reason", "")) if cycle2 is not None else "",
+            "cost_delta_cycle2_minus_cycle1": float(delta),
+            "better_cycle": str(better_cycle),
+            "cycle1_log_file": (
+                str(cfg.arena_games_dir_path() / f"game_{int(game_id)}_{MODEL_ADV_VS_TRIVIAL_CTRL_LABEL}.csv")
+                if cycle_logger is not None and cycle1 is not None
+                else ""
+            ),
+            "cycle2_log_file": (
+                str(cfg.arena_games_dir_path() / f"game_{int(game_id)}_{MODEL_ADV_VS_MODEL_CTRL_LABEL}.csv")
+                if cycle_logger is not None and cycle2 is not None
+                else ""
+            ),
+        }
+    finally:
+        _cleanup_after_game(bundle)
+
+
+# ---------------------------------------------------------------------------
+# Parallel arena execution
+# ---------------------------------------------------------------------------
+
+
+_WORKER_BUNDLE: _RunnerBundle | None = None
+_WORKER_CFG: ModelTesterConfig | None = None
+_WORKER_CYCLE_LOGGER: Any | None = None
+_WORKER_DETAIL_LOGGER: Any | None = None
+
+
+def _limit_native_threads(num_threads: int) -> None:
+    """Trim BLAS/OpenMP pools so workers do not oversubscribe the box."""
+
+    threads = max(1, int(num_threads))
+    for name in (
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ):
+        os.environ[name] = str(threads)
+    try:
+        from threadpoolctl import threadpool_limits
+
+        threadpool_limits(limits=threads)
+    except Exception:
+        pass
+
+
+def _arena_worker_init(cfg: ModelTesterConfig, worker_threads: int) -> None:
+    global _WORKER_BUNDLE, _WORKER_CFG, _WORKER_CYCLE_LOGGER, _WORKER_DETAIL_LOGGER
+    _limit_native_threads(int(worker_threads))
+    _WORKER_CFG = cfg
+    _WORKER_BUNDLE = _build_bundle(cfg)
+    _WORKER_CYCLE_LOGGER = (
+        ArenaGameCycleFileLogger(cfg.arena_games_dir_path())
+        if bool(cfg.write_arena_game_logs)
+        else None
+    )
+    _WORKER_DETAIL_LOGGER = (
+        ArenaModelActionDetailLogger(cfg.arena_games_dir_path())
+        if bool(cfg.write_model_action_detail_logs)
+        else None
+    )
+
+
+def _arena_worker_play(item: Tuple[int, int]) -> Dict[str, Any]:
+    game_id, hops = int(item[0]), int(item[1])
+    if _WORKER_BUNDLE is None or _WORKER_CFG is None:
+        raise RuntimeError("arena worker bundle not initialised")
+    return _play_one_game(
+        cfg=_WORKER_CFG,
+        bundle=_WORKER_BUNDLE,
+        game_id=int(game_id),
+        history_hops=int(hops),
+        cycle_logger=_WORKER_CYCLE_LOGGER,
+        model_action_detail_logger=_WORKER_DETAIL_LOGGER,
+    )
+
+
+def _run_arena_parallel(
+    cfg: ModelTesterConfig,
+    history_hops: Sequence[int],
+    *,
+    num_processes: int,
+    worker_threads: int,
+    start_method: str = "spawn",
+) -> List[Dict[str, Any]]:
+    if start_method not in mp.get_all_start_methods():
+        raise RuntimeError(f"multiprocessing start method {start_method!r} unavailable")
+    items = [
+        (int(cfg.game_id_start) + int(i), int(history_hops[i]))
+        for i in range(int(cfg.num_games))
+    ]
+    process_count = min(max(1, int(num_processes)), len(items))
+    print(
+        f"[Model_Tester] running {len(items)} games with {process_count} workers, "
+        f"start_method={start_method}, worker_threads={worker_threads}",
+        flush=True,
+    )
+    ctx = mp.get_context(start_method)
+    rows: List[Dict[str, Any]] = []
+    with ctx.Pool(
+        processes=int(process_count),
+        initializer=_arena_worker_init,
+        initargs=(cfg, int(worker_threads)),
+        maxtasksperchild=int(getattr(cfg, "arena_maxtasks_per_child", 0) or 0) or None,
+    ) as pool:
+        for row in pool.imap_unordered(_arena_worker_play, items):
+            rows.append(row)
+            print(
+                f"[Model_Tester] game {row['game_id']} hops={row['history_hops']} "
+                f"trivial_cost={row['cycle1_total_cost']:.3f} "
+                f"model_cost={row['cycle2_total_cost']:.3f} "
+                f"delta={row['cost_delta_cycle2_minus_cycle1']:+.3f}",
+                flush=True,
+            )
+    rows.sort(key=lambda r: int(r.get("game_id", 0)))
+    return rows
+
+
 def run_model_vs_trivial_tester(cfg: ModelTesterConfig) -> Path:
     cfg.validate()
     cfg.output_dir_path().mkdir(parents=True, exist_ok=True)
@@ -945,6 +1305,25 @@ def run_model_vs_trivial_tester(cfg: ModelTesterConfig) -> Path:
         except Exception:
             pass
 
+    history_hops = cfg.sample_history_hops()
+    rows: List[Dict[str, Any]] = []
+
+    arena_num_processes = int(getattr(cfg, "arena_num_processes", 1) or 1)
+    arena_worker_threads = int(getattr(cfg, "arena_worker_threads", 1) or 1)
+    arena_start_method = str(getattr(cfg, "arena_mp_start_method", "spawn") or "spawn")
+
+    if arena_num_processes > 1:
+        rows = _run_arena_parallel(
+            cfg,
+            history_hops,
+            num_processes=int(arena_num_processes),
+            worker_threads=int(arena_worker_threads),
+            start_method=str(arena_start_method),
+        )
+        out_csv = cfg.arena_results_csv_path()
+        _write_results_csv(out_csv, rows)
+        return out_csv
+
     bundle = _build_bundle(cfg)
     cycle_logger = (
         ArenaGameCycleFileLogger(cfg.arena_games_dir_path())
@@ -957,123 +1336,19 @@ def run_model_vs_trivial_tester(cfg: ModelTesterConfig) -> Path:
         else None
     )
 
-    history_hops = cfg.sample_history_hops()
-    rows: List[Dict[str, Any]] = []
-
     try:
         for i in range(int(cfg.num_games)):
             game_id = int(cfg.game_id_start) + int(i)
             hops = int(history_hops[i])
-            base_snapshot = None
-            base_stats = None
-            cycle1 = None
-            cycle2 = None
-
-            try:
-                base_snapshot, base_stats, base_player, base_depth = _prepare_base_state_for_game(
-                    cfg=cfg,
-                    bundle=bundle,
-                    game_id=int(game_id),
-                    history_nontrivial_hops=int(hops),
-                    cycle_file_logger=cycle_logger,
-                )
-
-                cycle1 = _run_policy_cycle(
-                    bundle=bundle,
-                    cfg=cfg,
-                    base_snapshot=base_snapshot,
-                    base_stats=base_stats,
-                    base_player=str(base_player),
-                    base_depth=int(base_depth),
-                    game_id=int(game_id),
-                    root_id_base=0,
-                    model=bundle.model,
-                    cycle_label=MODEL_ADV_VS_TRIVIAL_CTRL_LABEL,
-                    adversary_policy="model_depth1",
-                    controller_policy="trivial",
-                    cycle_file_logger=cycle_logger,
-                    model_action_detail_logger=model_action_detail_logger,
-                )
-                if cycle_logger is not None:
-                    cycle_logger.write_cycle_end(
-                        game_id=int(game_id),
-                        cycle_label=MODEL_ADV_VS_TRIVIAL_CTRL_LABEL,
-                        total_cost=float(cycle1["total_cost"]),
-                        slo_violations=int(cycle1["slo_violations"]),
-                        total_lateness=float(cycle1["total_lateness"]),
-                        end_reason=str(cycle1.get("end_reason", "")),
-                    )
-
-                cycle2 = _run_policy_cycle(
-                    bundle=bundle,
-                    cfg=cfg,
-                    base_snapshot=base_snapshot,
-                    base_stats=base_stats,
-                    base_player=str(base_player),
-                    base_depth=int(base_depth),
-                    game_id=int(game_id),
-                    root_id_base=1_000_000,
-                    model=bundle.model,
-                    cycle_label=MODEL_ADV_VS_MODEL_CTRL_LABEL,
-                    adversary_policy="model_depth1",
-                    controller_policy="model_depth1",
-                    cycle_file_logger=cycle_logger,
-                    model_action_detail_logger=model_action_detail_logger,
-                )
-                if cycle_logger is not None:
-                    cycle_logger.write_cycle_end(
-                        game_id=int(game_id),
-                        cycle_label=MODEL_ADV_VS_MODEL_CTRL_LABEL,
-                        total_cost=float(cycle2["total_cost"]),
-                        slo_violations=int(cycle2["slo_violations"]),
-                        total_lateness=float(cycle2["total_lateness"]),
-                        end_reason=str(cycle2.get("end_reason", "")),
-                    )
-
-                delta = float(cycle2["total_cost"]) - float(cycle1["total_cost"])
-                if delta < -1e-9:
-                    better_cycle = MODEL_ADV_VS_MODEL_CTRL_LABEL
-                elif delta > 1e-9:
-                    better_cycle = MODEL_ADV_VS_TRIVIAL_CTRL_LABEL
-                else:
-                    better_cycle = "tie"
-
-                rows.append(
-                    {
-                        "game_id": int(game_id),
-                        "history_hops": int(hops),
-                        "model_kind": str(cfg.model_kind),
-                        "model_checkpoint": str(cfg.model_checkpoint_path),
-                        "cycle1_label": MODEL_ADV_VS_TRIVIAL_CTRL_LABEL,
-                        "cycle1_slo_violations": int(cycle1["slo_violations"]),
-                        "cycle1_total_lateness": float(cycle1["total_lateness"]),
-                        "cycle1_total_cost": float(cycle1["total_cost"]),
-                        "cycle1_end_reason": str(cycle1.get("end_reason", "")),
-                        "cycle2_label": MODEL_ADV_VS_MODEL_CTRL_LABEL,
-                        "cycle2_slo_violations": int(cycle2["slo_violations"]),
-                        "cycle2_total_lateness": float(cycle2["total_lateness"]),
-                        "cycle2_total_cost": float(cycle2["total_cost"]),
-                        "cycle2_end_reason": str(cycle2.get("end_reason", "")),
-                        "cost_delta_cycle2_minus_cycle1": float(delta),
-                        "better_cycle": str(better_cycle),
-                        "cycle1_log_file": (
-                            str(cfg.arena_games_dir_path() / f"game_{int(game_id)}_{MODEL_ADV_VS_TRIVIAL_CTRL_LABEL}.csv")
-                            if cycle_logger is not None
-                            else ""
-                        ),
-                        "cycle2_log_file": (
-                            str(cfg.arena_games_dir_path() / f"game_{int(game_id)}_{MODEL_ADV_VS_MODEL_CTRL_LABEL}.csv")
-                            if cycle_logger is not None
-                            else ""
-                        ),
-                    }
-                )
-            finally:
-                base_snapshot = None
-                base_stats = None
-                cycle1 = None
-                cycle2 = None
-                _cleanup_after_game(bundle)
+            row = _play_one_game(
+                cfg=cfg,
+                bundle=bundle,
+                game_id=int(game_id),
+                history_hops=int(hops),
+                cycle_logger=cycle_logger,
+                model_action_detail_logger=model_action_detail_logger,
+            )
+            rows.append(row)
 
         out_csv = cfg.arena_results_csv_path()
         _write_results_csv(out_csv, rows)

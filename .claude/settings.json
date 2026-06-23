@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(*\\)\rRead\\(/home/shazer/Desktop/Research/Vidur/**\\)\rWrite\\(/home/shazer/Desktop/Research/Vidur/**\\)\rEdit\\(/home/shazer/Desktop/Research/Vidur/**\\)\rMultiEdit\\(/home/shazer/Desktop/Research/Vidur/**\\)\rGlob\\(/home/shazer/Desktop/Research/Vidur/**\\)\rGrep\\(/home/shazer/Desktop/Research/Vidur/**\\)\rLS\\(/home/shazer/Desktop/Research/Vidur/**)"
+    ]
+  }
+}

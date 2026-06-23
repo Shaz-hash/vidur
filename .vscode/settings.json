@@ -4,5 +4,60 @@
         "QWEN",
         "vidur"
     ],
-    "python.analysis.fixAll" : ["source.unusedImports"]
+    "python.analysis.fixAll": [
+        "source.unusedImports"
+    ],
+    "files.watcherExclude": {
+        "**/.git/objects/**": true,
+        "**/.git/subtree-cache/**": true,
+        "**/.venv/**": true,
+        "**/__pycache__/**": true,
+        "**/.pytest_cache/**": true,
+        "**/.cache/**": true,
+        "**/cache/**": true,
+        "**/simulator_output/**/mcts_dnn_dataset/**": true,
+        "**/simulator_output/**/mcts_dnn_checkpoints/**": true,
+        "**/simulator_output/**/network/**": true,
+        "**/simulator_output/GV3_Agent/model_search_roots_controller_350k_abs1_ratio40/**": true,
+        "**/simulator_output/GV3_Agent/BellmanConvergence/**": true,
+        "**/mcts_dnn_dataset/**": true,
+        "**/mcts_dnn_checkpoints/**": true,
+        "**/network/received/**": true,
+        "**/network/results/**": true,
+        "**/network/tasks/**": true
+    },
+    "search.exclude": {
+        "**/.venv/**": true,
+        "**/__pycache__/**": true,
+        "**/.pytest_cache/**": true,
+        "**/cache/**": true,
+        "**/simulator_output/**": true,
+        "**/mcts_dnn_dataset/**": true,
+        "**/mcts_dnn_checkpoints/**": true,
+        "**/network/received/**": true,
+        "**/network/results/**": true,
+        "**/network/tasks/**": true
+    },
+    "python.analysis.exclude": [
+        "**/.venv",
+        "**/__pycache__",
+        "**/.pytest_cache",
+        "**/cache",
+        "**/simulator_output",
+        "**/mcts_dnn_dataset",
+        "**/mcts_dnn_checkpoints",
+        "**/network/received",
+        "**/network/results",
+        "**/network/tasks"
+    ],
+    "python.analysis.ignore": [
+        "**/.venv",
+        "**/cache",
+        "**/simulator_output"
+    ],
+    "python.analysis.indexing": false,
+    "python.analysis.diagnosticMode": "openFilesOnly",
+    "git.autorefresh": false,
+    "python.terminal.activateEnvironment": false,
+    "python.terminal.activateEnvInCurrentTerminal": false
 }

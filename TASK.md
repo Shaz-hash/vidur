@@ -2,6 +2,8 @@
 
 ## Worktree Contract
 
+Familarise/Refresh yourself with how the GV3 game runs : by reading this : /home/shazer/Desktop/Research/Vidur/vidur-classical-search/vidur/mcts/Game_Versions/Game_Version3/readMe.md
+
 You are assigned to this worktree only:
 
 ```text
@@ -26,190 +28,395 @@ Stop immediately if the directory or branch is not the expected one. Do not edit
 
 ## Objective
 
-Build the best non-neural model you can for the GV3 controller value function on the fixed ModelSearchBed root-state dataset.
+Build the best classical now you can for the GV3 controller value function on the fixed ModelSearchBed root-state dataset.
 
 This is controller-perspective value learning only. The game is zero-sum/minimax, so we are not trying to learn a separate adversary value function here. Focus on `root_player == "controller"` records and predict `target_value`.
 
-Allowed approaches include:
+Allowed approaches include :
 
 ```text
 decision trees, random forests, extra trees, gradient boosted trees, linear models, generalized additive models, nearest-neighbor style methods, rule-based models, symbolic/hand-engineered formulas, feature crosses, calibration layers that are not neural networks.
 ```
 
-Not allowed:
+
+Hard parameter/model-size budget IMPORTANT !!:
 
 ```text
-neural networks, MLPs, DNNs, attention, transformers, torch trainable neural modules, learned embeddings, differentiable NN-style representation learning.
-```
-
-Hard parameter/model-size budget:
-
-```text
-effective trainable/scalar parameters <= 150,000
+effective trainable/scalar parameters <= 120,000
 ```
 
 For tree models, count approximately by number of learned split/value scalars. Keep the final model compact and explain the model-size estimate.
 
+## FEATURES :
+
+Use **only** the feature schema below for now. This feature contract supersedes the older
+498-d / 466-d feature-plan notes later in this task. The main lesson from the successful
+`experiments/cliff_aware_bellman/report.md` run is that the value model should read
+state-local GV3 request features in a fixed layout, with the same extraction logic used
+for parent states and child states during Bellman bootstrap. Our hypothesis is that using these features , we will be able to converge more closely to the bellman with lower max absolute error.
+
+
+```text
+target_n(parent) = max_a [reward_a + gamma_a * V_{n-1}(child_a)]
+```
+
+but the model input for both parent and child must be built from that state's own local
+features only.
+
+### A. Global State Features
+
+Start from GV3 `global_features` as built by:
+
+```text
+vidur/mcts/Game_Versions/Game_Version3/DNN/infer.py:build_model_inputs
+```
+
+Do **not** include:
+
+- player one-hot bits: `global_features[0]`, `global_features[1]`
+- `global_002 objective_cost`
+- `global_003 slo_violations`
+- `global_004 slo_lateness_sum`
+- `global_022 has_prefill`
+- `global_023 has_decode`
+
+Include the following global features, with names and meanings matching the style used
+in `experiments/cliff_aware_bellman/report.md`:
+
+| Column name | Source field in `infer.py` | Definition |
+|---|---|---|
+| `global_005_num_prefill` | `num_prefill` | active prefill request count, `_norm01` by `F.active_prefill_count_den` |
+| `global_006_num_decode` | `num_decode` | active decode request count, `_norm01` by `F.active_decode_count_den` |
+| `global_007_num_active` | `num_active` | total active request count, `_norm01` by `F.active_total_count_den` |
+| `global_008_total_remaining_prefill` | `total_remaining_prefill` | sum of remaining prefill tokens across active prefill reqs, `_norm01` by `F.total_remaining_prefill_den` |
+| `global_009_total_remaining_decode` | `total_remaining_decode` | sum of remaining decode tokens across active decode reqs, `_norm01` by `F.total_remaining_decode_den` |
+| `global_010_total_decode_generated_active` | `total_decode_generated_active` | total decode tokens already produced for active decode reqs, `_norm01` by `F.total_decode_generated_active_den` |
+| `global_011_num_violated_active` | `num_violated_active` | total active requests whose SLO is already violated, `_norm01` by `F.violated_count_den` |
+| `global_012_p_late_05_15` | `p_late_05_15` | # active prefill reqs with `near_drop_low <= lateness < near_drop_high`, `_norm01` by `F.prefill_near_drop_den` |
+| `global_013_p_late_15` | `p_late_15` | # active prefill reqs with `lateness >= near_drop_high`, `_norm01` by `F.prefill_near_drop_den` |
+| `global_014_d_late_05_15` | `d_late_05_15` | # active decode reqs with `near_drop_low <= lateness < near_drop_high`, `_norm01` by `F.decode_near_drop_den` |
+| `global_015_d_late_15` | `d_late_15` | # active decode reqs with `lateness >= near_drop_high`, `_norm01` by `F.decode_near_drop_den` |
+| `global_016_launch_count` | `launch_count` | # requests launched in the recent launch window, `_norm01` by `F.recent_launch_count_den` |
+| `global_017_launch_prefill` | `launch_prefill` | total prefill tokens launched in the recent launch window, `_norm01` by `F.recent_launch_prefill_den` |
+| `global_018_remaining_launch_request_headroom` | `remaining_launch_request_headroom` | `MAX_REQUESTS_PER_LAUNCH_WINDOW - launch_count`, clipped at `0`, `_norm01` by `MAX_REQUESTS_PER_LAUNCH_WINDOW` |
+| `global_019_remaining_launch_prefill_headroom` | `remaining_launch_prefill_headroom` | `MAX_PREFILL_TOKENS_PER_LAUNCH_WINDOW - launch_prefill`, clipped at `0`, `_norm01` by `MAX_PREFILL_TOKENS_PER_LAUNCH_WINDOW` |
+| `global_020_ewma` | `ewma` | EWMA of recent launch counts, `_norm01` by `F.recent_launch_count_den` |
+| `global_021_decode_credit` | `decode_credit` | available decode credit, `_norm01` by `F.decode_credit_den` |
+| `global_extra_prefill_violated_active` | compute from active prefill req ids and violated req ids | # active prefill requests whose SLO is already violated, `_norm01` by `F.active_prefill_count_den` |
+| `global_extra_decode_violated_active` | compute from active decode req ids and violated req ids | # active decode requests whose SLO is already violated, `_norm01` by `F.active_decode_count_den` |
+
+The two `global_extra_*` columns are not currently separate columns in GV3
+`global_features`; compute them directly from the same active request sets used by
+`build_model_inputs`. Keep them state-local and compute them identically for parent and
+child states.
+
+#### A.1 EDF / decode-batch-time scalar globals
+
+**Motivation.** The 17-bucket prefill-slack scheme cut V1 max_abs error from 6.05 → 2.93,
+but ~39 eval samples remain with `abs_err > 0.5`. Outlier inspection
+(`request_edf_analysis.csv` for v2) shows the model still cannot cleanly express
+"min EDF slack > decode batch time → cost = 0", because:
+
+1. Slack is encoded only as per-slot one-hots; min-over-slots requires AND-ing many
+   one-hots inside a single tree path (expensive within a 31-leaf budget).
+2. There is no continuous scalar for the most predictive number — the *minimum* slack
+   across all active requests vs the time of one decode batch.
+3. The decode batch time depends on the largest-context request currently active,
+   which is *also* not exposed.
+
+**Decode batch time lookup.** Use `simulator_output/decode_profile.csv` (columns
+`decode tokens, decode_time_seconds`). For a state, define the **largest active
+context length** as only for decode requests !:
+
+```text
+context_tokens(req) = num_prefill_tokens # done prefill
+                      + max(0, num_processed_tokens - num_prefill_tokens)  # done decode
+max_context_tokens(state) = max_{r in active_requests} context_tokens(r)
+```
+
+If there are no active decode requests, `max_context_tokens = 0`.
+
+Look up `decode_time_at_max = decode_profile[bucket(max_context_tokens)]`, where
+`bucket(x)` picks the row whose `decode tokens` value is **closest** to `x` (ties
+break to the smaller bucket). Treat the table as the canonical batch-execution
+time for the next decode tick at this state.
+
+**Min prefill slack.** Across active **prefill** requests only:
+
+```text
+prefill_slack(r) = (arrived_at(r) + prefill_slo_time(r)) - sim_time
+min_prefill_slack(state) = min_{r in active prefill} prefill_slack(r)
+```
+
+If there are no active prefill requests, set `min_prefill_slack = +inf` so the
+EDF margin below clips to 1 (no prefill urgency).
+
+**The new global features.** Append the following columns to section A:
+
+| Column name | Definition |
+|---|---|
+| `global_edf_minus_batch_norm` | `clip( (min_prefill_slack - decode_time_at_max) , 0, 1 )`. Zero means "the most-urgent active prefill is at or below the next decode batch's execution time" (cliff regime). One means "≥ 1 second of headroom" (clearly safe). HGB can express the cliff with a single threshold on this scalar. |
+| `global_n_active_with_edf_margin_gt_batch_norm` | Count of active requests (prefill + decode) whose own per-request deadline-vs-batch margin is strictly positive, divided by `F.active_total_count_den` (120). For each active request, define `request_deadline = arrived_at + prefill_slo_time` if the request is in the prefill phase (`is_prefill_complete == False`), otherwise `request_deadline = decode_next_deadline_by_id[rid]` (fall back to `arrived_at + decode_slo_time` if missing). The per-request margin is `(request_deadline - sim_time) - decode_time_at_max`. Count requests with margin > 0 and normalise by `F.active_total_count_den`. **Why:** v3 outlier inspection shows several cases where `min_prefill_slack` is just barely above batch time but 5–6 active requests are crowded near deadline. The model needs a single-threshold scalar that says "all (or most) active requests are clearly safe" so HGB can isolate "many crowded but each above batch time → cost ≈ 0" without ANDing across per-slot one-hots. |
+
+`D_GLOBAL` grows from 19 to 21. Sections B and C unchanged. New
+`D_TOTAL = 21 + 7*25 + 7*4 = 224`.
+
+**Determinism.** All inputs (snapshot + stats + `decode_profile.csv`) are state-local
+and identical at parent and child rows, satisfying the iteration-time symmetry rule
+in the Q&A section below.
+
+### B. Prefill Request Slots
+
+Use at most:
+
+```text
+MAX_REQUESTS_PER_LAUNCH_WINDOW = 7
+```
+
+prefill request slots.
+
+Selection rule:
+
+1. Consider currently active prefill requests only.
+2. Compute remaining prefill slack time:
+
+```text
+prefill_slack_sec = prefill_slo_deadline - current_sim_time
+prefill_slack_sec_clamped = max(0.0, prefill_slack_sec)
+```
+
+3. Sort requests by `prefill_slack_sec_clamped` ascending. The most urgent request
+   goes first. Break ties by request id ascending.
+4. If all active prefill requests have already violated their SLO, ignore slack ordering
+   and select the first 7 by request id ascending.
+5. If fewer than 7 requests exist, pad the remaining slots with zeros. Each slot should
+   include a `present` bit so padded zeros are distinguishable from real zero-valued
+   features.
+
+For each selected prefill slot, emit only:
+
+- `prefill_slot_present`: `1` for a real slot, `0` for padding.
+- `prefill_remaining_tokens`: remaining prefill tokens for that request.
+- `prefill_total_tokens`: total prefill tokens for that request.
+- `prefill_violated_bit`: `1` if the request has violated prefill SLO, else `0`.
+- `prefill_lateness_bucket`: one-hot bucket over request lateness:
+  - `[0.0, 0.5)`
+  - `[0.5, 1.0)`
+  - `[1.0, 1.5)`
+  - `[1.5, +inf)`
+- `prefill_slack_bucket`: one-hot bucket over `prefill_slack_sec_clamped`.
+
+Use the following prefill slack bucket boundaries. The first sub-bucket range
+(`0.0 < slack <= 0.015725797204323228`, the 128-prefill-token profile time) is split
+into 6 finer sub-buckets to give the model granular resolution around the
+~13.29 ms decode-batch execution time. Rationale: V1 outlier analysis
+(`request_edf_analysis.csv`) showed all 40 worst eval predictions have minimum
+slack in `[0.0133, 0.0157]`. As long as the earliest deadline is slightly above
+the decode-batch time (~0.01329 s), a near-zero immediate cost is reachable, but
+HGB cannot separate "EDF slightly above batch time → 0 cost" from "EDF below
+batch time → cliff" with the original single coarse bucket.
+
+| Bucket | Slack range |
+|---:|---|
+| 0 | `slack == 0.0` |
+| 1 | `0.0 < slack <= 0.0133` |
+| 2 | `0.0133 < slack <= 0.0135` |
+| 3 | `0.0135 < slack <= 0.0137` |
+| 4 | `0.0137 < slack <= 0.0140` |
+| 5 | `0.0140 < slack <= 0.0145` |
+| 6 | `0.0145 < slack <= 0.015725797204323228` |
+| 7 | `0.015725797204323228 < slack <= 0.023274675327417962` |
+| 8 | `0.023274675327417962 < slack <= 0.031963770276289896` |
+| 9 | `0.031963770276289896 < slack <= 0.03888623299112536` |
+| 10 | `0.03888623299112536 < slack <= 0.06091750997076902` |
+| 11 | `0.06091750997076902 < slack <= 0.07016849423102292` |
+| 12 | `0.07016849423102292 < slack <= 0.08612442901238251` |
+| 13 | `0.08612442901238251 < slack <= 0.09850190759874299` |
+| 14 | `0.09850190759874299 < slack <= 0.19613847773632437` |
+| 15 | `0.19613847773632437 < slack <= 0.28408680179190937` |
+| 16 | `slack > 0.28408680179190937` |
+
+Buckets 7..15 still correspond to the prefill_profile token times:
+
+```text
+128, 256, 384, 512, 640, 768, 896, 1024, 2048, 3072 prefill-token profile times
+```
+
+with an explicit zero-slack bucket (0), 6 fine sub-buckets within the
+128-token-time band (1..6), and a final `>3072-token-time` bucket (16).
+Total: 17 prefill slack buckets.
+
+### C. Decode Request Slots
+
+Use at most:
+
+```text
+MAX_REQUESTS_PER_LAUNCH_WINDOW = 7
+```
+
+decode request slots.
+
+Selection rule:
+
+1. Consider only active decode requests that have **not** yet experienced SLO violation.
+2. If there are more than 7 non-violated decode requests, choose 7 randomly.
+3. The random choice must be deterministic for a given state. Use a stable seed derived
+   from the root/sample id when available; otherwise use a deterministic hash of the
+   state signature and active request ids. Do not use nondeterministic process-global
+   randomness, because train-time and bootstrap-time feature extraction must agree.
+4. If fewer than 7 non-violated decode requests exist, pad the remaining slots with zeros.
+   Each slot should include a `present` bit so padding is explicit.
+
+For each selected decode slot, emit only:
+
+- `decode_slot_present`: `1` for a real slot, `0` for padding.
+- `decode_remaining_norm`: remaining decode tokens normalized to `[0, 1]`.
+- `decode_done_gt_216_bit`: `1` if decoded tokens processed so far is greater than `216`,
+  else `0`.
+- `decode_done_gt_512_bit`: `1` if decoded tokens processed so far is greater than `512`,
+  else `0`.
+
+Do not include already-violated decode requests in the decode slots.
+
+
+## Optimisations :
+Now that you have the dataset , and their cached children formed, you may create features etc of both these states and their children at once for faster iterations etc. Iteration time shouldnt be long if you create the features once for both the dataset and their children. 
+
 ## Fixed Dataset
 
-Use this dataset as read-only input:
+
+Dataset 1 — original 292k:
+  - Path: simulator_output/GV3_Agent/model_search_roots_controller_350k_abs1_ratio40/
+  - 292,713 controller records
+  - Manifest: manifest.jsonl with 4,288 shards
+
+  Dataset 2 — new 400k:
+  - Path: simulator_output/GV3_Agent/model_search_roots_controller_extra_400k_abs1_ratio40_unique_from_292k_hops0_320/
+  - 399,488 controller records
+  - Manifest: manifest.jsonl with 15,160 shards (smaller shards: 128 records each vs 64 records each)
+
+For the eval dataset, use the same 50k samples created from the earlier Dataset 1 — original 292k, basically the eval ratio was 0.2 , eval split seed : 12345
+
+
+## Target Goals & Metrics
+
+For all of the goals below, use the remote machine we have provided you, not this local machine. Once your goals are done, bring all the csvs in the simulator output of this classical branch from the remote machine ! For training the model, evaluation etc use multiple processes like we currently did in our previous classical approach
+
+- The goal is extremely low error on the supervised learning like the current classical model is able to achieve for example both train and eval splits for every iteration 1 to n iterations, n could be 100 or 200 etc for example
 
 ```text
-/home/shazer/Desktop/Research/Vidur/vidur/simulator_output/GV3_Agent/model_search_roots_controller_350k_abs1_ratio40
-```
-
-Current known size:
-
-```text
-292,713 controller root records
-~40.5% have abs(target_value) >= 1
-```
-
-Do not generate a new root dataset.
-
-Do not pass:
-
-```text
---allow-dataset-generation
---overwrite
-```
-
-Use deterministic train/eval split with:
-
-```text
---eval-ratio 0.2
-```
-
-## Target Metrics
-
-The goal is extremely low error on both train and eval splits:
-
-```text
-MSE < 0.1
+MSE < 0.05
 RMSE < 0.05
 MAE < 0.05
 p95_abs_error < 0.05
-max_abs_error < 0.1
+max asbolute error < 0.5 on both training and eval
 ```
 
-If those are not achievable, provide the best model you can find and clearly report the closest metrics. Do not hide failure cases. Include what you tried and why the final model is the best candidate.
+if at any iteration your model fails to get the error to meet these constraints then stop the experiment and revisit your model and features and loss and other hyper params.
 
-## Allowed Code Changes
+- Secondly, your model should be designed such that max_abs_error clearly converges i.e. bellman convergence i.e, unlike the current classical model which is failing to bring the max absolute error to very small value such as around 0.5 or less . we need bellman convergence from your model as we go along the iterations ! and there is clear strong pattern of convergence. We need that your bellman convergence happens and becomes stabilised as you train the model with more iterations within the bounds above (i.e. < 0.5). If this does not happen, revisit your model and featues and hyper params 
 
-You may modify files inside this worktree only.
+- Create the csvs for each of the iteration like we currently do in the classical so that we can better understand that whether you were able to reach convergence or not. Save the model versions along each iteration if you were able to reach convergence.
 
-Primary files you may modify:
+- Once your model has reached convergence , use that model version in the Model Tester to run arena games where each game is of 5s length and run 50 games. Ideally your model should be able to have lower Cost in the end than best trivial policy that we currently have i.e. SJF 512. Right now we run games sequentially, it would be better if you change model tester code so that each game runs in parrallel, will give you more speed to get results quicker!
 
-```text
-vidur/mcts/Game_Versions/Game_Version3/DNN/trainer.py
-vidur/mcts/Game_Versions/Game_Version3/DNN/infer.py
-vidur/mcts/Game_Versions/Game_Version3/ModelSearchBed/self_model_test.py
+## Terminologies : 
+
+- Iteration n-1 to n and its csvs are essentially using the previous model n-1 to provide us with the bootstrap value applied on the child state (supervised learning) and we train the model version n on it (except for the first iteraiton where the boostrap value is 0, hence controller value function learns the immediate max value action!). 
+- Iteration n to n and its csvs are essentially the convergence (bellman convergence) happening, where the boostrap value comes from the model version n and we see how close is the prediction converging. Use this on the eval set to see if our max absolute error is within constraints or not  
+
+## Clarifications & Plan (Q&A — reference, do not deviate)
+
+These are the locked-in answers from the planning conversation. Re-read this section any time before changing approach.
+
+### Feature rules
+
+- FORBIDDEN as inputs to V: parent-side features that aggregate the parent's children
+  (e.g. `la_max_qfloor = max_a [r + gamma * child_doomed_floor]` from prior v9/v10/v14 work).
+- ALLOWED at iteration time: querying V at a child using the child's own self-features
+  (the 498-d cliff+action+forecast schema). That is how the Bellman bootstrap target is
+  computed: target_n(parent) = max_a [r + gamma * V_{n-1}(child_a)].
+- ALLOWED parent-only inputs:
+  - The 498-d cliff + action + forecast features extracted from the parent state.
+  - On-the-fly transforms of those parent features (chunk-aware, realizability sigmoid,
+    eta_to_tick ratio, etc.) computed from columns that exist in BOTH parent and child
+    feature rows so train and inference stay consistent.
+  - Analytical lookahead features built from `prefill_profile.csv`: e.g., for each candidate
+    token_budget B in {128, 256, 512, 1024}, simulate one tick of greedy chunked prefill
+    using the profile's batch-time table on the parent's pending prefills; report counts
+    of prefills that miss SLO. Parent-only — NOT children.
+
+### Target (label) per iteration
+
+- Iteration 1 (V_0 = 0): target_1(parent) = max_a [reward_a + gamma_a * 0] = act_max_reward(parent).
+  The dataset's stored `target_value` and `act_max_reward` are equal at iteration 1 by definition. Hence your model should be able to learn the max reward in V_0 accurately !! Your features and model design should support that ! Dont have it directly as a feature !
+- Iteration n >= 2: target_n(parent) = max_a [reward_a + gamma_a * V_{n-1}(child_a)] using the
+  cached children for both datasets.
+
+### Eval split (locked, do not regenerate)
+
+- Use the same 58,543 PSIDs from Dataset 1 split with `eval_ratio=0.2, split_seed=12345`
+  (file: `simulator_output/GV3_Agent/BellmanConvergence/cached_v4_actfc_25v/split_indices.json`).
+- Train = the other 234,170 PSIDs from Dataset 1 + all 399,488 PSIDs from Dataset 2 = 633,658.
+- Total combined parents indexed = 692,201 (Dataset 1 first, Dataset 2 appended).
+
+### Param budget
+
+- Hard cap: <= 200,000 effective trainable scalar params.
+- Counted as approx `3 * (sum of leaves across all trees)` for HGB-style ensembles.
+- One model per iteration; V_n supersedes V_{n-1}. Budget applies to a single iteration's model.
+- Initial target shape: HGB max_iter ~ 1500, max_leaf_nodes ~ 31 -> ~ 93k params.
+
+
+
+### Pass / fail per iteration
+
+Every iteration must satisfy on BOTH train and eval, on BOTH forward and same-version CSVs:
+
+```
+MSE < 0.05
+RMSE < 0.05
+MAE < 0.05
+p95_abs_error < 0.05
+max_abs_error < 0.5
 ```
 
-You may add classical-model helper files under:
+If ANY iteration breaches max_abs_error < 0.5 (or any other constraint):
 
-```text
-vidur/mcts/Game_Versions/Game_Version3/ModelSearchBed/
-```
+1. STOP the run.
+2. Fix one of:
+   (a) HGB hyperparams (max_leaf_nodes, max_iter, learning_rate, sample weighting, loss).
+   (b) Add / refine features (e.g., new prefill_profile-derived features).
+3. Restart from V_0 (rebuild from scratch).
 
-Avoid modifying neural-model files unless it is only to bypass/disable unused neural fallback paths:
+### "Stabilised convergence" definition
 
-```text
-vidur/mcts/Game_Versions/Game_Version3/DNN/models.py
-vidur/mcts/Game_Versions/Game_Version3/DNN/value_models.py
-vidur/mcts/Game_Versions/Game_Version3/DNN/dnn_spec.py
-```
+- Search for the first k where same-version max_abs_error < 0.5 on eval, AND the prior ks
+  show the pattern that same-version max_abs_error is essentially decreasing
+  (monotone-ish downward trend toward < 0.5).
+- From that k, run consecutive iterations with same-version every iteration to verify
+  >= 5 consecutive iterations within the bounds (oscillation OK if it stays under 0.5).
+- After convergence is detected, KEEP iterating to N = 100 or 200 to build long-term
+  confidence in stability.
 
-Do not modify root generation/storage code unless absolutely necessary:
+### Arena (after convergence)
 
-```text
-vidur/mcts/Game_Versions/Game_Version3/ModelSearchBed/root_storage.py
-```
+- Use a converged V_n joblib in the Model Tester.
+- Run 50 games x 5 sec each, vs SJF-512 trivial (the strongest baseline). then 256, 128
+- Modify Model Tester to run games in parallel (currently sequential) to speed up.
+- Success = model mean cost < SJF-512 trivial mean cost.
 
-If you believe `root_storage.py` must change, document the reason first. The stored dataset is already produced and should remain read-only.
+### Outputs to pull back to local
 
-## Harness Contract
+- Per-iteration train_results.csv, eval_results.csv, train_results_same_version.csv,
+  eval_results_same_version.csv.
+- Per-iteration V_n joblib.
+- Arena results CSV.
+- All under `simulator_output/GV3_Agent/BellmanConvergence/<run_name>/Model_Version{n}/`
+  on the remote machine.
 
-`self_model_test.py` is the experiment harness. It should:
 
-1. Load the fixed dataset.
-2. Split train/eval with `eval_ratio=0.2`.
-3. Call trainer code to fit the candidate classical model.
-4. Call infer code to produce one scalar prediction per record.
-5. Report train/eval metrics.
-
-Feature extraction, model choice, objective, fitting procedure, and inference representation are your responsibility. You can implement custom hooks:
-
-```python
-# in DNN/trainer.py
-def train_model_search(train_records, eval_records, cfg, state_loader, output_dir):
-    ...
-
-# in DNN/infer.py
-def predict_model_search_values(model, records, cfg, state_loader, split_name):
-    ...
-```
-
-The harness passes raw stored root records. Each record contains simulator snapshot, stats, metadata, and `target_value`. Use `state_loader(record)` only if you need to reconstruct the GV3 state; avoid doing that in hot loops unless needed.
-
-## Feature Guidance
-
-You are free to build any non-neural feature representation from:
-
-```text
-simulator_snapshot
-stats
-request metadata
-active/prefill/decode request state
-timing/cost/SLO fields
-history depth
-best_action metadata, if using it does not leak target directly
-```
-
-Do not leak `target_value` into features. Do not use `best_reward`, `best_child_cost`, or equivalent target-construction fields as input features if the deployed inference path would not know them. Those fields are labels/diagnostics, not state features.
-
-## Run Commands
-
-Use the original repo venv but this worktree as `PYTHONPATH`:
-
-```bash
-cd /home/shazer/Desktop/Research/Vidur/vidur-classical-search
-
-PYTHONPATH=$PWD \
-/home/shazer/Desktop/Research/Vidur/vidur/.venv/bin/python3 \
-  -m vidur.mcts.Game_Versions.Game_Version3.ModelSearchBed.self_model_test \
-  --dataset-dir /home/shazer/Desktop/Research/Vidur/vidur/simulator_output/GV3_Agent/model_search_roots_controller_350k_abs1_ratio40 \
-  --output-dir $PWD/simulator_output/GV3_Agent/model_search_results/classical_agent \
-  --num-roots 292713 \
-  --max-candidate-roots 292713 \
-  --root-player-filter controller \
-  --eval-ratio 0.2 \
-  --batch-size 256 \
-  --model-name classical_agent_candidate
-```
-
-For quick smoke tests, use a smaller `--num-roots`, for example `2048`, but final reported metrics must use the largest practical dataset size.
-
-## Output Requirements
-
-Write outputs only under:
-
-```text
-$PWD/simulator_output/GV3_Agent/model_search_results/classical_agent/
-```
-
-Do not commit generated checkpoints, CSV outputs, or large artifacts unless explicitly requested.
-
-At the end, provide:
-
-```text
-best model description
-model-size / parameter estimate
-feature design
-training/fitting setup
-train metrics
-eval metrics
-exact command used
-files changed
-known failure modes or limitations
-```
+### Use the motivation from the current xl models to achieve our targets more sucessfully !
+- use the existing features. 
+- try to excel in the goals than the current xl models in all of the iterations. but make sure the first version exceeds before moving to the next iterations.
+- and you are not supposed to stop unless you win all games against SJF 128,256,512 games

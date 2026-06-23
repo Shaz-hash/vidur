@@ -3,8 +3,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Callable, Optional, Protocol, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, Optional, Protocol, Tuple
 
 import torch
 
@@ -28,6 +28,12 @@ class ModelInputs:
     # Optional legacy aliases
     req_features: Optional[torch.Tensor] = None
     req_mask: Optional[torch.Tensor] = None
+
+    # Opt-in side channel for non-tensor feature builders (e.g. classical v4
+    # HGB wrappers that need the raw simulator_snapshot+stats to produce the
+    # 224-d state-local features). Only populated when build_model_inputs is
+    # called with the extras flag enabled. The torch DNN ignores this field.
+    extras: Optional[Dict[str, Any]] = None
 
 
 class DNNModel(Protocol):

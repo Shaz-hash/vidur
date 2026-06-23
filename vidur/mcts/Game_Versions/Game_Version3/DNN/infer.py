@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import math
 import random
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as Fnn
@@ -67,6 +67,30 @@ D_GLOBAL: int = int(_SPEC.d_global)
 
 NUM_ACTIONS_CONTROLLER: int = int(_SPEC.num_actions_controller)
 NUM_ACTIONS_ADVERSARY: int = int(_SPEC.num_actions_adversary)
+
+
+# Process-global opt-in for attaching simulator_snapshot+stats onto every
+# ModelInputs returned by build_model_inputs(). Defaults to False so that the
+# torch DNN / native MCTS / training paths keep their exact previous behavior
+# (no extra snapshot copy on the hot path). Classical v4 wrappers flip this
+# on at load time.
+_ATTACH_INPUTS_EXTRAS: bool = False
+
+
+def enable_inputs_extras() -> None:
+    """Turn on snapshot+stats attachment to ModelInputs.extras for this process."""
+    global _ATTACH_INPUTS_EXTRAS
+    _ATTACH_INPUTS_EXTRAS = True
+
+
+def disable_inputs_extras() -> None:
+    """Turn off snapshot+stats attachment (default state)."""
+    global _ATTACH_INPUTS_EXTRAS
+    _ATTACH_INPUTS_EXTRAS = False
+
+
+def inputs_extras_enabled() -> bool:
+    return bool(_ATTACH_INPUTS_EXTRAS)
 
 
 # -----------------------------
@@ -525,6 +549,18 @@ def build_model_inputs(
     )
     req_mask_legacy = torch.cat([prefill_mask, decode_mask], dim=1)
 
+    extras: Optional[Dict[str, object]] = None
+    if _ATTACH_INPUTS_EXTRAS:
+        # Same capture pattern as VidurMCTS.snapshot_state_and_stats: prefer
+        # the fast snapshot when available, and clone stats so downstream
+        # mutations of `state.stats` cannot bleed into the captured dict.
+        snap = sim.snapshot_state_fast() if hasattr(sim, "snapshot_state_fast") else sim.snapshot_state()
+        stats_clone = stats.clone() if (stats is not None and hasattr(stats, "clone")) else stats
+        extras = {
+            "simulator_snapshot": snap,
+            "stats": stats_clone,
+        }
+
     return ModelInputs(
         prefill_req_features=prefill_feat,
         decode_req_features=decode_feat,
@@ -534,6 +570,7 @@ def build_model_inputs(
         action_mask=action_mask,
         req_features=req_features_legacy,
         req_mask=req_mask_legacy,
+        extras=extras,
     )
 
 
@@ -642,8 +679,30 @@ def predict_model_search_values(
         predict_learned_classical_values,
         predict_symbolic_bellman_values,
     )
+    from ..ModelSearchBed.cliff_aware_value_model import (
+        CliffAwareControllerValueModel,
+        predict_cliff_aware_values,
+    )
+    from ..ModelSearchBed.neural_value_model import (
+        NeuralValueModel,
+        predict_neural_values,
+    )
 
     record_list = list(records)
+    if isinstance(model, NeuralValueModel):
+        return predict_neural_values(
+            model=model,
+            records=record_list,
+            state_loader=state_loader,
+            split_name=str(split_name),
+        )
+    if isinstance(model, CliffAwareControllerValueModel):
+        return predict_cliff_aware_values(
+            model=model,
+            records=record_list,
+            state_loader=state_loader,
+            split_name=str(split_name),
+        )
     if isinstance(model, LearnedClassicalControllerValueModel):
         return predict_learned_classical_values(
             model=model,
@@ -673,7 +732,29 @@ def predict_model_search_value_from_inputs(
         LearnedClassicalControllerValueModel,
         predict_learned_classical_value_from_inputs,
     )
+    from ..ModelSearchBed.cliff_aware_value_model import (
+        CliffAwareControllerValueModel,
+        predict_cliff_aware_value_from_inputs,
+    )
+    from ..ModelSearchBed.neural_value_model import (
+        NeuralValueModel,
+        predict_neural_value_from_inputs,
+    )
 
+    if isinstance(model, NeuralValueModel):
+        return predict_neural_value_from_inputs(
+            model=model,
+            inputs=inputs,
+            player=str(player),
+            device=device,
+        )
+    if isinstance(model, CliffAwareControllerValueModel):
+        return predict_cliff_aware_value_from_inputs(
+            model=model,
+            inputs=inputs,
+            player=str(player),
+            device=device,
+        )
     if isinstance(model, LearnedClassicalControllerValueModel):
         return predict_learned_classical_value_from_inputs(
             model=model,
@@ -696,6 +777,7 @@ def predict_model_search_values_from_inputs_batch(
     inputs_list,
     players=None,
     device=None,
+    action_feature_rows=None,
 ) -> list[float]:
     """Return controller-perspective values for a batch of child `ModelInputs`."""
 
@@ -704,8 +786,27 @@ def predict_model_search_values_from_inputs_batch(
         LearnedClassicalControllerValueModel,
         predict_learned_classical_values_from_inputs_batch,
     )
+    from ..ModelSearchBed.cliff_aware_value_model import (
+        CliffAwareControllerValueModel,
+        predict_cliff_aware_values_from_inputs_batch,
+    )
+    from ..ModelSearchBed.neural_value_model import (
+        NeuralValueModel,
+        predict_neural_values_from_inputs_batch,
+    )
 
     items = list(inputs_list)
+    if isinstance(model, NeuralValueModel):
+        return predict_neural_values_from_inputs_batch(
+            model=model,
+            inputs_list=items,
+            action_feature_rows=action_feature_rows,
+        )
+    if isinstance(model, CliffAwareControllerValueModel):
+        return predict_cliff_aware_values_from_inputs_batch(
+            model=model,
+            inputs_list=items,
+        )
     if isinstance(model, LearnedClassicalControllerValueModel):
         return predict_learned_classical_values_from_inputs_batch(
             model=model,

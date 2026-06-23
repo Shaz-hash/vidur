@@ -122,8 +122,14 @@ class GV2PlayerActionSampler:
             prefill_deadline = arrived_at + prefill_slo
             prefill_late_now = max(0.0, t - prefill_deadline)
 
-            # Prefer stats if available, fallback to instantaneous proxy.
-            prefill_lateness = float(pref_lat.get(rid, prefill_late_now))
+            # Prefer stored stats. Only use current-time lateness while prefill is unfinished;
+            # completed prefill lateness is fixed at completion time.
+            if rid in pref_lat:
+                prefill_lateness = float(pref_lat.get(rid, 0.0))
+            elif prefill_done:
+                prefill_lateness = max(0.0, float(getattr(req, "prefill_lateness", 0.0)))
+            else:
+                prefill_lateness = prefill_late_now
             decode_lateness = float(dec_lat.get(rid, 0.0))
             total_lateness = max(0.0, prefill_lateness) + max(0.0, decode_lateness)
 

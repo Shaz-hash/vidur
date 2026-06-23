@@ -1,0 +1,58 @@
+[
+  {
+    "name": "aws-gpu-AlphaGoZero",
+    "ssh_host": "aws-gpu-AlphaGoZero",
+    "public_ip": "13.223.0.244",
+    "repo_dir": "/home/ubuntu/vidur",
+    "python": "/home/ubuntu/vidur/.venv/bin/python"
+  },
+  {
+    "name": "aws-arm-Beta",
+    "ssh_host": "aws-arm-Beta",
+    "public_ip": "3.236.255.228",
+    "repo_dir": "/home/ubuntu/vidur",
+    "python": "/home/ubuntu/vidur/.venv/bin/python"
+  },
+  {
+    "name": "aws-gv3-machine3",
+    "ssh_host": "aws-gv3-machine3",
+    "public_ip": "35.170.75.16",
+    "repo_dir": "/home/ubuntu/vidur",
+    "python": "/home/ubuntu/vidur/.venv/bin/python"
+  },
+  {
+    "name": "aws-gv3-machine4",
+    "ssh_host": "aws-gv3-machine4",
+    "public_ip": "3.238.250.237",
+    "repo_dir": "/home/ubuntu/vidur",
+    "python": "/home/ubuntu/vidur/.venv/bin/python"
+  },
+  {
+    "name": "aws-native-1-gv3",
+    "ssh_host": "aws-native-1-gv3",
+    "public_ip": "44.210.96.95",
+    "repo_dir": "/home/ubuntu/vidur",
+    "python": "/home/ubuntu/vidur/.venv/bin/python"
+  },
+  {
+    "name": "aws-native-2-gv3",
+    "ssh_host": "aws-native-2-gv3",
+    "public_ip": "3.239.56.237",
+    "repo_dir": "/home/ubuntu/vidur",
+    "python": "/home/ubuntu/vidur/.venv/bin/python"
+  },
+  {
+    "name": "aws-native-3-gv3",
+    "ssh_host": "aws-native-3-gv3",
+    "public_ip": "3.239.90.136",
+    "repo_dir": "/home/ubuntu/vidur",
+    "python": "/home/ubuntu/vidur/.venv/bin/python"
+  },
+  {
+    "name": "aws-native-4-gv3",
+    "ssh_host": "aws-native-4-gv3",
+    "public_ip": "18.207.237.75",
+    "repo_dir": "/home/ubuntu/vidur",
+    "python": "/home/ubuntu/vidur/.venv/bin/python"
+  }
+]
