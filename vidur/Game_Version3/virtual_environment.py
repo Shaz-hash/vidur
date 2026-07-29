@@ -374,6 +374,367 @@ class VirtualVidurMCTSEnvironment:
         self._ops._v2_set_missed_adv_source(state, source)
 
     
+    ### Functions for the trace Testing :
+
+    @staticmethod
+    def _trace_spec_get(spec: Any, name: str, default: Any = None) -> Any:
+        if isinstance(spec, dict):
+            return spec.get(name, default)
+        return getattr(spec, name, default)
+
+    def _trace_effective_tokens(
+        self,
+        *,
+        prefill_tokens: int,
+        decode_tokens: int,
+        token_policy: str,
+    ) -> tuple[int, int]:
+        policy = str(token_policy or "clip").strip().lower()
+
+        min_decode = int(self._gv2_cfg.request.min_decode_tokens_per_request)
+        max_decode = int(self._gv2_cfg.request.max_decode_tokens_per_request)
+        max_prefill = int(self._gv2_cfg.request.max_prefill_tokens_per_request)
+
+        raw_prefill = int(prefill_tokens)
+        raw_decode = int(decode_tokens)
+
+        if policy == "clip":
+            eff_prefill = max(1, min(raw_prefill, max_prefill))
+            eff_decode = max(min_decode, min(raw_decode, max_decode))
+            return int(eff_prefill), int(eff_decode)
+
+        if policy == "bucket_gv3":
+            allowed = sorted(int(x) for x in self._gv2_cfg.request.allowed_prefill_tokens)
+            clipped_prefill = max(1, min(raw_prefill, max_prefill))
+            eff_prefill = min(allowed, key=lambda x: (abs(int(x) - int(clipped_prefill)), int(x)))
+            eff_decode = max(min_decode, min(raw_decode, max_decode))
+            return int(eff_prefill), int(eff_decode)
+
+        if policy in {"raw", "none"}:
+            eff_prefill = max(1, raw_prefill)
+            eff_decode = max(min_decode, raw_decode)
+            return int(eff_prefill), int(eff_decode)
+
+        raise ValueError(
+            f"Unsupported trace token_policy={token_policy!r}; "
+            "expected one of: clip, bucket_gv3, raw"
+        )
+
+    def _trace_default_decode_slo_time(self) -> float:
+        legacy = getattr(self._gv2_cfg, "legacy_mcts", None)
+        decode_slos = tuple(float(x) for x in (getattr(legacy, "decode_slos", None) or (50.0,)))
+        return float(decode_slos[0]) / 1000.0 if decode_slos else 0.05
+
+    def _trace_launch_groups(
+        self,
+        state: VidurMCTSState,
+        trace_requests: Sequence[Any],
+        *,
+        now: float,
+        token_policy: str,
+        allow_future_arrivals: bool,
+        enforce_gv3_launch_constraints: bool,
+    ) -> list[tuple[float, int, int]]:
+        by_arrival: dict[float, dict[str, Any]] = {}
+        for spec in trace_requests:
+            arrival_time = float(self._trace_spec_get(spec, "arrived_at", now))
+            if (not bool(allow_future_arrivals)) and arrival_time > now + self._EPS:
+                raise ValueError(
+                    f"Trace request arrived_at={arrival_time} is in the future "
+                    f"relative to simulator time={now}. Fast-forward before injecting."
+                )
+
+            eff_prefill, eff_decode = self._trace_effective_tokens(
+                prefill_tokens=int(self._trace_spec_get(spec, "num_prefill_tokens", 0)),
+                decode_tokens=int(self._trace_spec_get(spec, "num_decode_tokens", 0)),
+                token_policy=str(token_policy),
+            )
+            group = by_arrival.setdefault(
+                float(arrival_time),
+                {"count": 0, "prefill_total": 0, "prefill_values": set(), "decode_values": set()},
+            )
+            group["count"] = int(group["count"]) + 1
+            group["prefill_total"] = int(group["prefill_total"]) + int(eff_prefill)
+            group["prefill_values"].add(int(eff_prefill))
+            group["decode_values"].add(int(eff_decode))
+
+        grouped_launches: list[tuple[float, int, int]] = []
+        launch_history = list(self._v2_get_recent_launches(state))
+        allowed_prefill = {int(x) for x in self._gv2_cfg.request.allowed_prefill_tokens}
+        expected_decode = int(self._gv2_cfg.request.max_decode_tokens_per_request)
+        max_launch_count = int(self._gv2_cfg.adversary_action.max_launch_count_per_tick)
+        request_window_cap = int(self._gv2_cfg.timing.max_requests_per_launch_window)
+        prefill_window_cap = int(self._prefill_window_cap_tokens)
+        tick_sec = float(self._gv2_cfg.timing.adversary_tick_sec)
+        tick_tolerance = max(1e-8, 10.0 * float(self._EPS))
+
+        for arrival_time in sorted(by_arrival):
+            group = by_arrival[arrival_time]
+            count = int(group["count"])
+            prefill_values = set(group["prefill_values"])
+            decode_values = set(group["decode_values"])
+
+            if bool(enforce_gv3_launch_constraints):
+                if tick_sec > 0.0:
+                    nearest_tick = round(float(arrival_time) / tick_sec) * tick_sec
+                    if abs(float(arrival_time) - float(nearest_tick)) > tick_tolerance:
+                        raise ValueError(
+                            "GV3 trace launch is off the adversary decision grid: "
+                            f"arrival={arrival_time}, tick_sec={tick_sec}."
+                        )
+                if len(prefill_values) != 1:
+                    raise ValueError(
+                        "GV3 trace launch must use one homogeneous prefill template per tick: "
+                        f"arrival={arrival_time}, prefill_values={sorted(prefill_values)}."
+                    )
+                prefill_tokens = int(next(iter(prefill_values)))
+                if prefill_tokens not in allowed_prefill:
+                    raise ValueError(
+                        "GV3 trace launch uses an unsupported prefill template: "
+                        f"arrival={arrival_time}, prefill={prefill_tokens}, "
+                        f"allowed={sorted(allowed_prefill)}."
+                    )
+                if decode_values != {expected_decode}:
+                    raise ValueError(
+                        "GV3 trace launch must use the native adversary decode size: "
+                        f"arrival={arrival_time}, decode_values={sorted(decode_values)}, "
+                        f"expected={expected_decode}."
+                    )
+                if count > max_launch_count:
+                    raise ValueError(
+                        "GV3 trace launch exceeds the per-tick request cap: "
+                        f"arrival={arrival_time}, count={count}, cap={max_launch_count}."
+                    )
+            launch_prefill = int(group["prefill_total"])
+
+            if bool(enforce_gv3_launch_constraints):
+                used_count, used_prefill = self._v2_window_usage(
+                    float(arrival_time), launch_history
+                )
+                if used_count + count > request_window_cap:
+                    raise ValueError(
+                        "GV3 trace launch exceeds the sliding request-window cap: "
+                        f"arrival={arrival_time}, used={used_count}, launch={count}, "
+                        f"cap={request_window_cap}."
+                    )
+                if used_prefill + launch_prefill > prefill_window_cap:
+                    raise ValueError(
+                        "GV3 trace launch exceeds the sliding prefill-window cap: "
+                        f"arrival={arrival_time}, used={used_prefill}, launch={launch_prefill}, "
+                        f"cap={prefill_window_cap}."
+                    )
+
+            launch = (float(arrival_time), int(count), int(launch_prefill))
+            grouped_launches.append(launch)
+            launch_history.append(launch)
+
+        return grouped_launches
+
+    def inject_trace_requests(
+        self,
+        state: VidurMCTSState,
+        trace_requests: Sequence[Any],
+        *,
+        inplace: bool = True,
+        token_policy: str = "clip",
+        slo_policy: str = "gv3_default",
+        allow_future_arrivals: bool = False,
+        record_launch_history: bool = False,
+        enforce_gv3_launch_constraints: bool = False,
+    ) -> tuple[VidurMCTSState, dict[str, Any]]:
+        """
+        Inject external trace arrivals directly into the live environment.
+
+        This intentionally does NOT use AdversaryAction. AdversaryAction applies
+        GV3 synthetic adversary tick/window rules, while trace arrivals are an
+        external workload source.
+
+        Expected fields per trace request, as dict keys or object attrs:
+          - arrived_at
+          - num_prefill_tokens
+          - num_decode_tokens
+          - trace_row_id, optional
+          - prefill_slo, optional
+          - decode_slo, optional
+        """
+        target_state = state if inplace else state.fork()
+        sim = target_state.simulator
+        now = float(sim._time)
+
+        if not trace_requests:
+            return target_state, {
+                "created_count": 0,
+                "created_request_ids": [],
+                "token_policy": str(token_policy),
+                "slo_policy": str(slo_policy),
+                "launch_history_recorded": bool(record_launch_history),
+                "gv3_launch_constraints_enforced": bool(enforce_gv3_launch_constraints),
+            }
+
+        grouped_launches = self._trace_launch_groups(
+            target_state,
+            trace_requests,
+            now=float(now),
+            token_policy=str(token_policy),
+            allow_future_arrivals=bool(allow_future_arrivals),
+            enforce_gv3_launch_constraints=bool(enforce_gv3_launch_constraints),
+        )
+
+        req_map = self._req_map(sim)
+        request_counter = getattr(sim, "_request_id_counter", None)
+        if request_counter is None:
+            request_counter = max((int(rid) for rid in req_map.keys()), default=-1)
+        Request._id = int(request_counter)
+
+        created_ids: list[int] = []
+        created_rows: list[dict[str, Any]] = []
+        latest_arrival = None
+
+        for spec in trace_requests:
+            arrival_time = float(self._trace_spec_get(spec, "arrived_at", now))
+            if (not bool(allow_future_arrivals)) and arrival_time > now + self._EPS:
+                raise ValueError(
+                    f"Trace request arrived_at={arrival_time} is in the future "
+                    f"relative to simulator time={now}. Fast-forward before injecting."
+                )
+
+            raw_prefill = int(self._trace_spec_get(spec, "num_prefill_tokens", 0))
+            raw_decode = int(self._trace_spec_get(spec, "num_decode_tokens", 0))
+            eff_prefill, eff_decode = self._trace_effective_tokens(
+                prefill_tokens=raw_prefill,
+                decode_tokens=raw_decode,
+                token_policy=str(token_policy),
+            )
+
+            req = Request(
+                arrived_at=float(arrival_time),
+                num_prefill_tokens=int(eff_prefill),
+                num_decode_tokens=int(eff_decode),
+                block_hash_ids=None,
+                block_size=None,
+            )
+
+            self._slo_manager.set_slos(req)
+
+            prefill_slo = self._trace_spec_get(spec, "prefill_slo", None)
+            decode_slo = self._trace_spec_get(spec, "decode_slo", None)
+            slo_mode = str(slo_policy or "gv3_default").strip().lower()
+            if prefill_slo is not None:
+                req.prefill_slo_time = float(prefill_slo)
+            elif slo_mode in {"gv3_default", "profile", "trace_default"}:
+                req.prefill_slo_time = float(self._prefill_profile.lookup(int(eff_prefill)))
+            if decode_slo is not None:
+                req.decode_slo_time = float(decode_slo)
+            elif slo_mode in {"gv3_default", "profile", "trace_default"}:
+                req.decode_slo_time = float(self._trace_default_decode_slo_time())
+
+            req.completion_slo_time = -1
+            setattr(req, "_desired_prefill_slo_time", float(req.prefill_slo_time))
+            setattr(req, "_desired_decode_slo_time", float(req.decode_slo_time))
+
+            trace_row_id = self._trace_spec_get(spec, "trace_row_id", None)
+            if trace_row_id is not None:
+                setattr(req, "_trace_row_id", int(trace_row_id))
+            setattr(req, "_trace_original_prefill_tokens", int(raw_prefill))
+            setattr(req, "_trace_original_decode_tokens", int(raw_decode))
+            setattr(req, "_trace_effective_prefill_tokens", int(eff_prefill))
+            setattr(req, "_trace_effective_decode_tokens", int(eff_decode))
+            setattr(req, "_trace_token_policy", str(token_policy))
+            setattr(req, "_trace_slo_policy", str(slo_policy))
+
+            req.assign_replica(sim.replica_id)
+            rs = sim._scheduler.get_replica_scheduler(sim.replica_id)
+            rs.add_request(req)
+            sim._request_id_counter = int(Request._id)
+
+            rid = int(req.id)
+            target_state.stats.active_request_ids.add(rid)
+            target_state.stats.requests_generated += 1
+
+            created_ids.append(rid)
+            created_rows.append(
+                {
+                    "request_id": rid,
+                    "trace_row_id": "" if trace_row_id is None else int(trace_row_id),
+                    "arrived_at": float(arrival_time),
+                    "original_prefill_tokens": int(raw_prefill),
+                    "original_decode_tokens": int(raw_decode),
+                    "effective_prefill_tokens": int(eff_prefill),
+                    "effective_decode_tokens": int(eff_decode),
+                    "prefill_slo": float(req.prefill_slo_time),
+                    "decode_slo": float(req.decode_slo_time),
+                }
+            )
+            latest_arrival = (
+                float(arrival_time)
+                if latest_arrival is None
+                else max(float(latest_arrival), float(arrival_time))
+            )
+
+        if latest_arrival is not None:
+            target_state.stats.last_prefill_batch_time = float(latest_arrival)
+
+        if bool(record_launch_history):
+            launch_history = list(self._v2_get_recent_launches(target_state))
+            launch_history.extend(grouped_launches)
+            oldest_in_window = float(now) - float(self._gv2_cfg.timing.launch_window_sec)
+            launch_history = [
+                (float(ts), int(count), int(prefill))
+                for ts, count, prefill in launch_history
+                if float(ts) + self._EPS >= oldest_in_window
+            ]
+            launch_history.sort(key=lambda item: float(item[0]))
+            self._v2_set_recent_launches(target_state, launch_history)
+
+        self._update_requests_and_stats(target_state, batch_exec=None)
+
+        return target_state, {
+            "created_count": int(len(created_ids)),
+            "created_request_ids": [int(x) for x in created_ids],
+            "created_rows": created_rows,
+            "token_policy": str(token_policy),
+            "slo_policy": str(slo_policy),
+            "launch_history_recorded": bool(record_launch_history),
+            "gv3_launch_constraints_enforced": bool(enforce_gv3_launch_constraints),
+            "recorded_launches": grouped_launches if bool(record_launch_history) else [],
+        }
+
+    def prepare_trace_controller_turn(
+        self,
+        state: VidurMCTSState,
+        *,
+        inplace: bool = True,
+        adversary_tick_delay_sec: float | None = None,
+    ) -> VidurMCTSState:
+        """
+        Make the current external-trace state controller-actionable.
+
+        GV3 normally blocks controller actions when the synthetic adversary tick is
+        pending. In trace evaluation, arrivals come from the trace, so the outer
+        controller should not be blocked by a stale synthetic adversary tick.
+
+        Keep the next synthetic adversary tick close, not far in the future. That
+        lets AlphaGoZero MCTS still imagine its learned adversary shortly after
+        the controller action when this state is used for model selection.
+        """
+        target_state = state if inplace else state.fork()
+        now = float(target_state.simulator._time)
+        delay = (
+            float(self._MINI_TICK_SEC)
+            if adversary_tick_delay_sec is None
+            else max(float(adversary_tick_delay_sec), self._EPS)
+        )
+
+        next_tick = self._v2_round(now + delay)
+        if next_tick <= now + self._EPS:
+            next_tick = self._v2_round(now + float(self._MINI_TICK_SEC))
+
+        self._v2_meta_set(target_state.stats, self._META_NEXT_ADV_TICK, float(next_tick))
+        self._v2_set_controller_idle_until(target_state, None)
+        self._v2_set_missed_adv_source(target_state, 0)
+        return target_state
+
+    ### Functions for trace testing end here
 
     ## Util function ends here 
 

@@ -439,6 +439,11 @@ def _native_state_payload(env: Any, state: Any) -> dict[str, Any]:
         _safe_getattr(stats, "missed_adv_source", decode_deadlines.get(META_MISSED_ADV_SOURCE, 0.0)),
         _safe_int(decode_deadlines.get(META_MISSED_ADV_SOURCE, 0.0), 0),
     )
+    pending_adv_tick = next_adv_tick <= (sim_time + 1e-9)
+    try:
+        pending_adv_tick = bool(env._v2_has_pending_adv_tick(state))
+    except Exception:
+        pass
     decode_deadlines[META_NEXT_ADV_TICK] = float(next_adv_tick)
     decode_deadlines[META_LAST_ADV_TICK] = float(last_adv_tick)
     decode_deadlines[META_MISSED_ADV_SOURCE] = float(missed_adv_source)
@@ -502,7 +507,7 @@ def _native_state_payload(env: Any, state: Any) -> dict[str, Any]:
             "decode_next_deadline_by_id": decode_deadlines,
             "next_adv_tick": float(next_adv_tick),
             "last_adv_tick": float(last_adv_tick),
-            "pending_adv_tick": _safe_bool(_safe_getattr(stats, "pending_adv_tick", False), False),
+            "pending_adv_tick": bool(pending_adv_tick),
             "missed_adv_source": int(missed_adv_source),
             "decode_credit_balance": int(decode_credit_balance),
             "decode_credit_available": max(0, int(decode_credit_balance)),

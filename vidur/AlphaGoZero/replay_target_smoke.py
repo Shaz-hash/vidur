@@ -14,7 +14,7 @@ import math
 from pathlib import Path
 from typing import Any
 
-DISCOUNT_FACTOR = 0.98
+DISCOUNT_FACTOR = 0.995
 DISCOUNT_TIME_DENOM_SEC = 0.015725797204323228
 
 FIELDS = [

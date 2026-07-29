@@ -76,20 +76,43 @@ public:
         std::vector<double> values);
 
     std::tuple<double, double> lookup_batch_time(
-        const std::vector<ControllerPredictorRequestState>& reqs,
-        const std::vector<int>& token_alloc,
+        const InlineVector<ControllerPredictorRequestState, 32>& reqs,
+        const InlineVector<int, 32>& token_alloc,
         const std::vector<int>& profile_tokens,
         const std::vector<double>& profile_times,
         double fallback_total = 0.001,
         double fallback_model = 0.0007) const;
 
     static PredictorKey build_key(
-        const std::vector<ControllerPredictorRequestState>& reqs,
-        const std::vector<int>& token_alloc,
+        const InlineVector<ControllerPredictorRequestState, 32>& reqs,
+        const InlineVector<int, 32>& token_alloc,
         int kv_granularity = 64,
         int prefill_chunk_granularity = 32);
 
 private:
+    struct ComponentTableCache {
+        bool initialized = false;
+        const PredictorTable* attn_pre_proj = nullptr;
+        const PredictorTable* attn_post_proj = nullptr;
+        const PredictorTable* mlp_up_proj = nullptr;
+        const PredictorTable* mlp_down_proj = nullptr;
+        const PredictorTable* mlp_act = nullptr;
+        const PredictorTable* input_layernorm = nullptr;
+        const PredictorTable* add = nullptr;
+        const PredictorTable* attn_rope = nullptr;
+        const PredictorTable* attn_kv_cache_save = nullptr;
+        const PredictorTable* attn_decode = nullptr;
+        const PredictorTable* attn_prefill = nullptr;
+        const PredictorTable* post_attention_layernorm = nullptr;
+        const PredictorTable* schedule = nullptr;
+        const PredictorTable* sampler_e2e = nullptr;
+        const PredictorTable* prepare_inputs_e2e = nullptr;
+        const PredictorTable* process_model_outputs = nullptr;
+        const PredictorTable* ray_comm_time = nullptr;
+        const PredictorTable* all_reduce = nullptr;
+        const PredictorTable* send_recv = nullptr;
+    };
+
     static long long pack_key(const PredictorKey& k);
     static int round_up(int x, int g);
     static double nearest_prefill_estimate(
@@ -97,15 +120,18 @@ private:
         const std::vector<int>& profile_tokens,
         const std::vector<double>& profile_times);
     static std::tuple<double, double> default_fallback_time(
-        const std::vector<ControllerPredictorRequestState>& reqs,
-        const std::vector<int>& token_alloc,
+        const InlineVector<ControllerPredictorRequestState, 32>& reqs,
+        const InlineVector<int, 32>& token_alloc,
         const std::vector<int>& profile_tokens,
         const std::vector<double>& profile_times,
         double fallback_total,
         double fallback_model);
+    void invalidate_component_table_cache();
+    const ComponentTableCache& component_table_cache() const;
 
     std::unordered_map<long long, PredictorValue> table_;
     std::unordered_map<std::string, PredictorTable> component_tables_;
+    mutable ComponentTableCache component_table_cache_;
     int kv_granularity_ = 64;
     int prefill_chunk_granularity_ = 32;
     PredictorRuntimeConfig runtime_cfg_;
@@ -121,12 +147,11 @@ struct VirtualSimulatorConfig {
 
 struct ControllerBatchPlan {
     bool strict_noop = false;
-    std::unordered_map<int, int> prefill_alloc;
-    std::unordered_map<int, int> decode_alloc;
-    std::unordered_map<int, int> token_alloc;
-    std::vector<int> request_ids;
-    std::vector<int> num_tokens;
-    std::vector<ControllerPredictorRequestState> predictor_reqs;
+    InlineVector<int, 32> request_ids;
+    InlineVector<int, 32> prefill_tokens;
+    InlineVector<int, 32> decode_tokens;
+    InlineVector<int, 32> num_tokens;
+    InlineVector<ControllerPredictorRequestState, 32> predictor_reqs;
 };
 
 struct BatchExecutionResult {

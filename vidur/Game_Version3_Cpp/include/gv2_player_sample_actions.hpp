@@ -12,6 +12,8 @@ template <typename T>
 struct SampledActionSet {
     std::vector<T> actions;
     std::vector<uint8_t> mask;  // 0/1
+    // Populated by compact rollout sampling; ordinary sampling uses position.
+    std::vector<int> original_indices;
 };
 
 struct AdversarySamplerConfig {
@@ -74,9 +76,18 @@ SampledActionSet<AdversaryAction> sample_adversary_actions_gv2(
     const SimState& state,
     const AdversarySamplerConfig& cfg,
     double decision_tick,
-    const std::unordered_set<int>& forbidden_stop_ids = {});
+    const std::unordered_set<int>& forbidden_stop_ids = {},
+    bool compact_valid_only = false,
+    bool compact_request_materialization = false);
 
 SampledActionSet<ControllerAction> sample_controller_actions_gv2(
+    const SimState& state,
+    const ControllerSamplerConfig& cfg,
+    int decode_credit_balance,
+    bool compact_valid_only = false,
+    bool canonical_compact_only = false);
+
+SampledActionSet<RolloutControllerAction> sample_controller_rollout_actions_gv2(
     const SimState& state,
     const ControllerSamplerConfig& cfg,
     int decode_credit_balance);

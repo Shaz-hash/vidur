@@ -3,13 +3,17 @@
 
 from __future__ import annotations
 
+import os
 import shlex
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
 REMOTE_REPO = "/home/ubuntu/vidur-classical-search"
-REMOTE_OUTPUT_ROOT = f"{REMOTE_REPO}/simulator_output/GV3_Agent/AlphaGoZero"
+REMOTE_OUTPUT_ROOT = os.environ.get(
+    "AGZ_REMOTE_OUTPUT_ROOT",
+    f"{REMOTE_REPO}/simulator_output/GV3_Agent/AlphaGoZero",
+)
 LOCAL_REPO = Path(__file__).resolve().parents[2]
 
 
@@ -21,8 +25,17 @@ class HostSpec:
     role: str = "worker"
 
 
-XL = HostSpec(worker_id="xl", host="bellman-classical-xl", ordinal=0, role="xl")
-WORKERS = [
+@dataclass(frozen=True)
+class ClusterSpec:
+    """A coordinator plus the workers that may serve one experiment."""
+
+    name: str
+    xl: HostSpec
+    workers: tuple[HostSpec, ...]
+
+
+DEFAULT_XL = HostSpec(worker_id="xl", host="bellman-classical-xl", ordinal=0, role="xl")
+DEFAULT_WORKERS = (
     HostSpec("worker1", "bellman-classical-worker-1", 1),
     HostSpec("worker2", "bellman-classical-worker-2", 2),
     HostSpec("worker3", "bellman-classical-worker-3", 3),
@@ -31,7 +44,38 @@ WORKERS = [
     HostSpec("worker6", "bellman-classical-worker-6", 6),
     HostSpec("worker7", "bellman-classical-worker-7", 7),
     HostSpec("worker8", "bellman-classical-worker-8", 8),
-]
+)
+EXP2_XL = HostSpec(worker_id="xl", host="bellman-classical-exp2-xl", ordinal=0, role="xl")
+EXP2_WORKERS = tuple(
+    HostSpec(f"worker{index}", f"bellman-classical-exp2-worker-{index}", index)
+    for index in range(1, 9)
+)
+EXP3_XL = HostSpec(worker_id="xl", host="bellman-classical-exp3-xl", ordinal=0, role="xl")
+EXP3_WORKERS = tuple(
+    HostSpec(f"worker{index}", f"bellman-classical-exp3-worker-{index}", index)
+    for index in range(1, 9)
+)
+
+CLUSTERS = {
+    "default": ClusterSpec("default", DEFAULT_XL, DEFAULT_WORKERS),
+    "exp2": ClusterSpec("exp2", EXP2_XL, EXP2_WORKERS),
+    "exp3": ClusterSpec("exp3", EXP3_XL, EXP3_WORKERS),
+}
+
+
+def get_cluster(name: str | None = None) -> ClusterSpec:
+    """Resolve the selected cluster without changing the legacy default."""
+    cluster_name = str(name or os.environ.get("AGZ_CLUSTER", "default")).strip().lower()
+    try:
+        return CLUSTERS[cluster_name]
+    except KeyError as exc:
+        available = ", ".join(sorted(CLUSTERS))
+        raise ValueError(f"unknown AGZ cluster {cluster_name!r}; expected one of: {available}") from exc
+
+
+ACTIVE_CLUSTER = get_cluster()
+XL = ACTIVE_CLUSTER.xl
+WORKERS = list(ACTIVE_CLUSTER.workers)
 
 
 def parse_workers(raw: str | None) -> list[HostSpec]:

@@ -3,17 +3,62 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <cstring>
 #include <iomanip>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <random>
 #include <sstream>
 #include <stdexcept>
+#include <type_traits>
 #include <unordered_set>
 
 namespace mcts_native_gv2 {
 namespace {
+
+std::uint64_t rollout_hash_bytes(
+    const void* data,
+    std::size_t size,
+    std::uint64_t seed) {
+    const auto* bytes = static_cast<const unsigned char*>(data);
+    std::uint64_t hash = seed;
+    for (std::size_t idx = 0; idx < size; ++idx) {
+        hash ^= static_cast<std::uint64_t>(bytes[idx]);
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+std::uint64_t rollout_hash_fast(
+    const void* data,
+    std::size_t size,
+    std::uint64_t seed) {
+    const auto* bytes = static_cast<const unsigned char*>(data);
+    std::uint64_t hash =
+        seed ^ (static_cast<std::uint64_t>(size) * 0x9e3779b185ebca87ULL);
+    while (size >= sizeof(std::uint64_t)) {
+        std::uint64_t word = 0;
+        std::memcpy(&word, bytes, sizeof(word));
+        word ^= word >> 33U;
+        word *= 0xff51afd7ed558ccdULL;
+        word ^= word >> 33U;
+        hash ^= word;
+        hash = ((hash << 27U) | (hash >> 37U)) *
+            0x3c79ac492ba7b653ULL + 0x1c69b3f74ac4ae35ULL;
+        bytes += sizeof(std::uint64_t);
+        size -= sizeof(std::uint64_t);
+    }
+    std::uint64_t tail = 0;
+    if (size > 0) std::memcpy(&tail, bytes, size);
+    hash ^= tail * 0x9e3779b185ebca87ULL;
+    hash ^= hash >> 33U;
+    hash *= 0xc2b2ae3d27d4eb4fULL;
+    hash ^= hash >> 29U;
+    return hash;
+}
 
 template <typename T>
 T clampv(T x, T lo, T hi) {
@@ -273,50 +318,85 @@ double time_discount(double t_child, double t_parent, const SearchInput& in) {
     return std::pow(gamma, dt / denom);
 }
 
-std::string controller_action_key(const ControllerAction& a) {
-    auto sorted_pairs = [](const std::unordered_map<int, int>& mp) {
-        std::vector<std::pair<int, int>> out;
-        out.reserve(mp.size());
-        for (const auto& kv : mp) out.emplace_back(int(kv.first), int(kv.second));
-        std::sort(out.begin(), out.end());
-        return out;
-    };
-    auto sorted_ids = [](const std::vector<int>& ids) {
-        std::vector<int> out;
-        out.reserve(ids.size());
-        for (int id : ids) out.push_back(int(id));
-        std::sort(out.begin(), out.end());
-        out.erase(std::unique(out.begin(), out.end()), out.end());
-        return out;
-    };
+std::uint64_t hash_controller_component(std::uint64_t value) {
+    value += 0x9e3779b97f4a7c15ULL;
+    value = (value ^ (value >> 30U)) * 0xbf58476d1ce4e5b9ULL;
+    value = (value ^ (value >> 27U)) * 0x94d049bb133111ebULL;
+    return value ^ (value >> 31U);
+}
 
-    std::ostringstream oss;
-    const auto token_alloc = sorted_pairs(a.token_allocations);
-    const auto prefill_alloc = sorted_pairs(a.prefill_allocations);
-    const auto decode_alloc = sorted_pairs(a.decode_allocations);
-    const auto evicted_ids = sorted_ids(a.evicted_request_ids);
+std::uint64_t hash_controller_allocations(
+    const std::unordered_map<int, int>& allocations,
+    std::uint64_t salt) {
+    std::uint64_t sum = 0;
+    std::uint64_t mixed_xor = 0;
+    for (const auto& allocation : allocations) {
+        const std::uint64_t packed =
+            (static_cast<std::uint64_t>(static_cast<std::uint32_t>(allocation.first)) << 32U) |
+            static_cast<std::uint32_t>(allocation.second);
+        const std::uint64_t mixed = hash_controller_component(packed ^ salt);
+        sum += mixed;
+        mixed_xor ^= mixed;
+    }
+    return hash_controller_component(
+        salt ^ static_cast<std::uint64_t>(allocations.size()) ^ sum ^
+        (mixed_xor * 0x9e3779b97f4a7c15ULL));
+}
 
-    oss << "alloc:";
-    for (std::size_t i = 0; i < token_alloc.size(); ++i) {
-        if (i > 0) oss << "|";
-        oss << token_alloc[i].first << ":" << token_alloc[i].second;
+std::uint64_t controller_action_hash(const ControllerAction& action) {
+    std::uint64_t hash =
+        hash_controller_allocations(action.token_allocations, 0x3c79ac492ba7b653ULL) ^
+        hash_controller_allocations(action.prefill_allocations, 0x1c69b3f74ac4ae35ULL) ^
+        hash_controller_allocations(action.decode_allocations, 0xd6e8feb86659fd93ULL);
+    std::uint64_t evicted_sum = 0;
+    std::uint64_t evicted_xor = 0;
+    std::size_t unique_count = 0;
+    for (std::size_t i = 0; i < action.evicted_request_ids.size(); ++i) {
+        const int request_id = action.evicted_request_ids[i];
+        bool seen = false;
+        for (std::size_t j = 0; j < i; ++j) {
+            if (action.evicted_request_ids[j] == request_id) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen) continue;
+        const std::uint64_t mixed = hash_controller_component(
+            static_cast<std::uint32_t>(request_id) ^ 0xa0761d6478bd642fULL);
+        evicted_sum += mixed;
+        evicted_xor ^= mixed;
+        ++unique_count;
     }
-    oss << ";prefill:";
-    for (std::size_t i = 0; i < prefill_alloc.size(); ++i) {
-        if (i > 0) oss << "|";
-        oss << prefill_alloc[i].first << ":" << prefill_alloc[i].second;
+    return hash_controller_component(
+        hash ^ evicted_sum ^ (evicted_xor * 0xe7037ed1a0b428dbULL) ^
+        static_cast<std::uint64_t>(unique_count));
+}
+
+bool controller_actions_equivalent(
+    const ControllerAction& left,
+    const ControllerAction& right) {
+    if (left.token_allocations != right.token_allocations ||
+        left.prefill_allocations != right.prefill_allocations ||
+        left.decode_allocations != right.decode_allocations) {
+        return false;
     }
-    oss << ";decode:";
-    for (std::size_t i = 0; i < decode_alloc.size(); ++i) {
-        if (i > 0) oss << "|";
-        oss << decode_alloc[i].first << ":" << decode_alloc[i].second;
+    for (int request_id : left.evicted_request_ids) {
+        if (std::find(
+                right.evicted_request_ids.begin(),
+                right.evicted_request_ids.end(),
+                request_id) == right.evicted_request_ids.end()) {
+            return false;
+        }
     }
-    oss << ";evicted:";
-    for (std::size_t i = 0; i < evicted_ids.size(); ++i) {
-        if (i > 0) oss << "|";
-        oss << evicted_ids[i];
+    for (int request_id : right.evicted_request_ids) {
+        if (std::find(
+                left.evicted_request_ids.begin(),
+                left.evicted_request_ids.end(),
+                request_id) == left.evicted_request_ids.end()) {
+            return false;
+        }
     }
-    return oss.str();
+    return true;
 }
 
 std::string adversary_action_key(const AdversaryAction& a) {
@@ -388,6 +468,13 @@ public:
             r = getrandbits(k);
         }
         return static_cast<int>(r);
+    }
+
+    double random_double() {
+        const std::uint32_t a = genrand_uint32() >> 5;
+        const std::uint32_t b = genrand_uint32() >> 6;
+        return (static_cast<double>(a) * 67108864.0 + static_cast<double>(b)) /
+            9007199254740992.0;
     }
 
 private:
@@ -495,6 +582,8 @@ struct TreeNode {
     double reward = 0.0;
     int visits = 0;
     double value_sum = 0.0;
+    double rollout_reward_value_sum = 0.0;
+    double rollout_bootstrap_value_sum = 0.0;
     double state_cost = 0.0;
     double sim_time = 0.0;
     int num_valid_actions = 0;
@@ -507,6 +596,7 @@ struct TreeNode {
     std::vector<AdversaryAction> adversary_actions_by_index;
     std::vector<uint8_t> valid_mask;
     std::vector<int> untried_action_indices;
+    std::vector<int> rollout_action_original_indices;
 
     bool has_nn_value = false;
     double nn_value_controller = 0.0;
@@ -533,7 +623,7 @@ struct SelectionResult {
     TreeNode* child = nullptr;
 };
 
-constexpr double kActionSelectionTieEps = 1e-5;
+constexpr double kActionSelectionTieEps = 0.0;
 
 std::pair<bool, double> is_missed_adv_tick(const SimState& state, const GV2EnvConfig& cfg) {
     const double tick = (cfg.adversary_tick_sec > 0.0) ? cfg.adversary_tick_sec : 0.2;
@@ -665,7 +755,8 @@ public:
     SearchOutput run() {
         if (in_.search_mode == "full_tree" ||
             in_.search_mode == "mcts_full_tree" ||
-            in_.search_mode == "tree") {
+            in_.search_mode == "tree" ||
+            in_.search_mode == "full_tree_rollout") {
             return run_full_tree_search();
         }
         return run_gv3_depth_one_search();
@@ -948,25 +1039,182 @@ private:
         return late;
     }
 
-    std::vector<float> controller_action_features_for_policy(
-        const SimState& state,
-        const ControllerAction& action) const {
+    struct ControllerPolicyFeatureSlot {
+        int rid = -1;
+        int remaining = 0;
+        double slack = 0.0;
+        bool violated = false;
+    };
+
+    struct ControllerPolicyFeatureContext {
+        std::size_t prefill_count = 0;
+        std::vector<int> prefill_ids;
+        std::vector<int> decode_ids;
+        std::vector<int> prefill_late_ids;
+        std::vector<int> prefill_missed_ids;
+        std::vector<int> decode_late_ids;
+        int highest_prefill_late = -1;
+        int highest_decode_late = -1;
+        std::vector<ControllerPolicyFeatureSlot> slots;
+        std::vector<const RequestState*> prefill_requests;
+        std::vector<const RequestState*> decode_requests;
+    };
+
+    static bool policy_id_contains(
+        const std::vector<int>& sorted_ids,
+        int rid) {
+        return std::binary_search(sorted_ids.begin(), sorted_ids.end(), rid);
+    }
+
+    const ControllerPolicyFeatureContext& build_controller_policy_feature_context(
+        const SimState& state) const {
+        thread_local ControllerPolicyFeatureContext context;
+        context.prefill_count = 0;
+        context.prefill_ids.clear();
+        context.decode_ids.clear();
+        context.prefill_late_ids.clear();
+        context.prefill_missed_ids.clear();
+        context.decode_late_ids.clear();
+        context.highest_prefill_late = -1;
+        context.highest_decode_late = -1;
+        context.slots.clear();
+        context.prefill_requests.clear();
+        context.decode_requests.clear();
+
+        const auto& active_ids = state.stats.active_request_ids;
+        const bool active_ids_sorted =
+            std::is_sorted(active_ids.begin(), active_ids.end());
+        const auto is_active = [&](int rid) {
+            if (active_ids.empty()) return true;
+            if (active_ids_sorted) {
+                return std::binary_search(
+                    active_ids.begin(), active_ids.end(), rid);
+            }
+            return std::find(active_ids.begin(), active_ids.end(), rid) !=
+                active_ids.end();
+        };
+        for (const RequestState& request : state.requests) {
+            if (!is_active(request.request_id) || request.completed) continue;
+            if (!request.prefill_done() && request.remaining_prefill() > 0) {
+                context.prefill_requests.push_back(&request);
+            } else if (request.prefill_done() && request.remaining_decode() > 0) {
+                context.decode_requests.push_back(&request);
+            }
+        }
+        const auto request_id_less = [](
+            const RequestState* left,
+            const RequestState* right) {
+            return left->request_id < right->request_id;
+        };
+        std::sort(
+            context.prefill_requests.begin(),
+            context.prefill_requests.end(),
+            request_id_less);
+        std::sort(
+            context.decode_requests.begin(),
+            context.decode_requests.end(),
+            request_id_less);
+
+        const auto& prefill_reqs = context.prefill_requests;
+        const auto& decode_reqs = context.decode_requests;
+        context.prefill_count = prefill_reqs.size();
+        context.prefill_ids.reserve(prefill_reqs.size());
+        context.decode_ids.reserve(decode_reqs.size());
+        context.prefill_late_ids.reserve(prefill_reqs.size());
+        context.prefill_missed_ids.reserve(prefill_reqs.size());
+        context.decode_late_ids.reserve(decode_reqs.size());
+        context.slots.reserve(prefill_reqs.size());
+
+        double highest_prefill_value = -1.0;
+        for (const RequestState* request : prefill_reqs) {
+            const int rid = request->request_id;
+            context.prefill_ids.push_back(rid);
+            const double late = prefill_lateness_for_policy(state, *request);
+            if (late > 0.5) context.prefill_late_ids.push_back(rid);
+            if (state.sim_time > request->arrived_at + request->prefill_slo_time) {
+                context.prefill_missed_ids.push_back(rid);
+            }
+            if (context.highest_prefill_late < 0 ||
+                late > highest_prefill_value ||
+                (std::abs(late - highest_prefill_value) <= 1e-12 &&
+                 rid < context.highest_prefill_late)) {
+                context.highest_prefill_late = rid;
+                highest_prefill_value = late;
+            }
+            const double deadline =
+                request->arrived_at + request->prefill_slo_time;
+            context.slots.push_back(ControllerPolicyFeatureSlot{
+                rid,
+                std::max(0, request->remaining_prefill()),
+                std::max(0.0, deadline - state.sim_time),
+                has_id(state.stats.violated_request_ids, rid),
+            });
+        }
+
+        double highest_decode_value = -1.0;
+        for (const RequestState* request : decode_reqs) {
+            const int rid = request->request_id;
+            context.decode_ids.push_back(rid);
+            const double late = get_lateness(
+                state.stats.per_request_decode_lateness_by_id, rid);
+            if (late > 0.5) context.decode_late_ids.push_back(rid);
+            if (context.highest_decode_late < 0 ||
+                late > highest_decode_value ||
+                (std::abs(late - highest_decode_value) <= 1e-12 &&
+                 rid < context.highest_decode_late)) {
+                context.highest_decode_late = rid;
+                highest_decode_value = late;
+            }
+        }
+
+        const bool all_violated = !context.slots.empty() &&
+            std::all_of(
+                context.slots.begin(),
+                context.slots.end(),
+                [](const ControllerPolicyFeatureSlot& item) {
+                    return item.violated;
+                });
+        if (all_violated) {
+            std::sort(
+                context.slots.begin(),
+                context.slots.end(),
+                [](const ControllerPolicyFeatureSlot& left,
+                   const ControllerPolicyFeatureSlot& right) {
+                    return left.rid < right.rid;
+                });
+        } else {
+            std::sort(
+                context.slots.begin(),
+                context.slots.end(),
+                [](const ControllerPolicyFeatureSlot& left,
+                   const ControllerPolicyFeatureSlot& right) {
+                    if (std::abs(left.slack - right.slack) > 1e-12) {
+                        return left.slack < right.slack;
+                    }
+                    return left.rid < right.rid;
+                });
+        }
+        return context;
+    }
+
+    template <typename ControllerActionType>
+    void write_controller_action_features_for_policy(
+        const ControllerActionType& action,
+        const ControllerPolicyFeatureContext& context,
+        float* output) const {
         constexpr double kMaxPrefillActionAlloc = 4096.0;
         constexpr double kMaxDecodeRequests = 100.0;
         constexpr int kMaxPrefillSlots = 7;
+        constexpr bool kRolloutAction =
+            std::is_same_v<ControllerActionType, RolloutControllerAction>;
 
-        const auto prefill_reqs = active_prefill_requests_for_policy(state);
-        const auto decode_reqs = active_decode_requests_for_policy(state);
-        std::unordered_set<int> prefill_ids;
-        std::unordered_set<int> decode_ids;
-        prefill_ids.reserve(prefill_reqs.size());
-        decode_ids.reserve(decode_reqs.size());
-        for (const RequestState* r : prefill_reqs) prefill_ids.insert(r->request_id);
-        for (const RequestState* r : decode_reqs) decode_ids.insert(r->request_id);
-
-        std::unordered_set<int> evicted;
-        evicted.reserve(action.evicted_request_ids.size());
-        for (int rid : action.evicted_request_ids) evicted.insert(rid);
+        thread_local std::vector<int> evicted;
+        evicted.assign(
+            action.evicted_request_ids.begin(),
+            action.evicted_request_ids.end());
+        std::sort(evicted.begin(), evicted.end());
+        evicted.erase(
+            std::unique(evicted.begin(), evicted.end()), evicted.end());
 
         int evicted_prefill = 0;
         int evicted_decode = 0;
@@ -974,141 +1222,199 @@ private:
         int evicted_prefill_late = 0;
         int evicted_prefill_missed = 0;
         for (int rid : evicted) {
-            if (prefill_ids.find(rid) != prefill_ids.end()) {
+            if (policy_id_contains(context.prefill_ids, rid)) {
                 ++evicted_prefill;
-                const RequestState* req = nullptr;
-                for (const RequestState* r : prefill_reqs) {
-                    if (r->request_id == rid) {
-                        req = r;
-                        break;
-                    }
+                if (policy_id_contains(context.prefill_late_ids, rid)) {
+                    ++evicted_prefill_late;
                 }
-                if (req != nullptr) {
-                    if (prefill_lateness_for_policy(state, *req) > 0.5) ++evicted_prefill_late;
-                    if (state.sim_time > req->arrived_at + req->prefill_slo_time) ++evicted_prefill_missed;
+                if (policy_id_contains(context.prefill_missed_ids, rid)) {
+                    ++evicted_prefill_missed;
                 }
             }
-            if (decode_ids.find(rid) != decode_ids.end()) {
+            if (policy_id_contains(context.decode_ids, rid)) {
                 ++evicted_decode;
-                if (get_lateness(state.stats.per_request_decode_lateness_by_id, rid) > 0.5) {
+                if (policy_id_contains(context.decode_late_ids, rid)) {
                     ++evicted_decode_late;
                 }
             }
         }
 
         int total_prefill_alloc = 0;
-        for (const auto& kv : action.prefill_allocations) total_prefill_alloc += std::max(0, kv.second);
-        int total_decode_alloc = 0;
-        for (const auto& kv : action.decode_allocations) total_decode_alloc += std::max(0, kv.second);
-
-        int highest_prefill_late = -1;
-        double highest_prefill_value = -1.0;
-        for (const RequestState* r : prefill_reqs) {
-            const double late = prefill_lateness_for_policy(state, *r);
-            if (highest_prefill_late < 0 ||
-                late > highest_prefill_value ||
-                (std::abs(late - highest_prefill_value) <= 1e-12 && r->request_id < highest_prefill_late)) {
-                highest_prefill_late = r->request_id;
-                highest_prefill_value = late;
+        if constexpr (kRolloutAction) {
+            for (const auto& item : action.compact_prefill_allocations) {
+                total_prefill_alloc += std::max(0, item.second);
             }
-        }
-
-        int highest_decode_late = -1;
-        double highest_decode_value = -1.0;
-        for (const RequestState* r : decode_reqs) {
-            const double late = get_lateness(state.stats.per_request_decode_lateness_by_id, r->request_id);
-            if (highest_decode_late < 0 ||
-                late > highest_decode_value ||
-                (std::abs(late - highest_decode_value) <= 1e-12 && r->request_id < highest_decode_late)) {
-                highest_decode_late = r->request_id;
-                highest_decode_value = late;
-            }
-        }
-
-        std::vector<float> out;
-        out.reserve(43);
-        out.push_back(static_cast<float>(norm01_feature(total_prefill_alloc, kMaxPrefillActionAlloc)));
-        out.push_back(static_cast<float>(norm01_feature(total_decode_alloc, kMaxDecodeRequests)));
-        out.push_back(static_cast<float>(norm01_feature(static_cast<double>(action.prefill_allocations.size()), kMaxPrefillSlots)));
-        out.push_back(static_cast<float>(norm01_feature(static_cast<double>(action.decode_allocations.size()), kMaxDecodeRequests)));
-        out.push_back(static_cast<float>(norm01_feature(static_cast<double>(evicted_prefill), std::max(1.0, static_cast<double>(prefill_reqs.size())))));
-        out.push_back(static_cast<float>(norm01_feature(static_cast<double>(evicted_decode), kMaxDecodeRequests)));
-        out.push_back(total_prefill_alloc > 0 ? 1.0f : 0.0f);
-        out.push_back(total_decode_alloc > 0 ? 1.0f : 0.0f);
-        out.push_back(evicted.empty() ? 0.0f : 1.0f);
-        out.push_back((total_prefill_alloc == 0 && total_decode_alloc == 0 && evicted.empty()) ? 1.0f : 0.0f);
-        out.push_back(static_cast<float>(norm01_feature(static_cast<double>(evicted_decode_late), kMaxDecodeRequests)));
-        out.push_back(static_cast<float>(norm01_feature(static_cast<double>(evicted_prefill_late), kMaxPrefillSlots)));
-        out.push_back(static_cast<float>(norm01_feature(static_cast<double>(evicted_prefill_missed), kMaxPrefillSlots)));
-        out.push_back((highest_prefill_late >= 0 && evicted.find(highest_prefill_late) != evicted.end()) ? 1.0f : 0.0f);
-        out.push_back((highest_decode_late >= 0 && evicted.find(highest_decode_late) != evicted.end()) ? 1.0f : 0.0f);
-
-        struct SlotItem {
-            int rid = -1;
-            int remaining = 0;
-            double slack = 0.0;
-            bool violated = false;
-        };
-        std::vector<SlotItem> slots;
-        slots.reserve(prefill_reqs.size());
-        for (const RequestState* r : prefill_reqs) {
-            const double deadline = r->arrived_at + r->prefill_slo_time;
-            slots.push_back(SlotItem{
-                r->request_id,
-                std::max(0, r->remaining_prefill()),
-                std::max(0.0, deadline - state.sim_time),
-                has_id(state.stats.violated_request_ids, r->request_id),
-            });
-        }
-        const bool all_violated = !slots.empty() &&
-            std::all_of(slots.begin(), slots.end(), [](const SlotItem& x) { return x.violated; });
-        if (all_violated) {
-            std::sort(slots.begin(), slots.end(), [](const SlotItem& a, const SlotItem& b) {
-                return a.rid < b.rid;
-            });
         } else {
-            std::sort(slots.begin(), slots.end(), [](const SlotItem& a, const SlotItem& b) {
-                if (std::abs(a.slack - b.slack) > 1e-12) return a.slack < b.slack;
-                return a.rid < b.rid;
-            });
+            if (action.compact_allocations) {
+                for (const auto& item : action.compact_prefill_allocations) {
+                    total_prefill_alloc += std::max(0, item.second);
+                }
+            } else {
+                for (const auto& item : action.prefill_allocations) {
+                    total_prefill_alloc += std::max(0, item.second);
+                }
+            }
         }
+        int total_decode_alloc = 0;
+        if constexpr (kRolloutAction) {
+            total_decode_alloc = static_cast<int>(
+                action.compact_decode_request_ids.size());
+        } else {
+            if (action.compact_allocations) {
+                total_decode_alloc = static_cast<int>(
+                    action.compact_decode_request_ids.size());
+            } else {
+                for (const auto& item : action.decode_allocations) {
+                    total_decode_alloc += std::max(0, item.second);
+                }
+            }
+        }
+        std::size_t prefill_allocation_count = 0;
+        std::size_t decode_allocation_count = 0;
+        if constexpr (kRolloutAction) {
+            prefill_allocation_count = action.compact_prefill_allocations.size();
+            decode_allocation_count = action.compact_decode_request_ids.size();
+        } else {
+            prefill_allocation_count = action.compact_allocations
+                ? action.compact_prefill_allocations.size()
+                : action.prefill_allocations.size();
+            decode_allocation_count = action.compact_allocations
+                ? action.compact_decode_request_ids.size()
+                : action.decode_allocations.size();
+        }
+
+        float* out = output;
+        *out++ = static_cast<float>(norm01_feature(
+            total_prefill_alloc, kMaxPrefillActionAlloc));
+        *out++ = static_cast<float>(norm01_feature(
+            total_decode_alloc, kMaxDecodeRequests));
+        *out++ = static_cast<float>(norm01_feature(
+            static_cast<double>(prefill_allocation_count),
+            kMaxPrefillSlots));
+        *out++ = static_cast<float>(norm01_feature(
+            static_cast<double>(decode_allocation_count),
+            kMaxDecodeRequests));
+        *out++ = static_cast<float>(norm01_feature(
+            static_cast<double>(evicted_prefill),
+            std::max(1.0, static_cast<double>(context.prefill_count))));
+        *out++ = static_cast<float>(norm01_feature(
+            static_cast<double>(evicted_decode), kMaxDecodeRequests));
+        *out++ = total_prefill_alloc > 0 ? 1.0f : 0.0f;
+        *out++ = total_decode_alloc > 0 ? 1.0f : 0.0f;
+        *out++ = evicted.empty() ? 0.0f : 1.0f;
+        *out++ = (total_prefill_alloc == 0 &&
+                   total_decode_alloc == 0 && evicted.empty())
+            ? 1.0f
+            : 0.0f;
+        *out++ = static_cast<float>(norm01_feature(
+            static_cast<double>(evicted_decode_late), kMaxDecodeRequests));
+        *out++ = static_cast<float>(norm01_feature(
+            static_cast<double>(evicted_prefill_late), kMaxPrefillSlots));
+        *out++ = static_cast<float>(norm01_feature(
+            static_cast<double>(evicted_prefill_missed), kMaxPrefillSlots));
+        *out++ = (context.highest_prefill_late >= 0 &&
+                  std::binary_search(evicted.begin(), evicted.end(), context.highest_prefill_late))
+            ? 1.0f
+            : 0.0f;
+        *out++ = (context.highest_decode_late >= 0 &&
+                  std::binary_search(evicted.begin(), evicted.end(), context.highest_decode_late))
+            ? 1.0f
+            : 0.0f;
 
         for (int slot = 0; slot < kMaxPrefillSlots; ++slot) {
-            const bool has_slot = slot < static_cast<int>(slots.size());
-            const int rid = has_slot ? slots[static_cast<std::size_t>(slot)].rid : -1;
-            const int remaining = has_slot ? std::max(1, slots[static_cast<std::size_t>(slot)].remaining) : 1;
-            const auto alloc_it = action.prefill_allocations.find(rid);
-            const int alloc = (alloc_it == action.prefill_allocations.end()) ? 0 : std::max(0, alloc_it->second);
-            out.push_back(alloc > 0 ? 1.0f : 0.0f);
-            out.push_back(static_cast<float>(norm01_feature(static_cast<double>(alloc), kMaxPrefillActionAlloc)));
-            out.push_back(static_cast<float>(norm01_feature(static_cast<double>(alloc), static_cast<double>(remaining))));
-            out.push_back((rid >= 0 && evicted.find(rid) != evicted.end()) ? 1.0f : 0.0f);
+            const bool has_slot =
+                slot < static_cast<int>(context.slots.size());
+            const int rid = has_slot
+                ? context.slots[static_cast<std::size_t>(slot)].rid
+                : -1;
+            const int remaining = has_slot
+                ? std::max(
+                    1,
+                    context.slots[static_cast<std::size_t>(slot)].remaining)
+                : 1;
+            int alloc = 0;
+            if constexpr (kRolloutAction) {
+                for (const auto& item : action.compact_prefill_allocations) {
+                    if (item.first == rid) {
+                        alloc = std::max(0, item.second);
+                        break;
+                    }
+                }
+            } else {
+                if (action.compact_allocations) {
+                    for (const auto& item : action.compact_prefill_allocations) {
+                        if (item.first == rid) {
+                            alloc = std::max(0, item.second);
+                            break;
+                        }
+                    }
+                } else {
+                    const auto allocation = action.prefill_allocations.find(rid);
+                    if (allocation != action.prefill_allocations.end()) {
+                        alloc = std::max(0, allocation->second);
+                    }
+                }
+            }
+            *out++ = alloc > 0 ? 1.0f : 0.0f;
+            *out++ = static_cast<float>(norm01_feature(
+                static_cast<double>(alloc), kMaxPrefillActionAlloc));
+            *out++ = static_cast<float>(norm01_feature(
+                static_cast<double>(alloc), static_cast<double>(remaining)));
+            *out++ = (rid >= 0 && std::binary_search(evicted.begin(), evicted.end(), rid))
+                ? 1.0f
+                : 0.0f;
         }
-        return out;
+    }
+
+    std::vector<float> controller_action_features_for_policy(
+        const SimState& state,
+        const ControllerAction& action) const {
+        const ControllerPolicyFeatureContext& context =
+            build_controller_policy_feature_context(state);
+        std::vector<float> output(43, 0.0f);
+        write_controller_action_features_for_policy(
+            action, context, output.data());
+        return output;
+    }
+    void write_adversary_action_features_for_policy(
+        const AdversaryAction& action,
+        int canon_action_index,
+        float* output) const {
+        constexpr double kMaxLaunchWindow = 7.0;
+        constexpr double kMaxPrefillTokens = 4096.0;
+        constexpr int kStopRuleCount = 5;
+
+        const int request_count = action.compact_requests
+            ? std::max(0, action.compact_request_count)
+            : static_cast<int>(action.requests.size());
+        double avg_prefill = action.compact_requests
+            ? static_cast<double>(action.compact_prefill_tokens)
+            : 0.0;
+        if (!action.compact_requests && !action.requests.empty()) {
+            for (const auto& request : action.requests) {
+                avg_prefill += static_cast<double>(request.prefill_tokens);
+            }
+            avg_prefill /= static_cast<double>(action.requests.size());
+        }
+        const int stop_idx =
+            ((canon_action_index % kStopRuleCount) + kStopRuleCount) %
+            kStopRuleCount;
+        output[0] = static_cast<float>(norm01_feature(
+            static_cast<double>(request_count), kMaxLaunchWindow));
+        output[1] = static_cast<float>(norm01_feature(
+            avg_prefill, kMaxPrefillTokens));
+        for (int index = 0; index < kStopRuleCount; ++index) {
+            output[2 + index] = index == stop_idx ? 1.0f : 0.0f;
+        }
     }
 
     std::vector<float> adversary_action_features_for_policy(
         const AdversaryAction& action,
         int canon_action_index) const {
-        constexpr double kMaxLaunchWindow = 7.0;
-        constexpr double kMaxPrefillTokens = 4096.0;
-        constexpr int kStopRuleCount = 5;
-
-        double avg_prefill = 0.0;
-        if (!action.requests.empty()) {
-            for (const auto& req : action.requests) avg_prefill += static_cast<double>(req.prefill_tokens);
-            avg_prefill /= static_cast<double>(action.requests.size());
-        }
-        const int stop_idx = ((canon_action_index % kStopRuleCount) + kStopRuleCount) % kStopRuleCount;
-
-        std::vector<float> out;
-        out.reserve(7);
-        out.push_back(static_cast<float>(norm01_feature(static_cast<double>(action.requests.size()), kMaxLaunchWindow)));
-        out.push_back(static_cast<float>(norm01_feature(avg_prefill, kMaxPrefillTokens)));
-        for (int i = 0; i < kStopRuleCount; ++i) {
-            out.push_back(i == stop_idx ? 1.0f : 0.0f);
-        }
-        return out;
+        std::vector<float> output(7, 0.0f);
+        write_adversary_action_features_for_policy(
+            action, canon_action_index, output.data());
+        return output;
     }
 
     bool hgb_policy_priors_available(const std::string& player) const {
@@ -1183,9 +1489,59 @@ private:
                 flat_rows.begin() + row_offset + state_features.size());
         }
 
-        scores = prior_runtime->predict_raw_batch_flat(flat_rows, num_rows, row_dim);
+        std::string cache_key;
+        bool cache_owner = false;
+        if (rollout_policy_cache_active_) {
+            const std::uint64_t metadata =
+                (static_cast<std::uint64_t>(num_rows) << 32U) ^
+                static_cast<std::uint64_t>(row_dim) ^
+                (node->player == "controller" ? 0x434f4e54524f4c4cULL
+                                               : 0x4144564552534152ULL);
+            const std::size_t byte_count = flat_rows.size() * sizeof(float);
+            const std::uint64_t hash1 = rollout_hash_bytes(
+                flat_rows.data(), byte_count, 1469598103934665603ULL ^ metadata);
+            const std::uint64_t hash2 = rollout_hash_bytes(
+                flat_rows.data(), byte_count, 1099511628211ULL ^ ~metadata);
+            cache_key.resize(2U * sizeof(std::uint64_t));
+            std::memcpy(cache_key.data(), &hash1, sizeof(hash1));
+            std::memcpy(cache_key.data() + sizeof(hash1), &hash2, sizeof(hash2));
+            std::unique_lock<std::mutex> lock(rollout_policy_cache_mutex_);
+            auto cached = rollout_policy_score_cache_.find(cache_key);
+            if (cached != rollout_policy_score_cache_.end()) {
+                ++perf_rollout_policy_cache_hits_;
+                return cached->second;
+            }
+            while (rollout_policy_scores_inflight_.find(cache_key) !=
+                   rollout_policy_scores_inflight_.end()) {
+                rollout_policy_cache_cv_.wait(lock);
+                cached = rollout_policy_score_cache_.find(cache_key);
+                if (cached != rollout_policy_score_cache_.end()) {
+                    ++perf_rollout_policy_cache_hits_;
+                    return cached->second;
+                }
+            }
+            rollout_policy_scores_inflight_.insert(cache_key);
+            cache_owner = true;
+            ++perf_rollout_policy_cache_misses_;
+        }
+        try {
+            scores = prior_runtime->predict_raw_batch_flat(flat_rows, num_rows, row_dim);
+        } catch (...) {
+            if (cache_owner) {
+                std::lock_guard<std::mutex> lock(rollout_policy_cache_mutex_);
+                rollout_policy_scores_inflight_.erase(cache_key);
+                rollout_policy_cache_cv_.notify_all();
+            }
+            throw;
+        }
         for (std::size_t i = 0; i < valid_row.size() && i < scores.size(); ++i) {
             if (!valid_row[i]) scores[i] = 0.0;
+        }
+        if (rollout_policy_cache_active_) {
+            std::lock_guard<std::mutex> lock(rollout_policy_cache_mutex_);
+            rollout_policy_score_cache_.emplace(cache_key, scores);
+            rollout_policy_scores_inflight_.erase(cache_key);
+            rollout_policy_cache_cv_.notify_all();
         }
         return scores;
     }
@@ -1193,15 +1549,19 @@ private:
     void compute_policy_priors_plain(
         TreeNode* node,
         const SimState& state,
-        const std::vector<int>& canonical_indices) {
+        const std::vector<int>& canonical_indices,
+        double temperature_override = -1.0,
+        bool allow_root_noise = true) {
         if (node == nullptr) return;
 
+        const double policy_temperature = temperature_override > 0.0
+            ? temperature_override : in_.policy_prior_temperature;
         node->action_priors = uniform_policy_priors_plain(canonical_indices);
         std::vector<double> model_priors;
 
         if (in_.use_policy_prior && hgb_policy_priors_available(node->player)) {
             const std::vector<double> scores = hgb_policy_scores_plain(node, state, canonical_indices);
-            const std::vector<double> probs = softmax_scores_plain(scores, in_.policy_prior_temperature);
+            const std::vector<double> probs = softmax_scores_plain(scores, policy_temperature);
             if (probs.size() == canonical_indices.size()) {
                 const double min_prob = std::max(0.0, in_.prior_min_prob);
                 double z = 0.0;
@@ -1261,9 +1621,23 @@ private:
                     canonical_scores.push_back(score);
                 }
 
-                const std::vector<double> probs = softmax_scores_plain(
-                    canonical_scores,
-                    in_.policy_prior_temperature);
+                // Torch policy inference already returns masked probabilities.
+                // Apply temperature in probability space; softmaxing these
+                // probabilities again would flatten the policy a second time.
+                const double inverse_temperature = 1.0 /
+                    std::max(1e-6, policy_temperature);
+                std::vector<double> probs(canonical_scores.size(), 0.0);
+                double probability_sum = 0.0;
+                for (std::size_t i = 0; i < canonical_scores.size(); ++i) {
+                    const double probability = clampv(canonical_scores[i], 0.0, 1.0);
+                    probs[i] = probability > 0.0
+                        ? std::pow(probability, inverse_temperature)
+                        : 0.0;
+                    probability_sum += probs[i];
+                }
+                if (probability_sum > 0.0 && std::isfinite(probability_sum)) {
+                    for (double& probability : probs) probability /= probability_sum;
+                }
                 if (probs.size() == canonical_indices.size()) {
                     const double min_prob = std::max(0.0, in_.prior_min_prob);
                     double z = 0.0;
@@ -1281,7 +1655,7 @@ private:
             }
         }
 
-        apply_root_dirichlet_noise_plain(node);
+        if (allow_root_noise) apply_root_dirichlet_noise_plain(node);
         refresh_policy_prior_vectors_plain(node, model_priors);
     }
 
@@ -1412,55 +1786,82 @@ private:
         std::unordered_map<int, int> alias_to_canon;
         std::unordered_map<int, std::vector<int>> canon_to_aliases;
         std::vector<int> canonical_indices;
-        std::unordered_map<std::string, int> sig_to_canon;
+        std::unordered_map<std::uint64_t, std::vector<int>> hash_to_canons;
 
         alias_to_canon.reserve(valid_indices.size());
         canon_to_aliases.reserve(valid_indices.size());
         canonical_indices.reserve(valid_indices.size());
-        sig_to_canon.reserve(valid_indices.size());
+        hash_to_canons.reserve(valid_indices.size());
 
         for (int idx : valid_indices) {
             const ControllerAction& act = sampled.actions[static_cast<std::size_t>(idx)];
-            const std::string sig = controller_action_key(act);
-            const auto it = sig_to_canon.find(sig);
-            if (it == sig_to_canon.end()) {
-                sig_to_canon.emplace(sig, idx);
+            const std::uint64_t hash = controller_action_hash(act);
+            std::vector<int>& candidates = hash_to_canons[hash];
+            int canonical = -1;
+            for (int candidate : candidates) {
+                if (controller_actions_equivalent(
+                        act, sampled.actions[static_cast<std::size_t>(candidate)])) {
+                    canonical = candidate;
+                    break;
+                }
+            }
+            if (canonical < 0) {
+                candidates.push_back(idx);
                 alias_to_canon[idx] = idx;
                 canon_to_aliases[idx] = {idx};
                 canonical_indices.push_back(idx);
             } else {
-                alias_to_canon[idx] = it->second;
-                canon_to_aliases[it->second].push_back(idx);
+                alias_to_canon[idx] = canonical;
+                canon_to_aliases[canonical].push_back(idx);
             }
         }
         return {std::move(alias_to_canon), std::move(canon_to_aliases), std::move(canonical_indices)};
+    }
+
+    std::vector<int> canonicalize_controller_indices_only(
+        const SampledActionSet<ControllerAction>& sampled,
+        const std::vector<int>& valid_indices) const {
+        std::vector<int> canonical_indices;
+        std::unordered_map<std::uint64_t, std::vector<int>> hash_to_canons;
+        canonical_indices.reserve(valid_indices.size());
+        hash_to_canons.reserve(valid_indices.size());
+        for (int idx : valid_indices) {
+            const ControllerAction& action =
+                sampled.actions[static_cast<std::size_t>(idx)];
+            const std::uint64_t hash = controller_action_hash(action);
+            std::vector<int>& candidates = hash_to_canons[hash];
+            bool found = false;
+            for (int candidate : candidates) {
+                if (controller_actions_equivalent(
+                        action,
+                        sampled.actions[static_cast<std::size_t>(candidate)])) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                candidates.push_back(idx);
+                canonical_indices.push_back(idx);
+            }
+        }
+        return canonical_indices;
     }
 
     std::tuple<std::unordered_map<int, int>, std::unordered_map<int, std::vector<int>>, std::vector<int>>
     canonicalize_adversary_indices(
         const SampledActionSet<AdversaryAction>& sampled,
         const std::vector<int>& valid_indices) const {
+        (void)sampled;
         std::unordered_map<int, int> alias_to_canon;
         std::unordered_map<int, std::vector<int>> canon_to_aliases;
         std::vector<int> canonical_indices;
-        std::unordered_map<std::string, int> sig_to_canon;
         alias_to_canon.reserve(valid_indices.size());
         canon_to_aliases.reserve(valid_indices.size());
         canonical_indices.reserve(valid_indices.size());
-        sig_to_canon.reserve(valid_indices.size());
         for (int idx : valid_indices) {
-            const AdversaryAction& act = sampled.actions[static_cast<std::size_t>(idx)];
-            const std::string sig = adversary_action_key(act);
-            const auto it = sig_to_canon.find(sig);
-            if (it == sig_to_canon.end()) {
-                sig_to_canon.emplace(sig, idx);
-                alias_to_canon[idx] = idx;
-                canon_to_aliases[idx] = {idx};
-                canonical_indices.push_back(idx);
-            } else {
-                alias_to_canon[idx] = it->second;
-                canon_to_aliases[it->second].push_back(idx);
-            }
+            alias_to_canon[idx] = idx;
+            canon_to_aliases[idx] = {idx};
+            canonical_indices.push_back(idx);
         }
         return {std::move(alias_to_canon), std::move(canon_to_aliases), std::move(canonical_indices)};
     }
@@ -1961,7 +2362,7 @@ private:
         if (node == nullptr || plain_expanded(*node)) return;
 
         if (node->player == "controller") {
-            const auto sampled = env_.sample_controller_actions(state);
+            auto sampled = env_.sample_controller_actions(state);
             const auto valid = valid_controller_indices(sampled);
             auto canon = canonicalize_controller_indices(sampled, valid);
 
@@ -2213,8 +2614,1665 @@ private:
         return best;
     }
 
-    double rollout_value_plain(const SimState& state, const std::string& player) {
-        if (!model_bootstrap_enabled()) return 0.0;
+    struct PolicyRolloutEdge {
+        double reward = 0.0;
+        double discount = 1.0;
+    };
+
+    struct RolloutValueParts {
+        double reward_return = 0.0;
+        double bootstrap_return = 0.0;
+
+        double total() const { return reward_return + bootstrap_return; }
+    };
+
+    struct PolicyRolloutTrajectory {
+        SimState state;
+        std::string player;
+        std::vector<PolicyRolloutEdge> edges;
+        std::vector<int> action_history;
+        std::vector<std::string> step_players;
+        std::vector<std::string> step_action_categories;
+        std::vector<double> step_sim_times_before;
+        std::vector<double> step_sim_times_after;
+        bool active = true;
+        bool terminal = false;
+        double policy_sec = 0.0;
+        double transition_sec = 0.0;
+        PythonRandomCompat rng;
+    };
+
+    static std::string controller_rollout_category(
+        const ControllerAction& action) {
+        int prefill_tokens = 0;
+        int decode_tokens = 0;
+        if (action.compact_allocations) {
+            for (const auto& item : action.compact_prefill_allocations) {
+                prefill_tokens += item.second;
+            }
+            decode_tokens = static_cast<int>(
+                action.compact_decode_request_ids.size());
+        } else {
+            for (const auto& item : action.prefill_allocations) {
+                prefill_tokens += item.second;
+            }
+            for (const auto& item : action.decode_allocations) {
+                decode_tokens += item.second;
+            }
+        }
+        if (prefill_tokens == 0 && decode_tokens > 0) return "decode_only";
+        if (prefill_tokens == 128) return "prefill_128";
+        if (prefill_tokens == 256) return "prefill_256";
+        if (prefill_tokens == 512) return "prefill_512";
+        if (prefill_tokens == 1024) return "prefill_1024";
+        return prefill_tokens > 0 ? "prefill_other" : "other";
+    }
+
+    struct RolloutPreparedPolicy {
+        TreeNode sentinel;
+        TreeNode node;
+        bool compact_mode = false;
+        bool controller_player = false;
+        std::vector<RolloutControllerAction> compact_controller_actions;
+        std::vector<AdversaryAction> compact_adversary_actions;
+        std::vector<int> compact_original_indices;
+        std::vector<double> compact_priors;
+        std::vector<int> canonical_indices;
+        std::vector<float> state_features;
+        std::vector<float> flat_actions;
+        std::vector<uint8_t> valid_rows;
+        int action_dim = 0;
+        int action_index = -1;
+        double initialize_sec = 0.0;
+        double state_features_sec = 0.0;
+        double action_features_sec = 0.0;
+    };
+
+    struct RolloutPolicyBatchWorkspace {
+        std::vector<std::size_t> selected;
+        std::vector<float> flat_states;
+        std::vector<float> flat_actions;
+        std::vector<uint8_t> valid_rows;
+        std::vector<int> group_offsets;
+        std::vector<std::uint64_t> cache_hashes;
+    };
+
+    struct FastRolloutPolicyCacheEntry {
+        bool controller_player = false;
+        int action_dim = 0;
+        std::size_t canonical_count = 0;
+        std::vector<float> state_features;
+        std::vector<float> flat_actions;
+        std::vector<uint8_t> valid_rows;
+        std::vector<double> scores;
+    };
+
+    void reset_rollout_prepared_policy_plain(
+        RolloutPreparedPolicy* prepared) {
+        if (prepared == nullptr) return;
+        prepared->node.player.clear();
+        prepared->node.parent = nullptr;
+        prepared->node.controller_actions_by_index.clear();
+        prepared->node.adversary_actions_by_index.clear();
+        prepared->node.valid_mask.clear();
+        prepared->node.untried_action_indices.clear();
+        prepared->node.rollout_action_original_indices.clear();
+        prepared->node.action_priors.clear();
+        prepared->node.action_alias_to_canonical.clear();
+        prepared->node.canonical_to_action_aliases.clear();
+        prepared->compact_mode = false;
+        prepared->controller_player = false;
+        prepared->compact_controller_actions.clear();
+        prepared->compact_adversary_actions.clear();
+        prepared->compact_original_indices.clear();
+        prepared->compact_priors.clear();
+        prepared->canonical_indices.clear();
+        prepared->state_features.clear();
+        prepared->flat_actions.clear();
+        prepared->valid_rows.clear();
+        prepared->action_dim = 0;
+        prepared->action_index = -1;
+        prepared->initialize_sec = 0.0;
+        prepared->state_features_sec = 0.0;
+        prepared->action_features_sec = 0.0;
+    }
+
+    void initialize_compact_rollout_policy_plain(
+        RolloutPreparedPolicy* prepared,
+        const SimState& state,
+        bool controller_player) {
+        prepared->compact_mode = true;
+        prepared->controller_player = controller_player;
+        if (controller_player) {
+            bool has_schedulable_request = false;
+            for (const auto& request : state.requests) {
+                if (request.feature_only || request.completed) continue;
+                if ((!request.prefill_done() && request.remaining_prefill() > 0) ||
+                    (request.prefill_done() && request.remaining_decode() > 0)) {
+                    has_schedulable_request = true;
+                    break;
+                }
+            }
+            const bool pending_adversary_tick =
+                state.stats.next_adv_tick >= 0.0 &&
+                state.stats.next_adv_tick <= state.sim_time + env_.cfg().eps;
+            if (pending_adversary_tick || !has_schedulable_request) {
+                RolloutControllerAction noop;
+                noop.token_budget = 0;
+                noop.mapping = {0, 0, 0};
+                noop.has_mapping = true;
+                noop.valid = true;
+                prepared->compact_controller_actions.push_back(std::move(noop));
+                prepared->compact_original_indices.push_back(0);
+            } else {
+                auto sampled = env_.sample_controller_rollout_actions(state);
+                prepared->compact_controller_actions = std::move(sampled.actions);
+                prepared->compact_original_indices =
+                    std::move(sampled.original_indices);
+            }
+            prepared->canonical_indices.resize(
+                prepared->compact_controller_actions.size());
+        } else {
+            const bool strictly_before_adversary_tick =
+                state.stats.next_adv_tick >= 0.0 &&
+                state.sim_time + 1e-9 < state.stats.next_adv_tick;
+            if (strictly_before_adversary_tick) {
+                AdversaryAction noop;
+                noop.valid = true;
+                prepared->compact_adversary_actions.push_back(std::move(noop));
+                prepared->compact_original_indices.push_back(0);
+            } else {
+                auto sampled = env_.sample_adversary_actions(
+                    state, {}, true, true);
+                prepared->compact_adversary_actions = std::move(sampled.actions);
+                prepared->compact_original_indices =
+                    std::move(sampled.original_indices);
+            }
+            prepared->canonical_indices.resize(
+                prepared->compact_adversary_actions.size());
+        }
+        std::iota(
+            prepared->canonical_indices.begin(),
+            prepared->canonical_indices.end(),
+            0);
+        const std::size_t action_count = prepared->canonical_indices.size();
+        prepared->compact_priors.assign(
+            action_count,
+            action_count > 0
+                ? 1.0 / static_cast<double>(action_count)
+                : 0.0);
+    }
+
+    bool prepare_rollout_policy_plain(
+        RolloutPreparedPolicy* prepared,
+        const PolicyRolloutTrajectory& trajectory) {
+        if (prepared == nullptr || !trajectory.active) return false;
+        const bool controller_player = trajectory.player == "controller";
+        const bool detailed_perf = !in_.rollout_optimized_execution;
+        const auto initialize_begin = detailed_perf
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
+        if (in_.rollout_optimized_execution) {
+            initialize_compact_rollout_policy_plain(
+                prepared, trajectory.state, controller_player);
+        } else {
+            prepared->node.player = trajectory.player;
+            prepared->node.parent = &prepared->sentinel;
+            initialize_rollout_policy_node_plain(
+                &prepared->node, trajectory.state);
+            prepared->canonical_indices =
+                prepared->node.untried_action_indices;
+            prepared->node.action_priors =
+                uniform_policy_priors_plain(prepared->canonical_indices);
+        }
+        if (detailed_perf) {
+            const auto initialize_end = std::chrono::steady_clock::now();
+            prepared->initialize_sec = std::chrono::duration_cast<
+                std::chrono::duration<double>>(
+                    initialize_end - initialize_begin).count();
+        }
+        if (prepared->canonical_indices.empty()) return false;
+        // A forced policy decision has probability one regardless of model
+        // logits or temperature.
+        if (prepared->canonical_indices.size() == 1U) return false;
+
+        if (!in_.use_policy_prior ||
+            !hgb_policy_priors_available(trajectory.player)) {
+            if (!prepared->compact_mode) {
+                compute_policy_priors_plain(
+                    &prepared->node,
+                    trajectory.state,
+                    prepared->canonical_indices,
+                    std::max(1e-8, in_.rollout_policy_temperature),
+                    false);
+            }
+            return false;
+        }
+
+        const NativeHGBModelRuntime* prior_runtime = controller_player
+            ? controller_prior_runtime_
+            : adversary_prior_runtime_;
+        const auto state_features_begin = detailed_perf
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
+        hgb_runtime_->build_features_into(
+            trajectory.state,
+            &env_.virtual_simulator(),
+            -1,
+            &prepared->state_features,
+            nullptr);
+        if (detailed_perf) {
+            const auto state_features_end = std::chrono::steady_clock::now();
+            prepared->state_features_sec = std::chrono::duration_cast<
+                std::chrono::duration<double>>(
+                    state_features_end - state_features_begin).count();
+        }
+        const int row_dim = prior_runtime->feature_dim();
+        prepared->action_dim =
+            row_dim - static_cast<int>(prepared->state_features.size());
+        if (row_dim <= 0 || prepared->action_dim <= 0) {
+            if (!prepared->compact_mode) {
+                compute_policy_priors_plain(
+                    &prepared->node,
+                    trajectory.state,
+                    prepared->canonical_indices,
+                    std::max(1e-8, in_.rollout_policy_temperature),
+                    false);
+            }
+            return false;
+        }
+
+        const int num_rows =
+            static_cast<int>(prepared->canonical_indices.size());
+        prepared->flat_actions.assign(
+            static_cast<std::size_t>(num_rows) *
+                static_cast<std::size_t>(prepared->action_dim),
+            0.0f);
+        prepared->valid_rows.assign(static_cast<std::size_t>(num_rows), 1);
+        const auto action_features_begin = detailed_perf
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
+        const ControllerPolicyFeatureContext* controller_context = nullptr;
+        if (controller_player) {
+            if (prepared->action_dim != 43) {
+                throw std::runtime_error(
+                    "native rollout policy action feature dimension mismatch");
+            }
+            controller_context =
+                &build_controller_policy_feature_context(trajectory.state);
+        } else if (prepared->action_dim != 7) {
+            throw std::runtime_error(
+                "native rollout policy action feature dimension mismatch");
+        }
+        for (int row_idx = 0; row_idx < num_rows; ++row_idx) {
+            const int canon_idx =
+                prepared->canonical_indices[static_cast<std::size_t>(row_idx)];
+            const std::size_t row_offset =
+                static_cast<std::size_t>(row_idx) *
+                static_cast<std::size_t>(prepared->action_dim);
+            float* action_features =
+                prepared->flat_actions.data() + row_offset;
+
+            if (controller_player) {
+                if (prepared->compact_mode) {
+                    const auto& actions = prepared->compact_controller_actions;
+                    if (canon_idx < 0 ||
+                        canon_idx >= static_cast<int>(actions.size())) {
+                        prepared->valid_rows[static_cast<std::size_t>(row_idx)] = 0;
+                        continue;
+                    }
+                    write_controller_action_features_for_policy(
+                        actions[static_cast<std::size_t>(canon_idx)],
+                        *controller_context,
+                        action_features);
+                } else {
+                    const auto& actions =
+                        prepared->node.controller_actions_by_index;
+                    if (canon_idx < 0 ||
+                        canon_idx >= static_cast<int>(actions.size())) {
+                        prepared->valid_rows[static_cast<std::size_t>(row_idx)] = 0;
+                        continue;
+                    }
+                    write_controller_action_features_for_policy(
+                        actions[static_cast<std::size_t>(canon_idx)],
+                        *controller_context,
+                        action_features);
+                }
+            } else {
+                const auto& actions = prepared->compact_mode
+                    ? prepared->compact_adversary_actions
+                    : prepared->node.adversary_actions_by_index;
+                if (canon_idx < 0 ||
+                    canon_idx >= static_cast<int>(actions.size())) {
+                    prepared->valid_rows[static_cast<std::size_t>(row_idx)] = 0;
+                    continue;
+                }
+                const auto& original_indices = prepared->compact_mode
+                    ? prepared->compact_original_indices
+                    : prepared->node.rollout_action_original_indices;
+                const int original_idx =
+                    canon_idx < static_cast<int>(original_indices.size())
+                        ? original_indices[static_cast<std::size_t>(canon_idx)]
+                        : canon_idx;
+                write_adversary_action_features_for_policy(
+                    actions[static_cast<std::size_t>(canon_idx)],
+                    original_idx,
+                    action_features);
+            }
+        }
+        if (detailed_perf) {
+            const auto action_features_end = std::chrono::steady_clock::now();
+            prepared->action_features_sec = std::chrono::duration_cast<
+                std::chrono::duration<double>>(
+                    action_features_end - action_features_begin).count();
+        }
+        return true;
+    }
+
+    void apply_rollout_policy_scores_plain(
+        RolloutPreparedPolicy* prepared,
+        const double* scores,
+        std::size_t score_count) {
+        if (prepared == nullptr || scores == nullptr ||
+            score_count != prepared->canonical_indices.size()) {
+            throw std::runtime_error(
+                "native grouped rollout policy score size mismatch");
+        }
+
+        if (prepared->compact_mode) {
+            const double temperature = std::max(
+                1e-8, in_.rollout_policy_temperature);
+            double max_scaled = -std::numeric_limits<double>::infinity();
+            for (std::size_t idx = 0; idx < score_count; ++idx) {
+                max_scaled = std::max(
+                    max_scaled, scores[idx] / temperature);
+            }
+            double softmax_total = 0.0;
+            for (std::size_t idx = 0; idx < score_count; ++idx) {
+                const int canon_idx = prepared->canonical_indices[idx];
+                const double probability = std::exp(
+                    scores[idx] / temperature - max_scaled);
+                prepared->compact_priors[
+                    static_cast<std::size_t>(canon_idx)] = probability;
+                softmax_total += probability;
+            }
+            if (!(softmax_total > 0.0) ||
+                !std::isfinite(softmax_total)) {
+                const double uniform = 1.0 /
+                    static_cast<double>(score_count);
+                for (int canon_idx : prepared->canonical_indices) {
+                    prepared->compact_priors[
+                        static_cast<std::size_t>(canon_idx)] = uniform;
+                }
+            } else {
+                for (int canon_idx : prepared->canonical_indices) {
+                    prepared->compact_priors[
+                        static_cast<std::size_t>(canon_idx)] /= softmax_total;
+                }
+            }
+
+            const double min_prob = std::max(0.0, in_.prior_min_prob);
+            double total = 0.0;
+            for (int canon_idx : prepared->canonical_indices) {
+                double& probability = prepared->compact_priors[
+                    static_cast<std::size_t>(canon_idx)];
+                probability = std::max(min_prob, probability);
+                total += probability;
+            }
+            if (total > 0.0 && std::isfinite(total)) {
+                for (int canon_idx : prepared->canonical_indices) {
+                    prepared->compact_priors[
+                        static_cast<std::size_t>(canon_idx)] /= total;
+                }
+            } else {
+                const double uniform = 1.0 /
+                    static_cast<double>(score_count);
+                for (int canon_idx : prepared->canonical_indices) {
+                    prepared->compact_priors[
+                        static_cast<std::size_t>(canon_idx)] = uniform;
+                }
+            }
+            return;
+        }
+
+        const std::vector<double> score_vector(
+            scores, scores + score_count);
+        const std::vector<double> probs = softmax_scores_plain(
+            score_vector,
+            std::max(1e-8, in_.rollout_policy_temperature));
+        const double min_prob = std::max(0.0, in_.prior_min_prob);
+        double total = 0.0;
+        for (std::size_t idx = 0; idx < score_count; ++idx) {
+            const double probability = std::max(min_prob, probs[idx]);
+            prepared->node.action_priors[
+                prepared->canonical_indices[idx]] = probability;
+            total += probability;
+        }
+        if (total > 0.0 && std::isfinite(total)) {
+            for (int canon_idx : prepared->canonical_indices) {
+                prepared->node.action_priors[canon_idx] /= total;
+            }
+        } else {
+            prepared->node.action_priors =
+                uniform_policy_priors_plain(prepared->canonical_indices);
+        }
+    }
+
+    void apply_rollout_policy_scores_plain(
+        RolloutPreparedPolicy* prepared,
+        const std::vector<double>& scores) {
+        apply_rollout_policy_scores_plain(
+            prepared, scores.data(), scores.size());
+    }
+
+    void score_grouped_rollout_policies_plain(
+        std::vector<RolloutPreparedPolicy>* prepared,
+        const std::vector<PolicyRolloutTrajectory>& trajectories,
+        const std::string& player,
+        int parallel_threads,
+        RolloutPolicyBatchWorkspace* workspace) {
+        if (prepared == nullptr || workspace == nullptr) return;
+        const NativeHGBModelRuntime* prior_runtime =
+            player == "controller"
+                ? controller_prior_runtime_
+                : adversary_prior_runtime_;
+        if (prior_runtime == nullptr || !prior_runtime->loaded()) return;
+
+        auto& selected = workspace->selected;
+        auto& flat_states = workspace->flat_states;
+        auto& flat_actions = workspace->flat_actions;
+        auto& valid_rows = workspace->valid_rows;
+        auto& group_offsets = workspace->group_offsets;
+        auto& cache_hashes = workspace->cache_hashes;
+        std::vector<std::string> cache_keys;
+        selected.clear();
+        flat_states.clear();
+        flat_actions.clear();
+        valid_rows.clear();
+        group_offsets.clear();
+        cache_hashes.clear();
+        group_offsets.push_back(0);
+        int state_dim = 0;
+        int action_dim = 0;
+        int total_rows = 0;
+        for (std::size_t idx = 0; idx < prepared->size(); ++idx) {
+            auto& item = (*prepared)[idx];
+            const bool player_matches = item.compact_mode
+                ? ((player == "controller") == item.controller_player)
+                : item.node.player == player;
+            if (!trajectories[idx].active ||
+                !player_matches ||
+                item.flat_actions.empty()) {
+                continue;
+            }
+            perf_rollout_policy_action_rows_ +=
+                static_cast<std::int64_t>(item.canonical_indices.size());
+
+            std::uint64_t fast_hash = 0;
+            bool fast_cache_hit = false;
+            if (in_.rollout_optimized_execution) {
+                const bool controller_item = player == "controller";
+                const std::uint64_t metadata[] = {
+                    controller_item ? 1ULL : 0ULL,
+                    static_cast<std::uint64_t>(item.state_features.size()),
+                    static_cast<std::uint64_t>(item.flat_actions.size()),
+                    static_cast<std::uint64_t>(item.valid_rows.size()),
+                    static_cast<std::uint64_t>(item.action_dim),
+                    static_cast<std::uint64_t>(item.canonical_indices.size()),
+                };
+                std::uint64_t hash1 = rollout_hash_fast(
+                    metadata, sizeof(metadata), 0x243f6a8885a308d3ULL);
+                hash1 = rollout_hash_fast(
+                    item.state_features.data(),
+                    item.state_features.size() * sizeof(float), hash1);
+                hash1 = rollout_hash_fast(
+                    item.flat_actions.data(),
+                    item.flat_actions.size() * sizeof(float), hash1);
+                hash1 = rollout_hash_fast(
+                    item.valid_rows.data(), item.valid_rows.size(), hash1);
+                fast_hash = hash1;
+
+                const auto cached_bucket =
+                    fast_rollout_policy_score_cache_.find(hash1);
+                if (cached_bucket != fast_rollout_policy_score_cache_.end()) {
+                    for (const auto& entry : cached_bucket->second) {
+                        const bool exact_match =
+                            entry.controller_player == controller_item &&
+                            entry.action_dim == item.action_dim &&
+                            entry.canonical_count == item.canonical_indices.size() &&
+                            entry.state_features.size() == item.state_features.size() &&
+                            entry.flat_actions.size() == item.flat_actions.size() &&
+                            entry.valid_rows.size() == item.valid_rows.size() &&
+                            entry.scores.size() == item.canonical_indices.size() &&
+                            (item.state_features.empty() ||
+                                std::memcmp(
+                                    entry.state_features.data(),
+                                    item.state_features.data(),
+                                    item.state_features.size() * sizeof(float)) == 0) &&
+                            (item.flat_actions.empty() ||
+                                std::memcmp(
+                                    entry.flat_actions.data(),
+                                    item.flat_actions.data(),
+                                    item.flat_actions.size() * sizeof(float)) == 0) &&
+                            (item.valid_rows.empty() ||
+                                std::memcmp(
+                                    entry.valid_rows.data(),
+                                    item.valid_rows.data(),
+                                    item.valid_rows.size()) == 0);
+                        if (!exact_match) continue;
+                        apply_rollout_policy_scores_plain(&item, entry.scores);
+                        ++perf_rollout_policy_cache_hits_;
+                        fast_cache_hit = true;
+                        break;
+                    }
+                }
+                if (fast_cache_hit) continue;
+                ++perf_rollout_policy_cache_misses_;
+            }
+
+            std::string cache_key;
+            if (rollout_policy_cache_active_) {
+                const std::uint64_t player_tag =
+                    player == "controller" ? 0x434f4e54524f4c4cULL
+                                           : 0x4144564552534152ULL;
+                const std::uint64_t metadata[] = {
+                    player_tag,
+                    static_cast<std::uint64_t>(item.state_features.size()),
+                    static_cast<std::uint64_t>(item.flat_actions.size()),
+                    static_cast<std::uint64_t>(item.valid_rows.size()),
+                    static_cast<std::uint64_t>(item.action_dim),
+                    static_cast<std::uint64_t>(item.canonical_indices.size()),
+                };
+                cache_key.reserve(
+                    sizeof(metadata) +
+                    item.state_features.size() * sizeof(float) +
+                    item.flat_actions.size() * sizeof(float) +
+                    item.valid_rows.size());
+                cache_key.append(
+                    reinterpret_cast<const char*>(metadata), sizeof(metadata));
+                cache_key.append(
+                    reinterpret_cast<const char*>(item.state_features.data()),
+                    item.state_features.size() * sizeof(float));
+                cache_key.append(
+                    reinterpret_cast<const char*>(item.flat_actions.data()),
+                    item.flat_actions.size() * sizeof(float));
+                cache_key.append(
+                    reinterpret_cast<const char*>(item.valid_rows.data()),
+                    item.valid_rows.size());
+                const auto cached =
+                    rollout_policy_score_cache_.find(cache_key);
+                if (cached != rollout_policy_score_cache_.end()) {
+                    apply_rollout_policy_scores_plain(&item, cached->second);
+                    ++perf_rollout_policy_cache_hits_;
+                    continue;
+                }
+                ++perf_rollout_policy_cache_misses_;
+            }
+
+            if (state_dim == 0) {
+                state_dim = static_cast<int>(item.state_features.size());
+                action_dim = item.action_dim;
+            }
+            if (static_cast<int>(item.state_features.size()) != state_dim ||
+                item.action_dim != action_dim) {
+                throw std::runtime_error(
+                    "native grouped rollout policy split dimensions differ");
+            }
+
+            selected.push_back(idx);
+            cache_keys.push_back(std::move(cache_key));
+            if (in_.rollout_optimized_execution) {
+                cache_hashes.push_back(fast_hash);
+            }
+            flat_states.insert(
+                flat_states.end(),
+                item.state_features.begin(),
+                item.state_features.end());
+            flat_actions.insert(
+                flat_actions.end(),
+                item.flat_actions.begin(),
+                item.flat_actions.end());
+            valid_rows.insert(
+                valid_rows.end(),
+                item.valid_rows.begin(),
+                item.valid_rows.end());
+            total_rows += static_cast<int>(item.canonical_indices.size());
+            group_offsets.push_back(total_rows);
+        }
+        if (selected.empty()) return;
+
+        perf_rollout_policy_scored_action_rows_ += total_rows;
+
+        std::vector<double> scores =
+            prior_runtime->predict_raw_grouped_split_batch_flat(
+                flat_states,
+                flat_actions,
+                total_rows,
+                group_offsets,
+                parallel_threads);
+        if (scores.size() != static_cast<std::size_t>(total_rows)) {
+            throw std::runtime_error(
+                "native grouped rollout policy output size mismatch");
+        }
+        for (std::size_t row = 0; row < valid_rows.size(); ++row) {
+            if (!valid_rows[row]) scores[row] = 0.0;
+        }
+        for (std::size_t group = 0; group < selected.size(); ++group) {
+            const int begin = group_offsets[group];
+            const int end = group_offsets[group + 1];
+            auto& selected_item = (*prepared)[selected[group]];
+            apply_rollout_policy_scores_plain(
+                &selected_item,
+                scores.data() + begin,
+                static_cast<std::size_t>(end - begin));
+            if (in_.rollout_optimized_execution) {
+                constexpr std::size_t kFastPolicyCacheMaxEntries = 65536U;
+                if (fast_rollout_policy_cache_entry_count_ >=
+                    kFastPolicyCacheMaxEntries) {
+                    fast_rollout_policy_score_cache_.clear();
+                    fast_rollout_policy_cache_entry_count_ = 0;
+                }
+                FastRolloutPolicyCacheEntry entry;
+                entry.controller_player = player == "controller";
+                entry.action_dim = selected_item.action_dim;
+                entry.canonical_count = selected_item.canonical_indices.size();
+                entry.state_features = std::move(selected_item.state_features);
+                entry.flat_actions = std::move(selected_item.flat_actions);
+                entry.valid_rows = std::move(selected_item.valid_rows);
+                entry.scores.assign(scores.begin() + begin, scores.begin() + end);
+                fast_rollout_policy_score_cache_[cache_hashes[group]]
+                    .push_back(std::move(entry));
+                ++fast_rollout_policy_cache_entry_count_;
+            }
+            if (rollout_policy_cache_active_) {
+                std::vector<double> group_scores(
+                    scores.begin() + begin, scores.begin() + end);
+                rollout_policy_score_cache_.emplace(
+                    std::move(cache_keys[group]), std::move(group_scores));
+            }
+        }
+    }
+
+    void initialize_rollout_policy_node_plain(TreeNode* node, const SimState& state) {
+        if (node == nullptr || plain_expanded(*node)) return;
+        if (node->player == "controller") {
+            bool has_schedulable_request = false;
+            for (const auto& request : state.requests) {
+                if (request.feature_only || request.completed) continue;
+                if ((!request.prefill_done() && request.remaining_prefill() > 0) ||
+                    (request.prefill_done() && request.remaining_decode() > 0)) {
+                    has_schedulable_request = true;
+                    break;
+                }
+            }
+            const bool pending_adversary_tick =
+                state.stats.next_adv_tick >= 0.0 &&
+                state.stats.next_adv_tick <=
+                    (state.sim_time + env_.cfg().eps);
+            if (pending_adversary_tick || !has_schedulable_request) {
+                ControllerAction noop;
+                noop.token_budget = 0;
+                noop.strategy = "GV2|evict_none";
+                noop.mapping = {0, 0, 0};
+                noop.has_mapping = true;
+                noop.valid = true;
+                node->controller_actions_by_index.push_back(std::move(noop));
+                node->valid_mask.push_back(1u);
+                node->untried_action_indices.push_back(0);
+                node->rollout_action_original_indices.push_back(0);
+                return;
+            }
+            auto sampled = env_.sample_controller_actions(
+                state, true, in_.rollout_optimized_execution);
+            if (in_.rollout_optimized_execution) {
+                node->untried_action_indices.reserve(sampled.actions.size());
+                for (int index = 0;
+                     index < static_cast<int>(sampled.actions.size());
+                     ++index) {
+                    node->untried_action_indices.push_back(index);
+                }
+            } else {
+                const auto valid = valid_controller_indices(sampled);
+                node->untried_action_indices =
+                    canonicalize_controller_indices_only(sampled, valid);
+            }
+            node->controller_actions_by_index = std::move(sampled.actions);
+            node->valid_mask = std::move(sampled.mask);
+            node->rollout_action_original_indices =
+                std::move(sampled.original_indices);
+        } else {
+            const bool strictly_before_adversary_tick =
+                state.stats.next_adv_tick >= 0.0 &&
+                (state.sim_time + 1e-9) < state.stats.next_adv_tick;
+            if (strictly_before_adversary_tick) {
+                AdversaryAction noop;
+                noop.valid = true;
+                node->adversary_actions_by_index.push_back(std::move(noop));
+                node->valid_mask.push_back(1u);
+                node->untried_action_indices.push_back(0);
+                node->rollout_action_original_indices.push_back(0);
+                return;
+            }
+            auto sampled = env_.sample_adversary_actions(
+                state, {}, true, in_.rollout_optimized_execution);
+            node->untried_action_indices =
+                valid_adversary_indices(sampled);
+            node->adversary_actions_by_index = std::move(sampled.actions);
+            node->valid_mask = std::move(sampled.mask);
+            node->rollout_action_original_indices =
+                std::move(sampled.original_indices);
+        }
+    }
+
+    void ensure_rollout_policy_node_plain(TreeNode* node, const SimState& state) {
+        if (node == nullptr || plain_expanded(*node)) return;
+        initialize_rollout_policy_node_plain(node, state);
+        compute_policy_priors_plain(
+            node,
+            state,
+            node->untried_action_indices,
+            std::max(1e-8, in_.rollout_policy_temperature),
+            false);
+    }
+
+    int sample_rollout_action_plain(const TreeNode& node, PythonRandomCompat* rng) {
+        std::vector<int> indices = node.untried_action_indices;
+        std::sort(indices.begin(), indices.end());
+        if (indices.empty()) return -1;
+        if (indices.size() == 1) return indices.front();
+
+        double total = 0.0;
+        for (int idx : indices) total += std::max(0.0, plain_action_prior(node, idx));
+        std::vector<double> probabilities;
+        probabilities.reserve(indices.size());
+        if (!(total > 0.0) || !std::isfinite(total)) {
+            probabilities.assign(indices.size(), 1.0 / static_cast<double>(indices.size()));
+        } else {
+            for (int idx : indices) {
+                probabilities.push_back(std::max(0.0, plain_action_prior(node, idx)) / total);
+            }
+        }
+        const double quantum = in_.rollout_probability_quantum;
+        if (quantum > 0.0) {
+            double quantized_total = 0.0;
+            for (double& probability : probabilities) {
+                probability = std::floor(probability / quantum + 0.5) * quantum;
+                quantized_total += probability;
+            }
+            if (quantized_total > 0.0) {
+                for (double& probability : probabilities) probability /= quantized_total;
+            }
+        }
+        const double draw = rng->random_double();
+        double cumulative = 0.0;
+        for (std::size_t pos = 0; pos < indices.size(); ++pos) {
+            cumulative += probabilities[pos];
+            if (draw < cumulative) return indices[pos];
+        }
+        return indices.back();
+    }
+
+    int sample_rollout_action_plain(
+        const RolloutPreparedPolicy& prepared,
+        PythonRandomCompat* rng) {
+        if (!prepared.compact_mode) {
+            return sample_rollout_action_plain(prepared.node, rng);
+        }
+        std::vector<int> indices = prepared.canonical_indices;
+        std::sort(indices.begin(), indices.end());
+        if (indices.empty()) return -1;
+        if (indices.size() == 1) return indices.front();
+
+        double total = 0.0;
+        for (int idx : indices) {
+            total += std::max(
+                0.0,
+                prepared.compact_priors[static_cast<std::size_t>(idx)]);
+        }
+        std::vector<double> probabilities;
+        probabilities.reserve(indices.size());
+        if (!(total > 0.0) || !std::isfinite(total)) {
+            probabilities.assign(
+                indices.size(), 1.0 / static_cast<double>(indices.size()));
+        } else {
+            for (int idx : indices) {
+                probabilities.push_back(
+                    std::max(
+                        0.0,
+                        prepared.compact_priors[
+                            static_cast<std::size_t>(idx)]) /
+                    total);
+            }
+        }
+        const double quantum = in_.rollout_probability_quantum;
+        if (quantum > 0.0) {
+            double quantized_total = 0.0;
+            for (double& probability : probabilities) {
+                probability = std::floor(probability / quantum + 0.5) * quantum;
+                quantized_total += probability;
+            }
+            if (quantized_total > 0.0) {
+                for (double& probability : probabilities) {
+                    probability /= quantized_total;
+                }
+            }
+        }
+        const double draw = rng->random_double();
+        double cumulative = 0.0;
+        for (std::size_t pos = 0; pos < indices.size(); ++pos) {
+            cumulative += probabilities[pos];
+            if (draw < cumulative) return indices[pos];
+        }
+        return indices.back();
+    }
+
+    void advance_policy_rollout_plain(PolicyRolloutTrajectory* trajectory) {
+        if (trajectory == nullptr || !trajectory->active) return;
+        const auto policy_begin = std::chrono::steady_clock::now();
+        TreeNode sentinel;
+        TreeNode policy_node;
+        policy_node.player = trajectory->player;
+        policy_node.parent = &sentinel;
+        ensure_rollout_policy_node_plain(&policy_node, trajectory->state);
+        const int action_idx = sample_rollout_action_plain(policy_node, &trajectory->rng);
+        const auto policy_end = std::chrono::steady_clock::now();
+        trajectory->policy_sec += std::chrono::duration_cast<
+            std::chrono::duration<double>>(policy_end - policy_begin).count();
+        if (action_idx < 0) {
+            trajectory->active = false;
+            trajectory->terminal = true;
+            return;
+        }
+
+        const double parent_cost = state_cost(trajectory->state);
+        const double parent_time = trajectory->state.sim_time;
+        const auto transition_begin = std::chrono::steady_clock::now();
+        if (trajectory->player == "controller") {
+            if (action_idx >= static_cast<int>(policy_node.controller_actions_by_index.size())) {
+                throw std::runtime_error("rollout controller action index out of range");
+            }
+            env_.apply_controller_action_inplace(
+                trajectory->state,
+                policy_node.controller_actions_by_index[static_cast<std::size_t>(action_idx)],
+                true);
+        } else {
+            if (action_idx >= static_cast<int>(policy_node.adversary_actions_by_index.size())) {
+                throw std::runtime_error("rollout adversary action index out of range");
+            }
+            env_.apply_adversary_action_inplace(
+                trajectory->state,
+                policy_node.adversary_actions_by_index[static_cast<std::size_t>(action_idx)]);
+        }
+
+        const double final_time = trajectory->state.stats.transition_final_time >= 0.0
+            ? trajectory->state.stats.transition_final_time
+            : trajectory->state.sim_time;
+        PolicyRolloutEdge edge;
+        edge.reward = parent_cost - state_cost(trajectory->state);
+        edge.discount = time_discount(final_time, parent_time, in_);
+        trajectory->edges.push_back(edge);
+        trajectory->action_history.push_back(action_idx);
+        trajectory->player = next_player(trajectory->player);
+        const auto transition_end = std::chrono::steady_clock::now();
+        trajectory->transition_sec += std::chrono::duration_cast<
+            std::chrono::duration<double>>(transition_end - transition_begin).count();
+    }
+
+    void apply_prepared_rollout_action_plain(
+        PolicyRolloutTrajectory* trajectory,
+        const RolloutPreparedPolicy& prepared,
+        int action_idx) {
+        if (trajectory == nullptr || !trajectory->active) return;
+        if (action_idx < 0) {
+            trajectory->active = false;
+            trajectory->terminal = true;
+            return;
+        }
+
+        const double parent_cost = state_cost(trajectory->state);
+        const double parent_time = trajectory->state.sim_time;
+        if (current_rollout_trace_enabled_) {
+            trajectory->step_players.push_back(trajectory->player);
+        }
+        const bool detailed_perf = !in_.rollout_optimized_execution;
+        const auto transition_begin = detailed_perf
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
+        if (trajectory->player == "controller") {
+            if (prepared.compact_mode) {
+                const auto& actions = prepared.compact_controller_actions;
+                if (action_idx >= static_cast<int>(actions.size())) {
+                    throw std::runtime_error(
+                        "rollout controller action index out of range");
+                }
+                const auto& compact =
+                    actions[static_cast<std::size_t>(action_idx)];
+                ControllerAction action;
+                action.token_budget = compact.token_budget;
+                action.evicted_request_ids.assign(
+                    compact.evicted_request_ids.begin(),
+                    compact.evicted_request_ids.end());
+                action.compact_prefill_allocations =
+                    compact.compact_prefill_allocations;
+                action.compact_decode_request_ids =
+                    compact.compact_decode_request_ids;
+                action.compact_allocations = compact.compact_allocations;
+                action.mapping = compact.mapping;
+                action.has_mapping = compact.has_mapping;
+                action.valid = compact.valid;
+                env_.apply_controller_action_inplace(
+                    trajectory->state, action, true);
+                if (current_rollout_trace_enabled_) {
+                    trajectory->step_action_categories.push_back(
+                        controller_rollout_category(action));
+                }
+            } else {
+                const auto& actions =
+                    prepared.node.controller_actions_by_index;
+                if (action_idx >= static_cast<int>(actions.size())) {
+                    throw std::runtime_error(
+                        "rollout controller action index out of range");
+                }
+                const auto& action =
+                    actions[static_cast<std::size_t>(action_idx)];
+                env_.apply_controller_action_inplace(
+                    trajectory->state, action, true);
+                if (current_rollout_trace_enabled_) {
+                    trajectory->step_action_categories.push_back(
+                        controller_rollout_category(action));
+                }
+            }
+        } else {
+            const auto& actions = prepared.compact_mode
+                ? prepared.compact_adversary_actions
+                : prepared.node.adversary_actions_by_index;
+            if (action_idx >= static_cast<int>(actions.size())) {
+                throw std::runtime_error(
+                    "rollout adversary action index out of range");
+            }
+            env_.apply_adversary_action_inplace(
+                trajectory->state,
+                actions[static_cast<std::size_t>(action_idx)]);
+            if (current_rollout_trace_enabled_) {
+                trajectory->step_action_categories.push_back("adversary");
+            }
+        }
+
+        const double final_time =
+            trajectory->state.stats.transition_final_time >= 0.0
+                ? trajectory->state.stats.transition_final_time
+                : trajectory->state.sim_time;
+        PolicyRolloutEdge edge;
+        edge.reward = parent_cost - state_cost(trajectory->state);
+        edge.discount = time_discount(final_time, parent_time, in_);
+        trajectory->edges.push_back(edge);
+        if (current_rollout_trace_enabled_) {
+            trajectory->step_sim_times_before.push_back(parent_time);
+            trajectory->step_sim_times_after.push_back(trajectory->state.sim_time);
+        }
+        const auto& original_indices = prepared.compact_mode
+            ? prepared.compact_original_indices
+            : prepared.node.rollout_action_original_indices;
+        const int original_action_idx =
+            action_idx < static_cast<int>(original_indices.size())
+                ? original_indices[static_cast<std::size_t>(action_idx)]
+                : action_idx;
+        trajectory->action_history.push_back(original_action_idx);
+        trajectory->player = next_player(trajectory->player);
+        if (detailed_perf) {
+            const auto transition_end = std::chrono::steady_clock::now();
+            trajectory->transition_sec += std::chrono::duration_cast<
+                std::chrono::duration<double>>(
+                    transition_end - transition_begin).count();
+        }
+    }
+    void copy_shared_rollout_transition_plain(
+        PolicyRolloutTrajectory* target,
+        const PolicyRolloutTrajectory& source) {
+        if (target == nullptr || !target->active) return;
+        const bool detailed_perf = !in_.rollout_optimized_execution;
+        const auto copy_begin = detailed_perf
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
+        target->state = source.state;
+        target->active = source.active;
+        target->terminal = source.terminal;
+        target->player = source.player;
+        if (!source.edges.empty()) {
+            target->edges.push_back(source.edges.back());
+        }
+        if (!source.action_history.empty()) {
+            target->action_history.push_back(source.action_history.back());
+        }
+        if (current_rollout_trace_enabled_) {
+            if (!source.step_players.empty()) {
+                target->step_players.push_back(source.step_players.back());
+            }
+            if (!source.step_action_categories.empty()) {
+                target->step_action_categories.push_back(
+                    source.step_action_categories.back());
+            }
+            if (!source.step_sim_times_before.empty()) {
+                target->step_sim_times_before.push_back(
+                    source.step_sim_times_before.back());
+            }
+            if (!source.step_sim_times_after.empty()) {
+                target->step_sim_times_after.push_back(
+                    source.step_sim_times_after.back());
+            }
+        }
+        if (detailed_perf) {
+            const auto copy_end = std::chrono::steady_clock::now();
+            target->transition_sec += std::chrono::duration_cast<
+                std::chrono::duration<double>>(
+                    copy_end - copy_begin).count();
+        }
+    }
+
+    struct IndependentRolloutPerf {
+        double policy_sec = 0.0;
+        double prepare_sec = 0.0;
+        double initialize_sec = 0.0;
+        double state_features_sec = 0.0;
+        double action_features_sec = 0.0;
+        double score_sec = 0.0;
+        double sample_sec = 0.0;
+        std::int64_t prepared_count = 0;
+        std::int64_t action_rows = 0;
+        std::int64_t scored_action_rows = 0;
+        bool exceeded_max_actions = false;
+    };
+
+    void run_independent_rollout_trajectory_plain(
+        PolicyRolloutTrajectory* trajectory,
+        double target_time,
+        int max_actions,
+        int policy_parallel_threads,
+        IndependentRolloutPerf* perf) {
+        if (trajectory == nullptr || perf == nullptr) return;
+        RolloutPreparedPolicy prepared;
+        std::vector<int> group_offsets = {0, 0};
+        for (int step = 0; step < max_actions; ++step) {
+            if (!trajectory->active ||
+                trajectory->state.sim_time >= target_time) {
+                trajectory->active = false;
+                break;
+            }
+
+            const auto policy_begin = std::chrono::steady_clock::now();
+            reset_rollout_prepared_policy_plain(&prepared);
+            prepare_rollout_policy_plain(&prepared, *trajectory);
+            const auto prepare_end = std::chrono::steady_clock::now();
+            perf->prepare_sec += std::chrono::duration_cast<
+                std::chrono::duration<double>>(
+                    prepare_end - policy_begin).count();
+            perf->initialize_sec += prepared.initialize_sec;
+            perf->state_features_sec += prepared.state_features_sec;
+            perf->action_features_sec += prepared.action_features_sec;
+            ++perf->prepared_count;
+
+            const auto score_begin = prepare_end;
+            if (!prepared.flat_actions.empty()) {
+                const NativeHGBModelRuntime* prior_runtime =
+                    prepared.controller_player
+                        ? controller_prior_runtime_
+                        : adversary_prior_runtime_;
+                if (prior_runtime == nullptr || !prior_runtime->loaded()) {
+                    throw std::runtime_error(
+                        "native independent rollout policy runtime is unavailable");
+                }
+                const int row_count = static_cast<int>(
+                    prepared.canonical_indices.size());
+                group_offsets[1] = row_count;
+                std::vector<double> scores =
+                    prior_runtime->predict_raw_grouped_split_batch_flat(
+                        prepared.state_features,
+                        prepared.flat_actions,
+                        row_count,
+                        group_offsets,
+                        std::max(1, policy_parallel_threads));
+                if (scores.size() != prepared.canonical_indices.size()) {
+                    throw std::runtime_error(
+                        "native independent rollout policy output size mismatch");
+                }
+                for (std::size_t row = 0;
+                     row < prepared.valid_rows.size();
+                     ++row) {
+                    if (!prepared.valid_rows[row]) scores[row] = 0.0;
+                }
+                apply_rollout_policy_scores_plain(&prepared, scores);
+                perf->action_rows += row_count;
+                perf->scored_action_rows += row_count;
+            }
+            const auto score_end = std::chrono::steady_clock::now();
+            perf->score_sec += std::chrono::duration_cast<
+                std::chrono::duration<double>>(
+                    score_end - score_begin).count();
+
+            const auto sample_begin = score_end;
+            prepared.action_index = sample_rollout_action_plain(
+                prepared, &trajectory->rng);
+            const auto sample_end = std::chrono::steady_clock::now();
+            perf->sample_sec += std::chrono::duration_cast<
+                std::chrono::duration<double>>(
+                    sample_end - sample_begin).count();
+            perf->policy_sec += std::chrono::duration_cast<
+                std::chrono::duration<double>>(
+                    sample_end - policy_begin).count();
+            apply_prepared_rollout_action_plain(
+                trajectory, prepared, prepared.action_index);
+            if (step + 1 == max_actions) {
+                perf->exceeded_max_actions = true;
+            }
+        }
+    }
+
+    double policy_rollout_deadline_plain(
+        double expansion_parent_time) const {
+        return expansion_parent_time +
+            std::max(0.0, in_.rollout_horizon_sec);
+    }
+
+    RolloutValueParts policy_rollout_value_plain(
+        const SimState& leaf_state,
+        const std::string& leaf_player,
+        double expansion_parent_time,
+        double target_time) {
+        const int count = std::max(1, in_.rollout_count);
+        const int policy_parallel_threads = std::max(
+            1, in_.rollout_policy_parallel_threads > 0
+                ? in_.rollout_policy_parallel_threads
+                : in_.rollout_parallel_threads);
+        const int trajectory_parallel_threads = std::max(
+            1, std::min(
+                count, std::max(1, in_.rollout_parallel_threads)));
+        const int max_actions = std::max(1, in_.rollout_max_actions);
+        perf_rollout_min_expansion_parent_time_ = std::min(
+            perf_rollout_min_expansion_parent_time_, expansion_parent_time);
+        perf_rollout_max_expansion_parent_time_ = std::max(
+            perf_rollout_max_expansion_parent_time_, expansion_parent_time);
+        const double remaining_rollout =
+            std::max(0.0, target_time - leaf_state.sim_time);
+        perf_rollout_min_remaining_sec_ = std::min(
+            perf_rollout_min_remaining_sec_, remaining_rollout);
+        perf_rollout_max_remaining_sec_ = std::max(
+            perf_rollout_max_remaining_sec_, remaining_rollout);
+        perf_rollout_min_start_time_ =
+            std::min(perf_rollout_min_start_time_, leaf_state.sim_time);
+        perf_rollout_max_start_time_ =
+            std::max(perf_rollout_max_start_time_, leaf_state.sim_time);
+        perf_rollout_min_deadline_ =
+            std::min(perf_rollout_min_deadline_, target_time);
+        perf_rollout_max_deadline_ =
+            std::max(perf_rollout_max_deadline_, target_time);
+        auto& trajectories = rollout_trajectories_workspace_;
+        trajectories.resize(static_cast<std::size_t>(count));
+        const std::uint64_t leaf_index =
+            static_cast<std::uint64_t>(perf_rollout_leaf_count_++);
+        const std::uint64_t base_seed =
+            static_cast<std::uint64_t>(std::max(0, in_.seed));
+        for (std::size_t idx = 0; idx < trajectories.size(); ++idx) {
+            auto& trajectory = trajectories[idx];
+            trajectory.state = leaf_state;
+            trajectory.player = leaf_player;
+            trajectory.edges.clear();
+            trajectory.action_history.clear();
+            trajectory.step_players.clear();
+            trajectory.step_action_categories.clear();
+            trajectory.step_sim_times_before.clear();
+            trajectory.step_sim_times_after.clear();
+            trajectory.active = true;
+            trajectory.terminal = false;
+            trajectory.policy_sec = 0.0;
+            trajectory.transition_sec = 0.0;
+            trajectory.action_history.reserve(static_cast<std::size_t>(max_actions));
+            if (in_.capture_rollout_trace) {
+                trajectory.step_players.reserve(static_cast<std::size_t>(max_actions));
+                trajectory.step_action_categories.reserve(
+                    static_cast<std::size_t>(max_actions));
+                trajectory.step_sim_times_before.reserve(
+                    static_cast<std::size_t>(max_actions));
+                trajectory.step_sim_times_after.reserve(
+                    static_cast<std::size_t>(max_actions));
+            }
+            trajectory.rng.seed_int(
+                base_seed + leaf_index * 1000003ULL + idx * 9176ULL);
+        }
+
+        if (in_.rollout_optimized_execution &&
+            trajectory_parallel_threads > 1) {
+            std::vector<IndependentRolloutPerf> independent_perf(
+                static_cast<std::size_t>(count));
+            #pragma omp parallel for if(trajectory_parallel_threads > 1) \
+                num_threads(trajectory_parallel_threads) schedule(static)
+            for (int idx = 0; idx < count; ++idx) {
+                run_independent_rollout_trajectory_plain(
+                    &trajectories[static_cast<std::size_t>(idx)],
+                    target_time,
+                    max_actions,
+                    policy_parallel_threads,
+                    &independent_perf[static_cast<std::size_t>(idx)]);
+            }
+
+            bool exceeded_max_actions = false;
+            double max_prepare_sec = 0.0;
+            double max_score_sec = 0.0;
+            double max_sample_sec = 0.0;
+            for (std::size_t idx = 0; idx < independent_perf.size(); ++idx) {
+                const auto& item = independent_perf[idx];
+                trajectories[idx].policy_sec = item.policy_sec;
+                max_prepare_sec = std::max(max_prepare_sec, item.prepare_sec);
+                max_score_sec = std::max(max_score_sec, item.score_sec);
+                max_sample_sec = std::max(max_sample_sec, item.sample_sec);
+                perf_rollout_initialize_cpu_sec_ += item.initialize_sec;
+                perf_rollout_state_features_cpu_sec_ += item.state_features_sec;
+                perf_rollout_action_features_cpu_sec_ += item.action_features_sec;
+                perf_rollout_prepared_unique_count_ += item.prepared_count;
+                perf_rollout_policy_action_rows_ += item.action_rows;
+                perf_rollout_policy_scored_action_rows_ +=
+                    item.scored_action_rows;
+                exceeded_max_actions =
+                    exceeded_max_actions || item.exceeded_max_actions;
+            }
+            perf_rollout_policy_prepare_sec_ += max_prepare_sec;
+            perf_rollout_policy_score_sec_ += max_score_sec;
+            perf_rollout_policy_sample_sec_ += max_sample_sec;
+            if (exceeded_max_actions) {
+                throw std::runtime_error(
+                    "policy rollout exceeded rollout_max_actions");
+            }
+        } else {
+
+        auto& prepared = rollout_prepared_workspace_;
+        prepared.resize(static_cast<std::size_t>(count));
+        auto& batch_workspace = rollout_batch_workspace_;
+        auto& prepared_owner = rollout_prepared_owner_workspace_;
+        prepared_owner.assign(static_cast<std::size_t>(count), -1);
+        bool any_active = true;
+        bool exceeded_max_actions = false;
+        for (int step = 0; step < max_actions; ++step) {
+            any_active = false;
+            for (auto& trajectory : trajectories) {
+                if (trajectory.active &&
+                    trajectory.state.sim_time < target_time) {
+                    any_active = true;
+                } else if (trajectory.active) {
+                    trajectory.active = false;
+                }
+            }
+            if (!any_active) break;
+
+            std::fill(prepared_owner.begin(), prepared_owner.end(), -1);
+            for (int idx = 0; idx < count; ++idx) {
+                if (!trajectories[static_cast<std::size_t>(idx)].active) continue;
+                int owner = idx;
+                for (int previous = 0; previous < idx; ++previous) {
+                    if (!trajectories[static_cast<std::size_t>(previous)].active) {
+                        continue;
+                    }
+                    if (trajectories[static_cast<std::size_t>(idx)].action_history ==
+                        trajectories[static_cast<std::size_t>(previous)].action_history) {
+                        owner = prepared_owner[static_cast<std::size_t>(previous)];
+                        break;
+                    }
+                }
+                prepared_owner[static_cast<std::size_t>(idx)] = owner;
+                if (owner == idx) {
+                    ++perf_rollout_prepared_unique_count_;
+                } else {
+                    ++perf_rollout_prepared_reuse_count_;
+                }
+            }
+
+            const auto policy_begin = std::chrono::steady_clock::now();
+            #pragma omp parallel for if(trajectory_parallel_threads > 1) \
+                num_threads(trajectory_parallel_threads) schedule(static)
+            for (int idx = 0; idx < count; ++idx) {
+                auto& item = prepared[static_cast<std::size_t>(idx)];
+                reset_rollout_prepared_policy_plain(&item);
+                if (trajectories[static_cast<std::size_t>(idx)].active &&
+                    prepared_owner[static_cast<std::size_t>(idx)] == idx) {
+                    prepare_rollout_policy_plain(
+                        &item,
+                        trajectories[static_cast<std::size_t>(idx)]);
+                }
+            }
+            for (const auto& item : prepared) {
+                perf_rollout_initialize_cpu_sec_ += item.initialize_sec;
+                perf_rollout_state_features_cpu_sec_ += item.state_features_sec;
+                perf_rollout_action_features_cpu_sec_ += item.action_features_sec;
+            }
+
+            const auto prepare_end = std::chrono::steady_clock::now();
+            perf_rollout_policy_prepare_sec_ += std::chrono::duration_cast<
+                std::chrono::duration<double>>(
+                    prepare_end - policy_begin).count();
+            const auto score_begin = prepare_end;
+
+            score_grouped_rollout_policies_plain(
+                &prepared,
+                trajectories,
+                "controller",
+                policy_parallel_threads,
+                &batch_workspace);
+            score_grouped_rollout_policies_plain(
+                &prepared,
+                trajectories,
+                "adversary",
+                policy_parallel_threads,
+                &batch_workspace);
+            const auto score_end = std::chrono::steady_clock::now();
+            perf_rollout_policy_score_sec_ += std::chrono::duration_cast<
+                std::chrono::duration<double>>(
+                    score_end - score_begin).count();
+            const auto sample_begin = score_end;
+
+            for (int idx = 0; idx < count; ++idx) {
+                auto& trajectory =
+                    trajectories[static_cast<std::size_t>(idx)];
+                if (!trajectory.active) continue;
+                auto& item = prepared[static_cast<std::size_t>(idx)];
+                const int owner = prepared_owner[static_cast<std::size_t>(idx)];
+                if (owner < 0) {
+                    item.action_index = -1;
+                } else {
+                    item.action_index = sample_rollout_action_plain(
+                        prepared[static_cast<std::size_t>(owner)],
+                        &trajectory.rng);
+                }
+            }
+            const auto policy_end = std::chrono::steady_clock::now();
+            perf_rollout_policy_sample_sec_ += std::chrono::duration_cast<
+                std::chrono::duration<double>>(
+                    policy_end - sample_begin).count();
+            perf_rollout_policy_sec_ += std::chrono::duration_cast<
+                std::chrono::duration<double>>(
+                    policy_end - policy_begin).count();
+
+            if (in_.rollout_optimized_execution) {
+                auto& transition_owner = rollout_transition_owner_workspace_;
+                transition_owner.assign(static_cast<std::size_t>(count), -1);
+                for (int idx = 0; idx < count; ++idx) {
+                    if (!trajectories[static_cast<std::size_t>(idx)].active) {
+                        continue;
+                    }
+                    const int policy_owner =
+                        prepared_owner[static_cast<std::size_t>(idx)];
+                    const int action_index =
+                        prepared[static_cast<std::size_t>(idx)].action_index;
+                    int owner = idx;
+                    if (policy_owner >= 0 && action_index >= 0) {
+                        for (int previous = 0; previous < idx; ++previous) {
+                            if (transition_owner[static_cast<std::size_t>(previous)] !=
+                                previous) {
+                                continue;
+                            }
+                            if (prepared_owner[static_cast<std::size_t>(previous)] ==
+                                    policy_owner &&
+                                prepared[static_cast<std::size_t>(previous)].action_index ==
+                                    action_index) {
+                                owner = previous;
+                                break;
+                            }
+                        }
+                    }
+                    transition_owner[static_cast<std::size_t>(idx)] = owner;
+                    if (owner != idx) ++perf_rollout_shared_transition_count_;
+                }
+
+                #pragma omp parallel for if(trajectory_parallel_threads > 1) \
+                    num_threads(trajectory_parallel_threads) schedule(static)
+                for (int idx = 0; idx < count; ++idx) {
+                    auto& trajectory =
+                        trajectories[static_cast<std::size_t>(idx)];
+                    if (!trajectory.active ||
+                        transition_owner[static_cast<std::size_t>(idx)] != idx) {
+                        continue;
+                    }
+                    const int policy_owner =
+                        prepared_owner[static_cast<std::size_t>(idx)];
+                    if (policy_owner < 0) {
+                        trajectory.active = false;
+                        trajectory.terminal = true;
+                        continue;
+                    }
+                    apply_prepared_rollout_action_plain(
+                        &trajectory,
+                        prepared[static_cast<std::size_t>(policy_owner)],
+                        prepared[static_cast<std::size_t>(idx)].action_index);
+                }
+
+                #pragma omp parallel for if(trajectory_parallel_threads > 1) \
+                    num_threads(trajectory_parallel_threads) schedule(static)
+                for (int idx = 0; idx < count; ++idx) {
+                    auto& trajectory =
+                        trajectories[static_cast<std::size_t>(idx)];
+                    if (!trajectory.active) continue;
+                    const int owner =
+                        transition_owner[static_cast<std::size_t>(idx)];
+                    if (owner >= 0 && owner != idx) {
+                        copy_shared_rollout_transition_plain(
+                            &trajectory,
+                            trajectories[static_cast<std::size_t>(owner)]);
+                    }
+                }
+            } else {
+                #pragma omp parallel for if(trajectory_parallel_threads > 1) \
+                    num_threads(trajectory_parallel_threads) schedule(static)
+                for (int idx = 0; idx < count; ++idx) {
+                    auto& trajectory =
+                        trajectories[static_cast<std::size_t>(idx)];
+                    if (!trajectory.active) continue;
+                    const auto& item =
+                        prepared[static_cast<std::size_t>(idx)];
+                    const int owner =
+                        prepared_owner[static_cast<std::size_t>(idx)];
+                    apply_prepared_rollout_action_plain(
+                        &trajectory,
+                        prepared[static_cast<std::size_t>(owner)],
+                        item.action_index);
+                }
+            }
+
+            if (step + 1 == max_actions) exceeded_max_actions = true;
+        }
+        if (exceeded_max_actions) {
+            throw std::runtime_error("policy rollout exceeded rollout_max_actions");
+        }
+        }
+
+        std::vector<double> bootstraps(trajectories.size(), 0.0);
+        if (model_bootstrap_enabled()) {
+            for (const std::string player : {"controller", "adversary"}) {
+                std::vector<std::size_t> selected;
+                std::vector<SimState> states;
+                for (std::size_t idx = 0; idx < trajectories.size(); ++idx) {
+                    if (trajectories[idx].player != player) continue;
+                    selected.push_back(idx);
+                    states.push_back(trajectories[idx].state);
+                }
+                if (states.empty()) continue;
+                const auto infer_begin = std::chrono::steady_clock::now();
+                const auto values = infer_values_for_states(
+                    states, player, all_true_action_mask(player));
+                const auto infer_end = std::chrono::steady_clock::now();
+                perf_infer_sec_ += std::chrono::duration_cast<
+                    std::chrono::duration<double>>(infer_end - infer_begin).count();
+                ++perf_infer_calls_;
+                if (values.size() != selected.size()) {
+                    throw std::runtime_error("rollout bootstrap batch size mismatch");
+                }
+                for (std::size_t i = 0; i < values.size(); ++i) {
+                    bootstraps[selected[i]] = values[i];
+                }
+            }
+        }
+
+        RolloutValueParts total;
+        if (leaf_index == 0 && !trajectories.empty()) {
+            std::uint32_t history_hash = 2166136261U;
+            for (int action_index : trajectories.front().action_history) {
+                history_hash = static_cast<std::uint32_t>(
+                    (history_hash ^ static_cast<std::uint32_t>(action_index)) *
+                    16777619U);
+            }
+            perf_rollout_first_history_hash_ = history_hash;
+            perf_rollout_first_history_actions_ = static_cast<int>(
+                trajectories.front().action_history.size());
+        }
+        for (std::size_t idx = 0; idx < trajectories.size(); ++idx) {
+            perf_rollout_action_count_ +=
+                static_cast<int>(trajectories[idx].edges.size());
+            perf_rollout_policy_sec_ += trajectories[idx].policy_sec;
+            perf_rollout_transition_sec_ += trajectories[idx].transition_sec;
+            perf_rollout_min_final_time_ = std::min(
+                perf_rollout_min_final_time_, trajectories[idx].state.sim_time);
+            perf_rollout_max_final_time_ = std::max(
+                perf_rollout_max_final_time_, trajectories[idx].state.sim_time);
+            if (trajectories[idx].terminal) ++perf_rollout_terminal_count_;
+            double reward_return = 0.0;
+            double bootstrap_return = bootstraps[idx];
+            for (auto edge = trajectories[idx].edges.rbegin();
+                 edge != trajectories[idx].edges.rend(); ++edge) {
+                reward_return = edge->reward + edge->discount * reward_return;
+                bootstrap_return = edge->discount * bootstrap_return;
+            }
+            total.reward_return += reward_return;
+            total.bootstrap_return += bootstrap_return;
+        }
+        perf_rollout_trajectory_count_ += count;
+        if (current_rollout_trace_enabled_) {
+            for (std::size_t idx = 0; idx < trajectories.size(); ++idx) {
+                const auto& trajectory = trajectories[idx];
+                double trajectory_reward_return = 0.0;
+                double trajectory_bootstrap_return = bootstraps[idx];
+                for (auto edge = trajectory.edges.rbegin();
+                     edge != trajectory.edges.rend(); ++edge) {
+                    trajectory_reward_return =
+                        edge->reward +
+                        edge->discount * trajectory_reward_return;
+                    trajectory_bootstrap_return =
+                        edge->discount * trajectory_bootstrap_return;
+                }
+                for (std::size_t path_idx =
+                         current_rollout_trace_path_.size();
+                     path_idx > 1; --path_idx) {
+                    const TreeNode* child =
+                        current_rollout_trace_path_[path_idx - 1];
+                    if (child == nullptr) continue;
+                    trajectory_reward_return =
+                        child->reward +
+                        child->edge_discount * trajectory_reward_return;
+                    trajectory_bootstrap_return =
+                        child->edge_discount * trajectory_bootstrap_return;
+                }
+                const double trajectory_total_return =
+                    trajectory_reward_return +
+                    trajectory_bootstrap_return;
+                double cumulative_cost = 0.0;
+                double running_discount = 1.0;
+                int trace_step_number = 0;
+
+                for (std::size_t path_idx = 1;
+                     path_idx < current_rollout_trace_path_.size();
+                     ++path_idx) {
+                    const TreeNode* parent =
+                        current_rollout_trace_path_[path_idx - 1];
+                    const TreeNode* child =
+                        current_rollout_trace_path_[path_idx];
+                    if (parent == nullptr || child == nullptr) continue;
+                    const double step_cost = -child->reward;
+                    const double discounted_step_cost =
+                        running_discount * step_cost;
+                    cumulative_cost += discounted_step_cost;
+
+                    RolloutTraceStep step;
+                    step.sim_iteration = current_sim_iteration_;
+                    step.leaf_evaluation_id = static_cast<int>(leaf_index);
+                    step.rollout_id = static_cast<int>(idx);
+                    step.root_action_index = current_root_action_index_;
+                    step.step_number = trace_step_number++;
+                    step.step_action_index = child->parent_action_index;
+                    step.root_sim_time = current_root_sim_time_;
+                    step.rollout_deadline = target_time;
+                    step.step_sim_time_before = parent->sim_time;
+                    step.step_sim_time_after = child->sim_time;
+                    step.step_cost = step_cost;
+                    step.discounted_step_cost = discounted_step_cost;
+                    step.cumulative_discounted_cost = cumulative_cost;
+                    step.trajectory_reward_return_from_root =
+                        trajectory_reward_return;
+                    step.trajectory_bootstrap_return_from_root =
+                        trajectory_bootstrap_return;
+                    step.trajectory_total_return_from_root =
+                        trajectory_total_return;
+                    step.root_action_category = current_root_action_category_;
+                    step.step_phase = "tree_path";
+                    step.step_player = parent->player;
+                    step.step_action_category =
+                        child->parent_action_is_controller
+                            ? controller_rollout_category(
+                                  child->parent_controller_action)
+                            : "adversary";
+                    rollout_trace_steps_.push_back(std::move(step));
+                    running_discount *= child->edge_discount;
+                }
+
+                for (std::size_t edge_idx = 0;
+                     edge_idx < trajectory.edges.size(); ++edge_idx) {
+                    const auto& edge = trajectory.edges[edge_idx];
+                    const double step_cost = -edge.reward;
+                    const double discounted_step_cost =
+                        running_discount * step_cost;
+                    cumulative_cost += discounted_step_cost;
+
+                    RolloutTraceStep step;
+                    step.sim_iteration = current_sim_iteration_;
+                    step.leaf_evaluation_id = static_cast<int>(leaf_index);
+                    step.rollout_id = static_cast<int>(idx);
+                    step.root_action_index = current_root_action_index_;
+                    step.step_number = trace_step_number++;
+                    step.step_action_index = trajectory.action_history[edge_idx];
+                    step.root_sim_time = current_root_sim_time_;
+                    step.rollout_deadline = target_time;
+                    step.step_sim_time_before =
+                        trajectory.step_sim_times_before[edge_idx];
+                    step.step_sim_time_after =
+                        trajectory.step_sim_times_after[edge_idx];
+                    step.step_cost = step_cost;
+                    step.discounted_step_cost = discounted_step_cost;
+                    step.cumulative_discounted_cost = cumulative_cost;
+                    step.trajectory_reward_return_from_root =
+                        trajectory_reward_return;
+                    step.trajectory_bootstrap_return_from_root =
+                        trajectory_bootstrap_return;
+                    step.trajectory_total_return_from_root =
+                        trajectory_total_return;
+                    step.root_action_category = current_root_action_category_;
+                    step.step_phase = "policy_rollout";
+                    step.step_player = trajectory.step_players[edge_idx];
+                    step.step_action_category =
+                        trajectory.step_action_categories[edge_idx];
+                    rollout_trace_steps_.push_back(std::move(step));
+                    running_discount *= edge.discount;
+                }
+            }
+        }
+        total.reward_return /= static_cast<double>(count);
+        total.bootstrap_return /= static_cast<double>(count);
+        return total;
+    }
+
+    RolloutValueParts rollout_value_plain(
+        const SimState& state,
+        const std::string& player,
+        double expansion_parent_time,
+        double target_time) {
+        if (in_.search_mode == "full_tree_rollout" && in_.rollout_horizon_sec > 0.0) {
+            return policy_rollout_value_plain(
+                state, player, expansion_parent_time, target_time);
+        }
+        if (!model_bootstrap_enabled()) return {};
 
         const std::vector<uint8_t> mask = all_true_action_mask(player);
         const auto t_infer_begin = std::chrono::steady_clock::now();
@@ -2222,7 +4280,7 @@ private:
         const auto t_infer_end = std::chrono::steady_clock::now();
         perf_infer_sec_ += std::chrono::duration_cast<std::chrono::duration<double>>(t_infer_end - t_infer_begin).count();
         perf_infer_calls_ += 1;
-        return infer_out.first;
+        return {0.0, infer_out.first};
     }
 
     void update_plain_node_bounds(TreeNode* node, double value) {
@@ -2231,16 +4289,24 @@ private:
         node->max_value = std::max(node->max_value, value);
     }
 
-    void backpropagate_plain(const std::vector<TreeNode*>& path, double leaf_value) {
-        double value = leaf_value;
+    void backpropagate_plain(
+        const std::vector<TreeNode*>& path,
+        RolloutValueParts leaf_value) {
+        double reward_return = leaf_value.reward_return;
+        double bootstrap_return = leaf_value.bootstrap_return;
         for (auto it = path.rbegin(); it != path.rend(); ++it) {
             TreeNode* node = *it;
             if (node->parent != nullptr) {
-                value = node->reward + node->edge_discount * value;
+                reward_return =
+                    node->reward + node->edge_discount * reward_return;
+                bootstrap_return = node->edge_discount * bootstrap_return;
             }
+            const double value = reward_return + bootstrap_return;
 
             node->visits += 1;
             node->value_sum += value;
+            node->rollout_reward_value_sum += reward_return;
+            node->rollout_bootstrap_value_sum += bootstrap_return;
 
             if (node->parent != nullptr) {
                 update_plain_node_bounds(node->parent, value);
@@ -2251,6 +4317,11 @@ private:
     SearchOutput run_full_tree_search() {
         using clock = std::chrono::steady_clock;
         const auto t_total_begin = clock::now();
+        rollout_policy_score_cache_.clear();
+        rollout_policy_scores_inflight_.clear();
+        rollout_policy_cache_active_ = !in_.rollout_optimized_execution &&
+            in_.search_mode == "full_tree_rollout" &&
+            in_.rollout_horizon_sec > 0.0;
 
         TreeNode root;
         root.player = in_.root_player;
@@ -2295,6 +4366,9 @@ private:
             SimState state = root.cached_state;
             std::vector<TreeNode*> path;
             path.push_back(node);
+            double rollout_parent_time = state.sim_time;
+            double rollout_deadline = state.sim_time;
+            bool expanded_action = false;
 
             if (in_.use_policy_prior) {
                 while (true) {
@@ -2315,14 +4389,21 @@ private:
                         continue;
                     }
 
-                    auto expanded = expand_one_child_plain(node, state, selected.action_index);
+                    rollout_parent_time = state.sim_time;
+                    rollout_deadline =
+                        policy_rollout_deadline_plain(rollout_parent_time);
+                    auto expanded = expand_one_child_plain(
+                        node, state, selected.action_index);
                     node = expanded.first;
                     state = std::move(expanded.second);
                     path.push_back(node);
+                    expanded_action = true;
                     break;
                 }
             } else {
-                while (plain_expanded(*node) && node->untried_action_indices.empty() && !node->children.empty()) {
+                while (plain_expanded(*node) &&
+                       node->untried_action_indices.empty() &&
+                       !node->children.empty()) {
                     node = select_child_plain(node);
                     if (node == nullptr) break;
                     state = node->cached_state;
@@ -2335,20 +4416,54 @@ private:
                 }
 
                 if (!node->untried_action_indices.empty()) {
+                    rollout_parent_time = state.sim_time;
+                    rollout_deadline =
+                        policy_rollout_deadline_plain(rollout_parent_time);
                     auto expanded = expand_one_child_plain(node, state);
                     node = expanded.first;
                     state = std::move(expanded.second);
                     path.push_back(node);
+                    expanded_action = true;
                 }
             }
 
             if (node == nullptr) continue;
-            const double leaf_value = rollout_value_plain(state, node->player);
+            current_sim_iteration_ = sim;
+            current_rollout_trace_enabled_ = false;
+            current_rollout_trace_path_.clear();
+            if (in_.capture_rollout_trace && expanded_action &&
+                path.size() >= 2 && root.player == "controller") {
+                TreeNode* root_child = path[1];
+                if (root_child != nullptr &&
+                    root_child->has_parent_action &&
+                    root_child->parent_action_is_controller) {
+                    const std::string category = controller_rollout_category(
+                        root_child->parent_controller_action);
+                    if (category == "decode_only" ||
+                        category == "prefill_128" ||
+                        category == "prefill_256" ||
+                        category == "prefill_512") {
+                        current_rollout_trace_enabled_ = true;
+                        current_root_action_index_ =
+                            root_child->parent_action_index;
+                        current_root_action_category_ = category;
+                        current_root_sim_time_ = root.sim_time;
+                        current_rollout_trace_path_ = path;
+                    }
+                }
+            }
+            if (!expanded_action) {
+                rollout_parent_time = state.sim_time;
+                rollout_deadline = state.sim_time;
+            }
+            const RolloutValueParts leaf_value = rollout_value_plain(
+                state, node->player, rollout_parent_time, rollout_deadline);
             backpropagate_plain(path, leaf_value);
         }
 
         out.root_visits = root.visits;
         out.root_value_sum = root.value_sum;
+        out.rollout_trace_steps = std::move(rollout_trace_steps_);
         out.mcts_root_prior = compute_root_prior(root, out.root_nn_valid_mask);
 
         int n_actions = static_cast<int>(out.root_nn_valid_mask.size());
@@ -2357,6 +4472,10 @@ private:
         out.root_action_rewards.assign(static_cast<std::size_t>(n_actions), 0.0);
         out.root_action_discounts.assign(static_cast<std::size_t>(n_actions), 1.0);
         out.root_action_bootstraps.assign(static_cast<std::size_t>(n_actions), 0.0);
+        out.root_action_rollout_reward_returns.assign(
+            static_cast<std::size_t>(n_actions), 0.0);
+        out.root_action_rollout_bootstrap_returns.assign(
+            static_cast<std::size_t>(n_actions), 0.0);
         out.root_action_reprs.assign(static_cast<std::size_t>(n_actions), std::string());
         out.root_action_leaf_prefill_counts.assign(static_cast<std::size_t>(n_actions), 0);
         out.root_action_leaf_decode_counts.assign(static_cast<std::size_t>(n_actions), 0);
@@ -2398,6 +4517,16 @@ private:
                 out.root_action_rewards[static_cast<std::size_t>(alias)] = child.reward;
                 out.root_action_discounts[static_cast<std::size_t>(alias)] = child.edge_discount;
                 out.root_action_bootstraps[static_cast<std::size_t>(alias)] = child.mean_value();
+                out.root_action_rollout_reward_returns[static_cast<std::size_t>(alias)] =
+                    child.visits > 0
+                        ? child.rollout_reward_value_sum /
+                            static_cast<double>(child.visits)
+                        : 0.0;
+                out.root_action_rollout_bootstrap_returns[static_cast<std::size_t>(alias)] =
+                    child.visits > 0
+                        ? child.rollout_bootstrap_value_sum /
+                            static_cast<double>(child.visits)
+                        : 0.0;
                 out.root_action_reprs[static_cast<std::size_t>(alias)] = action_json;
                 out.root_action_leaf_decode_credit_balances[static_cast<std::size_t>(alias)] = child.cached_state.stats.decode_credit_balance;
             }
@@ -2443,6 +4572,75 @@ private:
         out.perf["backprop_sec"] = 0.0;
         out.perf["selection_steps"] = 0.0;
         out.perf["forced_steps"] = 0.0;
+        out.perf["rollout_enabled"] =
+            in_.search_mode == "full_tree_rollout" ? 1.0 : 0.0;
+        out.perf["rollout_root_time"] = in_.root_state.sim_time;
+        out.perf["rollout_deadline"] = -1.0;
+        out.perf["rollout_min_deadline"] =
+            std::isfinite(perf_rollout_min_deadline_) ? perf_rollout_min_deadline_ : -1.0;
+        out.perf["rollout_max_deadline"] =
+            std::isfinite(perf_rollout_max_deadline_) ? perf_rollout_max_deadline_ : -1.0;
+        out.perf["rollout_min_expansion_parent_time"] =
+            std::isfinite(perf_rollout_min_expansion_parent_time_)
+                ? perf_rollout_min_expansion_parent_time_ : -1.0;
+        out.perf["rollout_max_expansion_parent_time"] =
+            std::isfinite(perf_rollout_max_expansion_parent_time_)
+                ? perf_rollout_max_expansion_parent_time_ : -1.0;
+        out.perf["rollout_min_remaining_rollout_sec"] =
+            std::isfinite(perf_rollout_min_remaining_sec_)
+                ? perf_rollout_min_remaining_sec_ : -1.0;
+        out.perf["rollout_max_remaining_rollout_sec"] =
+            std::isfinite(perf_rollout_max_remaining_sec_)
+                ? perf_rollout_max_remaining_sec_ : -1.0;
+        out.perf["rollout_first_history_hash"] =
+            static_cast<double>(perf_rollout_first_history_hash_);
+        out.perf["rollout_first_history_actions"] =
+            static_cast<double>(perf_rollout_first_history_actions_);
+        out.perf["rollout_cutoff_leaf_evaluations"] =
+            static_cast<double>(perf_rollout_cutoff_leaf_count_);
+        out.perf["rollout_min_start_time"] =
+            std::isfinite(perf_rollout_min_start_time_)
+                ? perf_rollout_min_start_time_ : -1.0;
+        out.perf["rollout_max_start_time"] =
+            std::isfinite(perf_rollout_max_start_time_)
+                ? perf_rollout_max_start_time_ : -1.0;
+        out.perf["rollout_min_final_time"] =
+            std::isfinite(perf_rollout_min_final_time_)
+                ? perf_rollout_min_final_time_ : -1.0;
+        out.perf["rollout_max_final_time"] =
+            std::isfinite(perf_rollout_max_final_time_)
+                ? perf_rollout_max_final_time_ : -1.0;
+        out.perf["rollout_trajectories"] =
+            static_cast<double>(perf_rollout_trajectory_count_);
+        out.perf["rollout_actions"] = static_cast<double>(perf_rollout_action_count_);
+        out.perf["rollout_prepared_unique"] =
+            static_cast<double>(perf_rollout_prepared_unique_count_);
+        out.perf["rollout_prepared_reused"] =
+            static_cast<double>(perf_rollout_prepared_reuse_count_);
+        out.perf["rollout_shared_transitions"] =
+            static_cast<double>(perf_rollout_shared_transition_count_);
+        out.perf["rollout_terminals"] = static_cast<double>(perf_rollout_terminal_count_);
+        out.perf["rollout_policy_cache_hits"] =
+            static_cast<double>(perf_rollout_policy_cache_hits_);
+        out.perf["rollout_policy_cache_misses"] =
+            static_cast<double>(perf_rollout_policy_cache_misses_);
+        out.perf["rollout_policy_sec"] = perf_rollout_policy_sec_;
+        out.perf["rollout_policy_prepare_sec"] =
+            perf_rollout_policy_prepare_sec_;
+        out.perf["rollout_initialize_cpu_sec"] =
+            perf_rollout_initialize_cpu_sec_;
+        out.perf["rollout_state_features_cpu_sec"] =
+            perf_rollout_state_features_cpu_sec_;
+        out.perf["rollout_action_features_cpu_sec"] =
+            perf_rollout_action_features_cpu_sec_;
+        out.perf["rollout_policy_score_sec"] = perf_rollout_policy_score_sec_;
+        out.perf["rollout_policy_sample_sec"] =
+            perf_rollout_policy_sample_sec_;
+        out.perf["rollout_policy_action_rows"] =
+            static_cast<double>(perf_rollout_policy_action_rows_);
+        out.perf["rollout_policy_scored_action_rows"] =
+            static_cast<double>(perf_rollout_policy_scored_action_rows_);
+        out.perf["rollout_transition_sec"] = perf_rollout_transition_sec_;
         return out;
     }
 
@@ -2452,22 +4650,85 @@ private:
     NewFeatures226HGBRuntime* hgb_runtime_ = nullptr;
     NativeHGBModelRuntime* controller_prior_runtime_ = nullptr;
     NativeHGBModelRuntime* adversary_prior_runtime_ = nullptr;
+    bool rollout_policy_cache_active_ = false;
+    mutable std::unordered_map<std::string, std::vector<double>>
+        rollout_policy_score_cache_;
+    std::unordered_map<std::uint64_t, std::vector<FastRolloutPolicyCacheEntry>>
+        fast_rollout_policy_score_cache_;
+    std::size_t fast_rollout_policy_cache_entry_count_ = 0;
+    mutable std::unordered_set<std::string> rollout_policy_scores_inflight_;
+    mutable std::mutex rollout_policy_cache_mutex_;
+    mutable std::condition_variable rollout_policy_cache_cv_;
+    std::vector<PolicyRolloutTrajectory> rollout_trajectories_workspace_;
+    std::vector<RolloutPreparedPolicy> rollout_prepared_workspace_;
+    RolloutPolicyBatchWorkspace rollout_batch_workspace_;
+    std::vector<int> rollout_prepared_owner_workspace_;
+    std::vector<int> rollout_transition_owner_workspace_;
+    std::vector<RolloutTraceStep> rollout_trace_steps_;
+    std::vector<TreeNode*> current_rollout_trace_path_;
+    bool current_rollout_trace_enabled_ = false;
+    int current_sim_iteration_ = -1;
+    int current_root_action_index_ = -1;
+    std::string current_root_action_category_;
+    double current_root_sim_time_ = 0.0;
     int model_version_ = 0;
     std::mt19937 rng_;
     PythonRandomCompat py_rng_;
     int next_node_id_ = 1;
     MinMaxStats min_max_;
 
+    double perf_rollout_min_start_time_ =
+        std::numeric_limits<double>::infinity();
+    double perf_rollout_max_start_time_ =
+        -std::numeric_limits<double>::infinity();
+    double perf_rollout_min_final_time_ =
+        std::numeric_limits<double>::infinity();
+    double perf_rollout_max_final_time_ =
+        -std::numeric_limits<double>::infinity();
+    double perf_rollout_min_deadline_ =
+        std::numeric_limits<double>::infinity();
+    double perf_rollout_max_deadline_ =
+        -std::numeric_limits<double>::infinity();
+    double perf_rollout_min_expansion_parent_time_ =
+        std::numeric_limits<double>::infinity();
+    double perf_rollout_max_expansion_parent_time_ =
+        -std::numeric_limits<double>::infinity();
+    double perf_rollout_min_remaining_sec_ =
+        std::numeric_limits<double>::infinity();
+    double perf_rollout_max_remaining_sec_ =
+        -std::numeric_limits<double>::infinity();
+    std::uint32_t perf_rollout_first_history_hash_ = 0U;
+    int perf_rollout_first_history_actions_ = 0;
     // Perf counters
     double perf_selection_sec_ = 0.0;
     double perf_restore_sec_ = 0.0;
     double perf_forced_sec_ = 0.0;
+    std::int64_t perf_rollout_cutoff_leaf_count_ = 0;
     double perf_expand_sec_ = 0.0;
     double perf_backprop_sec_ = 0.0;
     double perf_infer_sec_ = 0.0;
+    double perf_rollout_policy_sec_ = 0.0;
+    double perf_rollout_policy_prepare_sec_ = 0.0;
+    double perf_rollout_initialize_cpu_sec_ = 0.0;
+    double perf_rollout_state_features_cpu_sec_ = 0.0;
+    double perf_rollout_action_features_cpu_sec_ = 0.0;
+    double perf_rollout_policy_score_sec_ = 0.0;
+    double perf_rollout_policy_sample_sec_ = 0.0;
+    double perf_rollout_transition_sec_ = 0.0;
     int perf_infer_calls_ = 0;
     int perf_selection_steps_ = 0;
     int perf_forced_steps_ = 0;
+    std::int64_t perf_rollout_trajectory_count_ = 0;
+    std::int64_t perf_rollout_leaf_count_ = 0;
+    std::int64_t perf_rollout_action_count_ = 0;
+    std::int64_t perf_rollout_prepared_unique_count_ = 0;
+    std::int64_t perf_rollout_policy_action_rows_ = 0;
+    std::int64_t perf_rollout_policy_scored_action_rows_ = 0;
+    std::int64_t perf_rollout_prepared_reuse_count_ = 0;
+    std::int64_t perf_rollout_shared_transition_count_ = 0;
+    std::int64_t perf_rollout_terminal_count_ = 0;
+    mutable std::int64_t perf_rollout_policy_cache_hits_ = 0;
+    mutable std::int64_t perf_rollout_policy_cache_misses_ = 0;
 
     std::string build_adversary_prefill_deadlines_json(
         const AdversaryAction& action,
@@ -2863,20 +5124,28 @@ private:
                 valid_prior_by_idx[idx] = uniform_prior;
             }
 
-            std::unordered_map<std::string, int> sig_to_canon;
+            std::unordered_map<std::uint64_t, std::vector<int>> hash_to_canons;
             std::unordered_map<int, std::vector<int>> canon_to_alias;
             std::unordered_map<int, int> alias_to_canon;
             for (int idx : valid) {
                 const auto& act = sampled.actions[static_cast<std::size_t>(idx)];
-                const std::string sig = controller_action_key(act);
-                auto it = sig_to_canon.find(sig);
-                if (it == sig_to_canon.end()) {
-                    sig_to_canon.emplace(sig, idx);
+                const std::uint64_t hash = controller_action_hash(act);
+                std::vector<int>& candidates = hash_to_canons[hash];
+                int canonical = -1;
+                for (int candidate : candidates) {
+                    if (controller_actions_equivalent(
+                            act, sampled.actions[static_cast<std::size_t>(candidate)])) {
+                        canonical = candidate;
+                        break;
+                    }
+                }
+                if (canonical < 0) {
+                    candidates.push_back(idx);
                     canon_to_alias[idx] = {idx};
                     alias_to_canon[idx] = idx;
                 } else {
-                    canon_to_alias[it->second].push_back(idx);
-                    alias_to_canon[idx] = it->second;
+                    canon_to_alias[canonical].push_back(idx);
+                    alias_to_canon[idx] = canonical;
                 }
             }
 
@@ -3576,10 +5845,12 @@ SearchOutput run_search_hgb226_value_prior_with_env(
     NativeHGBModelRuntime& controller_prior_runtime,
     NativeHGBModelRuntime& adversary_prior_runtime) {
     SearchInput prior_in = in;
-    prior_in.search_mode = "full_tree";
+    if (prior_in.search_mode != "full_tree_rollout") {
+        prior_in.search_mode = "full_tree";
+    }
     prior_in.use_policy_prior = true;
     if (!std::isfinite(prior_in.puct_c) || prior_in.puct_c == 0.0) {
-        prior_in.puct_c = 1.0;
+        prior_in.puct_c = 2.5;
     }
     if (!std::isfinite(prior_in.policy_prior_temperature) ||
         prior_in.policy_prior_temperature <= 0.0) {

@@ -150,7 +150,7 @@ class VidurMCTS:
 
     def time_discount(self, child_final_time: float, parent_time: float) -> float:
         " Provides us with the discounting factor based on how much time as progressed due to action from parent to child "
-        gamma = float(getattr(self._mctsConfig, "discount_factor", 0.98))
+        gamma = float(getattr(self._mctsConfig, "discount_factor", 0.995))
         denom = float(getattr(self._mctsConfig, "_discount_time_denom", 0.015725797204323228))
         denom = max(denom, 1e-9)
 

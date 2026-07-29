@@ -192,7 +192,7 @@ class VidurMCTS:
         """
         discount = gamma ^ ((t_child_time - t_parent_branch) / prefill_time(step_tokens))
         """
-        gamma = float(getattr(self._cfg, "discount_factor", 0.98))
+        gamma = float(getattr(self._cfg, "discount_factor", 0.995))
         denom = max(float(getattr(self, "_discount_time_denom", getattr(self, "_prefill_step_time", 0.015725797204323228))), 1e-9)
         dt = max(0.0, float(t_child_time) - float(t_parent_branch))
         return gamma ** (dt / denom)

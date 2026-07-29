@@ -23,7 +23,7 @@ DEFAULT_ARENA_CSV = Path(
     "game_17000001_model_adv_depth1_vs_model_ctrl_depth1.csv"
 )
 
-DISCOUNT_FACTOR = 0.98
+DISCOUNT_FACTOR = 0.995
 DISCOUNT_TIME_DENOM_SEC = 0.015725797204323228
 
 

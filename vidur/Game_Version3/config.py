@@ -372,7 +372,7 @@ class MCTSSearchConfig:
     pb_c_init: float = 1.25
 
     # Time-discount config
-    discount_factor: float = 0.98
+    discount_factor: float = 0.995
     # If None: use profile-derived _prefill_step_time (current behavior).
     # If set: force this denominator in seconds for discount normalization.
     discount_time_denominator_sec: Optional[float] = 0.015725797204323228

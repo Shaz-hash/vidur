@@ -185,7 +185,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--worker-threads", type=int, default=1)
     parser.add_argument("--uct-c", type=float, default=1.4)
     parser.add_argument("--seed", type=int, default=2026)
-    parser.add_argument("--discount-factor", type=float, default=0.98)
+    parser.add_argument("--discount-factor", type=float, default=0.995)
     parser.add_argument("--discount-time-denom", type=float, default=0.015725797204323228)
     parser.add_argument("--arena-time-limit-sec", type=float, default=5.0)
     parser.add_argument("--environment-lang", choices=("python", "native"), default="python")

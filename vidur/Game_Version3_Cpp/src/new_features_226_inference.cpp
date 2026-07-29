@@ -11,7 +11,6 @@
 #include <random>
 #include <sstream>
 #include <stdexcept>
-#include <unordered_set>
 #include <utility>
 
 namespace mcts_native_gv2 {
@@ -140,6 +139,23 @@ bool is_decode_req(const RequestState& r) {
     return r.remaining_decode() > 0;
 }
 
+struct FeatureBuildScratch {
+    std::vector<const RequestState*> active_requests;
+    std::vector<const RequestState*> prefill_requests;
+    std::vector<const RequestState*> decode_requests;
+    std::vector<const RequestState*> non_violated_decode;
+    std::vector<const RequestState*> chosen_decode;
+};
+
+bool contains_sorted_or_linear(
+    const std::vector<int>& values,
+    bool values_are_sorted,
+    int request_id) {
+    return values_are_sorted
+        ? std::binary_search(values.begin(), values.end(), request_id)
+        : contains_id(values, request_id);
+}
+
 double decode_remaining(const RequestState& r) {
     return static_cast<double>(std::max(0, r.remaining_decode()));
 }
@@ -185,15 +201,21 @@ double decode_time_at_max(
     noop.has_mapping = true;
     noop.valid = true;
 
-    SimState tmp = state;
     const ControllerBatchPlan plan = simulator->build_controller_batch_plan(
-        tmp,
+        state,
         noop,
         true,
-        std::max(0, tmp.stats.decode_credit_balance));
-    SimState timing_state = state;
-    const BatchExecutionResult res = simulator->execute_controller_batch_timing(timing_state, plan);
-    return res.executed ? std::max(0.0, res.stage_total_time_sec) : 0.0;
+        std::max(0, state.stats.decode_credit_balance));
+    if (plan.predictor_reqs.empty()) return 0.0;
+    const auto& cfg = simulator->cfg();
+    const auto prediction = simulator->predictor().lookup_batch_time(
+        plan.predictor_reqs,
+        plan.num_tokens,
+        cfg.prefill_profile_tokens,
+        cfg.prefill_profile_times,
+        cfg.fallback_total_time_sec,
+        cfg.fallback_model_time_sec);
+    return std::max(0.0, std::get<0>(prediction));
 }
 
 std::uint32_t rotr32(std::uint32_t x, unsigned r) {
@@ -527,6 +549,21 @@ bool NewFeatures226HGBRuntime::load_model_export(const std::string& path) {
         throw std::runtime_error("failed to open native HGB export: " + path);
     }
 
+    std::string export_header;
+    std::getline(in, export_header);
+    if (trim_copy(export_header) == "agz_dnn_v1" ||
+        trim_copy(export_header) == "agz_dnn_v2") {
+        dnn_model_ = NativeDenseDNNModel();
+        dnn_model_.load_model_export(path);
+        if (!dnn_model_.is_value()) {
+            throw std::runtime_error("value runtime received a non-value DNN export");
+        }
+        feature_dim_ = dnn_model_.feature_dim();
+        model_tag_ = dnn_model_.model_tag();
+        trees_.clear();
+        return true;
+    }
+    in.clear(); in.seekg(0); dnn_model_ = NativeDenseDNNModel();
     model_tag_.clear();
     feature_dim_ = 226;
     baseline_ = 0.0;
@@ -598,29 +635,54 @@ std::vector<float> NewFeatures226HGBRuntime::build_features(
     const VirtualSimulatorGV2* simulator,
     int root_id,
     double* decode_time_at_max_out) const {
+    std::vector<float> output;
+    build_features_into(
+        state,
+        simulator,
+        root_id,
+        &output,
+        decode_time_at_max_out);
+    return output;
+}
+
+void NewFeatures226HGBRuntime::build_features_into(
+    const SimState& state,
+    const VirtualSimulatorGV2* simulator,
+    int root_id,
+    std::vector<float>* output,
+    double* decode_time_at_max_out) const {
+    if (output == nullptr) {
+        throw std::runtime_error("new_features_226 output is null");
+    }
     const double sim_time = state.sim_time;
 
-    std::unordered_set<int> active_set;
-    active_set.reserve(state.stats.active_request_ids.size());
-    for (int rid : state.stats.active_request_ids) active_set.insert(rid);
-
-    std::vector<const RequestState*> active_requests;
+    thread_local FeatureBuildScratch scratch;
+    auto& active_requests = scratch.active_requests;
+    auto& prefill_reqs = scratch.prefill_requests;
+    auto& decode_reqs = scratch.decode_requests;
+    active_requests.clear();
+    prefill_reqs.clear();
+    decode_reqs.clear();
     active_requests.reserve(state.requests.size());
+    prefill_reqs.reserve(state.requests.size());
+    decode_reqs.reserve(state.requests.size());
+    const bool active_ids_sorted = std::is_sorted(
+        state.stats.active_request_ids.begin(),
+        state.stats.active_request_ids.end());
     for (const auto& r : state.requests) {
         // Match build_state_local_features_adv.py: snapshot request records can
         // include finalized historical requests, so only ids in active_request_ids
         // are in-system feature candidates. An empty active set means no active
         // requests, not "all snapshot requests".
-        if (active_set.find(r.request_id) != active_set.end()) {
-            active_requests.push_back(&r);
+        if (!contains_sorted_or_linear(
+                state.stats.active_request_ids,
+                active_ids_sorted,
+                r.request_id)) {
+            continue;
         }
-    }
-
-    std::vector<const RequestState*> prefill_reqs;
-    std::vector<const RequestState*> decode_reqs;
-    for (const RequestState* r : active_requests) {
-        if (is_prefill_req(*r)) prefill_reqs.push_back(r);
-        else if (is_decode_req(*r)) decode_reqs.push_back(r);
+        active_requests.push_back(&r);
+        if (is_prefill_req(r)) prefill_reqs.push_back(&r);
+        else if (is_decode_req(r)) decode_reqs.push_back(&r);
     }
 
     const int num_prefill = static_cast<int>(prefill_reqs.size());
@@ -641,14 +703,23 @@ std::vector<float> NewFeatures226HGBRuntime::build_features(
     int num_violated_active = 0;
     int num_prefill_violated = 0;
     int num_decode_violated = 0;
+    const bool violated_ids_sorted = std::is_sorted(
+        state.stats.violated_request_ids.begin(),
+        state.stats.violated_request_ids.end());
+    const auto request_is_violated = [&](int request_id) {
+        return contains_sorted_or_linear(
+            state.stats.violated_request_ids,
+            violated_ids_sorted,
+            request_id);
+    };
     for (const RequestState* r : active_requests) {
-        if (contains_id(state.stats.violated_request_ids, r->request_id)) ++num_violated_active;
+        if (request_is_violated(r->request_id)) ++num_violated_active;
     }
     for (const RequestState* r : prefill_reqs) {
-        if (contains_id(state.stats.violated_request_ids, r->request_id)) ++num_prefill_violated;
+        if (request_is_violated(r->request_id)) ++num_prefill_violated;
     }
     for (const RequestState* r : decode_reqs) {
-        if (contains_id(state.stats.violated_request_ids, r->request_id)) ++num_decode_violated;
+        if (request_is_violated(r->request_id)) ++num_decode_violated;
     }
 
     int p_late_05_15 = 0;
@@ -737,7 +808,8 @@ std::vector<float> NewFeatures226HGBRuntime::build_features(
             sim_time);
     const double delta_next_adv_tick = std::max(0.0, next_adv_tick - sim_time);
 
-    std::vector<float> out(static_cast<std::size_t>(kFeatureDim), 0.0f);
+    output->assign(static_cast<std::size_t>(kFeatureDim), 0.0f);
+    std::vector<float>& out = *output;
     std::size_t pos = 0;
     auto push = [&](double v) {
         if (pos >= out.size()) throw std::runtime_error("new_features_226 overflow");
@@ -787,7 +859,7 @@ std::vector<float> NewFeatures226HGBRuntime::build_features(
         p.rid = r->request_id;
         p.remaining = std::max(0, r->remaining_prefill());
         p.total = std::max(0, r->num_prefill_tokens);
-        p.violated = contains_id(state.stats.violated_request_ids, r->request_id);
+        p.violated = request_is_violated(r->request_id);
         const double deadline = r->arrived_at + r->prefill_slo_time;
         p.slack_clamped = std::max(0.0, deadline - sim_time);
         p.lateness = std::max(
@@ -824,14 +896,20 @@ std::vector<float> NewFeatures226HGBRuntime::build_features(
         pos += kPrefillSlotDim;
     }
 
-    std::vector<const RequestState*> non_violated_decode;
+    auto& non_violated_decode = scratch.non_violated_decode;
+    non_violated_decode.clear();
+    non_violated_decode.reserve(decode_reqs.size());
     for (const RequestState* r : decode_reqs) {
-        if (!contains_id(state.stats.violated_request_ids, r->request_id)) non_violated_decode.push_back(r);
+        if (!request_is_violated(r->request_id)) {
+            non_violated_decode.push_back(r);
+        }
     }
     std::sort(non_violated_decode.begin(), non_violated_decode.end(), [](const RequestState* a, const RequestState* b) {
         return a->request_id < b->request_id;
     });
-    std::vector<const RequestState*> chosen_decode;
+    auto& chosen_decode = scratch.chosen_decode;
+    chosen_decode.clear();
+    chosen_decode.reserve(kDecodeSlots);
     if (static_cast<int>(non_violated_decode.size()) > kDecodeSlots) {
         const auto idxs = deterministic_subset_indices(
             static_cast<int>(non_violated_decode.size()),
@@ -839,7 +917,10 @@ std::vector<float> NewFeatures226HGBRuntime::build_features(
             decode_seed_key(root_id, sim_time, non_violated_decode));
         for (int idx : idxs) chosen_decode.push_back(non_violated_decode[static_cast<std::size_t>(idx)]);
     } else {
-        chosen_decode = non_violated_decode;
+        chosen_decode.insert(
+            chosen_decode.end(),
+            non_violated_decode.begin(),
+            non_violated_decode.end());
     }
 
     for (int slot = 0; slot < kDecodeSlots; ++slot) {
@@ -859,7 +940,6 @@ std::vector<float> NewFeatures226HGBRuntime::build_features(
     if (pos != out.size()) {
         throw std::runtime_error("new_features_226 final dim mismatch");
     }
-    return out;
 }
 
 double NewFeatures226HGBRuntime::tree_value(const Tree& tree, const std::vector<float>& features) {
@@ -886,6 +966,9 @@ double NewFeatures226HGBRuntime::tree_value(const Tree& tree, const std::vector<
 }
 
 double NewFeatures226HGBRuntime::predict_raw(const std::vector<float>& features) const {
+    if (dnn_model_.loaded()) {
+        return dnn_model_.predict_value(features);
+    }
     if (features.size() != static_cast<std::size_t>(feature_dim_)) {
         throw std::runtime_error("native HGB expected " + std::to_string(feature_dim_) +
                                  " features, got " + std::to_string(features.size()));
@@ -899,6 +982,11 @@ double NewFeatures226HGBRuntime::infer_value(
     const SimState& state,
     const VirtualSimulatorGV2* simulator,
     int root_id) const {
+    if (dnn_model_.is_markov_value()) {
+        return std::min(
+            dnn_model_.predict_markov_value(build_markov_value_features(state)),
+            0.0);
+    }
     const std::vector<float> f = build_features(state, simulator, root_id, nullptr);
     return std::min(predict_raw(f), 0.0);
 }
@@ -908,8 +996,14 @@ NewFeatures226Result NewFeatures226HGBRuntime::infer_debug(
     const VirtualSimulatorGV2* simulator,
     int root_id) const {
     NewFeatures226Result out;
-    out.features = build_features(state, simulator, root_id, &out.decode_time_at_max);
-    out.raw_value = predict_raw(out.features);
+    if (dnn_model_.is_markov_value()) {
+        const MarkovValueFeatures features = build_markov_value_features(state);
+        out.features = features.global_features;
+        out.raw_value = dnn_model_.predict_markov_value(features);
+    } else {
+        out.features = build_features(state, simulator, root_id, &out.decode_time_at_max);
+        out.raw_value = predict_raw(out.features);
+    }
     out.value = std::min(out.raw_value, 0.0);
     return out;
 }
@@ -921,10 +1015,11 @@ int NewFeatures226HGBRuntime::num_trees() const {
 }
 
 bool NewFeatures226HGBRuntime::loaded() const {
-    return !trees_.empty();
+    return dnn_model_.loaded() || !trees_.empty();
 }
 
 const std::string& NewFeatures226HGBRuntime::model_tag() const {
+    if (dnn_model_.loaded()) return dnn_model_.model_tag();
     return model_tag_;
 }
 
@@ -934,6 +1029,20 @@ bool NativeHGBModelRuntime::load_model_export(const std::string& path) {
         throw std::runtime_error("failed to open native HGB export: " + path);
     }
 
+    std::string export_header;
+    std::getline(in, export_header);
+    if (trim_copy(export_header) == "agz_dnn_v1") {
+        dnn_model_ = NativeDenseDNNModel();
+        dnn_model_.load_model_export(path);
+        if (!dnn_model_.is_policy()) {
+            throw std::runtime_error("policy runtime received a non-policy DNN export");
+        }
+        feature_dim_ = dnn_model_.feature_dim();
+        model_tag_ = dnn_model_.model_tag();
+        trees_.clear();
+        return true;
+    }
+    in.clear(); in.seekg(0); dnn_model_ = NativeDenseDNNModel();
     model_tag_.clear();
     feature_dim_ = 0;
     baseline_ = 0.0;
@@ -1024,6 +1133,9 @@ double NativeHGBModelRuntime::tree_value(const Tree& tree, const float* features
 }
 
 double NativeHGBModelRuntime::predict_raw(const std::vector<float>& features) const {
+    if (dnn_model_.loaded()) {
+        return dnn_model_.predict_policy(features);
+    }
     if (features.size() != static_cast<std::size_t>(feature_dim_)) {
         throw std::runtime_error("native HGB expected " + std::to_string(feature_dim_) +
                                  " features, got " + std::to_string(features.size()));
@@ -1038,6 +1150,9 @@ std::vector<double> NativeHGBModelRuntime::predict_raw_batch_flat(
     const std::vector<float>& flat_features,
     int num_rows,
     int row_dim) const {
+    if (dnn_model_.loaded()) {
+        return dnn_model_.predict_policy_batch_flat(flat_features, num_rows, row_dim);
+    }
     if (num_rows < 0) {
         throw std::runtime_error("native HGB batch num_rows must be non-negative");
     }
@@ -1064,6 +1179,79 @@ std::vector<double> NativeHGBModelRuntime::predict_raw_batch_flat(
     return out;
 }
 
+std::vector<double> NativeHGBModelRuntime::predict_raw_grouped_batch_flat(
+    const std::vector<float>& flat_features,
+    int num_rows,
+    int row_dim,
+    const std::vector<int>& group_offsets,
+    int parallel_threads) const {
+    if (dnn_model_.loaded()) {
+        return dnn_model_.predict_policy_grouped_batch_flat(
+            flat_features,
+            num_rows,
+            row_dim,
+            group_offsets,
+            parallel_threads);
+    }
+    return predict_raw_batch_flat(flat_features, num_rows, row_dim);
+}
+
+std::vector<double> NativeHGBModelRuntime::predict_raw_grouped_split_batch_flat(
+    const std::vector<float>& flat_states,
+    const std::vector<float>& flat_actions,
+    int num_rows,
+    const std::vector<int>& group_offsets,
+    int parallel_threads) const {
+    if (dnn_model_.loaded()) {
+        return dnn_model_.predict_policy_grouped_split_batch_flat(
+            flat_states,
+            flat_actions,
+            num_rows,
+            group_offsets,
+            parallel_threads);
+    }
+    if (num_rows < 0 || group_offsets.empty() || group_offsets.front() != 0 ||
+        group_offsets.back() != num_rows) {
+        throw std::runtime_error("native HGB split batch dimensions mismatch");
+    }
+    const int group_count = static_cast<int>(group_offsets.size()) - 1;
+    if (group_count == 0) return {};
+    if (flat_states.size() % static_cast<std::size_t>(group_count) != 0 ||
+        num_rows == 0 ||
+        flat_actions.size() % static_cast<std::size_t>(num_rows) != 0) {
+        throw std::runtime_error("native HGB split flat batch size mismatch");
+    }
+    const int state_dim = static_cast<int>(
+        flat_states.size() / static_cast<std::size_t>(group_count));
+    const int action_dim = static_cast<int>(
+        flat_actions.size() / static_cast<std::size_t>(num_rows));
+    const int row_dim = state_dim + action_dim;
+    if (row_dim != feature_dim_) {
+        throw std::runtime_error("native HGB split feature dimension mismatch");
+    }
+
+    std::vector<float> flat_features(
+        static_cast<std::size_t>(num_rows) * static_cast<std::size_t>(row_dim));
+    for (int group = 0; group < group_count; ++group) {
+        const int begin = group_offsets[static_cast<std::size_t>(group)];
+        const int end = group_offsets[static_cast<std::size_t>(group + 1)];
+        if (begin > end) {
+            throw std::runtime_error("native HGB split offsets are not monotonic");
+        }
+        const float* state = flat_states.data() +
+            static_cast<std::size_t>(group) * static_cast<std::size_t>(state_dim);
+        for (int row = begin; row < end; ++row) {
+            float* destination = flat_features.data() +
+                static_cast<std::size_t>(row) * static_cast<std::size_t>(row_dim);
+            std::copy(state, state + state_dim, destination);
+            const float* action = flat_actions.data() +
+                static_cast<std::size_t>(row) * static_cast<std::size_t>(action_dim);
+            std::copy(action, action + action_dim, destination + state_dim);
+        }
+    }
+    return predict_raw_batch_flat(flat_features, num_rows, row_dim);
+}
+
 int NativeHGBModelRuntime::feature_dim() const { return feature_dim_; }
 
 int NativeHGBModelRuntime::num_trees() const {
@@ -1071,10 +1259,11 @@ int NativeHGBModelRuntime::num_trees() const {
 }
 
 bool NativeHGBModelRuntime::loaded() const {
-    return !trees_.empty();
+    return dnn_model_.loaded() || !trees_.empty();
 }
 
 const std::string& NativeHGBModelRuntime::model_tag() const {
+    if (dnn_model_.loaded()) return dnn_model_.model_tag();
     return model_tag_;
 }
 

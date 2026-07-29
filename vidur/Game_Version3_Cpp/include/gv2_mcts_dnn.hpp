@@ -26,21 +26,36 @@ struct SearchInput {
     int max_forced_hops = 2000;
     double uct_c = 1.4;
     bool use_policy_prior = false;
-    double puct_c = 1.0;
+    double puct_c = 2.5;
     double policy_prior_temperature = 1.0;
     double prior_min_prob = 1e-8;
     double pb_c_base = 1500.0; // Decrease for more exploration : normal value 5000
     double pb_c_init = 1.25; // Increase for more exploration at low visit counts : normal value 0.75
-    double discount_factor = 0.98;
+    double discount_factor = 0.995;
     double prefill_step_time = 0.015725797204323228;
     double reward_knee = 25.0;
     double reward_max_penalty = 40.0;
     double reward_tail_alpha = 1.0 / 15.0;
 
+    // Optional policy-guided leaf continuations for full-tree search.
+    int rollout_count = 10;
+    int rollout_parallel_threads = 10;
+    // Zero preserves the legacy behavior of using rollout_parallel_threads.
+    int rollout_policy_parallel_threads = 0;
+
+    double rollout_horizon_sec = 0.4;
+    double rollout_policy_temperature = 1.0;
+    double rollout_probability_quantum = 1e-6;
+    int rollout_max_actions = 4096;
+    bool capture_rollout_trace = false;
+    // Local A/B switch for semantics-preserving rollout execution changes.
+    // Keep the reference path available until differential validation passes.
+    bool rollout_optimized_execution = true;
+
     // Root Dirichlet noise (AlphaZero style): root-only
     bool root_dirichlet_noise_enabled = false;
-    double root_dirichlet_alpha = 0.3;
-    double root_dirichlet_epsilon = 0.25;
+    double root_dirichlet_alpha = 0.1;
+    double root_dirichlet_epsilon = 0.35;
 
     // Environment/simulator config (optional overrides).
     GV2EnvConfig env_cfg;

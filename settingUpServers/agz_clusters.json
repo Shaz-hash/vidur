@@ -1,0 +1,78 @@
+{
+  "reference": {
+    "python_version": "3.12.13",
+    "architecture": "aarch64",
+    "vcpu_count": 96,
+    "minimum_memory_gib": 180,
+    "minimum_root_disk_gib": 1900,
+    "prefill_profile_sha256": "47f2ed85aca4a5ec47eacae8425d38284e76759b75f5c069852d393ecc62329b",
+    "repo": "/home/ubuntu/vidur-classical-search"
+  },
+  "clusters": {
+    "exp3": [
+      {
+        "role": "xl",
+        "alias": "bellman-classical-exp3-xl",
+        "ip": "3.92.29.240",
+        "instance_id": "i-02f4e2ed0c772c534",
+        "reference_alias": "bellman-classical-exp2-xl"
+      },
+      {
+        "role": "worker1",
+        "alias": "bellman-classical-exp3-worker-1",
+        "ip": "54.146.143.25",
+        "instance_id": "i-0e90f4613c2b78ad7",
+        "reference_alias": "bellman-classical-exp2-worker-1"
+      },
+      {
+        "role": "worker2",
+        "alias": "bellman-classical-exp3-worker-2",
+        "ip": "54.166.214.226",
+        "instance_id": "i-01b2eec16c274294e",
+        "reference_alias": "bellman-classical-exp2-worker-2"
+      },
+      {
+        "role": "worker3",
+        "alias": "bellman-classical-exp3-worker-3",
+        "ip": "3.82.3.46",
+        "instance_id": "i-014435c9a4b58835c",
+        "reference_alias": "bellman-classical-exp2-worker-3"
+      },
+      {
+        "role": "worker4",
+        "alias": "bellman-classical-exp3-worker-4",
+        "ip": "54.162.204.223",
+        "instance_id": "i-0d753bcfb659402f3",
+        "reference_alias": "bellman-classical-exp2-worker-4"
+      },
+      {
+        "role": "worker5",
+        "alias": "bellman-classical-exp3-worker-5",
+        "ip": "54.81.147.54",
+        "instance_id": "i-0c40daae4c3066233",
+        "reference_alias": "bellman-classical-exp2-worker-5"
+      },
+      {
+        "role": "worker6",
+        "alias": "bellman-classical-exp3-worker-6",
+        "ip": "54.163.82.13",
+        "instance_id": "i-01ffb145e88eba394",
+        "reference_alias": "bellman-classical-exp2-worker-6"
+      },
+      {
+        "role": "worker7",
+        "alias": "bellman-classical-exp3-worker-7",
+        "ip": "52.91.155.208",
+        "instance_id": "i-05bf2fbcc92c0ed4c",
+        "reference_alias": "bellman-classical-exp2-worker-7"
+      },
+      {
+        "role": "worker8",
+        "alias": "bellman-classical-exp3-worker-8",
+        "ip": "54.81.120.20",
+        "instance_id": "i-00b262b9fc57d1635",
+        "reference_alias": "bellman-classical-exp2-worker-8"
+      }
+    ]
+  }
+}

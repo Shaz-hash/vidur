@@ -7,10 +7,12 @@ namespace {
 
 SearchInput as_value_prior_input(const SearchInput& in) {
     SearchInput out = in;
-    out.search_mode = "full_tree";
+    if (out.search_mode != "full_tree_rollout") {
+        out.search_mode = "full_tree";
+    }
     out.use_policy_prior = true;
     if (!std::isfinite(out.puct_c) || out.puct_c == 0.0) {
-        out.puct_c = 1.0;
+        out.puct_c = 2.5;
     }
     if (!std::isfinite(out.policy_prior_temperature) || out.policy_prior_temperature <= 0.0) {
         out.policy_prior_temperature = 1.0;

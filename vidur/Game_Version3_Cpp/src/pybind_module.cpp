@@ -1507,6 +1507,30 @@ py::dict search_mcts_dnn_gv2_common(
     in.reward_knee = get_double({"reward_knee"}, in.reward_knee);
     in.reward_max_penalty = get_double({"reward_max_penalty"}, in.reward_max_penalty);
     in.reward_tail_alpha = get_double({"reward_tail_alpha"}, in.reward_tail_alpha);
+    in.rollout_count = get_int(
+        {"rollout_count", "mcts_rollout_count"}, in.rollout_count);
+    in.rollout_parallel_threads = get_int(
+        {"rollout_parallel_threads", "mcts_rollout_parallel_threads"},
+        in.rollout_parallel_threads);
+    in.rollout_horizon_sec = get_double(
+        {"rollout_horizon_sec", "mcts_rollout_horizon_sec"}, in.rollout_horizon_sec);
+    in.rollout_policy_parallel_threads = get_int(
+        {"rollout_policy_parallel_threads", "mcts_rollout_policy_parallel_threads"},
+        in.rollout_policy_parallel_threads);
+
+    in.rollout_policy_temperature = get_double(
+        {"rollout_policy_temperature", "mcts_rollout_policy_temperature"},
+        in.rollout_policy_temperature);
+    in.rollout_probability_quantum = get_double(
+        {"rollout_probability_quantum", "mcts_rollout_probability_quantum"},
+        in.rollout_probability_quantum);
+    in.rollout_max_actions = get_int(
+        {"rollout_max_actions", "mcts_rollout_max_actions"}, in.rollout_max_actions);
+    in.capture_rollout_trace = get_bool(
+        {"capture_rollout_trace"}, in.capture_rollout_trace);
+    in.rollout_optimized_execution = get_bool(
+        {"rollout_optimized_execution"},
+        in.rollout_optimized_execution);
     in.reuse_root_infer_inputs = get_bool({"reuse_root_infer_inputs"}, in.reuse_root_infer_inputs);
 
     // Environment/simulator knobs (direct keys only; adapter can flatten before call)
@@ -1811,6 +1835,10 @@ py::dict search_mcts_dnn_gv2_common(
     result["root_action_rewards"] = out.root_action_rewards;
     result["root_action_discounts"] = out.root_action_discounts;
     result["root_action_bootstraps"] = out.root_action_bootstraps;
+    result["root_action_rollout_reward_returns"] =
+        out.root_action_rollout_reward_returns;
+    result["root_action_rollout_bootstrap_returns"] =
+        out.root_action_rollout_bootstrap_returns;
     result["root_action_reprs"] = out.root_action_reprs;
     result["root_action_leaf_prefill_counts"] = out.root_action_leaf_prefill_counts;
     result["root_action_leaf_decode_counts"] = out.root_action_leaf_decode_counts;
@@ -1822,6 +1850,35 @@ py::dict search_mcts_dnn_gv2_common(
     result["children"] = py_children;
     result["mcts_root_prior"] = out.mcts_root_prior;
     result["iter_events"] = py_iter_events;
+    py::list py_rollout_trace_steps;
+    for (const auto& step : out.rollout_trace_steps) {
+        py::dict row;
+        row["sim_iteration"] = step.sim_iteration;
+        row["leaf_evaluation_id"] = step.leaf_evaluation_id;
+        row["rollout_id"] = step.rollout_id;
+        row["root_action_index"] = step.root_action_index;
+        row["step_number"] = step.step_number;
+        row["step_action_index"] = step.step_action_index;
+        row["root_sim_time"] = step.root_sim_time;
+        row["rollout_deadline"] = step.rollout_deadline;
+        row["step_sim_time_before"] = step.step_sim_time_before;
+        row["step_sim_time_after"] = step.step_sim_time_after;
+        row["step_cost"] = step.step_cost;
+        row["discounted_step_cost"] = step.discounted_step_cost;
+        row["cumulative_discounted_cost"] = step.cumulative_discounted_cost;
+        row["trajectory_reward_return_from_root"] =
+            step.trajectory_reward_return_from_root;
+        row["trajectory_bootstrap_return_from_root"] =
+            step.trajectory_bootstrap_return_from_root;
+        row["trajectory_total_return_from_root"] =
+            step.trajectory_total_return_from_root;
+        row["root_action_category"] = step.root_action_category;
+        row["step_phase"] = step.step_phase;
+        row["step_player"] = step.step_player;
+        row["step_action_category"] = step.step_action_category;
+        py_rollout_trace_steps.append(std::move(row));
+    }
+    result["rollout_trace_steps"] = std::move(py_rollout_trace_steps);
     result["perf"] = py_perf;
 
     return result;
@@ -2395,11 +2452,66 @@ py::dict build_search_debug_hgb_root_child(
 PYBIND11_MODULE(mcts_native_gv2, m) {
     m.doc() = "Game Version 2 native MCTS phase-1 module";
 
+    m.def(
+        "discounted_trajectory_targets",
+        [](const std::vector<double>& rewards,
+           const std::vector<double>& discounts,
+           double terminal_bootstrap_value) {
+            if (rewards.size() != discounts.size()) {
+                throw std::invalid_argument("rewards and discounts must have equal length");
+            }
+            if (!std::isfinite(terminal_bootstrap_value)) {
+                throw std::invalid_argument("terminal_bootstrap_value must be finite");
+            }
+            std::vector<double> targets(rewards.size(), 0.0);
+            double running_value = terminal_bootstrap_value;
+            for (std::size_t offset = 0; offset < rewards.size(); ++offset) {
+                const std::size_t index = rewards.size() - 1 - offset;
+                const double reward = rewards[index];
+                const double discount = discounts[index];
+                if (!std::isfinite(reward)) {
+                    throw std::invalid_argument("rewards must be finite");
+                }
+                if (!std::isfinite(discount) || discount < 0.0 || discount > 1.0) {
+                    throw std::invalid_argument("discounts must be finite and in [0, 1]");
+                }
+                running_value = reward + discount * running_value;
+                targets[index] = running_value;
+            }
+            return targets;
+        },
+        py::arg("rewards"),
+        py::arg("discounts"),
+        py::arg("terminal_bootstrap_value")
+    );
 
     py::class_<NewFeatures226HGBRuntime>(m, "NewFeatures226HGBRuntime")
         .def(py::init<>())
         .def("load_model_export", &NewFeatures226HGBRuntime::load_model_export, py::arg("path"))
         .def("predict_from_features", &NewFeatures226HGBRuntime::predict_raw, py::arg("features"))
+        .def(
+            "predict_batch_from_flat_features",
+            [](const NewFeatures226HGBRuntime& self,
+               const std::vector<float>& flat_features,
+               std::size_t num_rows,
+               std::size_t row_dim) {
+                if (row_dim != static_cast<std::size_t>(self.feature_dim())) {
+                    throw std::invalid_argument("value batch row_dim does not match model feature_dim");
+                }
+                if (flat_features.size() != num_rows * row_dim) {
+                    throw std::invalid_argument("value batch flat feature count is inconsistent");
+                }
+                std::vector<double> out;
+                out.reserve(num_rows);
+                for (std::size_t row = 0; row < num_rows; ++row) {
+                    const auto begin = flat_features.begin() + static_cast<std::ptrdiff_t>(row * row_dim);
+                    out.push_back(self.predict_raw(std::vector<float>(begin, begin + row_dim)));
+                }
+                return out;
+            },
+            py::arg("flat_features"),
+            py::arg("num_rows"),
+            py::arg("row_dim"))
         .def("build_features_from_state",
              [](const NewFeatures226HGBRuntime& self,
                 const py::dict& root_state_payload,
@@ -2421,6 +2533,24 @@ PYBIND11_MODULE(mcts_native_gv2, m) {
              py::arg("root_state_payload"),
              py::arg("cfg_payload") = py::dict(),
              py::arg("root_id") = -1)
+        .def("build_markov_features_from_state",
+             [](const NewFeatures226HGBRuntime&,
+                const py::dict& root_state_payload) {
+                const MarkovValueFeatures features = build_markov_value_features(
+                    parse_root_state_payload(root_state_payload));
+                py::dict out;
+                out["schema"] = kMarkovValueFeatureSchema;
+                out["global_features"] = features.global_features;
+                out["request_features"] = features.request_features;
+                out["request_ids"] = features.request_ids;
+                out["request_count"] = features.request_count;
+                out["request_dim"] = kMarkovRequestDim;
+                out["launch_features"] = features.launch_features;
+                out["launch_count"] = features.launch_count;
+                out["launch_dim"] = kMarkovLaunchDim;
+                return out;
+             },
+             py::arg("root_state_payload"))
         .def("infer_from_state",
              [](const NewFeatures226HGBRuntime& self,
                 const py::dict& root_state_payload,
@@ -2451,6 +2581,12 @@ PYBIND11_MODULE(mcts_native_gv2, m) {
         .def(py::init<>())
         .def("load_model_export", &NativeHGBModelRuntime::load_model_export, py::arg("path"))
         .def("predict_from_features", &NativeHGBModelRuntime::predict_raw, py::arg("features"))
+        .def(
+            "predict_batch_from_flat_features",
+            &NativeHGBModelRuntime::predict_raw_batch_flat,
+            py::arg("flat_features"),
+            py::arg("num_rows"),
+            py::arg("row_dim"))
         .def_property_readonly("feature_dim", &NativeHGBModelRuntime::feature_dim)
         .def_property_readonly("num_trees", &NativeHGBModelRuntime::num_trees)
         .def_property_readonly("loaded", &NativeHGBModelRuntime::loaded)

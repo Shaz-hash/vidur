@@ -38,6 +38,11 @@ from vidur.mcts.Game_Versions.Game_Version3.DNN.native_selfplay import (
 )
 from vidur.mcts.Game_Versions.Game_Version3.tests import native_logger_tests as nlt
 from vidur.AlphaGoZero.replay_runtime import AlphaGoZeroReplayRecorder
+from vidur.AlphaGoZero.config import AGZ_DISCOUNT_FACTOR, AGZ_VALUE_FEATURE_SCHEMA
+from vidur.AlphaGoZero.markov_value_features import (
+    MARKOV_VALUE_SCHEMA,
+    build_markov_value_features,
+)
 
 
 _RUNTIME_ARGS: argparse.Namespace | None = None
@@ -51,6 +56,7 @@ _NATIVE_CONTROLLER_PRIOR_EXPORT_PATH: Path | None = None
 _NATIVE_ADVERSARY_PRIOR_EXPORT_PATH: Path | None = None
 _CFG_PAYLOAD_CACHE: dict[int, dict[str, Any]] = {}
 _AGZ_REPLAY_RECORDER: AlphaGoZeroReplayRecorder | None = None
+_NATIVE_INT_SEED_MOD = 2_147_483_647
 
 
 def _repo_root() -> Path:
@@ -122,6 +128,11 @@ def _limit_native_threads(num_threads: int) -> None:
         pass
 
 
+def _native_int_seed(seed: int) -> int:
+    """Keep seeds inside pybind's signed C++ int conversion range."""
+    return int(seed) % _NATIVE_INT_SEED_MOD
+
+
 def _export_hgb_to_native_text(
     model: Any,
     out_path: Path,
@@ -178,6 +189,18 @@ def _load_value_runtime_from_joblib(
     model_tag: str,
 ) -> tuple[Any, Path, Any, bool]:
     model = joblib.load(model_path)
+    from vidur.AlphaGoZero.dnn_models import export_dnn_to_native, is_dnn_model
+
+    if is_dnn_model(model):
+        native_export = export_dnn_to_native(
+            model,
+            export_path,
+            model_tag=str(model_tag),
+        )
+        runtime = native.NewFeatures226HGBRuntime()
+        runtime.load_model_export(str(native_export))
+        return runtime, native_export, model, False
+
     wrapped = False
     if not callable(getattr(model, "infer_from_inputs", None)):
         from vidur.bellman_v4_adv.v4_adv_hgb_wrapper import V4AdvHGBWrapper
@@ -204,6 +227,18 @@ def _load_prior_runtime_from_joblib(
     model_tag: str,
 ) -> tuple[Any, Path]:
     model = joblib.load(model_path)
+    from vidur.AlphaGoZero.dnn_models import export_dnn_to_native, is_dnn_model
+
+    if is_dnn_model(model):
+        native_export = export_dnn_to_native(
+            model,
+            export_path,
+            model_tag=str(model_tag),
+        )
+        runtime = native.NativeHGBModelRuntime()
+        runtime.load_model_export(str(native_export))
+        return runtime, native_export
+
     native_export = _export_hgb_to_native_text(
         model,
         export_path,
@@ -333,9 +368,17 @@ def _get_cfg_payload(args: argparse.Namespace, cfg: Any, bundle: Any) -> dict[st
 
     pipeline_cfg = cfg.to_pipeline_cfg() if callable(getattr(cfg, "to_pipeline_cfg", None)) else cfg
     payload = _cfg_payload(pipeline_cfg, torchscript_model_spec="")
+    # Override the engine default only for this explicitly configured run.
+    payload["discount_factor"] = float(args.discount_factor)
     attach_execution_predictor_payload(payload, bundle.simulator)
     payload["use_model_bootstrap"] = bool(int(args.model_version) > 0) and not bool(args.disable_model_bootstrap)
-    payload["native_search_mode"] = "full_tree"
+    payload["native_search_mode"] = str(args.native_search_mode)
+    payload["rollout_count"] = int(args.rollout_count)
+    payload["rollout_parallel_threads"] = int(args.rollout_parallel_threads)
+    payload["rollout_horizon_sec"] = float(args.rollout_horizon_sec)
+    payload["rollout_policy_temperature"] = float(args.rollout_policy_temperature)
+    payload["rollout_probability_quantum"] = float(args.rollout_probability_quantum)
+    payload["rollout_max_actions"] = int(args.rollout_max_actions)
     payload["use_policy_prior"] = bool(_NATIVE_CONTROLLER_PRIOR_RUNTIME is not None and _NATIVE_ADVERSARY_PRIOR_RUNTIME is not None)
     payload["root_dirichlet_noise_enabled"] = bool(args.root_dirichlet_noise_enabled)
     payload["root_dirichlet_alpha"] = float(args.root_dirichlet_alpha)
@@ -353,20 +396,28 @@ def _get_cfg_payload(args: argparse.Namespace, cfg: Any, bundle: Any) -> dict[st
 
 
 
-def _build_state_features_for_replay(*, args: argparse.Namespace, cfg: Any, bundle: Any, state: Any, root_id: int) -> list[float]:
-    if _NATIVE_RUNTIME is None:
-        return []
+def _build_state_features_for_replay(*, args: argparse.Namespace, cfg: Any, bundle: Any, state: Any, root_id: int) -> tuple[list[float], dict[str, str | int]]:
+    state_payload = nlt._native_state_payload(bundle.env, state)
+    legacy_features: list[float] = []
+    if _NATIVE_RUNTIME is not None:
+        try:
+            payload = dict(_get_cfg_payload(args, cfg, bundle))
+            out = _NATIVE_RUNTIME.build_features_from_state(state_payload, payload, int(root_id))
+            values = [float(x) for x in list(out.get("features", []) or [])]
+            legacy_features = values if len(values) == 226 else []
+        except Exception:
+            legacy_features = []
+
+    schema = str(AGZ_VALUE_FEATURE_SCHEMA).strip().lower()
+    if schema == "legacy_226":
+        return legacy_features, {}
+    if schema != MARKOV_VALUE_SCHEMA:
+        raise RuntimeError(f"unsupported AGZ_VALUE_FEATURE_SCHEMA={schema!r}")
     try:
-        payload = dict(_get_cfg_payload(args, cfg, bundle))
-        out = _NATIVE_RUNTIME.build_features_from_state(
-            nlt._native_state_payload(bundle.env, state),
-            payload,
-            int(root_id),
-        )
-        values = [float(x) for x in list(out.get("features", []) or [])]
-        return values if len(values) == 226 else []
-    except Exception:
-        return []
+        value_fields = build_markov_value_features(state_payload).replay_fields()
+    except Exception as exc:
+        raise RuntimeError(f"failed to encode {MARKOV_VALUE_SCHEMA} replay state") from exc
+    return legacy_features, value_fields
 
 
 def _build_action_features_for_replay(*, bundle: Any, state: Any, player: str, action: Any, canon_idx: int) -> list[float]:
@@ -653,7 +704,7 @@ def _select_model_mcts_cpp_action(
             int(root_depth),
             int(game_id),
             int(root_id),
-            int(args.seed) + int(root_id) + int(turn) + (0 if player == "controller" else 1_000_000),
+            _native_int_seed(int(args.seed) + int(root_id) + int(turn) + (0 if player == "controller" else 1_000_000)),
             bool(log_events),
             False,
             root_log_path,
@@ -671,7 +722,7 @@ def _select_model_mcts_cpp_action(
             int(root_depth),
             int(game_id),
             int(root_id),
-            int(args.seed) + int(root_id) + int(turn) + (0 if player == "controller" else 1_000_000),
+            _native_int_seed(int(args.seed) + int(root_id) + int(turn) + (0 if player == "controller" else 1_000_000)),
             bool(log_events),
             False,
             root_log_path,
@@ -709,7 +760,7 @@ def _select_model_mcts_cpp_action(
     root_value_sum = float(native_out.get("root_value_sum", 0.0) or 0.0)
     mcts_root_value = float(root_value_sum / root_visits) if root_visits > 0 else 0.0
     model_value_at_state = float(native_out.get("root_nn_value_controller", 0.0) or 0.0)
-    state_features_for_replay = _build_state_features_for_replay(
+    state_features_for_replay, value_features_for_replay = _build_state_features_for_replay(
         args=args,
         cfg=cfg,
         bundle=bundle,
@@ -845,6 +896,7 @@ def _select_model_mcts_cpp_action(
         "mcts_action_temperature": float(action_temperature),
         "mcts_action_sample_count": int(sample_count_before) + (1 if use_temperature_sample else 0),
         "state_features": [float(x) for x in state_features_for_replay],
+        **value_features_for_replay,
         "policy_rows": [
             {
                 "canon_action_index": int(r["canon_idx"]),
@@ -937,7 +989,17 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--num-parallel-games", type=int, default=5)
     parser.add_argument("--launcher-poll-sec", type=float, default=10.0)
     parser.add_argument("--launcher-worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--keep-job-model-artifacts",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Keep per-job native_model/ and arena_model/ scratch directories. "
+            "By default the launcher deletes them after copying arena CSVs upward."
+        ),
+    )
     parser.add_argument("--shared-root-mcts-iterations", type=int, default=1_000)
+    parser.add_argument("--discount-factor", type=float, default=AGZ_DISCOUNT_FACTOR)
     parser.add_argument("--write-mcts-visit-logs", action="store_true")
     parser.add_argument("--mcts-visit-log-dir", default="")
     parser.add_argument("--native-model-export-path", default="")
@@ -951,6 +1013,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--role-adversary-prior-model-path", default="")
     parser.add_argument("--force-build-native", action="store_true")
     parser.add_argument("--worker-threads", type=int, default=1)
+    parser.add_argument("--native-search-mode", choices=("full_tree", "full_tree_rollout"), default="full_tree")
+    parser.add_argument("--rollout-count", type=int, default=10)
+    parser.add_argument("--rollout-parallel-threads", type=int, default=1)
+    parser.add_argument("--rollout-horizon-sec", type=float, default=0.4)
+    parser.add_argument("--rollout-policy-temperature", type=float, default=1.0)
+    parser.add_argument("--rollout-probability-quantum", type=float, default=1e-6)
+    parser.add_argument("--rollout-max-actions", type=int, default=4096)
     parser.add_argument("--trivial-budget-tokens", type=int, default=512)
     parser.add_argument("--skip-model-ctrl-cycle", action="store_true")
     parser.add_argument("--only-model-ctrl-cycle", action="store_true")
@@ -976,6 +1045,12 @@ def _parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=DEFAULT_MODEL_TESTER_CONFIG.history_hops_force_zero,
     )
+    parser.add_argument(
+        "--history-hops-prefix-stable",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--uct-c", type=float, default=1.4)
     parser.add_argument("--puct-c", type=float, default=1.0)
@@ -991,6 +1066,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--write-model-action-detail-logs", action="store_true")
     parser.add_argument("--agz-replay-target-csv", default="")
     parser.add_argument("--agz-replay-min-canonical-actions", type=int, default=2)
+    parser.add_argument(
+        "--agz-replay-sample-window-sec",
+        type=float,
+        default=0.0,
+        help="Emit only replay states within this many simulated seconds of the history root; 0 emits all states.",
+    )
     parser.add_argument("--parent-dataset-dir", default="")
     parser.add_argument("--parent-state-id", type=int, default=-1)
     parser.add_argument("--parent-root-player-filter", choices=("controller", "adversary", "any"), default="any")
@@ -1017,7 +1098,11 @@ def _planned_history_hops(args: argparse.Namespace) -> list[int]:
         population = list(range(lo, hi + 1))
         if planned_n > len(population):
             raise ValueError("num_games exceeds unique history-hop capacity")
-        hops = rng.sample(population, k=planned_n)
+        if bool(getattr(args, "history_hops_prefix_stable", False)):
+            rng.shuffle(population)
+            hops = population[:planned_n]
+        else:
+            hops = rng.sample(population, k=planned_n)
     else:
         hops = [int(rng.randint(lo, hi)) for _ in range(planned_n)]
 
@@ -1055,6 +1140,8 @@ def _worker_command(args: argparse.Namespace, *, game_id: int, hop: int, job_dir
         "1",
         "--shared-root-mcts-iterations",
         str(int(args.shared_root_mcts_iterations)),
+        "--discount-factor",
+        str(float(args.discount_factor)),
         "--worker-threads",
         str(int(args.worker_threads)),
         "--trivial-budget-tokens",
@@ -1090,6 +1177,20 @@ def _worker_command(args: argparse.Namespace, *, game_id: int, hop: int, job_dir
         str(int(args.agz_sample_initial_move_count)),
         "--agz-mcts-action-temperature",
         str(float(args.agz_mcts_action_temperature)),
+        "--native-search-mode",
+        str(args.native_search_mode),
+        "--rollout-count",
+        str(int(args.rollout_count)),
+        "--rollout-parallel-threads",
+        str(int(args.rollout_parallel_threads)),
+        "--rollout-horizon-sec",
+        str(float(args.rollout_horizon_sec)),
+        "--rollout-policy-temperature",
+        str(float(args.rollout_policy_temperature)),
+        "--rollout-probability-quantum",
+        str(float(args.rollout_probability_quantum)),
+        "--rollout-max-actions",
+        str(int(args.rollout_max_actions)),
     ]
     if bool(args.skip_model_ctrl_cycle):
         cmd.append("--skip-model-ctrl-cycle")
@@ -1134,6 +1235,7 @@ def _worker_command(args: argparse.Namespace, *, game_id: int, hop: int, job_dir
     if str(args.agz_replay_target_csv or ""):
         cmd.extend(["--agz-replay-target-csv", str(job_dir / Path(str(args.agz_replay_target_csv)).name)])
         cmd.extend(["--agz-replay-min-canonical-actions", str(int(args.agz_replay_min_canonical_actions))])
+        cmd.extend(["--agz-replay-sample-window-sec", str(float(args.agz_replay_sample_window_sec))])
     return cmd
 
 
@@ -1165,6 +1267,7 @@ def _write_job_status(output_dir: Path, jobs: list[dict[str, Any]]) -> None:
         "job_output_dir",
         "log_file",
         "arena_results_csv",
+        "model_artifacts_cleaned",
     ]
     with (output_dir / "job_status.csv").open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
@@ -1183,6 +1286,20 @@ def _copy_job_arena_logs(job: dict[str, Any], output_dir: Path) -> None:
         if src.name.endswith("_model_action_details.csv"):
             continue
         shutil.copy2(src, dst_dir / src.name)
+
+
+def _cleanup_job_model_artifacts(job: dict[str, Any], *, keep: bool) -> None:
+    if bool(keep):
+        job["model_artifacts_cleaned"] = "kept"
+        return
+    job_dir = Path(job["job_output_dir"])
+    removed: list[str] = []
+    for name in ("native_model", "arena_model"):
+        path = job_dir / name
+        if path.exists():
+            shutil.rmtree(path, ignore_errors=True)
+            removed.append(name)
+    job["model_artifacts_cleaned"] = ",".join(removed) if removed else "none"
 
 
 def _merge_job_results(output_dir: Path) -> int:
@@ -1346,6 +1463,10 @@ def _run_parallel_launcher(args: argparse.Namespace) -> None:
                     job["status"] = "ok"
                     completed += 1
                     _copy_job_arena_logs(job, output_dir)
+                    _cleanup_job_model_artifacts(
+                        job,
+                        keep=bool(getattr(args, "keep_job_model_artifacts", False)),
+                    )
                     print(
                         f"[native-cpp-launcher] done game={job['game_id']} "
                         f"hop={job['history_hops']} rc=0",
@@ -1435,9 +1556,20 @@ def _run_single_game(args: argparse.Namespace) -> None:
         replay_path = Path(str(args.agz_replay_target_csv)).expanduser()
         if replay_path.exists():
             replay_path.unlink()
+        native_backup_fn = getattr(_NATIVE_MODULE, "discounted_trajectory_targets", None)
         _AGZ_REPLAY_RECORDER = AlphaGoZeroReplayRecorder(
             replay_path,
             min_canonical_actions=int(args.agz_replay_min_canonical_actions),
+            discount_factor=float(args.discount_factor),
+            sample_window_sec=float(args.agz_replay_sample_window_sec),
+            target_backup_fn=native_backup_fn,
+            target_backup_backend="native" if native_backup_fn is not None else "python",
+        )
+        print(
+            "[arena-mcts-cpp-game] "
+            f"agz_replay_sample_window_sec={float(args.agz_replay_sample_window_sec)} "
+            f"target_backup_backend={'native' if native_backup_fn is not None else 'python'}",
+            flush=True,
         )
     else:
         _AGZ_REPLAY_RECORDER = None

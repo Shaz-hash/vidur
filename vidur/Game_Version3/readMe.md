@@ -118,7 +118,7 @@ From `MCTSSearchConfig`:
 
 | Setting | Value | Meaning |
 | --- | ---: | --- |
-| `discount_factor` | `0.98` | Base time discount factor |
+| `discount_factor` | `0.995` | Base time discount factor |
 | `discount_time_denominator_sec` | `0.015725797204323228` | Time denominator for exponent |
 | `reward_knee` | `25.0` | Reward shaping knee |
 | `reward_max_penalty` | `40.0` | Reward shaping cap |

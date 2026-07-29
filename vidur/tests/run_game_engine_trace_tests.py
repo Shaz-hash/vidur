@@ -34,18 +34,20 @@ def _iter_paths(raw_paths: Iterable[str]) -> list[Path]:
     return paths if paths else [DEFAULT_TRACE]
 
 
-def _choose_trace_builder(path: Path, rows: list[ge_tests.Row], mode: str) -> tuple[list[list[ge_tests.Row]], bool]:
+def _choose_trace_builder(path: Path, rows: list[ge_tests.Row], mode: str) -> tuple[list[list[ge_tests.Row]], bool, bool]:
     name = path.name.lower()
+    if mode == "synthetic-trace":
+        return ge_tests.build_ordered_root_traces(rows), True, True
     if mode == "ordered" or (mode == "auto" and ("root_child_adv_trace" in name or "extracted_trace" in name)):
-        return ge_tests.build_ordered_root_traces(rows), True
+        return ge_tests.build_ordered_root_traces(rows), True, False
     if mode == "extracted-style" or (mode == "auto" and "mcts_iter" in name):
-        return ge_tests.build_extracted_style_leaf_traces(rows), True
-    return ge_tests.build_leaf_traces(rows), False
+        return ge_tests.build_extracted_style_leaf_traces(rows), True, False
+    return ge_tests.build_leaf_traces(rows), False, False
 
 
 def run_file(path: Path, *, mode: str, failed_dir: Path) -> tuple[int, int]:
     rows, fieldnames, raw_by_rownum = ge_tests.load_rows(str(path))
-    traces, is_extracted = _choose_trace_builder(path, rows, mode)
+    traces, is_extracted, synthetic_trace_mode = _choose_trace_builder(path, rows, mode)
     prefill_profile: dict[int, float] = {}
     unsupported_hits: set[str] = set()
 
@@ -56,6 +58,7 @@ def run_file(path: Path, *, mode: str, failed_dir: Path) -> tuple[int, int]:
                 trace,
                 prefill_profile=prefill_profile,
                 assume_extracted_trace=is_extracted,
+                synthetic_trace_mode=synthetic_trace_mode,
                 unsupported_hits=unsupported_hits,
             )
         except ge_tests.TestFailure:
@@ -84,7 +87,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode",
-        choices=("auto", "ordered", "extracted-style", "leaf"),
+        choices=("auto", "ordered", "extracted-style", "leaf", "synthetic-trace"),
         default="auto",
         help="How to split CSV rows into test traces.",
     )

@@ -54,6 +54,7 @@ class RequestState:
     arrived_at: float
     prefill_deadline: float
     decode_slo: float = 0.05
+    decode_tokens_total: int = _GV2_DECODE_CAP
 
     prefill_lateness: float = 0.0
     decode_lateness: float = 0.0
@@ -809,6 +810,7 @@ def run_trace(
     *,
     prefill_profile: Dict[int, float],
     assume_extracted_trace: bool = False,
+    synthetic_trace_mode: bool = False,
     unsupported_hits: Optional[Set[str]] = None,
 ) -> int:
     trace_id = f"game={trace_rows[0].game_id} root={trace_rows[0].root_id} leaf={trace_rows[-1].node_id}"
@@ -896,18 +898,29 @@ def run_trace(
                 }
             adv_actions_checked += int(len(adversary_requests) > 0)
 
-            test_adversary_prefill_token_bounds(
-                row, adv_prefill_tokens=[int(r.get("prefill_tokens", -1)) for r in adversary_requests], trace_id=trace_id
-            )
+            if not bool(synthetic_trace_mode):
+                test_adversary_prefill_token_bounds(
+                    row, adv_prefill_tokens=[int(r.get("prefill_tokens", -1)) for r in adversary_requests], trace_id=trace_id
+                )
             test_adversary_request_ids_sequential(ctx, row, new_ids=created_ids, trace_id=trace_id)
-            test_adversary_deadlines_correct(
-                row,
-                decision_tick=decision_tick,
-                created_ids=created_ids,
-                adversary_requests=adversary_requests,
-                deadline_by_id=deadline_by_id_for_row,
-                trace_id=trace_id,
-            )
+            if bool(synthetic_trace_mode):
+                test_synthetic_trace_adversary_deadlines_correct(
+                    row,
+                    decision_tick=decision_tick,
+                    created_ids=created_ids,
+                    adversary_requests=adversary_requests,
+                    deadline_by_id=deadline_by_id_for_row,
+                    trace_id=trace_id,
+                )
+            else:
+                test_adversary_deadlines_correct(
+                    row,
+                    decision_tick=decision_tick,
+                    created_ids=created_ids,
+                    adversary_requests=adversary_requests,
+                    deadline_by_id=deadline_by_id_for_row,
+                    trace_id=trace_id,
+                )
             test_adversary_interval_and_update_arrival(
                 ctx,
                 row,
@@ -916,10 +929,11 @@ def run_trace(
                 stop_decode_count=len(stop_decode_ids),
                 trace_id=trace_id,
             )
-            test_adversary_action_index_matches_payload(
-                row, action_index=row.action_index, adversary_requests=adversary_requests,
-                stop_decode_ids=stop_decode_ids, trace_id=trace_id
-            )
+            if not bool(synthetic_trace_mode):
+                test_adversary_action_index_matches_payload(
+                    row, action_index=row.action_index, adversary_requests=adversary_requests,
+                    stop_decode_ids=stop_decode_ids, trace_id=trace_id
+                )
             test_adversary_tick_progression_gv2(
                 ctx,
                 row,
@@ -944,16 +958,17 @@ def run_trace(
             )
 
             replay_basis = getattr(ctx, "_gv2_replay_stop_basis_requests", None)
-            test_adversary_stop_rule_applied_and_completion_updated_gv2(
-                ctx, row,
-                action_index=row.action_index,
-                stop_decode_ids=stop_decode_ids,
-                current_stopped_decode_ids=stopped_ids,
-                current_completed_ids=completed_ids,
-                requests_completed=row.requests_completed,
-                request_basis=replay_basis,
-                trace_id=trace_id,
-            )
+            if not bool(synthetic_trace_mode):
+                test_adversary_stop_rule_applied_and_completion_updated_gv2(
+                    ctx, row,
+                    action_index=row.action_index,
+                    stop_decode_ids=stop_decode_ids,
+                    current_stopped_decode_ids=stopped_ids,
+                    current_completed_ids=completed_ids,
+                    requests_completed=row.requests_completed,
+                    request_basis=replay_basis,
+                    trace_id=trace_id,
+                )
             if replay_basis is not None:
                 setattr(ctx, "_gv2_replay_stop_basis_requests", None)
 
@@ -964,6 +979,7 @@ def run_trace(
                 pf = int(req.get("prefill_tokens", 0))
                 pf_slo = float(req.get("prefill_slo", 0.0))
                 dd_slo = float(req.get("decode_slo", 0.05))
+                dd_total = int(req.get("decode_tokens", _GV2_DECODE_CAP))
                 deadline = float(deadline_by_id_for_row.get(rid, decision_tick + pf_slo))
                 ctx.requests[rid] = RequestState(
                     rid=rid,
@@ -972,6 +988,7 @@ def run_trace(
                     arrived_at=decision_tick,
                     prefill_deadline=deadline,
                     decode_slo=dd_slo,
+                    decode_tokens_total=dd_total,
                 )
 
         elif row.player_acted == "controller":
@@ -1627,6 +1644,104 @@ def test_adversary_deadlines_correct(
         if abs(actual_deadline - expected_deadline) > _GV2_DEADLINE_TOL:
             _fail(
                 "test_adversary_deadlines_correct",
+                f"rid={rid} deadline mismatch: expected={expected_deadline:.9f}, got={actual_deadline:.9f}",
+                row,
+                trace_id,
+            )
+
+
+def test_synthetic_trace_adversary_deadlines_correct(
+    row: "Row",
+    *,
+    decision_tick: float,
+    created_ids: List[int],
+    adversary_requests: List[Dict[str, object]],
+    deadline_by_id: Dict[int, float],
+    trace_id: str,
+) -> None:
+    """
+    Synthetic trace rows can use natural trace token counts instead of GV3
+    adversary templates. Keep deadline/objective sanity without requiring
+    allowed prefill buckets or decode cap payloads.
+    """
+    tick = float(decision_tick)
+    if not math.isfinite(tick):
+        _fail(
+            "test_synthetic_trace_adversary_deadlines_correct",
+            f"non-finite decision_tick={decision_tick!r}",
+            row,
+            trace_id,
+        )
+
+    ids = [int(x) for x in created_ids]
+    if len(ids) != len(set(ids)):
+        _fail(
+            "test_synthetic_trace_adversary_deadlines_correct",
+            f"created_ids contains duplicates: {ids}",
+            row,
+            trace_id,
+        )
+
+    if len(adversary_requests) != len(ids):
+        reparsed = _parse_adversary_requests("", row.action_repr)
+        if len(reparsed) == len(ids):
+            adversary_requests = reparsed
+        else:
+            _fail(
+                "test_synthetic_trace_adversary_deadlines_correct",
+                f"adversary_requests len={len(adversary_requests)} != created_ids len={len(ids)}",
+                row,
+                trace_id,
+            )
+
+    map_keys = sorted(int(k) for k in deadline_by_id.keys())
+    if sorted(ids) != map_keys:
+        _fail(
+            "test_synthetic_trace_adversary_deadlines_correct",
+            f"deadline keys mismatch: expected ids={sorted(ids)}, got keys={map_keys}",
+            row,
+            trace_id,
+        )
+
+    for rid, req in zip(ids, adversary_requests):
+        prefill = int(req.get("prefill_tokens", -1))
+        decode = int(req.get("decode_tokens", -1))
+        prefill_slo = float(req.get("prefill_slo", float("nan")))
+        decode_slo = float(req.get("decode_slo", float("nan")))
+        if prefill <= 0:
+            _fail(
+                "test_synthetic_trace_adversary_deadlines_correct",
+                f"rid={rid} invalid prefill_tokens={prefill}",
+                row,
+                trace_id,
+            )
+        if decode <= 0:
+            _fail(
+                "test_synthetic_trace_adversary_deadlines_correct",
+                f"rid={rid} invalid decode_tokens={decode}",
+                row,
+                trace_id,
+            )
+        if (not math.isfinite(prefill_slo)) or prefill_slo < 0.0:
+            _fail(
+                "test_synthetic_trace_adversary_deadlines_correct",
+                f"rid={rid} invalid prefill_slo={prefill_slo}",
+                row,
+                trace_id,
+            )
+        if (not math.isfinite(decode_slo)) or decode_slo < 0.0:
+            _fail(
+                "test_synthetic_trace_adversary_deadlines_correct",
+                f"rid={rid} invalid decode_slo={decode_slo}",
+                row,
+                trace_id,
+            )
+
+        expected_deadline = float(tick) + float(prefill_slo)
+        actual_deadline = float(deadline_by_id.get(rid, float("nan")))
+        if abs(actual_deadline - expected_deadline) > _GV2_DEADLINE_TOL:
+            _fail(
+                "test_synthetic_trace_adversary_deadlines_correct",
                 f"rid={rid} deadline mismatch: expected={expected_deadline:.9f}, got={actual_deadline:.9f}",
                 row,
                 trace_id,

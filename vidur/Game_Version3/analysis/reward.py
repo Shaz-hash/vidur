@@ -39,7 +39,7 @@ def _row_action_reward(rows: list[dict], row_index: int) -> float:
 
 
 def get_discounted_sum_reward(rows: list[dict], row_index: int) -> float:
-    discount_factor = 0.98
+    discount_factor = 0.995
     step_time = 0.015725797204323228
 
     row_time = _safe_float(rows[row_index].get("sim_time_before"))

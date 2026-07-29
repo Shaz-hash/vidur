@@ -330,8 +330,8 @@ double NativeBatchTimePredictorGV2::nearest_prefill_estimate(
 }
 
 std::tuple<double, double> NativeBatchTimePredictorGV2::default_fallback_time(
-    const std::vector<ControllerPredictorRequestState>& reqs,
-    const std::vector<int>& token_alloc,
+    const InlineVector<ControllerPredictorRequestState, 32>& reqs,
+    const InlineVector<int, 32>& token_alloc,
     const std::vector<int>& profile_tokens,
     const std::vector<double>& profile_times,
     double fallback_total,
@@ -359,8 +359,8 @@ std::tuple<double, double> NativeBatchTimePredictorGV2::default_fallback_time(
 }
 
 PredictorKey NativeBatchTimePredictorGV2::build_key(
-    const std::vector<ControllerPredictorRequestState>& reqs,
-    const std::vector<int>& token_alloc,
+    const InlineVector<ControllerPredictorRequestState, 32>& reqs,
+    const InlineVector<int, 32>& token_alloc,
     int kv_granularity,
     int prefill_chunk_granularity) {
     PredictorKey k;
@@ -374,8 +374,7 @@ PredictorKey NativeBatchTimePredictorGV2::build_key(
 
     int prefill_batch = 0;
     int decode_batch = 0;
-    std::vector<int> decode_kv;
-    decode_kv.reserve(static_cast<std::size_t>(n));
+    long long decode_kv_sum = 0;
     int prefill_agg_kv = 0;
     long long prefill_agg_chunk_sq = 0;
 
@@ -384,7 +383,7 @@ PredictorKey NativeBatchTimePredictorGV2::build_key(
         const int tok = std::max(0, token_alloc[static_cast<std::size_t>(i)]);
         if (r.prefill_done) {
             decode_batch += 1;
-            decode_kv.push_back(std::max(0, r.num_processed_tokens));
+            decode_kv_sum += std::max(0, r.num_processed_tokens);
         } else {
             prefill_batch += 1;
             prefill_agg_kv += std::max(0, r.num_processed_tokens);
@@ -398,13 +397,12 @@ PredictorKey NativeBatchTimePredictorGV2::build_key(
     const int kv_g = std::max(1, kv_granularity);
     const int prefill_g = std::max(1, prefill_chunk_granularity);
 
-    if (!decode_kv.empty()) {
-        const long long s = std::accumulate(decode_kv.begin(), decode_kv.end(), 0LL);
+    if (decode_batch > 0) {
         // Python uses int(np.mean(...)) before granularity rounding, i.e. floor
         // for these non-negative token counts. Using llround here changes
         // half cases like 128.5 -> 192 at granularity 64, which breaks parity.
-        const int avg = static_cast<int>(static_cast<double>(s) /
-                                         static_cast<double>(decode_kv.size()));
+        const int avg = static_cast<int>(static_cast<double>(decode_kv_sum) /
+                                         static_cast<double>(decode_batch));
         k.decode_avg_kv_cache_size = round_up(avg, kv_g);
     }
 
@@ -503,6 +501,7 @@ bool NativeBatchTimePredictorGV2::has_component_tables() const {
 
 void NativeBatchTimePredictorGV2::clear_component_tables() {
     component_tables_.clear();
+    invalidate_component_table_cache();
 }
 
 void NativeBatchTimePredictorGV2::set_runtime_config(const PredictorRuntimeConfig& cfg) {
@@ -527,14 +526,53 @@ void NativeBatchTimePredictorGV2::set_component_table(
     table.shape = std::move(shape);
     table.values = std::move(values);
     component_tables_[name] = std::move(table);
+    invalidate_component_table_cache();
 
     kv_granularity_ = std::max(1, kv_gran);
     prefill_chunk_granularity_ = std::max(1, prefill_gran);
 }
 
+void NativeBatchTimePredictorGV2::invalidate_component_table_cache() {
+    component_table_cache_ = {};
+}
+
+const NativeBatchTimePredictorGV2::ComponentTableCache&
+NativeBatchTimePredictorGV2::component_table_cache() const {
+    if (component_table_cache_.initialized) {
+        return component_table_cache_;
+    }
+
+    const auto find_table = [&](const char* name) -> const PredictorTable* {
+        const auto it = component_tables_.find(name);
+        return it == component_tables_.end() ? nullptr : &it->second;
+    };
+    auto& cache = component_table_cache_;
+    cache.attn_pre_proj = find_table("attn_pre_proj");
+    cache.attn_post_proj = find_table("attn_post_proj");
+    cache.mlp_up_proj = find_table("mlp_up_proj");
+    cache.mlp_down_proj = find_table("mlp_down_proj");
+    cache.mlp_act = find_table("mlp_act");
+    cache.input_layernorm = find_table("input_layernorm");
+    cache.add = find_table("add");
+    cache.attn_rope = find_table("attn_rope");
+    cache.attn_kv_cache_save = find_table("attn_kv_cache_save");
+    cache.attn_decode = find_table("attn_decode");
+    cache.attn_prefill = find_table("attn_prefill");
+    cache.post_attention_layernorm = find_table("post_attention_layernorm");
+    cache.schedule = find_table("schedule");
+    cache.sampler_e2e = find_table("sampler_e2e");
+    cache.prepare_inputs_e2e = find_table("prepare_inputs_e2e");
+    cache.process_model_outputs = find_table("process_model_outputs");
+    cache.ray_comm_time = find_table("ray_comm_time");
+    cache.all_reduce = find_table("all_reduce");
+    cache.send_recv = find_table("send_recv");
+    cache.initialized = true;
+    return cache;
+}
+
 std::tuple<double, double> NativeBatchTimePredictorGV2::lookup_batch_time(
-    const std::vector<ControllerPredictorRequestState>& reqs,
-    const std::vector<int>& token_alloc,
+    const InlineVector<ControllerPredictorRequestState, 32>& reqs,
+    const InlineVector<int, 32>& token_alloc,
     const std::vector<int>& profile_tokens,
     const std::vector<double>& profile_times,
     double fallback_total,
@@ -550,52 +588,35 @@ std::tuple<double, double> NativeBatchTimePredictorGV2::lookup_batch_time(
     };
 
     if (!component_tables_.empty()) {
-        bool can_use_component_tables = true;
-        const char* required_tables[] = {
-            "attn_pre_proj",
-            "attn_post_proj",
-            "mlp_up_proj",
-            "mlp_down_proj",
-            "mlp_act",
-            "input_layernorm",
-            "add",
-            "attn_rope",
-            "attn_kv_cache_save",
-            "attn_decode",
-            "attn_prefill",
-        };
-        for (const char* name : required_tables) {
-            if (!has_name(component_tables_, name)) {
-                can_use_component_tables = false;
-                break;
-            }
-        }
-        if (can_use_component_tables && runtime_cfg_.post_attn_norm &&
-            !has_name(component_tables_, "post_attention_layernorm")) {
-            can_use_component_tables = false;
+        const auto& tables = component_table_cache();
+        bool can_use_component_tables =
+            tables.attn_pre_proj &&
+            tables.attn_post_proj &&
+            tables.mlp_up_proj &&
+            tables.mlp_down_proj &&
+            tables.mlp_act &&
+            tables.input_layernorm &&
+            tables.add &&
+            tables.attn_rope &&
+            tables.attn_kv_cache_save &&
+            tables.attn_decode &&
+            tables.attn_prefill;
+        if (can_use_component_tables && runtime_cfg_.post_attn_norm) {
+            can_use_component_tables = tables.post_attention_layernorm;
         }
         if (can_use_component_tables && !runtime_cfg_.skip_cpu_overhead_modeling) {
-            const char* cpu_tables[] = {
-                "schedule",
-                "sampler_e2e",
-                "prepare_inputs_e2e",
-                "process_model_outputs",
-                "ray_comm_time",
-            };
-            for (const char* name : cpu_tables) {
-                if (!has_name(component_tables_, name)) {
-                    can_use_component_tables = false;
-                    break;
-                }
-            }
+            can_use_component_tables =
+                tables.schedule &&
+                tables.sampler_e2e &&
+                tables.prepare_inputs_e2e &&
+                tables.process_model_outputs &&
+                tables.ray_comm_time;
         }
-        if (can_use_component_tables && runtime_cfg_.tensor_parallel_size > 1 &&
-            !has_name(component_tables_, "all_reduce")) {
-            can_use_component_tables = false;
+        if (can_use_component_tables && runtime_cfg_.tensor_parallel_size > 1) {
+            can_use_component_tables = tables.all_reduce;
         }
-        if (can_use_component_tables && runtime_cfg_.num_pipeline_stages > 1 &&
-            !has_name(component_tables_, "send_recv")) {
-            can_use_component_tables = false;
+        if (can_use_component_tables && runtime_cfg_.num_pipeline_stages > 1) {
+            can_use_component_tables = tables.send_recv;
         }
 
         if (can_use_component_tables) {
@@ -603,33 +624,29 @@ std::tuple<double, double> NativeBatchTimePredictorGV2::lookup_batch_time(
             int total_num_tokens = 0;
             for (int tok : token_alloc) total_num_tokens += std::max(0, tok);
 
-            const auto lookup1 = [&](const char* name, int a) -> double {
-                const auto it = component_tables_.find(name);
-                if (it == component_tables_.end()) return 0.0;
-                return table_lookup_with_python_fallback(it->second, a, 0);
+            const auto lookup1 = [&](const PredictorTable* table, int a) -> double {
+                return table ? table_lookup_with_python_fallback(*table, a, 0) : 0.0;
             };
-            const auto lookup2 = [&](const char* name, int a, int b) -> double {
-                const auto it = component_tables_.find(name);
-                if (it == component_tables_.end()) return 0.0;
-                return table_lookup_with_python_fallback(it->second, a, b);
+            const auto lookup2 = [&](const PredictorTable* table, int a, int b) -> double {
+                return table ? table_lookup_with_python_fallback(*table, a, b) : 0.0;
             };
 
-            const double attn_pre_proj = lookup1("attn_pre_proj", k.total_tokens_rounded);
-            const double attn_post_proj = lookup1("attn_post_proj", k.total_tokens_rounded);
-            const double mlp_up_proj = lookup1("mlp_up_proj", k.total_tokens_rounded);
-            const double mlp_down_proj = lookup1("mlp_down_proj", k.total_tokens_rounded);
-            const double mlp_act = lookup1("mlp_act", k.total_tokens_rounded);
-            const double attn_norm = lookup1("input_layernorm", k.total_tokens_rounded);
+            const double attn_pre_proj = lookup1(tables.attn_pre_proj, k.total_tokens_rounded);
+            const double attn_post_proj = lookup1(tables.attn_post_proj, k.total_tokens_rounded);
+            const double mlp_up_proj = lookup1(tables.mlp_up_proj, k.total_tokens_rounded);
+            const double mlp_down_proj = lookup1(tables.mlp_down_proj, k.total_tokens_rounded);
+            const double mlp_act = lookup1(tables.mlp_act, k.total_tokens_rounded);
+            const double attn_norm = lookup1(tables.input_layernorm, k.total_tokens_rounded);
             const double mlp_norm = runtime_cfg_.post_attn_norm
-                ? lookup1("post_attention_layernorm", k.total_tokens_rounded)
+                ? lookup1(tables.post_attention_layernorm, k.total_tokens_rounded)
                 : 0.0;
-            const double add_time = lookup1("add", k.total_tokens_rounded);
-            const double attn_rope = lookup1("attn_rope", k.total_tokens_rounded);
-            const double attn_kv_cache_save = lookup1("attn_kv_cache_save", total_num_tokens);
+            const double add_time = lookup1(tables.add, k.total_tokens_rounded);
+            const double attn_rope = lookup1(tables.attn_rope, k.total_tokens_rounded);
+            const double attn_kv_cache_save = lookup1(tables.attn_kv_cache_save, total_num_tokens);
 
             double attn_decode = 0.0;
             if (k.decode_batch_size > 0) {
-                const double base = lookup2("attn_decode", k.decode_batch_size, k.decode_avg_kv_cache_size);
+                const double base = lookup2(tables.attn_decode, k.decode_batch_size, k.decode_avg_kv_cache_size);
                 attn_decode = base *
                     (1.0 + runtime_cfg_.attention_decode_batching_overhead_fraction *
                                (k.decode_batch_size > 1 ? 1.0 : 0.0));
@@ -637,7 +654,7 @@ std::tuple<double, double> NativeBatchTimePredictorGV2::lookup_batch_time(
 
             double attn_prefill = 0.0;
             if (k.prefill_batch_size > 0) {
-                const double base = lookup2("attn_prefill", k.prefill_agg_chunk_size, k.prefill_agg_kv_cache_size);
+                const double base = lookup2(tables.attn_prefill, k.prefill_agg_chunk_size, k.prefill_agg_kv_cache_size);
                 attn_prefill = base *
                     (1.0 + runtime_cfg_.attention_prefill_batching_overhead_fraction *
                                (k.prefill_batch_size > 1 ? 1.0 : 0.0));
@@ -646,7 +663,7 @@ std::tuple<double, double> NativeBatchTimePredictorGV2::lookup_batch_time(
             double tensor_parallel_comm = 0.0;
             if (runtime_cfg_.tensor_parallel_size > 1) {
                 tensor_parallel_comm =
-                    lookup1("all_reduce", k.total_tokens_rounded) +
+                    lookup1(tables.all_reduce, k.total_tokens_rounded) +
                     runtime_cfg_.nccl_cpu_launch_overhead_ms +
                     runtime_cfg_.nccl_cpu_skew_overhead_per_device_ms *
                         std::pow(static_cast<double>(runtime_cfg_.tensor_parallel_size), 1.25);
@@ -654,16 +671,16 @@ std::tuple<double, double> NativeBatchTimePredictorGV2::lookup_batch_time(
 
             double pipeline_parallel_comm = 0.0;
             if (runtime_cfg_.num_pipeline_stages > 1) {
-                pipeline_parallel_comm = lookup1("send_recv", k.total_tokens_rounded);
+                pipeline_parallel_comm = lookup1(tables.send_recv, k.total_tokens_rounded);
             }
 
             double cpu_overhead_ms = 0.0;
             if (!runtime_cfg_.skip_cpu_overhead_modeling) {
-                cpu_overhead_ms += lookup1("schedule", k.batch_size);
-                cpu_overhead_ms += lookup1("sampler_e2e", k.batch_size);
-                cpu_overhead_ms += lookup1("prepare_inputs_e2e", k.batch_size);
-                cpu_overhead_ms += lookup1("process_model_outputs", k.batch_size);
-                cpu_overhead_ms += lookup1("ray_comm_time", k.batch_size);
+                cpu_overhead_ms += lookup1(tables.schedule, k.batch_size);
+                cpu_overhead_ms += lookup1(tables.sampler_e2e, k.batch_size);
+                cpu_overhead_ms += lookup1(tables.prepare_inputs_e2e, k.batch_size);
+                cpu_overhead_ms += lookup1(tables.process_model_outputs, k.batch_size);
+                cpu_overhead_ms += lookup1(tables.ray_comm_time, k.batch_size);
             }
 
             const double attn_layer_ms =
@@ -739,55 +756,76 @@ ControllerBatchPlan VirtualSimulatorGV2::build_controller_batch_plan(
     int decode_credit_available) const {
     ControllerBatchPlan plan;
 
-    std::unordered_map<int, int> prefill_alloc_in = action.prefill_allocations;
-    std::unordered_map<int, int> decode_alloc_in = action.decode_allocations;
-    std::unordered_map<int, int> token_alloc_in = action.token_allocations;
-
     plan.strict_noop =
         action.token_budget == 0 &&
         action.selected_request_ids.empty() &&
-        token_alloc_in.empty() &&
-        prefill_alloc_in.empty() &&
-        decode_alloc_in.empty();
+        action.token_allocations.empty() &&
+        action.prefill_allocations.empty() &&
+        action.decode_allocations.empty() &&
+        !action.compact_allocations;
 
-    // No-op means no prefill admission but decode can still execute.
+    InlineVector<int, 64> selected_ids;
     if (plan.strict_noop) {
-        std::vector<int> active_decode_ids;
-        for (const auto& r : state.requests) {
-            if (r.decode_active()) active_decode_ids.push_back(r.request_id);
+        // No-op means no prefill admission but decode can still execute.
+        for (const auto& request : state.requests) {
+            if (request.decode_active()) {
+                selected_ids.push_back(request.request_id);
+            }
         }
-        std::sort(active_decode_ids.begin(), active_decode_ids.end());
-        for (const int rid : active_decode_ids) {
-            decode_alloc_in[rid] = 1;
-            token_alloc_in[rid] = 1;
+    } else if (action.compact_allocations) {
+        selected_ids.reserve(
+            action.compact_prefill_allocations.size() +
+            action.compact_decode_request_ids.size());
+        for (const auto& item : action.compact_prefill_allocations) {
+            selected_ids.push_back(item.first);
         }
-    }
-
-    std::vector<int> selected_ids;
-    selected_ids.reserve(
-        action.selected_request_ids.size() + token_alloc_in.size() + prefill_alloc_in.size() + decode_alloc_in.size());
-
-    if (!action.selected_request_ids.empty()) {
-        selected_ids = action.selected_request_ids;
+        for (const int request_id : action.compact_decode_request_ids) {
+            selected_ids.push_back(request_id);
+        }
+    } else if (!action.selected_request_ids.empty()) {
+        selected_ids.assign(
+            action.selected_request_ids.begin(),
+            action.selected_request_ids.end());
     } else {
-        for (const auto& kv : token_alloc_in) selected_ids.push_back(kv.first);
-        for (const auto& kv : prefill_alloc_in) selected_ids.push_back(kv.first);
-        for (const auto& kv : decode_alloc_in) selected_ids.push_back(kv.first);
+        selected_ids.reserve(
+            action.token_allocations.size() +
+            action.prefill_allocations.size() +
+            action.decode_allocations.size());
+        for (const auto& item : action.token_allocations) {
+            selected_ids.push_back(item.first);
+        }
+        for (const auto& item : action.prefill_allocations) {
+            selected_ids.push_back(item.first);
+        }
+        for (const auto& item : action.decode_allocations) {
+            selected_ids.push_back(item.first);
+        }
     }
 
     std::sort(selected_ids.begin(), selected_ids.end());
-    selected_ids.erase(std::unique(selected_ids.begin(), selected_ids.end()), selected_ids.end());
 
     int decode_credit_left = enforce_nonnegative_decode_credits
         ? std::max(0, decode_credit_available)
         : std::numeric_limits<int>::max();
 
+    bool have_previous_id = false;
+    int previous_id = 0;
     for (const int rid : selected_ids) {
+        if (have_previous_id && rid == previous_id) continue;
+        previous_id = rid;
+        have_previous_id = true;
         const RequestState* req = nullptr;
-        for (const auto& r : state.requests) {
-            if (r.request_id == rid) {
-                req = &r;
-                break;
+        if (rid >= 0 && rid < static_cast<int>(state.requests.size())) {
+            const auto& direct =
+                state.requests[static_cast<std::size_t>(rid)];
+            if (direct.request_id == rid) req = &direct;
+        }
+        if (req == nullptr) {
+            for (const auto& request : state.requests) {
+                if (request.request_id == rid) {
+                    req = &request;
+                    break;
+                }
             }
         }
         if (req == nullptr || !request_is_active(*req)) continue;
@@ -797,21 +835,35 @@ ControllerBatchPlan VirtualSimulatorGV2::build_controller_batch_plan(
         const int rem_dec = req->remaining_decode();
 
         int pre_tok = 0;
-        {
-            const auto it = prefill_alloc_in.find(rid);
-            if (it != prefill_alloc_in.end()) pre_tok = std::max(0, it->second);
-        }
-
-        int dec_tok = 0;
-        {
-            const auto it = decode_alloc_in.find(rid);
-            if (it != decode_alloc_in.end()) dec_tok = std::max(0, it->second);
+        int dec_tok = plan.strict_noop ? 1 : 0;
+        if (action.compact_allocations) {
+            for (const auto& item : action.compact_prefill_allocations) {
+                if (item.first == rid) {
+                    pre_tok = std::max(0, item.second);
+                    break;
+                }
+            }
+            if (std::binary_search(
+                    action.compact_decode_request_ids.begin(),
+                    action.compact_decode_request_ids.end(),
+                    rid)) {
+                dec_tok = 1;
+            }
+        } else {
+            const auto prefill_it = action.prefill_allocations.find(rid);
+            if (prefill_it != action.prefill_allocations.end()) {
+                pre_tok = std::max(0, prefill_it->second);
+            }
+            const auto decode_it = action.decode_allocations.find(rid);
+            if (decode_it != action.decode_allocations.end()) {
+                dec_tok = std::max(0, decode_it->second);
+            }
         }
 
         if (pre_tok == 0 && dec_tok == 0) {
-            const auto it = token_alloc_in.find(rid);
-            if (it != token_alloc_in.end()) {
-                const int base = std::max(0, it->second);
+            const auto token_it = action.token_allocations.find(rid);
+            if (token_it != action.token_allocations.end()) {
+                const int base = std::max(0, token_it->second);
                 if (prefill_done) dec_tok = base;
                 else pre_tok = base;
             }
@@ -833,11 +885,9 @@ ControllerBatchPlan VirtualSimulatorGV2::build_controller_batch_plan(
         const int total = pre_tok + dec_tok;
         if (total <= 0) continue;
 
-        if (pre_tok > 0) plan.prefill_alloc[rid] = pre_tok;
-        if (dec_tok > 0) plan.decode_alloc[rid] = dec_tok;
-        plan.token_alloc[rid] = total;
-
         plan.request_ids.push_back(rid);
+        plan.prefill_tokens.push_back(pre_tok);
+        plan.decode_tokens.push_back(dec_tok);
         plan.num_tokens.push_back(total);
 
         ControllerPredictorRequestState prs;
@@ -847,7 +897,9 @@ ControllerBatchPlan VirtualSimulatorGV2::build_controller_batch_plan(
         prs.remaining_decode = rem_dec;
         prs.arrived_at = req->arrived_at;
         prs.prefill_slo = req->prefill_slo_time;
-        prs.num_processed_tokens = req->num_processed_prefill_tokens + req->num_processed_decode_tokens;
+        prs.num_processed_tokens =
+            req->num_processed_prefill_tokens +
+            req->num_processed_decode_tokens;
         plan.predictor_reqs.push_back(prs);
     }
 
@@ -884,7 +936,15 @@ bool VirtualSimulatorGV2::is_pending(const RequestState& r) {
     return r.decode_active();
 }
 
-RequestState* VirtualSimulatorGV2::find_request(SimState& state, int request_id) {
+RequestState* VirtualSimulatorGV2::find_request(
+    SimState& state,
+    int request_id) {
+    if (request_id >= 0 &&
+        request_id < static_cast<int>(state.requests.size())) {
+        auto& direct =
+            state.requests[static_cast<std::size_t>(request_id)];
+        if (direct.request_id == request_id) return &direct;
+    }
     for (auto& r : state.requests) {
         if (r.request_id == request_id) return &r;
     }

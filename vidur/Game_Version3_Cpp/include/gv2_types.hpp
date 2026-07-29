@@ -1,7 +1,10 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -120,7 +123,136 @@ struct AdversaryRequestSpec {
 struct AdversaryAction {
     std::vector<AdversaryRequestSpec> requests;
     std::vector<int> stop_decode_ids;
+    int compact_request_count = 0;
+    int compact_prefill_tokens = 0;
+    int compact_decode_tokens = 0;
+    double compact_prefill_slo = 0.0;
+    double compact_decode_slo = 0.0;
+    bool compact_requests = false;
     bool valid = false;
+};
+
+template <typename T, std::size_t InlineCapacity>
+class InlineVector {
+public:
+    InlineVector() = default;
+    InlineVector(const InlineVector&) = default;
+    InlineVector& operator=(const InlineVector&) = default;
+
+    InlineVector(InlineVector&& other) noexcept
+        : inline_values_(std::move(other.inline_values_)),
+          overflow_(std::move(other.overflow_)),
+          size_(other.size_) {
+        other.size_ = 0;
+    }
+
+    InlineVector& operator=(InlineVector&& other) noexcept {
+        if (this == &other) return *this;
+        inline_values_ = std::move(other.inline_values_);
+        overflow_ = std::move(other.overflow_);
+        size_ = other.size_;
+        other.size_ = 0;
+        return *this;
+    }
+
+    InlineVector& operator=(const std::vector<T>& values) {
+        assign(values.begin(), values.end());
+        return *this;
+    }
+
+    InlineVector& operator=(std::vector<T>&& values) {
+        size_ = values.size();
+        if (size_ > InlineCapacity) {
+            overflow_ = std::move(values);
+        } else {
+            overflow_.clear();
+            std::move(values.begin(), values.end(), inline_values_.begin());
+        }
+        return *this;
+    }
+
+    template <typename Iterator>
+    void assign(Iterator first, Iterator last) {
+        size_ = static_cast<std::size_t>(std::distance(first, last));
+        if (size_ > InlineCapacity) {
+            overflow_.assign(first, last);
+        } else {
+            overflow_.clear();
+            std::copy(first, last, inline_values_.begin());
+        }
+    }
+
+    void clear() {
+        size_ = 0;
+        overflow_.clear();
+    }
+
+    void reserve(std::size_t capacity) {
+        if (capacity > InlineCapacity) overflow_.reserve(capacity);
+    }
+
+    void push_back(const T& value) {
+        if (size_ < InlineCapacity) {
+            inline_values_[size_++] = value;
+            return;
+        }
+        if (size_ == InlineCapacity) {
+            overflow_.assign(inline_values_.begin(), inline_values_.end());
+        }
+        overflow_.push_back(value);
+        ++size_;
+    }
+
+    void push_back(T&& value) {
+        if (size_ < InlineCapacity) {
+            inline_values_[size_++] = std::move(value);
+            return;
+        }
+        if (size_ == InlineCapacity) {
+            overflow_.assign(inline_values_.begin(), inline_values_.end());
+        }
+        overflow_.push_back(std::move(value));
+        ++size_;
+    }
+
+    template <typename... Args>
+    T& emplace_back(Args&&... args) {
+        if (size_ < InlineCapacity) {
+            inline_values_[size_] = T(std::forward<Args>(args)...);
+            return inline_values_[size_++];
+        }
+        if (size_ == InlineCapacity) {
+            overflow_.assign(inline_values_.begin(), inline_values_.end());
+        }
+        overflow_.emplace_back(std::forward<Args>(args)...);
+        ++size_;
+        return overflow_.back();
+    }
+
+    std::size_t size() const { return size_; }
+    bool empty() const { return size_ == 0; }
+
+    T* data() {
+        return size_ > InlineCapacity
+            ? overflow_.data() : inline_values_.data();
+    }
+    const T* data() const {
+        return size_ > InlineCapacity
+            ? overflow_.data() : inline_values_.data();
+    }
+
+    T* begin() { return data(); }
+    T* end() { return data() + size_; }
+    const T* begin() const { return data(); }
+    const T* end() const { return data() + size_; }
+
+    T& operator[](std::size_t index) { return data()[index]; }
+    const T& operator[](std::size_t index) const { return data()[index]; }
+
+private:
+    std::array<T, InlineCapacity> inline_values_{};
+    std::vector<T> overflow_;
+    std::size_t size_ = 0;
 };
 
 struct ControllerAction {
@@ -130,8 +262,26 @@ struct ControllerAction {
     std::unordered_map<int, int> token_allocations;
     std::unordered_map<int, int> prefill_allocations;
     std::unordered_map<int, int> decode_allocations;
+    // Rollout-only compact representation. Root actions retain the maps above
+    // so logging and the external contract remain unchanged.
+    InlineVector<std::pair<int, int>, 16> compact_prefill_allocations;
+    InlineVector<int, 32> compact_decode_request_ids;
+    bool compact_allocations = false;
     std::string heuristic;
     std::string strategy;
+    std::array<int, 3> mapping = {-1, -1, -1};
+    bool has_mapping = false;
+    bool valid = false;
+};
+
+// Search rollouts do not log or expose candidate actions.  Keep only the
+// fields needed by policy features and by the selected game transition.
+struct RolloutControllerAction {
+    int token_budget = 0;
+    InlineVector<int, 16> evicted_request_ids;
+    InlineVector<std::pair<int, int>, 16> compact_prefill_allocations;
+    InlineVector<int, 32> compact_decode_request_ids;
+    bool compact_allocations = false;
     std::array<int, 3> mapping = {-1, -1, -1};
     bool has_mapping = false;
     bool valid = false;
@@ -231,6 +381,29 @@ struct ChildSummary {
     std::string parent_action_json;
 };
 
+struct RolloutTraceStep {
+    int sim_iteration = -1;
+    int leaf_evaluation_id = -1;
+    int rollout_id = -1;
+    int root_action_index = -1;
+    int step_number = -1;
+    int step_action_index = -1;
+    double root_sim_time = 0.0;
+    double rollout_deadline = 0.0;
+    double step_sim_time_before = 0.0;
+    double step_sim_time_after = 0.0;
+    double step_cost = 0.0;
+    double discounted_step_cost = 0.0;
+    double cumulative_discounted_cost = 0.0;
+    double trajectory_reward_return_from_root = 0.0;
+    double trajectory_bootstrap_return_from_root = 0.0;
+    double trajectory_total_return_from_root = 0.0;
+    std::string root_action_category;
+    std::string step_phase;
+    std::string step_player;
+    std::string step_action_category;
+};
+
 struct SearchOutput {
     std::string contract_version = kGV2NativeContractVersion;
     double decision_state_time = 0.0;
@@ -253,6 +426,7 @@ struct SearchOutput {
     std::vector<ChildSummary> children;
     std::vector<double> mcts_root_prior;
     std::vector<IterEvent> iter_events;
+    std::vector<RolloutTraceStep> rollout_trace_steps;
 
     std::unordered_map<std::string, double> perf;
 
@@ -278,6 +452,8 @@ struct SearchOutput {
     std::vector<double> root_action_rewards;
     std::vector<double> root_action_discounts;
     std::vector<double> root_action_bootstraps;
+    std::vector<double> root_action_rollout_reward_returns;
+    std::vector<double> root_action_rollout_bootstrap_returns;
     std::vector<std::string> root_action_reprs;
     std::vector<int> root_action_leaf_prefill_counts;
     std::vector<int> root_action_leaf_decode_counts;

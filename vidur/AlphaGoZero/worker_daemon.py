@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import inspect
 import json
 import os
 import random
@@ -22,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from vidur.AlphaGoZero.config import Phase1SmokeConfig, REPO_ROOT
+from vidur.AlphaGoZero.replay_runtime import AlphaGoZeroReplayRecorder
 from vidur.AlphaGoZero.durable_transfer import (
     append_csv_file,
     append_csv_row,
@@ -41,13 +43,18 @@ WORKER_REPLAY_FIELDS = [
     "adversary_states",
     "games_executed_so_far",
     "model_iteration_version",
+    "controller_model_iteration_version",
+    "adversary_model_iteration_version",
     "time_24h",
 ]
 MODEL_COMM_FIELDS = [
     "model_received_time",
     "model_version",
+    "controller_model_version",
+    "adversary_model_version",
     "states_generated_by_model_version_current_buffer",
 ]
+NATIVE_GAME_ID_MAX = 2_147_483_647
 
 
 @dataclass
@@ -57,7 +64,21 @@ class WorkerState:
     adversary: int = 0
     games: int = 0
     shard_index: int = 0
+    next_game_sequence: int = 0
     model_version: int = 100
+    controller_model_version: int = 100
+    adversary_model_version: int = 100
+
+
+@dataclass(frozen=True)
+class CurrentModelPaths:
+    controller_value_model_path: Path
+    adversary_value_model_path: Path
+    controller_prior_model_path: Path
+    adversary_prior_model_path: Path
+    model_version: int
+    controller_model_version: int
+    adversary_model_version: int
 
 
 @dataclass
@@ -68,6 +89,8 @@ class RunningGame:
     log_path: Path
     proc: subprocess.Popen[Any]
     model_version: int
+    controller_model_version: int
+    adversary_model_version: int
 
 
 def _path_arg(value: str) -> Path:
@@ -76,7 +99,11 @@ def _path_arg(value: str) -> Path:
 
 def _load_state(path: Path, default_model_version: int) -> WorkerState:
     if not path.exists():
-        return WorkerState(model_version=int(default_model_version))
+        return WorkerState(
+            model_version=int(default_model_version),
+            controller_model_version=int(default_model_version),
+            adversary_model_version=int(default_model_version),
+        )
     data = json.loads(path.read_text(encoding="utf-8"))
     return WorkerState(
         states=int(data.get("states", 0)),
@@ -84,7 +111,10 @@ def _load_state(path: Path, default_model_version: int) -> WorkerState:
         adversary=int(data.get("adversary", 0)),
         games=int(data.get("games", 0)),
         shard_index=int(data.get("shard_index", 0)),
+        next_game_sequence=int(data.get("next_game_sequence", 0)),
         model_version=int(data.get("model_version", default_model_version)),
+        controller_model_version=int(data.get("controller_model_version", data.get("model_version", default_model_version))),
+        adversary_model_version=int(data.get("adversary_model_version", data.get("model_version", default_model_version))),
     )
 
 
@@ -95,7 +125,10 @@ def _save_state(path: Path, st: WorkerState) -> None:
         "adversary": st.adversary,
         "games": st.games,
         "shard_index": st.shard_index,
+        "next_game_sequence": st.next_game_sequence,
         "model_version": st.model_version,
+        "controller_model_version": st.controller_model_version,
+        "adversary_model_version": st.adversary_model_version,
         "updated_at_utc": utc_now(),
     })
 
@@ -104,6 +137,19 @@ def _ensure_active_dir(root: Path) -> Path:
     active = root / "active"
     active.mkdir(parents=True, exist_ok=True)
     return active
+
+
+def _allocate_game_id(args: argparse.Namespace, st: WorkerState, state_path: Path) -> int:
+    game_id = int(args.game_id_start) + int(st.next_game_sequence)
+    if game_id < 0 or game_id > NATIVE_GAME_ID_MAX:
+        raise RuntimeError(
+            f"worker game-id sequence exhausted native int32 range: game_id={game_id}; "
+            "choose a lower --game-id-start"
+        )
+    st.next_game_sequence += 1
+    # Persist before launch so daemon restarts never reuse an in-flight game ID.
+    _save_state(state_path, st)
+    return game_id
 
 
 def _worker_buffer_path(root: Path) -> Path:
@@ -122,6 +168,8 @@ def _append_worker_status(root: Path, st: WorkerState) -> None:
         "adversary_states": int(st.adversary),
         "games_executed_so_far": int(st.games),
         "model_iteration_version": int(st.model_version),
+        "controller_model_iteration_version": int(st.controller_model_version),
+        "adversary_model_iteration_version": int(st.adversary_model_version),
         "time_24h": local_time_24h(),
     })
 
@@ -130,30 +178,57 @@ def _append_model_comm(root: Path, st: WorkerState) -> None:
     append_csv_row(_model_comm_path(root), MODEL_COMM_FIELDS, {
         "model_received_time": local_time_24h(),
         "model_version": int(st.model_version),
+        "controller_model_version": int(st.controller_model_version),
+        "adversary_model_version": int(st.adversary_model_version),
         "states_generated_by_model_version_current_buffer": int(st.states),
     })
 
 
-def _current_model_paths(args: argparse.Namespace) -> tuple[Path, Path, Path, int]:
+def _current_model_paths(args: argparse.Namespace) -> CurrentModelPaths:
     cfg = Phase1SmokeConfig()
-    # Initial implementation uses configured file paths. Worker model pulling can
-    # later atomically update current_model.json to override these paths.
     current = Path(args.output_root) / "models" / "current_model.json"
     if current.exists():
         data = json.loads(current.read_text(encoding="utf-8"))
-        return (
-            Path(data["value_model_path"]),
-            Path(data["controller_prior_model_path"]),
-            Path(data["adversary_prior_model_path"]),
-            int(data["model_version"]),
+        model_family = str(data.get("model_family", "hgb") or "hgb").lower()
+        if model_family == "dnn" and data.get("native_ready") is not True:
+            raise RuntimeError("refusing to launch an EXP2 DNN bundle without native_ready=true")
+        legacy_version = int(data.get("model_version", 100) or 100)
+        controller_version = int(data.get("controller_model_version", legacy_version) or legacy_version)
+        adversary_version = int(data.get("adversary_model_version", legacy_version) or legacy_version)
+        legacy_value_path = data.get("value_model_path") or str(cfg.value_model_path)
+        result = CurrentModelPaths(
+            controller_value_model_path=Path(data.get("controller_value_model_path") or legacy_value_path),
+            adversary_value_model_path=Path(data.get("adversary_value_model_path") or legacy_value_path),
+            controller_prior_model_path=Path(data["controller_prior_model_path"]),
+            adversary_prior_model_path=Path(data["adversary_prior_model_path"]),
+            model_version=int(max(legacy_version, controller_version, adversary_version)),
+            controller_model_version=int(controller_version),
+            adversary_model_version=int(adversary_version),
         )
-    return (
-        Path(args.value_model_path or cfg.value_model_path),
-        Path(args.controller_prior_model_path or cfg.controller_prior_model_path),
-        Path(args.adversary_prior_model_path or cfg.adversary_prior_model_path),
-        int(args.model_version),
+        missing = [
+            str(path)
+            for path in (
+                result.controller_value_model_path,
+                result.adversary_value_model_path,
+                result.controller_prior_model_path,
+                result.adversary_prior_model_path,
+            )
+            if not path.is_file()
+        ]
+        if missing:
+            raise FileNotFoundError(f"current model bundle is incomplete: {missing}")
+        return result
+    model_version = int(args.model_version)
+    value_path = Path(args.value_model_path or cfg.value_model_path)
+    return CurrentModelPaths(
+        controller_value_model_path=Path(getattr(args, "controller_value_model_path", "") or value_path),
+        adversary_value_model_path=Path(getattr(args, "adversary_value_model_path", "") or value_path),
+        controller_prior_model_path=Path(args.controller_prior_model_path or cfg.controller_prior_model_path),
+        adversary_prior_model_path=Path(args.adversary_prior_model_path or cfg.adversary_prior_model_path),
+        model_version=int(model_version),
+        controller_model_version=int(model_version),
+        adversary_model_version=int(model_version),
     )
-
 
 def _select_parent_args(args: argparse.Namespace, rng: random.Random, used: set[int]) -> list[str]:
     dataset = str(args.parent_dataset_dir or "")
@@ -189,21 +264,22 @@ def _build_game_command(
     out_dir: Path,
     used_parent_ids: set[int],
     rng: random.Random,
-) -> tuple[list[str], Path, int]:
-    value_model, ctrl_prior, adv_prior, model_version = _current_model_paths(args)
+) -> tuple[list[str], Path, CurrentModelPaths]:
+    model_paths = _current_model_paths(args)
     replay_csv = out_dir / "replay_target_runtime.csv"
     cmd = [
         sys.executable,
         "-m", "vidur.bellman_v4_adv.arena_mcts_value_runnerCPP",
         "--launcher-worker",
-        "--model-path", str(value_model),
-        "--model-version", str(int(model_version)),
+        "--model-path", str(model_paths.controller_value_model_path),
+        "--model-version", str(int(model_paths.model_version)),
         "--feature-dim", str(int(args.feature_dim)),
         "--output-dir", str(out_dir),
         "--game-id-start", str(int(game_id)),
         "--num-games", "1",
         "--num-parallel-games", "1",
         "--shared-root-mcts-iterations", str(int(args.iterations)),
+        "--discount-factor", str(float(args.discount_factor)),
         "--worker-threads", str(int(args.worker_threads)),
         "--trivial-budget-tokens", str(int(args.trivial_budget_tokens)),
         "--arena-time-limit-sec", str(float(args.arena_time_limit_sec)),
@@ -221,17 +297,29 @@ def _build_game_command(
         "--agz-sample-initial-moves" if bool(args.agz_sample_initial_moves) else "--no-agz-sample-initial-moves",
         "--agz-sample-initial-move-count", str(int(args.agz_sample_initial_move_count)),
         "--agz-mcts-action-temperature", str(float(args.agz_mcts_action_temperature)),
-        "--controller-prior-model-path", str(ctrl_prior),
-        "--adversary-prior-model-path", str(adv_prior),
+        "--controller-prior-model-path", str(model_paths.controller_prior_model_path),
+        "--adversary-prior-model-path", str(model_paths.adversary_prior_model_path),
+        "--role-controller-value-model-path", str(model_paths.controller_value_model_path),
+        "--role-controller-prior-model-path", str(model_paths.controller_prior_model_path),
+        "--role-adversary-value-model-path", str(model_paths.adversary_value_model_path),
+        "--role-adversary-prior-model-path", str(model_paths.adversary_prior_model_path),
+        "--native-search-mode", str(args.native_search_mode),
+        "--rollout-count", str(int(args.rollout_count)),
+        "--rollout-parallel-threads", str(int(args.rollout_parallel_threads)),
+        "--rollout-horizon-sec", str(float(args.rollout_horizon_sec)),
+        "--rollout-policy-temperature", str(float(args.rollout_policy_temperature)),
+        "--rollout-probability-quantum", str(float(args.rollout_probability_quantum)),
+        "--rollout-max-actions", str(int(args.rollout_max_actions)),
         "--only-model-ctrl-cycle",
         "--agz-replay-target-csv", str(replay_csv),
+        "--agz-replay-sample-window-sec", str(float(args.replay_sample_window_sec)),
     ]
     if int(args.history_hops) == 0:
         cmd.append("--history-hops-force-zero")
     else:
         cmd.append("--no-history-hops-force-zero")
     cmd.extend(_select_parent_args(args, rng, used_parent_ids))
-    return cmd, replay_csv, int(model_version)
+    return cmd, replay_csv, model_paths
 
 
 def _launch_one_game(
@@ -242,7 +330,7 @@ def _launch_one_game(
     used_parent_ids: set[int],
     rng: random.Random,
 ) -> RunningGame:
-    cmd, replay_csv, model_version = _build_game_command(
+    cmd, replay_csv, model_paths = _build_game_command(
         args,
         game_id=int(game_id),
         out_dir=out_dir,
@@ -263,7 +351,9 @@ def _launch_one_game(
         replay_csv=replay_csv,
         log_path=log,
         proc=proc,
-        model_version=int(model_version),
+        model_version=int(model_paths.model_version),
+        controller_model_version=int(model_paths.controller_model_version),
+        adversary_model_version=int(model_paths.adversary_model_version),
     )
 
 
@@ -273,6 +363,8 @@ def _run_one_game(args: argparse.Namespace, *, game_id: int, out_dir: Path, st: 
     if int(rc) != 0:
         raise RuntimeError(f"game {game_id} failed rc={rc}; see {running.log_path}")
     st.model_version = int(running.model_version)
+    st.controller_model_version = int(running.controller_model_version)
+    st.adversary_model_version = int(running.adversary_model_version)
     return running.replay_csv
 
 
@@ -284,15 +376,23 @@ def _merge_game_into_active(
     replay_csv: Path,
     st: WorkerState,
     model_version: int | None = None,
+    controller_model_version: int | None = None,
+    adversary_model_version: int | None = None,
 ) -> dict[str, int]:
     active = _ensure_active_dir(Path(args.output_root))
     active_replay = active / "replay_target_runtime.csv"
     if model_version is None:
         model_version = int(st.model_version)
+    if controller_model_version is None:
+        controller_model_version = int(st.controller_model_version)
+    if adversary_model_version is None:
+        adversary_model_version = int(st.adversary_model_version)
     extra = {
         "worker_id": str(args.worker_id),
         "run_id": str(args.run_id),
         "model_version": int(model_version),
+        "controller_model_version": int(controller_model_version),
+        "adversary_model_version": int(adversary_model_version),
         "game_id_source": int(game_id),
     }
     added = append_csv_file(active_replay, replay_csv, extra=extra)
@@ -309,8 +409,15 @@ def _merge_game_into_active(
     active_games.mkdir(parents=True, exist_ok=True)
     manifest = {
         "game_id": int(game_id),
+        "mcts_iterations": int(args.iterations),
+        "puct_c": float(args.puct_c),
+        "root_dirichlet_alpha": float(args.root_dirichlet_alpha),
+        "root_dirichlet_epsilon": float(args.root_dirichlet_epsilon),
         "game_output_dir": str(game_out),
         "replay_rows": int(added),
+        "model_version": int(model_version),
+        "controller_model_version": int(controller_model_version),
+        "adversary_model_version": int(adversary_model_version),
         "created_at_utc": utc_now(),
     }
     atomic_write_json(active_games / f"game_{int(game_id)}.json", manifest)
@@ -321,6 +428,81 @@ def _cleanup_game_output(args: argparse.Namespace, game_out: Path) -> None:
     if bool(getattr(args, "keep_game_runs", False)):
         return
     shutil.rmtree(Path(game_out), ignore_errors=True)
+
+
+def _eval_pause_paths(root: Path) -> tuple[Path, Path]:
+    control = Path(root) / "control"
+    return control / "eval_pause.request", control / "eval_pause.ack.json"
+
+
+def _eval_pause_requested(root: Path) -> bool:
+    request, _ack = _eval_pause_paths(root)
+    return request.is_file()
+
+
+def _pause_selfplay_if_requested(
+    args: argparse.Namespace,
+    running: list[RunningGame],
+) -> bool:
+    root = Path(args.output_root)
+    request, ack = _eval_pause_paths(root)
+    if not request.is_file():
+        ack.unlink(missing_ok=True)
+        return False
+
+    terminated = list(running)
+    for game in terminated:
+        if game.proc.poll() is None:
+            game.proc.terminate()
+    deadline = time.monotonic() + 10.0
+    for game in terminated:
+        if game.proc.poll() is None:
+            try:
+                game.proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                game.proc.kill()
+                game.proc.wait()
+        _cleanup_game_output(args, game.out_dir)
+    running.clear()
+
+    if not ack.is_file():
+        ack.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(
+            ack,
+            {
+                "status": "paused",
+                "worker_id": str(args.worker_id),
+                "terminated_inflight_games": int(len(terminated)),
+                "time_utc": utc_now(),
+            },
+        )
+    time.sleep(float(args.poll_sec))
+    return True
+
+
+def _validate_runtime_compatibility(args: argparse.Namespace) -> None:
+    parameters = inspect.signature(AlphaGoZeroReplayRecorder.__init__).parameters
+    if "discount_factor" not in parameters:
+        raise RuntimeError(
+            "incompatible AlphaGoZeroReplayRecorder deployment: "
+            "worker runner requires discount_factor support"
+        )
+    if not (0.0 < float(args.discount_factor) <= 1.0):
+        raise ValueError("discount_factor must be in (0, 1]")
+
+
+def _preserve_last_game_error(root: Path, game: RunningGame, return_code: int) -> Path:
+    try:
+        tail = game.log_path.read_text(encoding="utf-8", errors="replace")[-16_000:]
+    except Exception:
+        tail = ""
+    path = Path(root) / "last_game_error.log"
+    path.write_text(
+        f"game_id={int(game.game_id)} return_code={int(return_code)} "
+        f"time_utc={utc_now()}\n{tail}",
+        encoding="utf-8",
+    )
+    return path
 
 
 def _freeze_if_needed(args: argparse.Namespace, st: WorkerState, *, force: bool = False) -> Path | None:
@@ -337,7 +519,19 @@ def _freeze_if_needed(args: argparse.Namespace, st: WorkerState, *, force: bool 
         shard_id=shard_id,
         worker_id=str(args.worker_id),
         model_version=int(st.model_version),
+        controller_model_version=int(st.controller_model_version),
+        adversary_model_version=int(st.adversary_model_version),
         games_executed=int(st.games),
+        metadata={
+            "mcts_iterations": int(args.iterations),
+            "puct_c": float(args.puct_c),
+            "root_dirichlet_noise_enabled": bool(args.root_dirichlet_noise_enabled),
+            "root_dirichlet_alpha": float(args.root_dirichlet_alpha),
+            "root_dirichlet_epsilon": float(args.root_dirichlet_epsilon),
+            "agz_sample_initial_moves": bool(args.agz_sample_initial_moves),
+            "agz_sample_initial_move_count": int(args.agz_sample_initial_move_count),
+            "agz_mcts_action_temperature": float(args.agz_mcts_action_temperature),
+        },
     )
     st.shard_index += 1
     st.states = 0
@@ -349,11 +543,21 @@ def _freeze_if_needed(args: argparse.Namespace, st: WorkerState, *, force: bool 
     return shard
 
 
+def _ready_shards_in_upload_order(
+    args: argparse.Namespace,
+    ready: Path,
+    current: CurrentModelPaths,
+) -> list[Path]:
+    del args, current
+    return sorted((path for path in Path(ready).iterdir() if path.is_dir()), key=lambda path: path.name)
+
+
 def _upload_ready_shards(args: argparse.Namespace) -> None:
     ready = Path(args.output_root) / "ready"
     if not ready.exists():
         return
-    for shard in sorted(p for p in ready.iterdir() if p.is_dir()):
+    current = _current_model_paths(args)
+    for shard in _ready_shards_in_upload_order(args, ready, current):
         shard_id = shard.name
         upload = f"{args.xl_output_root.rstrip('/')}/incoming_uploading/{args.worker_id}/{shard_id}"
         incoming = f"{args.xl_output_root.rstrip('/')}/incoming/{args.worker_id}/{shard_id}"
@@ -383,12 +587,15 @@ def _uploader_loop(args: argparse.Namespace, stop_event: threading.Event) -> Non
 def run_worker(args: argparse.Namespace) -> None:
     root = Path(args.output_root)
     root.mkdir(parents=True, exist_ok=True)
-    st = _load_state(root / "worker_state.json", int(args.model_version))
+    _validate_runtime_compatibility(args)
+    state_path = root / "worker_state.json"
+    st = _load_state(state_path, int(args.model_version))
     _append_model_comm(root, st)
     rng = random.Random(int(args.seed) + abs(hash(str(args.worker_id))) % 1000000)
     used_parent_ids: set[int] = set()
     running: list[RunningGame] = []
     launched = 0
+    consecutive_game_errors = 0
 
     uploader_stop = threading.Event()
     uploader_thread: threading.Thread | None = None
@@ -398,14 +605,24 @@ def run_worker(args: argparse.Namespace) -> None:
 
     try:
         while True:
+            if _pause_selfplay_if_requested(args, running):
+                continue
             can_launch_more = int(args.max_games) <= 0 or launched < int(args.max_games)
             while can_launch_more and len(running) < max(1, int(args.parallel_games)):
-                _value_model, _ctrl_prior, _adv_prior, current_model_version = _current_model_paths(args)
-                if int(current_model_version) != int(st.model_version):
-                    st.model_version = int(current_model_version)
-                    _save_state(root / "worker_state.json", st)
+                if _eval_pause_requested(root):
+                    break
+                current_paths = _current_model_paths(args)
+                if (
+                    int(current_paths.controller_model_version) != int(st.controller_model_version)
+                    or int(current_paths.adversary_model_version) != int(st.adversary_model_version)
+                    or int(current_paths.model_version) != int(st.model_version)
+                ):
+                    st.model_version = int(current_paths.model_version)
+                    st.controller_model_version = int(current_paths.controller_model_version)
+                    st.adversary_model_version = int(current_paths.adversary_model_version)
+                    _save_state(state_path, st)
                     _append_model_comm(root, st)
-                game_id = int(args.game_id_start) + int(st.shard_index) * 1_000_000 + launched
+                game_id = _allocate_game_id(args, st, state_path)
                 game_out = root / "runs" / f"game_{game_id}"
                 running.append(_launch_one_game(args, game_id=game_id, out_dir=game_out, used_parent_ids=used_parent_ids, rng=rng))
                 launched += 1
@@ -415,6 +632,8 @@ def run_worker(args: argparse.Namespace) -> None:
                 break
 
             completed_any = False
+            failed_this_poll = 0
+            succeeded_this_poll = 0
             for game in list(running):
                 rc = game.proc.poll()
                 if rc is None:
@@ -422,18 +641,24 @@ def run_worker(args: argparse.Namespace) -> None:
                 running.remove(game)
                 completed_any = True
                 if int(rc) != 0:
+                    preserved_log = _preserve_last_game_error(root, game, int(rc))
                     append_csv_row(root / "game_errors.csv", ["game_id", "model_version", "return_code", "log_path", "time_24h"], {
                         "game_id": int(game.game_id),
                         "model_version": int(game.model_version),
                         "return_code": int(rc),
-                        "log_path": str(game.log_path),
+                        "log_path": str(preserved_log),
                         "time_24h": local_time_24h(),
                     })
+                    _cleanup_game_output(args, game.out_dir)
+                    failed_this_poll += 1
                     if not bool(args.continue_on_game_error):
-                        raise RuntimeError(f"game {game.game_id} failed rc={rc}; see {game.log_path}")
+                        raise RuntimeError(f"game {game.game_id} failed rc={rc}; see {preserved_log}")
                     continue
 
+                succeeded_this_poll += 1
                 st.model_version = int(game.model_version)
+                st.controller_model_version = int(game.controller_model_version)
+                st.adversary_model_version = int(game.adversary_model_version)
                 _merge_game_into_active(
                     args,
                     game_id=int(game.game_id),
@@ -441,13 +666,25 @@ def run_worker(args: argparse.Namespace) -> None:
                     replay_csv=game.replay_csv,
                     st=st,
                     model_version=int(game.model_version),
+                    controller_model_version=int(game.controller_model_version),
+                    adversary_model_version=int(game.adversary_model_version),
                 )
                 _cleanup_game_output(args, game.out_dir)
-                _save_state(root / "worker_state.json", st)
+                _save_state(state_path, st)
                 _append_worker_status(root, st)
                 _freeze_if_needed(args, st)
 
-            if not completed_any:
+            if succeeded_this_poll:
+                consecutive_game_errors = 0
+            elif failed_this_poll:
+                consecutive_game_errors += int(failed_this_poll)
+                if consecutive_game_errors >= int(args.max_consecutive_game_errors):
+                    raise RuntimeError(
+                        f"stopping after {consecutive_game_errors} consecutive game errors; "
+                        f"see {root / 'last_game_error.log'}"
+                    )
+                time.sleep(float(args.game_error_backoff_sec))
+            elif not completed_any:
                 time.sleep(float(args.poll_sec))
 
         if bool(args.flush_at_end):
@@ -461,6 +698,11 @@ def run_worker(args: argparse.Namespace) -> None:
         for game in running:
             if game.proc.poll() is None:
                 game.proc.terminate()
+                try:
+                    game.proc.wait(timeout=10.0)
+                except subprocess.TimeoutExpired:
+                    game.proc.kill()
+            _cleanup_game_output(args, game.out_dir)
 
 
 def parse_args() -> argparse.Namespace:
@@ -472,6 +714,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--xl-host", default="bellman-classical-xl")
     p.add_argument("--xl-output-root", default="/home/ubuntu/vidur-classical-search/simulator_output/GV3_Agent/AlphaGoZero")
     p.add_argument("--value-model-path", default=str(cfg.value_model_path))
+    p.add_argument("--controller-value-model-path", default="")
+    p.add_argument("--adversary-value-model-path", default="")
     p.add_argument("--controller-prior-model-path", default=str(cfg.controller_prior_model_path))
     p.add_argument("--adversary-prior-model-path", default=str(cfg.adversary_prior_model_path))
     p.add_argument("--model-version", type=int, default=cfg.model_version)
@@ -482,21 +726,30 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--poll-sec", type=float, default=1.0)
     p.add_argument("--buffer-threshold", type=int, default=10_000)
     p.add_argument("--iterations", type=int, default=cfg.mcts_iterations)
+    p.add_argument("--discount-factor", type=float, default=cfg.discount_factor)
     p.add_argument("--history-hops", type=int, default=0)
-    p.add_argument("--arena-time-limit-sec", type=float, default=5.0)
+    p.add_argument("--arena-time-limit-sec", type=float, default=cfg.arena_time_limit_sec)
+    p.add_argument("--replay-sample-window-sec", type=float, default=cfg.replay_sample_window_sec)
     p.add_argument("--trivial-budget-tokens", type=int, default=256)
     p.add_argument("--puct-c", type=float, default=cfg.puct_c)
     p.add_argument("--uct-c", type=float, default=1.4)
     p.add_argument("--policy-prior-temperature", type=float, default=1.0)
     p.add_argument("--prior-min-prob", type=float, default=1e-8)
     p.add_argument("--root-dirichlet-noise-enabled", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--root-dirichlet-alpha", type=float, default=0.03)
-    p.add_argument("--root-dirichlet-epsilon", type=float, default=0.25)
+    p.add_argument("--root-dirichlet-alpha", type=float, default=cfg.root_dirichlet_alpha)
+    p.add_argument("--root-dirichlet-epsilon", type=float, default=cfg.root_dirichlet_epsilon)
     p.add_argument("--agz-sample-initial-moves", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--agz-sample-initial-move-count", type=int, default=30)
+    p.add_argument("--agz-sample-initial-move-count", type=int, default=cfg.agz_sample_initial_move_count)
     p.add_argument("--agz-mcts-action-temperature", type=float, default=1.0)
     p.add_argument("--seed", type=int, default=2026)
     p.add_argument("--worker-threads", type=int, default=1)
+    p.add_argument("--native-search-mode", choices=("full_tree", "full_tree_rollout"), default=cfg.native_search_mode)
+    p.add_argument("--rollout-count", type=int, default=cfg.rollout_count)
+    p.add_argument("--rollout-parallel-threads", type=int, default=cfg.rollout_parallel_threads)
+    p.add_argument("--rollout-horizon-sec", type=float, default=cfg.rollout_horizon_sec)
+    p.add_argument("--rollout-policy-temperature", type=float, default=cfg.rollout_policy_temperature)
+    p.add_argument("--rollout-probability-quantum", type=float, default=cfg.rollout_probability_quantum)
+    p.add_argument("--rollout-max-actions", type=int, default=cfg.rollout_max_actions)
     p.add_argument("--parent-dataset-dir", default="")
     p.add_argument("--parent-state-id", type=int, default=-1)
     p.add_argument("--parent-state-count", type=int, default=0)
@@ -506,6 +759,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--flush-at-end", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--ack-timeout-sec", type=int, default=0)
     p.add_argument("--continue-on-game-error", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--max-consecutive-game-errors", type=int, default=120)
+    p.add_argument("--game-error-backoff-sec", type=float, default=30.0)
     p.add_argument("--keep-game-runs", action=argparse.BooleanOptionalAction, default=False)
     return p.parse_args()
 

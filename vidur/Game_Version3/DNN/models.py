@@ -73,7 +73,7 @@ V_TAIL_COMPRESS_POWER: float = DEFAULT_SPEC.v_tail_compress_power
 # MuZero-style value support (optional, but you already started it) * Note : Penalty and Max SLO cost in real units in seconds
 # HARD_MISS_PENALTY: float = 5
 # MAX_SLO_COST: float = 10
-# GAMMA: float = 0.98
+# GAMMA: float = 0.995
 # VALUE_SCALE: float = 0.5  # scale between real and scaled units
 
 # # SUPPORT_SIZE: int = math.ceil(((MAX_SLO_COST + HARD_MISS_PENALTY) / (1.0 - GAMMA)) / VALUE_SCALE)

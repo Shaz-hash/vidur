@@ -1,5 +1,6 @@
 #pragma once
 
+#include "agz_dense_dnn.hpp"
 #include "gv2_types.hpp"
 #include "virtual_simulator.hpp"
 
@@ -23,6 +24,12 @@ public:
         const SimState& state,
         const VirtualSimulatorGV2* simulator = nullptr,
         int root_id = -1,
+        double* decode_time_at_max_out = nullptr) const;
+    void build_features_into(
+        const SimState& state,
+        const VirtualSimulatorGV2* simulator,
+        int root_id,
+        std::vector<float>* output,
         double* decode_time_at_max_out = nullptr) const;
 
     double predict_raw(const std::vector<float>& features) const;
@@ -59,6 +66,7 @@ private:
     std::string model_tag_;
     int feature_dim_ = 226;
     double baseline_ = 0.0;
+    NativeDenseDNNModel dnn_model_;
     std::vector<Tree> trees_;
 };
 
@@ -74,6 +82,18 @@ public:
         const std::vector<float>& flat_features,
         int num_rows,
         int row_dim) const;
+    std::vector<double> predict_raw_grouped_batch_flat(
+        const std::vector<float>& flat_features,
+        int num_rows,
+        int row_dim,
+        const std::vector<int>& group_offsets,
+        int parallel_threads) const;
+    std::vector<double> predict_raw_grouped_split_batch_flat(
+        const std::vector<float>& flat_states,
+        const std::vector<float>& flat_actions,
+        int num_rows,
+        const std::vector<int>& group_offsets,
+        int parallel_threads) const;
 
     int feature_dim() const;
     int num_trees() const;
@@ -99,6 +119,7 @@ private:
     std::string model_tag_;
     int feature_dim_ = 0;
     double baseline_ = 0.0;
+    NativeDenseDNNModel dnn_model_;
     std::vector<Tree> trees_;
 };
 

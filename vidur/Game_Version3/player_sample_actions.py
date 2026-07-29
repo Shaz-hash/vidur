@@ -526,6 +526,9 @@ class GV2PlayerActionSampler:
                 "ordered_by_heur": ordered_by_heur,
             }
 
+        positive_budgets = [int(b) for b in self._budgets if int(b) > 0]
+        min_positive_budget = min(positive_budgets) if positive_budgets else 0
+
         idx = 0
         for e_idx, ev_rule in enumerate(self._evict_rules):
             b = branch_cache[ev_rule]
@@ -546,7 +549,18 @@ class GV2PlayerActionSampler:
                     if budget < 0:
                         valid = False
                     if budget > total_prefill:
-                        valid = False
+                        # Natural trace prefill sizes are not guaranteed to be
+                        # multiples of the controller budget grid. Let the
+                        # smallest positive budget finish a sub-budget tail
+                        # while keeping larger duplicate over-budget actions
+                        # masked.
+                        if not (
+                            total_prefill > 0
+                            and min_positive_budget > 0
+                            and total_prefill < min_positive_budget
+                            and int(budget) == int(min_positive_budget)
+                        ):
+                            valid = False
                     if total_prefill == 0 and budget > 0:
                         valid = False
 
@@ -587,6 +601,7 @@ class GV2PlayerActionSampler:
                         heuristic=(heur if budget > 0 else None),
                         strategy=f"GV2|{ev_rule}",
                         mapping=(int(e_idx), int(b_idx), int(h_idx)),
+                        _evicted_request_ids=list(b["evict_ids"]),  # type: ignore[arg-type]
                     )
 
                     actions_by_index[idx] = action

@@ -9,6 +9,7 @@ namespace mcts_native_gv2 {
 class DecodeCreditLedger {
 public:
     explicit DecodeCreditLedger(int initial_balance = 0);
+    explicit DecodeCreditLedger(GameStats* borrowed_stats);
 
     void load_from_stats(const GameStats& stats);
     void write_back_stats(GameStats* stats, bool enforce_nonnegative) const;
@@ -37,7 +38,11 @@ public:
     const std::unordered_map<int, int>& decode_tokens_counted_by_id() const;
 
 private:
+    std::unordered_map<int, int>& mutable_decode_tokens_counted_by_id();
+    const std::unordered_map<int, int>& current_decode_tokens_counted_by_id() const;
+
     int balance_;
+    GameStats* borrowed_stats_ = nullptr;
     std::unordered_map<int, int> decode_tokens_counted_by_id_;
 };
 

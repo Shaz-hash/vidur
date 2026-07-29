@@ -174,7 +174,17 @@ def atomic_write_json(path: Path, data: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
-def build_shard_manifest(*, shard_dir: Path, shard_id: str, worker_id: str, model_version: int, games_executed: int) -> dict[str, Any]:
+def build_shard_manifest(
+    *,
+    shard_dir: Path,
+    shard_id: str,
+    worker_id: str,
+    model_version: int,
+    games_executed: int,
+    controller_model_version: int | None = None,
+    adversary_model_version: int | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     shard_dir = Path(shard_dir)
     replay_path = shard_dir / "replay_target_runtime.csv"
     counts = replay_counts(replay_path)
@@ -182,11 +192,15 @@ def build_shard_manifest(*, shard_dir: Path, shard_id: str, worker_id: str, mode
     for rel in _relative_files(shard_dir, include_manifest=False):
         f = shard_dir / rel
         files[rel.as_posix()] = {"bytes": f.stat().st_size, "sha256": sha256_file(f)}
-    return {
-        "schema_version": 1,
+    controller_version = int(controller_model_version if controller_model_version is not None else model_version)
+    adversary_version = int(adversary_model_version if adversary_model_version is not None else model_version)
+    manifest = {
+        "schema_version": 2,
         "shard_id": str(shard_id),
         "worker_id": str(worker_id),
         "model_version": int(model_version),
+        "controller_model_version": int(controller_version),
+        "adversary_model_version": int(adversary_version),
         "games_executed": int(games_executed),
         "states_generated": int(counts["states"]),
         "controller_states": int(counts["controller"]),
@@ -195,9 +209,23 @@ def build_shard_manifest(*, shard_dir: Path, shard_id: str, worker_id: str, mode
         "created_at_local_24h": local_time_24h(),
         "files": files,
     }
+    if metadata:
+        manifest.update(dict(metadata))
+    return manifest
 
 
-def finalize_shard(*, active_dir: Path, ready_root: Path, shard_id: str, worker_id: str, model_version: int, games_executed: int) -> Path:
+def finalize_shard(
+    *,
+    active_dir: Path,
+    ready_root: Path,
+    shard_id: str,
+    worker_id: str,
+    model_version: int,
+    games_executed: int,
+    controller_model_version: int | None = None,
+    adversary_model_version: int | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> Path:
     active_dir = Path(active_dir)
     ready_root = Path(ready_root)
     ready_root.mkdir(parents=True, exist_ok=True)
@@ -210,7 +238,10 @@ def finalize_shard(*, active_dir: Path, ready_root: Path, shard_id: str, worker_
         shard_id=shard_id,
         worker_id=worker_id,
         model_version=int(model_version),
+        controller_model_version=controller_model_version,
+        adversary_model_version=adversary_model_version,
         games_executed=int(games_executed),
+        metadata=metadata,
     )
     atomic_write_json(shard_dir / "shard_manifest.json", manifest)
     write_sha256sums(shard_dir, include_manifest=True)
@@ -272,11 +303,15 @@ class ShardAck:
 
 def wait_for_ack(*, host: str, ack_path: str, timeout_sec: int = 0, poll_sec: float = 5.0) -> ShardAck:
     start = time.time()
+    # timeout_sec <= 0 means wait indefinitely. This is the intended durable
+    # transfer backpressure: workers must not publish unlimited shards to XL
+    # when the coordinator is down or lagging.
+    timeout = int(timeout_sec)
     while True:
         cp = run_cmd(["ssh", host, f"test -f {ack_path!r} && echo yes || echo no"], check=False)
         accepted = "yes" in (cp.stdout or "")
         if accepted:
             return ShardAck(True, ack_path)
-        if timeout_sec <= 0 or time.time() - start >= timeout_sec:
+        if timeout > 0 and time.time() - start >= timeout:
             return ShardAck(False, ack_path)
         time.sleep(float(poll_sec))

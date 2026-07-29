@@ -82,12 +82,16 @@ def build_command(args: argparse.Namespace, *, command_output_dir: Path, launche
         str(float(args.launcher_poll_sec)),
         "--shared-root-mcts-iterations",
         str(int(args.iterations)),
+        "--discount-factor",
+        str(float(args.discount_factor)),
         "--worker-threads",
         str(int(args.worker_threads)),
         "--trivial-budget-tokens",
         str(int(args.trivial_budget_tokens)),
         "--arena-time-limit-sec",
         str(float(args.arena_time_limit_sec)),
+        "--agz-replay-sample-window-sec",
+        str(float(args.replay_sample_window_sec)),
         "--history-hops-min",
         str(int(args.history_hops)),
         "--history-hops-max",
@@ -117,6 +121,20 @@ def build_command(args: argparse.Namespace, *, command_output_dir: Path, launche
         str(args.controller_prior_model_path),
         "--adversary-prior-model-path",
         str(args.adversary_prior_model_path),
+        "--native-search-mode",
+        str(args.native_search_mode),
+        "--rollout-count",
+        str(int(args.rollout_count)),
+        "--rollout-parallel-threads",
+        str(int(args.rollout_parallel_threads)),
+        "--rollout-horizon-sec",
+        str(float(args.rollout_horizon_sec)),
+        "--rollout-policy-temperature",
+        str(float(args.rollout_policy_temperature)),
+        "--rollout-probability-quantum",
+        str(float(args.rollout_probability_quantum)),
+        "--rollout-max-actions",
+        str(int(args.rollout_max_actions)),
     ]
     if launcher_worker:
         cmd.append("--launcher-worker")
@@ -149,7 +167,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--parallel-games", type=int, default=cfg.parallel_games)
     parser.add_argument("--history-hops", type=int, default=cfg.history_hops)
     parser.add_argument("--iterations", type=int, default=cfg.mcts_iterations)
+    parser.add_argument("--discount-factor", type=float, default=cfg.discount_factor)
     parser.add_argument("--arena-time-limit-sec", type=float, default=cfg.arena_time_limit_sec)
+    parser.add_argument("--replay-sample-window-sec", type=float, default=cfg.replay_sample_window_sec)
     parser.add_argument("--trivial-budget-tokens", type=int, default=cfg.trivial_budget_tokens)
     parser.add_argument("--puct-c", type=float, default=cfg.puct_c)
     parser.add_argument("--uct-c", type=float, default=cfg.uct_c)
@@ -163,6 +183,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--agz-mcts-action-temperature", type=float, default=cfg.agz_mcts_action_temperature)
     parser.add_argument("--seed", type=int, default=cfg.seed)
     parser.add_argument("--worker-threads", type=int, default=cfg.worker_threads)
+    parser.add_argument("--native-search-mode", choices=("full_tree", "full_tree_rollout"), default=cfg.native_search_mode)
+    parser.add_argument("--rollout-count", type=int, default=cfg.rollout_count)
+    parser.add_argument("--rollout-parallel-threads", type=int, default=cfg.rollout_parallel_threads)
+    parser.add_argument("--rollout-horizon-sec", type=float, default=cfg.rollout_horizon_sec)
+    parser.add_argument("--rollout-policy-temperature", type=float, default=cfg.rollout_policy_temperature)
+    parser.add_argument("--rollout-probability-quantum", type=float, default=cfg.rollout_probability_quantum)
+    parser.add_argument("--rollout-max-actions", type=int, default=cfg.rollout_max_actions)
     parser.add_argument("--launcher-poll-sec", type=float, default=1.0)
     parser.add_argument("--output-dir", type=_path_arg, default=None)
     parser.add_argument("--skip-model-ctrl-cycle", action="store_true")
@@ -204,6 +231,9 @@ def main() -> None:
         "job_output_dir": str(command_output_dir),
         "command": cmd,
         "iterations": int(args.iterations),
+        "discount_factor": float(args.discount_factor),
+        "arena_time_limit_sec": float(args.arena_time_limit_sec),
+        "replay_sample_window_sec": float(args.replay_sample_window_sec),
         "history_hops": int(args.history_hops),
         "policy_prior_temperature": float(args.policy_prior_temperature),
         "root_dirichlet_noise_enabled": bool(args.root_dirichlet_noise_enabled),
@@ -213,6 +243,13 @@ def main() -> None:
         "agz_sample_initial_move_count": int(args.agz_sample_initial_move_count),
         "agz_mcts_action_temperature": float(args.agz_mcts_action_temperature),
         "trivial_budget_tokens": int(args.trivial_budget_tokens),
+        "native_search_mode": str(args.native_search_mode),
+        "rollout_count": int(args.rollout_count),
+        "rollout_parallel_threads": int(args.rollout_parallel_threads),
+        "rollout_horizon_sec": float(args.rollout_horizon_sec),
+        "rollout_policy_temperature": float(args.rollout_policy_temperature),
+        "rollout_probability_quantum": float(args.rollout_probability_quantum),
+        "rollout_max_actions": int(args.rollout_max_actions),
     }
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
 

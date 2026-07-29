@@ -196,7 +196,9 @@ GV2VirtualEnvironment::GV2VirtualEnvironment(GV2EnvConfig cfg)
           VirtualSimulatorConfig sim_cfg;
           sim_cfg.adversary_tick_sec = cfg_.adversary_tick_sec;
           return sim_cfg;
-      }()) {}
+      }()) {
+    refresh_sampler_configs();
+}
 
 GV2VirtualEnvironment::GV2VirtualEnvironment(GV2EnvConfig cfg, VirtualSimulatorConfig sim_cfg)
     : cfg_(std::move(cfg)), virtual_sim_(std::move(sim_cfg)) {
@@ -205,6 +207,7 @@ GV2VirtualEnvironment::GV2VirtualEnvironment(GV2EnvConfig cfg, VirtualSimulatorC
         patched.adversary_tick_sec = cfg_.adversary_tick_sec;
         virtual_sim_.set_config(std::move(patched));
     }
+    refresh_sampler_configs();
 }
 
 const GV2EnvConfig& GV2VirtualEnvironment::cfg() const { return cfg_; }
@@ -219,58 +222,130 @@ bool GV2VirtualEnvironment::load_predictor_csv(const std::string& path) {
 
 void GV2VirtualEnvironment::set_prefill_profile(std::vector<int> tokens, std::vector<double> times) {
     virtual_sim_.set_prefill_profile(std::move(tokens), std::move(times));
+    refresh_sampler_configs();
+}
+
+void GV2VirtualEnvironment::refresh_sampler_configs() {
+    auto& adversary = cfg_.adversary_sampler;
+    adversary.launch_window_sec = cfg_.launch_window_sec;
+    adversary.max_requests_per_launch_window = cfg_.max_requests_per_launch_window;
+    adversary.prefill_window_cap_tokens = cfg_.prefill_window_cap_tokens;
+    adversary.max_decode_tokens_per_request = cfg_.max_decode_tokens_per_request;
+    adversary.default_decode_slo_time = cfg_.decode_slo_time_default;
+    for (int tokens : adversary.allowed_prefill_tokens) {
+        const double profile_slo = std::max(
+            0.0, virtual_sim_.prefill_profile_lookup(tokens));
+        const auto it = adversary.prefill_slo_by_tokens.find(tokens);
+        if (it == adversary.prefill_slo_by_tokens.end() ||
+            (it->second <= 0.0 && profile_slo > 0.0)) {
+            adversary.prefill_slo_by_tokens[tokens] = profile_slo;
+        }
+    }
+
+    auto& controller = cfg_.controller_sampler;
+    controller.enforce_nonnegative_decode_credits =
+        cfg_.enforce_nonnegative_decode_credits;
+    controller.prefill_profile_tokens =
+        virtual_sim_.cfg().prefill_profile_tokens;
+    controller.prefill_profile_times =
+        virtual_sim_.cfg().prefill_profile_times;
 }
 
 SampledActionSet<AdversaryAction> GV2VirtualEnvironment::sample_adversary_actions(
     const SimState& state,
-    const std::unordered_set<int>& forbidden_stop_ids) const {
-    AdversarySamplerConfig scfg = cfg_.adversary_sampler;
-    scfg.launch_window_sec = cfg_.launch_window_sec;
-    scfg.max_requests_per_launch_window = cfg_.max_requests_per_launch_window;
-    scfg.prefill_window_cap_tokens = cfg_.prefill_window_cap_tokens;
-    scfg.max_decode_tokens_per_request = cfg_.max_decode_tokens_per_request;
-    scfg.default_decode_slo_time = cfg_.decode_slo_time_default;
-    for (int tokens : scfg.allowed_prefill_tokens) {
-        const double profile_slo = std::max(0.0, virtual_sim_.prefill_profile_lookup(tokens));
-        const auto it = scfg.prefill_slo_by_tokens.find(tokens);
-        if (it == scfg.prefill_slo_by_tokens.end() || (it->second <= 0.0 && profile_slo > 0.0)) {
-            scfg.prefill_slo_by_tokens[tokens] = profile_slo;
-        }
-    }
+    const std::unordered_set<int>& forbidden_stop_ids,
+    bool compact_valid_only,
+    bool compact_request_materialization) const {
 
     const double decision_tick = (state.stats.next_adv_tick >= 0.0)
         ? state.stats.next_adv_tick
         : quantize_down(state.sim_time);
 
-    return sample_adversary_actions_gv2(state, scfg, decision_tick, forbidden_stop_ids);
+    return sample_adversary_actions_gv2(
+        state,
+        cfg_.adversary_sampler,
+        decision_tick,
+        forbidden_stop_ids,
+        compact_valid_only,
+        compact_request_materialization);
 }
 
-SampledActionSet<ControllerAction> GV2VirtualEnvironment::sample_controller_actions(const SimState& state) const {
-    SimState tmp = state;
-    init_clock_if_needed(tmp);
-    if (has_pending_adv_tick(tmp)) {
+SampledActionSet<ControllerAction> GV2VirtualEnvironment::sample_controller_actions(
+    const SimState& state,
+    bool compact_valid_only,
+    bool canonical_compact_only) const {
+    const SimState* sampled_state = &state;
+    SimState initialized_state;
+    if (state.stats.next_adv_tick < 0.0 || state.stats.last_adv_tick < -1.0) {
+        initialized_state = state;
+        init_clock_if_needed(initialized_state);
+        sampled_state = &initialized_state;
+    }
+    if (sampled_state->stats.next_adv_tick <= (sampled_state->sim_time + cfg_.eps)) {
         const int n = controller_action_space_size(cfg_.controller_sampler);
         SampledActionSet<ControllerAction> out;
-        out.actions.resize(static_cast<std::size_t>(n));
-        out.mask.assign(static_cast<std::size_t>(n), 0u);
-        if (!out.actions.empty()) {
+        if (compact_valid_only) {
+            out.actions.reserve(1);
+            out.mask.reserve(1);
+            out.original_indices.reserve(1);
+        } else {
+            out.actions.resize(static_cast<std::size_t>(n));
+            out.mask.assign(static_cast<std::size_t>(n), 0u);
+        }
+        if (compact_valid_only || !out.actions.empty()) {
             ControllerAction noop;
             noop.token_budget = 0;
             noop.strategy = "GV2|evict_none";
             noop.mapping = {0, 0, 0};
             noop.has_mapping = true;
             noop.valid = true;
-            out.actions[0] = std::move(noop);
-            out.mask[0] = 1u;
+            if (compact_valid_only) {
+                out.actions.push_back(std::move(noop));
+                out.mask.push_back(1u);
+                out.original_indices.push_back(0);
+            } else {
+                out.actions[0] = std::move(noop);
+                out.mask[0] = 1u;
+            }
         }
         return out;
     }
 
-    ControllerSamplerConfig scfg = cfg_.controller_sampler;
-    scfg.enforce_nonnegative_decode_credits = cfg_.enforce_nonnegative_decode_credits;
-    scfg.prefill_profile_tokens = virtual_sim_.cfg().prefill_profile_tokens;
-    scfg.prefill_profile_times = virtual_sim_.cfg().prefill_profile_times;
-    return sample_controller_actions_gv2(tmp, scfg, std::max(0, tmp.stats.decode_credit_balance));
+    return sample_controller_actions_gv2(
+        *sampled_state,
+        cfg_.controller_sampler,
+        std::max(0, sampled_state->stats.decode_credit_balance),
+        compact_valid_only,
+        canonical_compact_only);
+}
+
+SampledActionSet<RolloutControllerAction>
+GV2VirtualEnvironment::sample_controller_rollout_actions(
+    const SimState& state) const {
+    const SimState* sampled_state = &state;
+    SimState initialized_state;
+    if (state.stats.next_adv_tick < 0.0 || state.stats.last_adv_tick < -1.0) {
+        initialized_state = state;
+        init_clock_if_needed(initialized_state);
+        sampled_state = &initialized_state;
+    }
+    if (sampled_state->stats.next_adv_tick <=
+        sampled_state->sim_time + cfg_.eps) {
+        SampledActionSet<RolloutControllerAction> out;
+        RolloutControllerAction noop;
+        noop.token_budget = 0;
+        noop.mapping = {0, 0, 0};
+        noop.has_mapping = true;
+        noop.valid = true;
+        out.actions.push_back(std::move(noop));
+        out.mask.push_back(1u);
+        out.original_indices.push_back(0);
+        return out;
+    }
+    return sample_controller_rollout_actions_gv2(
+        *sampled_state,
+        cfg_.controller_sampler,
+        std::max(0, sampled_state->stats.decode_credit_balance));
 }
 
 double GV2VirtualEnvironment::round_time(double t) const {
@@ -363,13 +438,26 @@ double GV2VirtualEnvironment::next_adv_tick(double sim_time, double tick_sec, do
 }
 
 RequestState* GV2VirtualEnvironment::find_request(SimState& s, int request_id) {
+    if (request_id >= 0 &&
+        request_id < static_cast<int>(s.requests.size())) {
+        auto& direct = s.requests[static_cast<std::size_t>(request_id)];
+        if (direct.request_id == request_id) return &direct;
+    }
     for (auto& r : s.requests) {
         if (r.request_id == request_id) return &r;
     }
     return nullptr;
 }
 
-const RequestState* GV2VirtualEnvironment::find_request_const(const SimState& s, int request_id) {
+const RequestState* GV2VirtualEnvironment::find_request_const(
+    const SimState& s,
+    int request_id) {
+    if (request_id >= 0 &&
+        request_id < static_cast<int>(s.requests.size())) {
+        const auto& direct =
+            s.requests[static_cast<std::size_t>(request_id)];
+        if (direct.request_id == request_id) return &direct;
+    }
     for (const auto& r : s.requests) {
         if (r.request_id == request_id) return &r;
     }
@@ -615,16 +703,19 @@ void GV2VirtualEnvironment::apply_batch_progress(
     DecodeCreditLedger* ledger) const {
     auto& stats = state.stats;
 
-    for (int rid : plan.request_ids) {
+    for (std::size_t request_index = 0;
+         request_index < plan.request_ids.size();
+         ++request_index) {
+        const int rid = plan.request_ids[request_index];
         RequestState* req = find_request(state, rid);
         if (req == nullptr || req->feature_only || req->completed) continue;
 
         const bool prefill_complete_before = req->prefill_done();
 
-        const int pre_add_req = [&]() {
-            const auto it = plan.prefill_alloc.find(rid);
-            return (it == plan.prefill_alloc.end()) ? 0 : std::max(0, it->second);
-        }();
+        const int pre_add_req =
+            request_index < plan.prefill_tokens.size()
+                ? std::max(0, plan.prefill_tokens[request_index])
+                : 0;
         if (pre_add_req > 0 && !req->prefill_done()) {
             const int applied = std::min(pre_add_req, req->remaining_prefill());
             if (applied > 0) {
@@ -647,10 +738,10 @@ void GV2VirtualEnvironment::apply_batch_progress(
                 std::max(0, cfg_.decode_credit_mint_per_prefill_complete));
         }
 
-        const int dec_add_req = [&]() {
-            const auto it = plan.decode_alloc.find(rid);
-            return (it == plan.decode_alloc.end()) ? 0 : std::max(0, it->second);
-        }();
+        const int dec_add_req =
+            request_index < plan.decode_tokens.size()
+                ? std::max(0, plan.decode_tokens[request_index])
+                : 0;
 
         if (dec_add_req > 0 && req->prefill_done() && !req->completed) {
             const int capped = std::min(dec_add_req, req->remaining_decode());
@@ -702,9 +793,15 @@ void GV2VirtualEnvironment::refresh_request_and_stats_post_step(
     auto& stats = state.stats;
     const double sim_time = state.sim_time;
 
-    std::unordered_set<int> finalized_prefill(
-        stats.prefill_lateness_finalized_ids.begin(),
-        stats.prefill_lateness_finalized_ids.end());
+    auto& finalized_prefill = stats.prefill_lateness_finalized_ids;
+    if (!std::is_sorted(finalized_prefill.begin(), finalized_prefill.end())) {
+        std::sort(finalized_prefill.begin(), finalized_prefill.end());
+    }
+    const auto finalized_unique_end =
+        std::unique(finalized_prefill.begin(), finalized_prefill.end());
+    if (finalized_unique_end != finalized_prefill.end()) {
+        finalized_prefill.erase(finalized_unique_end, finalized_prefill.end());
+    }
 
     for (auto& req : state.requests) {
         if (req.feature_only) continue;
@@ -713,7 +810,10 @@ void GV2VirtualEnvironment::refresh_request_and_stats_post_step(
         if (!req.completed) {
             if (req.prefill_slo_time >= 0.0) {
                 req.prefill_deadline = req.arrived_at + req.prefill_slo_time;
-                if (finalized_prefill.find(rid) == finalized_prefill.end()) {
+                if (!std::binary_search(
+                        finalized_prefill.begin(),
+                        finalized_prefill.end(),
+                        rid)) {
                     const double actual = (req.prefill_done() && req.prefill_completed_at >= 0.0)
                         ? req.prefill_completed_at
                         : sim_time;
@@ -728,7 +828,7 @@ void GV2VirtualEnvironment::refresh_request_and_stats_post_step(
                     }
                     req.prefill_lateness = std::max(prev, prefill_late);
                     if (req.prefill_done()) {
-                        finalized_prefill.insert(rid);
+                        add_sorted_unique(&finalized_prefill, rid);
                     }
                 } else {
                     const auto it = stats.per_request_prefill_lateness_by_id.find(rid);
@@ -782,9 +882,6 @@ void GV2VirtualEnvironment::refresh_request_and_stats_post_step(
             }
         }
     }
-
-    stats.prefill_lateness_finalized_ids.assign(finalized_prefill.begin(), finalized_prefill.end());
-    std::sort(stats.prefill_lateness_finalized_ids.begin(), stats.prefill_lateness_finalized_ids.end());
 
     finalize_decodes_to_credit_budget(state, ledger);
 
@@ -847,13 +944,11 @@ bool GV2VirtualEnvironment::maybe_fast_forward_decode_only_to_next_adv_tick(
 
         ControllerAction decode_action;
         decode_action.token_budget = static_cast<int>(decode_ids.size());
-        decode_action.selected_request_ids = decode_ids;
+        decode_action.compact_decode_request_ids.assign(
+            decode_ids.begin(), decode_ids.end());
+        decode_action.compact_allocations = true;
         decode_action.strategy = "GV2|decode_only_ff";
         decode_action.valid = true;
-        for (int rid : decode_ids) {
-            decode_action.token_allocations[rid] = 1;
-            decode_action.decode_allocations[rid] = 1;
-        }
 
         const int decode_credit_limit = cfg_.enforce_nonnegative_decode_credits
             ? ((ledger != nullptr)
@@ -889,7 +984,13 @@ void GV2VirtualEnvironment::apply_adversary_action_inplace(SimState& state, cons
     const double tick = current_adv_tick(state);
 
     const bool is_pre_tick = (time_now + cfg_.eps) < tick;
-    const bool strict_noop = action.requests.empty() && action.stop_decode_ids.empty();
+    const int compact_request_count = action.compact_requests
+        ? std::max(0, action.compact_request_count)
+        : 0;
+    const bool strict_noop =
+        compact_request_count == 0 &&
+        action.requests.empty() &&
+        action.stop_decode_ids.empty();
 
     if (strict_noop && is_pre_tick) {
         state.stats.decode_credit_available = cfg_.enforce_nonnegative_decode_credits
@@ -913,10 +1014,16 @@ void GV2VirtualEnvironment::apply_adversary_action_inplace(SimState& state, cons
     const int req_cap = std::max(0, cfg_.max_requests_per_launch_window);
     const int prefill_cap = std::max(0, cfg_.prefill_window_cap_tokens);
 
-    const int requested_count = static_cast<int>(action.requests.size());
-    int requested_prefill = 0;
-    for (const auto& spec : action.requests) {
-        requested_prefill += std::max(0, spec.prefill_tokens);
+    const int requested_count = action.compact_requests
+        ? compact_request_count
+        : static_cast<int>(action.requests.size());
+    int requested_prefill = action.compact_requests
+        ? requested_count * std::max(0, action.compact_prefill_tokens)
+        : 0;
+    if (!action.compact_requests) {
+        for (const auto& spec : action.requests) {
+            requested_prefill += std::max(0, spec.prefill_tokens);
+        }
     }
 
     const bool can_send =
@@ -929,17 +1036,23 @@ void GV2VirtualEnvironment::apply_adversary_action_inplace(SimState& state, cons
 
     if (can_send) {
         const double arrival_time = tick;
-        for (const auto& spec : action.requests) {
+        const auto append_request = [&](
+            int prefill_tokens,
+            int decode_tokens,
+            double prefill_slo,
+            double decode_slo) {
             RequestState r;
             r.request_id = state.next_request_id++;
             r.arrived_at = arrival_time;
             r.queued_at = arrival_time;
-            r.num_prefill_tokens = std::max(1, std::min(int(spec.prefill_tokens), cfg_.max_prefill_tokens_per_request));
+            r.num_prefill_tokens = std::max(
+                1,
+                std::min(prefill_tokens, cfg_.max_prefill_tokens_per_request));
             r.num_decode_tokens = std::max(
                 cfg_.min_decode_tokens_per_request,
-                std::min(int(spec.decode_tokens), cfg_.max_decode_tokens_per_request));
-            r.prefill_slo_time = std::max(0.0, spec.prefill_slo);
-            r.decode_slo_time = std::max(0.0, spec.decode_slo);
+                std::min(decode_tokens, cfg_.max_decode_tokens_per_request));
+            r.prefill_slo_time = std::max(0.0, prefill_slo);
+            r.decode_slo_time = std::max(0.0, decode_slo);
             r.prefill_deadline = arrival_time + r.prefill_slo_time;
             r.decode_next_deadline = -1.0;
             r.prefill_completed_at = -1.0;
@@ -952,6 +1065,23 @@ void GV2VirtualEnvironment::apply_adversary_action_inplace(SimState& state, cons
             state.stats.requests_generated += 1;
             created_count += 1;
             created_prefill_total += r.num_prefill_tokens;
+        };
+        if (action.compact_requests) {
+            for (int index = 0; index < requested_count; ++index) {
+                append_request(
+                    action.compact_prefill_tokens,
+                    action.compact_decode_tokens,
+                    action.compact_prefill_slo,
+                    action.compact_decode_slo);
+            }
+        } else {
+            for (const auto& spec : action.requests) {
+                append_request(
+                    spec.prefill_tokens,
+                    spec.decode_tokens,
+                    spec.prefill_slo,
+                    spec.decode_slo);
+            }
         }
 
         append_launch_event(state, arrival_time, created_count, created_prefill_total);
@@ -1004,8 +1134,7 @@ void GV2VirtualEnvironment::apply_controller_action_inplace(
     state.stats.transition_discount_time = state.sim_time;
     state.stats.transition_final_time = state.sim_time;
 
-    DecodeCreditLedger ledger(state.stats.decode_credit_balance);
-    ledger.load_from_stats(state.stats);
+    DecodeCreditLedger ledger(&state.stats);
 
     if (has_pending_adv_tick(state)) {
         refresh_request_and_stats_post_step(state, &ledger);
@@ -1094,12 +1223,20 @@ void GV2VirtualEnvironment::rebuild_active_completed_ids(SimState& s) {
     s.stats.stopped_decode_request_ids.clear();
     s.stats.violated_request_ids.clear();
 
+    bool request_ids_strictly_increasing = true;
+    int previous_request_id = std::numeric_limits<int>::min();
     for (const auto& r : s.requests) {
         if (r.feature_only) continue;
+        if (r.request_id <= previous_request_id) {
+            request_ids_strictly_increasing = false;
+        }
+        previous_request_id = r.request_id;
         if (r.completed) {
             s.stats.completed_request_ids.push_back(r.request_id);
             if (r.dropped) s.stats.dropped_request_ids.push_back(r.request_id);
-            if (r.stopped_decode) s.stats.stopped_decode_request_ids.push_back(r.request_id);
+            if (r.stopped_decode) {
+                s.stats.stopped_decode_request_ids.push_back(r.request_id);
+            }
             if (r.violated) s.stats.violated_request_ids.push_back(r.request_id);
         } else if (r.prefill_active() || r.decode_active()) {
             s.stats.active_request_ids.push_back(r.request_id);
@@ -1107,33 +1244,24 @@ void GV2VirtualEnvironment::rebuild_active_completed_ids(SimState& s) {
         }
     }
 
-    std::sort(s.stats.active_request_ids.begin(), s.stats.active_request_ids.end());
-    s.stats.active_request_ids.erase(
-        std::unique(s.stats.active_request_ids.begin(), s.stats.active_request_ids.end()),
-        s.stats.active_request_ids.end());
+    if (!request_ids_strictly_increasing) {
+        const auto sort_unique = [](std::vector<int>* values) {
+            std::sort(values->begin(), values->end());
+            values->erase(
+                std::unique(values->begin(), values->end()),
+                values->end());
+        };
+        sort_unique(&s.stats.active_request_ids);
+        sort_unique(&s.stats.completed_request_ids);
+        sort_unique(&s.stats.dropped_request_ids);
+        sort_unique(&s.stats.stopped_decode_request_ids);
+        sort_unique(&s.stats.violated_request_ids);
+    }
 
-    std::sort(s.stats.completed_request_ids.begin(), s.stats.completed_request_ids.end());
-    s.stats.completed_request_ids.erase(
-        std::unique(s.stats.completed_request_ids.begin(), s.stats.completed_request_ids.end()),
-        s.stats.completed_request_ids.end());
-
-    std::sort(s.stats.dropped_request_ids.begin(), s.stats.dropped_request_ids.end());
-    s.stats.dropped_request_ids.erase(
-        std::unique(s.stats.dropped_request_ids.begin(), s.stats.dropped_request_ids.end()),
-        s.stats.dropped_request_ids.end());
-
-    std::sort(s.stats.stopped_decode_request_ids.begin(), s.stats.stopped_decode_request_ids.end());
-    s.stats.stopped_decode_request_ids.erase(
-        std::unique(s.stats.stopped_decode_request_ids.begin(), s.stats.stopped_decode_request_ids.end()),
-        s.stats.stopped_decode_request_ids.end());
-
-    std::sort(s.stats.violated_request_ids.begin(), s.stats.violated_request_ids.end());
-    s.stats.violated_request_ids.erase(
-        std::unique(s.stats.violated_request_ids.begin(), s.stats.violated_request_ids.end()),
-        s.stats.violated_request_ids.end());
-
-    if (s.stats.requests_completed < static_cast<int>(s.stats.completed_request_ids.size())) {
-        s.stats.requests_completed = static_cast<int>(s.stats.completed_request_ids.size());
+    if (s.stats.requests_completed <
+        static_cast<int>(s.stats.completed_request_ids.size())) {
+        s.stats.requests_completed =
+            static_cast<int>(s.stats.completed_request_ids.size());
     }
 }
 

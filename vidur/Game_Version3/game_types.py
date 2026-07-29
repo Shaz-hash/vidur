@@ -28,3 +28,4 @@ class ControllerAction:
     heuristic: Optional[str] = None
     strategy: Optional[str] = None
     mapping: Optional[Tuple[int, ...]] = None
+    _evicted_request_ids: List[int] = field(default_factory=list, repr=False)

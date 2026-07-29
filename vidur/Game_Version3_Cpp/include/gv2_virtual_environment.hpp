@@ -52,8 +52,15 @@ public:
 
     SampledActionSet<AdversaryAction> sample_adversary_actions(
         const SimState& state,
-        const std::unordered_set<int>& forbidden_stop_ids = {}) const;
-    SampledActionSet<ControllerAction> sample_controller_actions(const SimState& state) const;
+        const std::unordered_set<int>& forbidden_stop_ids = {},
+        bool compact_valid_only = false,
+        bool compact_request_materialization = false) const;
+    SampledActionSet<ControllerAction> sample_controller_actions(
+        const SimState& state,
+        bool compact_valid_only = false,
+        bool canonical_compact_only = false) const;
+    SampledActionSet<RolloutControllerAction> sample_controller_rollout_actions(
+        const SimState& state) const;
 
     void apply_adversary_action_inplace(SimState& state, const AdversaryAction& action) const;
     void apply_controller_action_inplace(
@@ -67,6 +74,7 @@ private:
     GV2EnvConfig cfg_;
     mutable VirtualSimulatorGV2 virtual_sim_;
 
+    void refresh_sampler_configs();
     double round_time(double t) const;
     double quantize_down(double t) const;
     void init_clock_if_needed(SimState& state) const;
