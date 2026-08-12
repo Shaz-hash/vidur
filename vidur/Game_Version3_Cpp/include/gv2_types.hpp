@@ -404,6 +404,22 @@ struct RolloutTraceStep {
     std::string step_action_category;
 };
 
+struct RootPuctTraceStep {
+    // Zero is the pre-search baseline; positive values are completed simulations.
+    int sim_iteration = 0;
+    int action_index = -1;
+    bool visited = false;
+    int visits = 0;
+    double q_value = 0.0;
+    double normalized_q = 0.5;
+    double prior = 0.0;
+    double exploration_raw = 0.0;
+    double exploration_weighted = 0.0;
+    double puct_score = 0.0;
+    double parent_min_value = 0.0;
+    double parent_max_value = 0.0;
+};
+
 struct SearchOutput {
     std::string contract_version = kGV2NativeContractVersion;
     double decision_state_time = 0.0;
@@ -427,6 +443,7 @@ struct SearchOutput {
     std::vector<double> mcts_root_prior;
     std::vector<IterEvent> iter_events;
     std::vector<RolloutTraceStep> rollout_trace_steps;
+    std::vector<RootPuctTraceStep> root_puct_trace_steps;
 
     std::unordered_map<std::string, double> perf;
 

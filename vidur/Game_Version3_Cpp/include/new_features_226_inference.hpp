@@ -94,6 +94,14 @@ public:
         int num_rows,
         const std::vector<int>& group_offsets,
         int parallel_threads) const;
+    std::vector<double> predict_markov_policy_grouped_batch(
+        const std::vector<MarkovValueFeatures>& states,
+        const std::vector<float>& flat_actions,
+        int num_rows,
+        const std::vector<int>& group_offsets,
+        int parallel_threads) const;
+    bool is_markov_policy() const;
+    int action_dim() const;
 
     int feature_dim() const;
     int num_trees() const;

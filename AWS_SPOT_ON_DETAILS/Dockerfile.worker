@@ -1,0 +1,123 @@
+# syntax=docker/dockerfile:1.7
+
+ARG PYTHON_VERSION=3.12.13
+
+FROM python:${PYTHON_VERSION}-slim-bookworm AS builder
+
+ARG TARGETARCH
+ARG VIDUR_GIT_SHA=unknown
+ARG NATIVE_BUILD_JOBS=8
+
+ENV APP_HOME=/home/ubuntu/vidur-classical-search \
+    VIRTUAL_ENV=/home/ubuntu/vidur-classical-search/.venv \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        cmake \
+        git \
+        libopenblas-dev \
+        ninja-build \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python -m venv "${VIRTUAL_ENV}" \
+    && python -m pip install --upgrade pip==25.1.1 setuptools==80.9.0 wheel==0.45.1
+
+COPY requirements-worker.txt /tmp/requirements-worker.txt
+
+# PyPI's aarch64 Torch wheel is CPU-only. On x86_64, use the official CPU
+# index to avoid embedding several gigabytes of unused CUDA libraries.
+RUN set -eux; \
+    arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
+    if [ "${arch}" = "amd64" ]; then \
+        python -m pip install --index-url https://download.pytorch.org/whl/cpu torch==2.9.1; \
+    else \
+        python -m pip install torch==2.9.1; \
+    fi; \
+    python -m pip install -r /tmp/requirements-worker.txt
+
+WORKDIR ${APP_HOME}
+COPY repo/ ${APP_HOME}/
+COPY execution_cache/ ${APP_HOME}/cache/
+COPY runtime_profiles/prefill_profile.csv ${APP_HOME}/simulator_output/prefill_profile.csv
+COPY runtime_profiles/decode_profile.csv ${APP_HOME}/simulator_output/decode_profile.csv
+
+# Cross-architecture builds must not use the emulator host's -march=native.
+# armv8.2-a runs on Graviton 2/3/4; x86-64-v3 covers current compute families.
+RUN set -eux; \
+    arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
+    if [ "${arch}" = "arm64" ]; then native_arch="-march=armv8.2-a"; \
+    elif [ "${arch}" = "amd64" ]; then native_arch="-march=x86-64-v3"; \
+    else echo "unsupported target architecture: ${arch}" >&2; exit 2; fi; \
+    sed -i "s/-march=native/${native_arch}/g" vidur/Game_Version3_Cpp/CMakeLists.txt; \
+    cmake -S vidur/Game_Version3_Cpp \
+        -B vidur/Game_Version3_Cpp/build_container \
+        -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DPython_EXECUTABLE="${VIRTUAL_ENV}/bin/python" \
+        -Dpybind11_DIR="$(python -m pybind11 --cmakedir)"; \
+    cmake --build vidur/Game_Version3_Cpp/build_container \
+        --parallel "${NATIVE_BUILD_JOBS}"; \
+    test -n "$(find vidur/Game_Version3_Cpp -maxdepth 1 -name 'mcts_native_gv2*.so' -print -quit)"
+
+COPY container_smoke.py /usr/local/bin/agz-container-smoke
+RUN chmod 0755 /usr/local/bin/agz-container-smoke \
+    && PYTHONPATH="${APP_HOME}" AGZ_IMAGE_GIT_SHA="${VIDUR_GIT_SHA}" /usr/local/bin/agz-container-smoke --build-check
+
+FROM python:${PYTHON_VERSION}-slim-bookworm AS runtime
+
+ARG VIDUR_GIT_SHA=unknown
+ARG BUILD_DATE=unknown
+
+LABEL org.opencontainers.image.title="Vidur AlphaGoZero EXP3 worker" \
+      org.opencontainers.image.description="Native GV3 AlphaGoZero self-play and evaluation worker" \
+      org.opencontainers.image.revision="${VIDUR_GIT_SHA}" \
+      org.opencontainers.image.created="${BUILD_DATE}"
+
+ENV APP_HOME=/home/ubuntu/vidur-classical-search \
+    VIRTUAL_ENV=/home/ubuntu/vidur-classical-search/.venv \
+    HOME=/home/ubuntu \
+    AGZ_IMAGE_GIT_SHA=${VIDUR_GIT_SHA} \
+    OMP_NUM_THREADS=1 \
+    OPENBLAS_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    NUMEXPR_NUM_THREADS=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}" \
+    PYTHONPATH="${APP_HOME}" \
+    LD_LIBRARY_PATH="${VIRTUAL_ENV}/lib/python3.12/site-packages/torch/lib:${VIRTUAL_ENV}/lib/python3.12/site-packages/numpy.libs"
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        libgfortran5 \
+        libgomp1 \
+        libopenblas0-pthread \
+        openssh-client \
+        procps \
+        rsync \
+        tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 1000 ubuntu \
+    && useradd --uid 1000 --gid 1000 --create-home --shell /bin/bash ubuntu
+
+COPY --from=builder --chown=ubuntu:ubuntu /home/ubuntu/vidur-classical-search /home/ubuntu/vidur-classical-search
+COPY --from=builder /usr/local/bin/agz-container-smoke /usr/local/bin/agz-container-smoke
+COPY worker_entrypoint.sh /usr/local/bin/agz-worker-entrypoint
+RUN chmod 0755 /usr/local/bin/agz-worker-entrypoint /usr/local/bin/agz-container-smoke \
+    && mkdir -p /home/ubuntu/.ssh \
+    && chown -R ubuntu:ubuntu /home/ubuntu/.ssh
+
+WORKDIR ${APP_HOME}
+USER ubuntu
+ENTRYPOINT ["tini", "--", "/usr/local/bin/agz-worker-entrypoint"]
+CMD ["smoke"]

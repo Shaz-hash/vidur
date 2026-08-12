@@ -1,0 +1,8 @@
+build_context/
+resource_aware_context/
+artifacts/
+*.tar
+*.tar.gz
+*.oci
+*.orig
+image_metadata.local.json

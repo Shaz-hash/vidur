@@ -129,6 +129,7 @@ def _build_constraints_and_explore(cfg: "AlphaZeroConfig") -> tuple[MCTSConstrai
     setattr(explore_cfg, "prior_value_mode", str(search.prior_value_mode))
     setattr(explore_cfg, "root_dirichlet_noise_enabled", bool(search.root_dirichlet_noise_enabled))
     setattr(explore_cfg, "root_dirichlet_alpha", float(search.root_dirichlet_alpha))
+    setattr(explore_cfg, "root_dirichlet_total_concentration", float(search.root_dirichlet_total_concentration))
     setattr(explore_cfg, "root_dirichlet_epsilon", float(search.root_dirichlet_epsilon))
 
     setattr(explore_cfg, "discount_factor", float(search.discount_factor))

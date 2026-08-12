@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from vidur.AlphaGoZero.adaptive_rollout import active_rollout_horizon_sec
 from vidur.AlphaGoZero.config import Phase1SmokeConfig, REPO_ROOT
 from vidur.AlphaGoZero.replay_runtime import AlphaGoZeroReplayRecorder
 from vidur.AlphaGoZero.durable_transfer import (
@@ -55,6 +56,7 @@ MODEL_COMM_FIELDS = [
     "states_generated_by_model_version_current_buffer",
 ]
 NATIVE_GAME_ID_MAX = 2_147_483_647
+_UPLOAD_READY_LOCK = threading.Lock()
 
 
 @dataclass
@@ -257,6 +259,15 @@ def _select_parent_args(args: argparse.Namespace, rng: random.Random, used: set[
     ]
 
 
+
+def _rollout_horizon_sec_for_game(args: argparse.Namespace) -> float:
+    # Spot assignments are complete, fingerprint-verified controller configs.
+    # Fixed workers instead receive the adaptive runtime file in their root.
+    if str(getattr(args, "assignment_config_sha256", "")):
+        return float(args.rollout_horizon_sec)
+    return float(active_rollout_horizon_sec(Path(args.output_root)))
+
+
 def _build_game_command(
     args: argparse.Namespace,
     *,
@@ -265,6 +276,7 @@ def _build_game_command(
     used_parent_ids: set[int],
     rng: random.Random,
 ) -> tuple[list[str], Path, CurrentModelPaths]:
+    rollout_horizon_sec = _rollout_horizon_sec_for_game(args)
     model_paths = _current_model_paths(args)
     replay_csv = out_dir / "replay_target_runtime.csv"
     cmd = [
@@ -293,6 +305,7 @@ def _build_game_command(
         "--prior-min-prob", str(float(args.prior_min_prob)),
         "--root-dirichlet-noise-enabled" if bool(args.root_dirichlet_noise_enabled) else "--no-root-dirichlet-noise-enabled",
         "--root-dirichlet-alpha", str(float(args.root_dirichlet_alpha)),
+        "--root-dirichlet-total-concentration", str(float(args.root_dirichlet_total_concentration)),
         "--root-dirichlet-epsilon", str(float(args.root_dirichlet_epsilon)),
         "--agz-sample-initial-moves" if bool(args.agz_sample_initial_moves) else "--no-agz-sample-initial-moves",
         "--agz-sample-initial-move-count", str(int(args.agz_sample_initial_move_count)),
@@ -306,7 +319,7 @@ def _build_game_command(
         "--native-search-mode", str(args.native_search_mode),
         "--rollout-count", str(int(args.rollout_count)),
         "--rollout-parallel-threads", str(int(args.rollout_parallel_threads)),
-        "--rollout-horizon-sec", str(float(args.rollout_horizon_sec)),
+        "--rollout-horizon-sec", str(float(rollout_horizon_sec)),
         "--rollout-policy-temperature", str(float(args.rollout_policy_temperature)),
         "--rollout-probability-quantum", str(float(args.rollout_probability_quantum)),
         "--rollout-max-actions", str(int(args.rollout_max_actions)),
@@ -412,7 +425,10 @@ def _merge_game_into_active(
         "mcts_iterations": int(args.iterations),
         "puct_c": float(args.puct_c),
         "root_dirichlet_alpha": float(args.root_dirichlet_alpha),
+        "root_dirichlet_total_concentration": float(args.root_dirichlet_total_concentration),
         "root_dirichlet_epsilon": float(args.root_dirichlet_epsilon),
+        "assignment_id": str(getattr(args, "assignment_id", "")),
+        "selfplay_config_sha256": str(getattr(args, "assignment_config_sha256", "")),
         "game_output_dir": str(game_out),
         "replay_rows": int(added),
         "model_version": int(model_version),
@@ -527,10 +543,13 @@ def _freeze_if_needed(args: argparse.Namespace, st: WorkerState, *, force: bool 
             "puct_c": float(args.puct_c),
             "root_dirichlet_noise_enabled": bool(args.root_dirichlet_noise_enabled),
             "root_dirichlet_alpha": float(args.root_dirichlet_alpha),
+            "root_dirichlet_total_concentration": float(args.root_dirichlet_total_concentration),
             "root_dirichlet_epsilon": float(args.root_dirichlet_epsilon),
             "agz_sample_initial_moves": bool(args.agz_sample_initial_moves),
             "agz_sample_initial_move_count": int(args.agz_sample_initial_move_count),
             "agz_mcts_action_temperature": float(args.agz_mcts_action_temperature),
+            "assignment_id": str(getattr(args, "assignment_id", "")),
+            "selfplay_config_sha256": str(getattr(args, "assignment_config_sha256", "")),
         },
     )
     st.shard_index += 1
@@ -552,7 +571,7 @@ def _ready_shards_in_upload_order(
     return sorted((path for path in Path(ready).iterdir() if path.is_dir()), key=lambda path: path.name)
 
 
-def _upload_ready_shards(args: argparse.Namespace) -> None:
+def _upload_ready_shards_serial(args: argparse.Namespace) -> None:
     ready = Path(args.output_root) / "ready"
     if not ready.exists():
         return
@@ -570,6 +589,11 @@ def _upload_ready_shards(args: argparse.Namespace) -> None:
             shutil.rmtree(shard)
 
 
+def _upload_ready_shards(args: argparse.Namespace) -> None:
+    with _UPLOAD_READY_LOCK:
+        _upload_ready_shards_serial(args)
+
+
 def _uploader_loop(args: argparse.Namespace, stop_event: threading.Event) -> None:
     while not stop_event.is_set():
         try:
@@ -584,7 +608,11 @@ def _uploader_loop(args: argparse.Namespace, stop_event: threading.Event) -> Non
         stop_event.wait(float(args.upload_poll_sec))
 
 
-def run_worker(args: argparse.Namespace) -> None:
+def run_worker(
+    args: argparse.Namespace,
+    *,
+    preempt_event: threading.Event | None = None,
+) -> bool:
     root = Path(args.output_root)
     root.mkdir(parents=True, exist_ok=True)
     _validate_runtime_compatibility(args)
@@ -599,6 +627,7 @@ def run_worker(args: argparse.Namespace) -> None:
 
     uploader_stop = threading.Event()
     uploader_thread: threading.Thread | None = None
+    preempted = False
     if bool(args.upload_after_game):
         uploader_thread = threading.Thread(target=_uploader_loop, args=(args, uploader_stop), daemon=True)
         uploader_thread.start()
@@ -607,7 +636,11 @@ def run_worker(args: argparse.Namespace) -> None:
         while True:
             if _pause_selfplay_if_requested(args, running):
                 continue
-            can_launch_more = int(args.max_games) <= 0 or launched < int(args.max_games)
+            stop_requested = preempt_event is not None and preempt_event.is_set()
+            can_launch_more = (
+                not stop_requested
+                and (int(args.max_games) <= 0 or launched < int(args.max_games))
+            )
             while can_launch_more and len(running) < max(1, int(args.parallel_games)):
                 if _eval_pause_requested(root):
                     break
@@ -626,8 +659,20 @@ def run_worker(args: argparse.Namespace) -> None:
                 game_out = root / "runs" / f"game_{game_id}"
                 running.append(_launch_one_game(args, game_id=game_id, out_dir=game_out, used_parent_ids=used_parent_ids, rng=rng))
                 launched += 1
-                can_launch_more = int(args.max_games) <= 0 or launched < int(args.max_games)
+                can_launch_more = (
+                    (preempt_event is None or not preempt_event.is_set())
+                    and (
+                        int(args.max_games) <= 0
+                        or launched < int(args.max_games)
+                    )
+                )
 
+            if preempt_event is not None and preempt_event.is_set() and not running:
+                preempted = True
+                _freeze_if_needed(args, st, force=True)
+                if bool(args.upload_after_game):
+                    _upload_ready_shards(args)
+                break
             if not running and not can_launch_more:
                 break
 
@@ -687,14 +732,19 @@ def run_worker(args: argparse.Namespace) -> None:
             elif not completed_any:
                 time.sleep(float(args.poll_sec))
 
+            if preempt_event is not None and preempt_event.is_set():
+                preempted = True
+                _freeze_if_needed(args, st, force=True)
+                if bool(args.upload_after_game):
+                    _upload_ready_shards(args)
+                break
+
         if bool(args.flush_at_end):
             _freeze_if_needed(args, st, force=True)
         if bool(args.upload_after_game):
             _upload_ready_shards(args)
+        return preempted
     finally:
-        uploader_stop.set()
-        if uploader_thread is not None:
-            uploader_thread.join(timeout=10.0)
         for game in running:
             if game.proc.poll() is None:
                 game.proc.terminate()
@@ -703,9 +753,12 @@ def run_worker(args: argparse.Namespace) -> None:
                 except subprocess.TimeoutExpired:
                     game.proc.kill()
             _cleanup_game_output(args, game.out_dir)
+        uploader_stop.set()
+        if uploader_thread is not None:
+            uploader_thread.join(timeout=10.0)
 
 
-def parse_args() -> argparse.Namespace:
+def build_parser() -> argparse.ArgumentParser:
     cfg = Phase1SmokeConfig()
     p = argparse.ArgumentParser(description="Run AlphaGoZero worker self-play generation.")
     p.add_argument("--worker-id", required=True)
@@ -737,6 +790,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--prior-min-prob", type=float, default=1e-8)
     p.add_argument("--root-dirichlet-noise-enabled", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--root-dirichlet-alpha", type=float, default=cfg.root_dirichlet_alpha)
+    p.add_argument(
+        "--root-dirichlet-total-concentration",
+        type=float,
+        default=cfg.root_dirichlet_total_concentration,
+    )
     p.add_argument("--root-dirichlet-epsilon", type=float, default=cfg.root_dirichlet_epsilon)
     p.add_argument("--agz-sample-initial-moves", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--agz-sample-initial-move-count", type=int, default=cfg.agz_sample_initial_move_count)
@@ -762,7 +820,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-consecutive-game-errors", type=int, default=120)
     p.add_argument("--game-error-backoff-sec", type=float, default=30.0)
     p.add_argument("--keep-game-runs", action=argparse.BooleanOptionalAction, default=False)
-    return p.parse_args()
+    return p
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    return build_parser().parse_args(argv)
 
 
 def main() -> None:

@@ -1,0 +1,58 @@
+{
+  "AutoScalingGroupName": "vidur-agz-exp3-spot-workers-v1",
+  "MixedInstancesPolicy": {
+    "LaunchTemplate": {
+      "LaunchTemplateSpecification": {
+        "LaunchTemplateId": "lt-0497e8268243950c9",
+        "Version": "13"
+      },
+      "Overrides": [
+        { "InstanceType": "c7g.4xlarge", "WeightedCapacity": "16" },
+        { "InstanceType": "c7g.8xlarge", "WeightedCapacity": "32" },
+        { "InstanceType": "c7g.12xlarge", "WeightedCapacity": "48" },
+        { "InstanceType": "c7g.16xlarge", "WeightedCapacity": "64" },
+        { "InstanceType": "c8g.4xlarge", "WeightedCapacity": "16" },
+        { "InstanceType": "c8g.8xlarge", "WeightedCapacity": "32" },
+        { "InstanceType": "c8g.12xlarge", "WeightedCapacity": "48" },
+        { "InstanceType": "c8g.16xlarge", "WeightedCapacity": "64" },
+        { "InstanceType": "c8g.24xlarge", "WeightedCapacity": "96" },
+        { "InstanceType": "c7gn.4xlarge", "WeightedCapacity": "16" },
+        { "InstanceType": "c7gn.8xlarge", "WeightedCapacity": "32" },
+        { "InstanceType": "c7gn.12xlarge", "WeightedCapacity": "48" },
+        { "InstanceType": "c7gn.16xlarge", "WeightedCapacity": "64" }
+      ]
+    },
+    "InstancesDistribution": {
+      "OnDemandBaseCapacity": 0,
+      "OnDemandPercentageAboveBaseCapacity": 0,
+      "SpotAllocationStrategy": "price-capacity-optimized"
+    }
+  },
+  "MinSize": 0,
+  "MaxSize": 3000,
+  "DesiredCapacity": 0,
+  "DefaultCooldown": 60,
+  "VPCZoneIdentifier": "subnet-0c5f2813623306f4d,subnet-01f8d5a115b9efd7a,subnet-02803da48534bdec2,subnet-08a4f093123695a6b,subnet-0fa69164f1ea6ae88",
+  "HealthCheckType": "EC2",
+  "HealthCheckGracePeriod": 300,
+  "NewInstancesProtectedFromScaleIn": false,
+  "CapacityRebalance": true,
+  "DefaultInstanceWarmup": 300,
+  "Tags": [
+    {
+      "Key": "Name",
+      "Value": "vidur-agz-exp3-spot-worker",
+      "PropagateAtLaunch": true
+    },
+    {
+      "Key": "Experiment",
+      "Value": "AlphaGoZero-EXP3",
+      "PropagateAtLaunch": true
+    },
+    {
+      "Key": "ManagedBy",
+      "Value": "vidur-agz-autoscaling",
+      "PropagateAtLaunch": true
+    }
+  ]
+}

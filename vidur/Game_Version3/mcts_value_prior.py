@@ -14,6 +14,19 @@ from .launch_mcts_job import MCTSExploreConfig
 from .virtual_environment import VirtualVidurMCTSEnvironment
 from .logger.mcts_logger import MCTSCsvLogger
 
+def resolve_root_dirichlet_alpha(
+    fixed_alpha: float,
+    total_concentration: float,
+    canonical_action_count: int,
+) -> float:
+    """Resolve per-action alpha while preserving fixed-alpha compatibility."""
+    count = int(canonical_action_count)
+    total = float(total_concentration)
+    if total > 0.0 and count > 0:
+        return total / float(count)
+    return float(fixed_alpha)
+
+
 
 
 class MCTSConfig:
@@ -34,6 +47,7 @@ class MCTSConfig:
     # Optional root noise, AlphaZero-style. Keep off for evaluation.
     root_dirichlet_alpha: float = 0.0
     root_dirichlet_epsilon: float = 0.0
+    root_dirichlet_total_concentration: float = 0.0
 
     # Models. These should predict raw action scores/logits.
     controller_prior_model: Any = None
@@ -272,7 +286,11 @@ class VidurMCTS:
             return priors
 
         eps = float(getattr(self._mctsConfig, "root_dirichlet_epsilon", 0.0) or 0.0)
-        alpha = float(getattr(self._mctsConfig, "root_dirichlet_alpha", 0.0) or 0.0)
+        alpha = resolve_root_dirichlet_alpha(
+            float(getattr(self._mctsConfig, "root_dirichlet_alpha", 0.0) or 0.0),
+            float(getattr(self._mctsConfig, "root_dirichlet_total_concentration", 0.0) or 0.0),
+            len(priors),
+        )
         if eps <= 0.0 or alpha <= 0.0:
             return priors
 

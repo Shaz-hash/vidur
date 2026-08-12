@@ -55,11 +55,14 @@ EXP3_WORKERS = tuple(
     HostSpec(f"worker{index}", f"bellman-classical-exp3-worker-{index}", index)
     for index in range(1, 9)
 )
+SPOT_XL = HostSpec(worker_id="xl", host="localhost", ordinal=0, role="xl")
+SPOT_WORKERS: tuple[HostSpec, ...] = ()
 
 CLUSTERS = {
     "default": ClusterSpec("default", DEFAULT_XL, DEFAULT_WORKERS),
     "exp2": ClusterSpec("exp2", EXP2_XL, EXP2_WORKERS),
     "exp3": ClusterSpec("exp3", EXP3_XL, EXP3_WORKERS),
+    "spot": ClusterSpec("spot", SPOT_XL, SPOT_WORKERS),
 }
 
 

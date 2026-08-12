@@ -18,6 +18,7 @@ import numpy as np
 import torch
 
 from vidur.AlphaGoZero.dnn_models import (
+    MarkovPolicyRankDeepSet,
     MarkovValueDeepSet,
     PolicyRankMLP,
     ValueResidualMLP,
@@ -265,8 +266,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     value_types = (ValueResidualMLP, MarkovValueDeepSet)
     controller_value = _load(args.controller_value_model, value_types)
     adversary_value = _load(args.adversary_value_model, value_types)
-    controller_policy = _load(args.controller_policy_model, PolicyRankMLP)
-    adversary_policy = _load(args.adversary_policy_model, PolicyRankMLP)
+    policy_types = (PolicyRankMLP, MarkovPolicyRankDeepSet)
+    controller_policy = _load(args.controller_policy_model, policy_types)
+    adversary_policy = _load(args.adversary_policy_model, policy_types)
+    markov_policy = isinstance(controller_policy, MarkovPolicyRankDeepSet) or isinstance(
+        adversary_policy, MarkovPolicyRankDeepSet
+    )
+    if markov_policy and not bool(args.native_only):
+        raise ValueError(
+            "structured Markov policy MCTS parity currently requires --native-only; "
+            "direct Python/native policy and feature parity is checked separately"
+        )
 
     root_args = make_args(
         "agz_dnn_mcts_alignment",

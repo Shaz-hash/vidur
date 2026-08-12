@@ -33,6 +33,7 @@ def _agz_env_prefix() -> str:
     keys = (
         "AGZ_MODEL_FAMILY",
         "AGZ_VALUE_FEATURE_SCHEMA",
+        "AGZ_POLICY_FEATURE_SCHEMA",
         "AGZ_DNN_EPOCHS",
         "AGZ_DNN_VALUE_BATCH_SIZE",
         "AGZ_DNN_POLICY_ROOT_BATCH_SIZE",
@@ -43,10 +44,14 @@ def _agz_env_prefix() -> str:
         "AGZ_REMOTE_OUTPUT_ROOT",
         "AGZ_MCTS_ITERATIONS",
         "AGZ_EVAL_MCTS_ITERATIONS",
+        "AGZ_SELFPLAY_PUCT_C",
+        "AGZ_EVAL_PUCT_C",
+        "AGZ_SJF_PUCT_C",
         "AGZ_SELFPLAY_ARENA_TIME_LIMIT_SEC",
         "AGZ_REPLAY_SAMPLE_WINDOW_SEC",
         "AGZ_DISCOUNT_FACTOR",
         "AGZ_ROOT_DIRICHLET_ALPHA",
+        "AGZ_ROOT_DIRICHLET_TOTAL_CONCENTRATION",
         "AGZ_ROOT_DIRICHLET_EPSILON",
         "AGZ_PROMOTION_WIN_RATE_THRESHOLD",
         "AGZ_ROLE_PROMOTION_WIN_THRESHOLD",
@@ -100,6 +105,11 @@ def _agz_env_prefix() -> str:
         "AGZ_EVAL_ROLLOUT_PARALLEL_THREADS",
         "AGZ_SJF_ROLLOUT_PARALLEL_THREADS",
         "AGZ_ROLLOUT_HORIZON_SEC",
+        "AGZ_ADAPTIVE_ROLLOUT_HORIZON",
+        "AGZ_ROLLOUT_MAX_HORIZON_SEC",
+        "AGZ_ROLLOUT_VALUE_ERROR_THRESHOLD",
+        "AGZ_ROLLOUT_HORIZON_TICK_SEC",
+        "AGZ_ROLLOUT_REFERENCE_STEP_SEC",
         "AGZ_ROLLOUT_POLICY_TEMPERATURE",
         "AGZ_ROLLOUT_PROBABILITY_QUANTUM",
         "AGZ_ROLLOUT_MAX_ACTIONS",
@@ -216,11 +226,16 @@ def build_native(args: argparse.Namespace) -> None:
 def launch_xl_ingest(args: argparse.Namespace) -> None:
     remote_root = _remote_output_root(args)
     log = f"{remote_root}/xl_coordinator.log"
+    coordinator_cmd = (
+        f"{_agz_env_prefix()}{shlex.quote(REMOTE_PYTHON)} "
+        f"-m vidur.AlphaGoZero.xl_coordinator "
+        f"--output-root {shlex.quote(remote_root)} --loop --poll-sec {float(args.poll_sec)}"
+    )
     cmd = (
         f"mkdir -p {shlex.quote(remote_root)} && "
         f"cd {shlex.quote(REMOTE_REPO)} && "
-        f"nohup {_agz_env_prefix()}{shlex.quote(REMOTE_PYTHON)} -m vidur.AlphaGoZero.xl_coordinator --output-root {shlex.quote(remote_root)} --loop --poll-sec {float(args.poll_sec)} "
-        f"< /dev/null > {shlex.quote(log)} 2>&1 & echo $!"
+        f"setsid -f sh -c {shlex.quote(coordinator_cmd)} "
+        f"< /dev/null > {shlex.quote(log)} 2>&1 && echo launched"
     )
     print(_ssh(XL.host, cmd).stdout, end="")
 
@@ -393,7 +408,11 @@ def parse_args() -> argparse.Namespace:
     )
     p_large.add_argument("--game-id-start", type=int, default=20_000_000)
     p_large.add_argument("--max-games", type=int, default=0, help="0 means run forever")
-    p_large.add_argument("--parallel-games", type=int, default=60)
+    p_large.add_argument(
+        "--parallel-games",
+        type=int,
+        default=int(os.environ.get("AGZ_WORKER_PARALLEL_GAMES", "60")),
+    )
     p_large.add_argument("--buffer-threshold", type=int, default=10_000)
     p_large.add_argument("--upload-poll-sec", type=float, default=30.0)
     p_large.add_argument("--ack-timeout-sec", type=int, default=0)

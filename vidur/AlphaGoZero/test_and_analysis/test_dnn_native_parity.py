@@ -15,6 +15,7 @@ from vidur.AlphaGoZero.dnn_models import (
     ADVERSARY_ACTION_DIM,
     CONTROLLER_ACTION_DIM,
     VALUE_FEATURE_DIM,
+    MarkovPolicyRankDeepSet,
     MarkovValueDeepSet,
     PolicyRankMLP,
     ValueResidualMLP,
@@ -33,8 +34,10 @@ def _load_or_create(path: Path | None, model: torch.nn.Module) -> torch.nn.Modul
     if path is None:
         return model.eval()
     loaded = joblib.load(path)
-    if not isinstance(loaded, type(model)):
-        raise TypeError(f"{path} contains {type(loaded).__name__}, expected {type(model).__name__}")
+    if not isinstance(loaded, (PolicyRankMLP, MarkovPolicyRankDeepSet)):
+        raise TypeError(
+            f"{path} contains {type(loaded).__name__}, expected an AGZ policy DNN"
+        )
     return loaded.cpu().eval()
 
 
@@ -150,6 +153,50 @@ def _policy_parity(
     }
 
 
+def _markov_policy_parity(
+    native: object,
+    model: MarkovPolicyRankDeepSet,
+    actions: np.ndarray,
+    export_path: Path,
+) -> dict[str, float | int | str]:
+    from vidur.AlphaGoZero.test_and_analysis.test_markov_value_features import (
+        representative_state,
+        successor_states,
+    )
+
+    decode_only, with_prefill = successor_states()
+    payloads = [representative_state(), decode_only, with_prefill]
+    export_dnn_to_native(model, export_path, model_tag=f"parity_{model.role}_policy")
+    runtime = native.NativeHGBModelRuntime()
+    runtime.load_model_export(str(export_path))
+    python_rows: list[np.ndarray] = []
+    native_rows: list[np.ndarray] = []
+    for payload in payloads:
+        features = build_markov_value_features(payload)
+        python_rows.append(model.predict_root_structured(features, actions))
+        native_rows.append(
+            np.asarray(
+                runtime.predict_markov_policy_from_state(payload, actions.tolist()),
+                dtype=np.float32,
+            )
+        )
+    python_logits = np.concatenate(python_rows).astype(np.float64)
+    native_logits = np.concatenate(native_rows).astype(np.float64)
+    error = np.abs(python_logits - native_logits)
+    return {
+        "feature_schema": "markov_v2",
+        "rows": int(python_logits.size),
+        "single_max_abs_error": float(np.max(error)),
+        "batch_max_abs_error": float(np.max(error)),
+        "single_mean_abs_error": float(np.mean(error)),
+        "batch_mean_abs_error": float(np.mean(error)),
+        "python_top1": int(np.argmax(python_logits)),
+        "native_top1": int(np.argmax(native_logits)),
+        "python_top3": np.argsort(-python_logits, kind="stable")[:3].astype(int).tolist(),
+        "native_top3": np.argsort(-native_logits, kind="stable")[:3].astype(int).tolist(),
+    }
+
+
 def run(args: argparse.Namespace) -> dict[str, object]:
     torch.manual_seed(int(args.seed))
     rng = np.random.default_rng(int(args.seed))
@@ -174,8 +221,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         PolicyRankMLP(ADVERSARY_ACTION_DIM, role="adversary"),
     )
     assert isinstance(value, (ValueResidualMLP, MarkovValueDeepSet))
-    assert isinstance(controller, PolicyRankMLP)
-    assert isinstance(adversary, PolicyRankMLP)
+    assert isinstance(controller, (PolicyRankMLP, MarkovPolicyRankDeepSet))
+    assert isinstance(adversary, (PolicyRankMLP, MarkovPolicyRankDeepSet))
 
     value_features = rng.normal(0.0, 0.5, size=(int(args.rows), VALUE_FEATURE_DIM)).astype(np.float32)
     shared_controller_state = rng.normal(0.0, 0.5, size=(1, VALUE_FEATURE_DIM)).astype(np.float32)
@@ -202,19 +249,31 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         )
         result = {
             "value": value_result,
-            "controller_policy": _policy_parity(
-                native,
-                controller,
-                controller_states,
-                controller_actions,
-                tmp_path / "controller.tsv",
+            "controller_policy": (
+                _markov_policy_parity(
+                    native, controller, controller_actions, tmp_path / "controller.tsv"
+                )
+                if isinstance(controller, MarkovPolicyRankDeepSet)
+                else _policy_parity(
+                    native,
+                    controller,
+                    controller_states,
+                    controller_actions,
+                    tmp_path / "controller.tsv",
+                )
             ),
-            "adversary_policy": _policy_parity(
-                native,
-                adversary,
-                adversary_states,
-                adversary_actions,
-                tmp_path / "adversary.tsv",
+            "adversary_policy": (
+                _markov_policy_parity(
+                    native, adversary, adversary_actions, tmp_path / "adversary.tsv"
+                )
+                if isinstance(adversary, MarkovPolicyRankDeepSet)
+                else _policy_parity(
+                    native,
+                    adversary,
+                    adversary_states,
+                    adversary_actions,
+                    tmp_path / "adversary.tsv",
+                )
             ),
         }
 

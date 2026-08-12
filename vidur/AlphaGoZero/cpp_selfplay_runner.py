@@ -110,6 +110,8 @@ def build_command(args: argparse.Namespace, *, command_output_dir: Path, launche
         "--root-dirichlet-noise-enabled" if bool(args.root_dirichlet_noise_enabled) else "--no-root-dirichlet-noise-enabled",
         "--root-dirichlet-alpha",
         str(float(args.root_dirichlet_alpha)),
+        "--root-dirichlet-total-concentration",
+        str(float(args.root_dirichlet_total_concentration)),
         "--root-dirichlet-epsilon",
         str(float(args.root_dirichlet_epsilon)),
         "--agz-sample-initial-moves" if bool(args.agz_sample_initial_moves) else "--no-agz-sample-initial-moves",
@@ -177,6 +179,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prior-min-prob", type=float, default=cfg.prior_min_prob)
     parser.add_argument("--root-dirichlet-noise-enabled", action=argparse.BooleanOptionalAction, default=cfg.root_dirichlet_noise_enabled)
     parser.add_argument("--root-dirichlet-alpha", type=float, default=cfg.root_dirichlet_alpha)
+    parser.add_argument(
+        "--root-dirichlet-total-concentration",
+        type=float,
+        default=cfg.root_dirichlet_total_concentration,
+    )
     parser.add_argument("--root-dirichlet-epsilon", type=float, default=cfg.root_dirichlet_epsilon)
     parser.add_argument("--agz-sample-initial-moves", action=argparse.BooleanOptionalAction, default=cfg.agz_sample_initial_moves)
     parser.add_argument("--agz-sample-initial-move-count", type=int, default=cfg.agz_sample_initial_move_count)
@@ -239,6 +246,7 @@ def main() -> None:
         "root_dirichlet_noise_enabled": bool(args.root_dirichlet_noise_enabled),
         "root_dirichlet_alpha": float(args.root_dirichlet_alpha),
         "root_dirichlet_epsilon": float(args.root_dirichlet_epsilon),
+        "root_dirichlet_total_concentration": float(args.root_dirichlet_total_concentration),
         "agz_sample_initial_moves": bool(args.agz_sample_initial_moves),
         "agz_sample_initial_move_count": int(args.agz_sample_initial_move_count),
         "agz_mcts_action_temperature": float(args.agz_mcts_action_temperature),

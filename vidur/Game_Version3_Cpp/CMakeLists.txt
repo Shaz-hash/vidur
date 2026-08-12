@@ -58,6 +58,7 @@ pybind11_add_module(mcts_native_gv2
     src/gv2_player_sample_actions.cpp
     src/gv2_virtual_environment.cpp
     src/gv2_mcts_dnn.cpp
+    src/gv2_cross_game_batcher.cpp
     src/gv2_mcts_value_prior.cpp
     src/gv3_native_selfplay.cpp
     src/gv2_infer_runtime.cpp

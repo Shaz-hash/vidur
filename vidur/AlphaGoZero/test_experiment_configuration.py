@@ -21,6 +21,7 @@ from vidur.AlphaGoZero.config import (
     AGZ_MAX_ADVERSARY_VALUE_STATES,
     AGZ_MCTS_ITERATIONS,
     AGZ_ROOT_DIRICHLET_ALPHA,
+    AGZ_ROOT_DIRICHLET_TOTAL_CONCENTRATION,
     AGZ_ROOT_DIRICHLET_EPSILON,
     AGZ_SELFPLAY_ARENA_TIME_LIMIT_SEC,
     Phase1SmokeConfig,
@@ -35,6 +36,9 @@ class ExperimentConfigurationTests(unittest.TestCase):
     def test_deploy_forwards_dynamic_eval_layout(self) -> None:
         expected = {
             "AGZ_DISTRIBUTED_EVAL_ROLE_THREADS_PER_GAME": "2",
+            "AGZ_ROOT_DIRICHLET_TOTAL_CONCENTRATION": "10.0",
+            "AGZ_EVAL_PUCT_C": "0.5",
+            "AGZ_SJF_PUCT_C": "0.5",
             "AGZ_DISTRIBUTED_EVAL_SJF_THREADS_PER_GAME": "8",
             "AGZ_EVAL_ROLLOUT_COUNT": "8",
             "AGZ_SJF_ROLLOUT_COUNT": "3",
@@ -66,12 +70,12 @@ class ExperimentConfigurationTests(unittest.TestCase):
         with mock.patch.object(trainer, "AGZ_EVAL_ROLLOUT_COUNT", 3), mock.patch.object(
             trainer, "AGZ_SJF_ROLLOUT_COUNT", 2
         ):
-            role = trainer._arena_cmd(only_model_ctrl_cycle=True, **common)
+            role = trainer._arena_cmd(only_model_ctrl_cycle=True, puct_c=0.5, **common)
             trivial = trainer._arena_cmd(
-                only_model_ctrl_cycle=False, skip_model_ctrl_cycle=True, **common
+                only_model_ctrl_cycle=False, skip_model_ctrl_cycle=True, puct_c=0.75, **common
             )
             explicit = trainer._arena_cmd(
-                only_model_ctrl_cycle=True, rollout_count=7, **common
+                only_model_ctrl_cycle=True, rollout_count=7, puct_c=0.25, **common
             )
 
         def option(command: list[str], name: str) -> str:
@@ -80,6 +84,9 @@ class ExperimentConfigurationTests(unittest.TestCase):
         self.assertEqual(option(role, "--rollout-count"), "3")
         self.assertEqual(option(trivial, "--rollout-count"), "2")
         self.assertEqual(option(explicit, "--rollout-count"), "7")
+        self.assertEqual(option(role, "--puct-c"), "0.5")
+        self.assertEqual(option(trivial, "--puct-c"), "0.75")
+        self.assertEqual(option(explicit, "--puct-c"), "0.25")
 
     def test_simple_replay_and_search_defaults(self) -> None:
         self.assertEqual(XL_CONTROLLER_MAX_REPLAY_STATES, 20_000_000)
@@ -92,10 +99,12 @@ class ExperimentConfigurationTests(unittest.TestCase):
         self.assertEqual(AGZ_INITIAL_SAMPLE_MOVE_COUNT, 20)
         self.assertEqual(AGZ_ROOT_DIRICHLET_ALPHA, 0.05)
         self.assertEqual(AGZ_ROOT_DIRICHLET_EPSILON, 0.25)
+        self.assertEqual(AGZ_ROOT_DIRICHLET_TOTAL_CONCENTRATION, 0.0)
         cfg = Phase1SmokeConfig()
         self.assertEqual(cfg.mcts_iterations, 1_000)
         self.assertEqual(cfg.arena_time_limit_sec, 20.0)
         self.assertEqual(cfg.root_dirichlet_alpha, 0.05)
+        self.assertEqual(cfg.root_dirichlet_total_concentration, 0.0)
         self.assertEqual(cfg.root_dirichlet_epsilon, 0.25)
         self.assertEqual(cfg.agz_sample_initial_move_count, 20)
         trainer_default = inspect.signature(trainer.train_candidate).parameters["mcts_iterations"].default
@@ -180,6 +189,11 @@ class ExperimentConfigurationTests(unittest.TestCase):
             [f"bellman-classical-exp3-worker-{index}" for index in range(1, 9)],
         )
 
+    def test_spot_cluster_never_targets_fixed_workers(self) -> None:
+        cluster = get_cluster("spot")
+        self.assertEqual(cluster.xl.host, "localhost")
+        self.assertEqual(cluster.workers, ())
+
     def test_native_payload_uses_explicit_discount_override(self) -> None:
         simulator = object()
         args = SimpleNamespace(
@@ -188,6 +202,7 @@ class ExperimentConfigurationTests(unittest.TestCase):
             disable_model_bootstrap=False,
             root_dirichlet_noise_enabled=True,
             root_dirichlet_alpha=0.1,
+            root_dirichlet_total_concentration=10.0,
             root_dirichlet_epsilon=0.35,
             uct_c=1.4,
             puct_c=2.5,

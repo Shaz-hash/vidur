@@ -1320,10 +1320,11 @@ private:
         if (num_valid_actions <= 1) return;
         if (root->children.empty()) return;
 
-        const double alpha = in_.root_dirichlet_alpha;
+        const double fixed_alpha = in_.root_dirichlet_alpha;
+        const double total_concentration = in_.root_dirichlet_total_concentration;
         double eps = in_.root_dirichlet_epsilon;
 
-        if (alpha <= 0.0 || eps <= 0.0) return;
+        if ((fixed_alpha <= 0.0 && total_concentration <= 0.0) || eps <= 0.0) return;
         eps = clampv(eps, 0.0, 1.0);
 
         std::vector<int> child_indices;
@@ -1333,6 +1334,11 @@ private:
 
         const int n = static_cast<int>(child_indices.size());
         if (n <= 1) return;
+        const double alpha = resolve_root_dirichlet_alpha(
+            fixed_alpha,
+            total_concentration,
+            n);
+        if (alpha <= 0.0) return;
 
         std::gamma_distribution<double> gamma(alpha, 1.0);
         std::vector<double> noise_raw(static_cast<std::size_t>(n), 0.0);

@@ -1031,7 +1031,8 @@ bool NativeHGBModelRuntime::load_model_export(const std::string& path) {
 
     std::string export_header;
     std::getline(in, export_header);
-    if (trim_copy(export_header) == "agz_dnn_v1") {
+    if (trim_copy(export_header) == "agz_dnn_v1" ||
+        trim_copy(export_header) == "agz_dnn_v2") {
         dnn_model_ = NativeDenseDNNModel();
         dnn_model_.load_model_export(path);
         if (!dnn_model_.is_policy()) {
@@ -1252,6 +1253,23 @@ std::vector<double> NativeHGBModelRuntime::predict_raw_grouped_split_batch_flat(
     return predict_raw_batch_flat(flat_features, num_rows, row_dim);
 }
 
+std::vector<double> NativeHGBModelRuntime::predict_markov_policy_grouped_batch(
+    const std::vector<MarkovValueFeatures>& states,
+    const std::vector<float>& flat_actions,
+    int num_rows,
+    const std::vector<int>& group_offsets,
+    int parallel_threads) const {
+    if (!dnn_model_.is_markov_policy()) {
+        throw std::runtime_error("native prior runtime is not a Markov policy");
+    }
+    return dnn_model_.predict_markov_policy_grouped_batch(
+        states,
+        flat_actions,
+        num_rows,
+        group_offsets,
+        parallel_threads);
+}
+
 int NativeHGBModelRuntime::feature_dim() const { return feature_dim_; }
 
 int NativeHGBModelRuntime::num_trees() const {
@@ -1265,6 +1283,16 @@ bool NativeHGBModelRuntime::loaded() const {
 const std::string& NativeHGBModelRuntime::model_tag() const {
     if (dnn_model_.loaded()) return dnn_model_.model_tag();
     return model_tag_;
+}
+
+bool NativeHGBModelRuntime::is_markov_policy() const {
+    return dnn_model_.is_markov_policy();
+}
+
+int NativeHGBModelRuntime::action_dim() const {
+    return dnn_model_.loaded()
+        ? dnn_model_.action_dim()
+        : std::max(0, feature_dim_ - 226);
 }
 
 }  // namespace mcts_native_gv2

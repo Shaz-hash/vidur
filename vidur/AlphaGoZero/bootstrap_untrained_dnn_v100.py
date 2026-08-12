@@ -14,8 +14,8 @@ import numpy as np
 import torch
 
 from vidur.AlphaGoZero.dnn_models import (
+    MarkovPolicyRankDeepSet,
     MarkovValueDeepSet,
-    PolicyRankMLP,
     export_dnn_to_native,
     save_dnn_model,
     write_artifact_metadata,
@@ -24,7 +24,7 @@ from vidur.AlphaGoZero.durable_transfer import atomic_write_json, utc_now
 
 
 VALUE_CONFIG = "dnn_value_markov_deepset_192_v2"
-POLICY_CONFIG = "dnn_policy_rank_192_v1"
+POLICY_CONFIG = "dnn_policy_markov_deepset_192_v3"
 
 
 def _neutralize_output_head(model: torch.nn.Module) -> None:
@@ -88,7 +88,7 @@ def bootstrap(args: argparse.Namespace) -> dict[str, Any]:
     adversary_value.training_metadata["copied_from_controller_value_v100"] = True
 
     torch.manual_seed(seed + 1)
-    controller_policy = PolicyRankMLP(43, role="controller")
+    controller_policy = MarkovPolicyRankDeepSet(43, role="controller")
     _neutralize_output_head(controller_policy)
     _attach_fresh_optimizer(
         controller_policy,
@@ -98,7 +98,7 @@ def bootstrap(args: argparse.Namespace) -> dict[str, Any]:
     )
 
     torch.manual_seed(seed + 2)
-    adversary_policy = PolicyRankMLP(7, role="adversary")
+    adversary_policy = MarkovPolicyRankDeepSet(7, role="adversary")
     _neutralize_output_head(adversary_policy)
     _attach_fresh_optimizer(
         adversary_policy,
@@ -143,6 +143,7 @@ def bootstrap(args: argparse.Namespace) -> dict[str, Any]:
     result = {
         "model_family": "dnn",
         "value_feature_schema": "markov_v2",
+        "policy_feature_schema": "markov_v2",
         "model_version": 100,
         "controller_model_version": 100,
         "adversary_model_version": 100,

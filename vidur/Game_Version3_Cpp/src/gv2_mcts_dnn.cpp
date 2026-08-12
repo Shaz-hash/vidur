@@ -1,4 +1,5 @@
 #include "gv2_mcts_dnn.hpp"
+#include "gv2_cross_game_batcher.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -847,6 +848,18 @@ private:
         const std::string& player,
         const std::vector<uint8_t>& action_mask) {
         if (hgb_runtime_ != nullptr) {
+            if (in_.cross_game_inference_batcher != nullptr) {
+                const std::vector<double> values =
+                    in_.cross_game_inference_batcher->infer_values(
+                        *hgb_runtime_,
+                        {state},
+                        {&env_.virtual_simulator()});
+                if (values.size() != 1u) {
+                    throw std::runtime_error(
+                        "cross-game value batch returned wrong result count");
+                }
+                return {values.front(), {}};
+            }
             const double value = hgb_runtime_->infer_value(state, &env_.virtual_simulator(), -1);
             return {value, {}};
         }
@@ -905,15 +918,21 @@ private:
         if (!in_.root_dirichlet_noise_enabled) return;
         if (node->action_priors.size() <= 1) return;
 
-        const double alpha = in_.root_dirichlet_alpha;
+        const double fixed_alpha = in_.root_dirichlet_alpha;
+        const double total_concentration = in_.root_dirichlet_total_concentration;
         double eps = in_.root_dirichlet_epsilon;
-        if (alpha <= 0.0 || eps <= 0.0) return;
+        if ((fixed_alpha <= 0.0 && total_concentration <= 0.0) || eps <= 0.0) return;
         eps = clampv(eps, 0.0, 1.0);
 
         std::vector<int> keys;
         keys.reserve(node->action_priors.size());
         for (const auto& kv : node->action_priors) keys.push_back(kv.first);
         std::sort(keys.begin(), keys.end());
+        const double alpha = resolve_root_dirichlet_alpha(
+            fixed_alpha,
+            total_concentration,
+            static_cast<int>(keys.size()));
+        if (alpha <= 0.0) return;
 
         std::gamma_distribution<double> gamma(alpha, 1.0);
         std::vector<double> noise(keys.size(), 0.0);
@@ -1438,13 +1457,22 @@ private:
             (node->player == "controller") ? controller_prior_runtime_ : adversary_prior_runtime_;
         if (prior_runtime == nullptr || !prior_runtime->loaded()) return scores;
 
-        const std::vector<float> state_features = hgb_runtime_->build_features(
-            state,
-            &env_.virtual_simulator(),
-            -1,
-            nullptr);
-        const int row_dim = prior_runtime->feature_dim();
-        const int action_dim = row_dim - static_cast<int>(state_features.size());
+        const bool markov_policy = prior_runtime->is_markov_policy();
+        const MarkovValueFeatures markov_features = markov_policy
+            ? build_markov_value_features(state)
+            : MarkovValueFeatures{};
+        const std::vector<float> state_features = markov_policy
+            ? std::vector<float>{}
+            : hgb_runtime_->build_features(
+                state,
+                &env_.virtual_simulator(),
+                -1,
+                nullptr);
+        const int action_dim = markov_policy
+            ? prior_runtime->action_dim()
+            : prior_runtime->feature_dim() -
+                static_cast<int>(state_features.size());
+        const int row_dim = static_cast<int>(state_features.size()) + action_dim;
         if (row_dim <= 0 || action_dim <= 0) return scores;
 
         const int num_rows = static_cast<int>(canonical_indices.size());
@@ -1491,7 +1519,7 @@ private:
 
         std::string cache_key;
         bool cache_owner = false;
-        if (rollout_policy_cache_active_) {
+        if (rollout_policy_cache_active_ && !markov_policy) {
             const std::uint64_t metadata =
                 (static_cast<std::uint64_t>(num_rows) << 32U) ^
                 static_cast<std::uint64_t>(row_dim) ^
@@ -1525,7 +1553,21 @@ private:
             ++perf_rollout_policy_cache_misses_;
         }
         try {
-            scores = prior_runtime->predict_raw_batch_flat(flat_rows, num_rows, row_dim);
+            if (markov_policy) {
+                scores = in_.cross_game_inference_batcher != nullptr
+                    ? in_.cross_game_inference_batcher->predict_markov_policy(
+                        *prior_runtime,
+                        node->player,
+                        {markov_features},
+                        flat_rows,
+                        num_rows,
+                        {0, num_rows})
+                    : prior_runtime->predict_markov_policy_grouped_batch(
+                        {markov_features}, flat_rows, num_rows, {0, num_rows}, 1);
+            } else {
+                scores = prior_runtime->predict_raw_batch_flat(
+                    flat_rows, num_rows, row_dim);
+            }
         } catch (...) {
             if (cache_owner) {
                 std::lock_guard<std::mutex> lock(rollout_policy_cache_mutex_);
@@ -1537,7 +1579,7 @@ private:
         for (std::size_t i = 0; i < valid_row.size() && i < scores.size(); ++i) {
             if (!valid_row[i]) scores[i] = 0.0;
         }
-        if (rollout_policy_cache_active_) {
+        if (rollout_policy_cache_active_ && !markov_policy) {
             std::lock_guard<std::mutex> lock(rollout_policy_cache_mutex_);
             rollout_policy_score_cache_.emplace(cache_key, scores);
             rollout_policy_scores_inflight_.erase(cache_key);
@@ -1664,6 +1706,13 @@ private:
         const std::string& player,
         const std::vector<uint8_t>& action_mask) {
         if (hgb_runtime_ != nullptr) {
+            if (in_.cross_game_inference_batcher != nullptr) {
+                return in_.cross_game_inference_batcher->infer_values(
+                    *hgb_runtime_,
+                    states,
+                    std::vector<const VirtualSimulatorGV2*>(
+                        states.size(), &env_.virtual_simulator()));
+            }
             std::vector<double> out;
             out.reserve(states.size());
             for (const SimState& state : states) {
@@ -2568,6 +2617,59 @@ private:
         return exploit + c * explore;
     }
 
+    void capture_root_puct_snapshot(
+        const TreeNode& root,
+        int completed_simulations,
+        std::vector<RootPuctTraceStep>* trace) const {
+        if (trace == nullptr) return;
+
+        std::vector<int> action_indices;
+        action_indices.reserve(root.action_priors.size());
+        for (const auto& kv : root.action_priors) action_indices.push_back(kv.first);
+        std::sort(action_indices.begin(), action_indices.end());
+
+        double c = in_.puct_c;
+        if (!std::isfinite(c) || c == 0.0) c = 1.0;
+        const double bound_min = std::isfinite(root.min_value)
+            ? root.min_value
+            : std::numeric_limits<double>::quiet_NaN();
+        const double bound_max = std::isfinite(root.max_value)
+            ? root.max_value
+            : std::numeric_limits<double>::quiet_NaN();
+
+        for (int action_idx : action_indices) {
+            const auto child_it = root.children.find(action_idx);
+            const TreeNode* child = child_it != root.children.end()
+                ? child_it->second.get()
+                : nullptr;
+            const bool visited = child != nullptr && child->visits > 0;
+            const int visits = visited ? child->visits : 0;
+            const double q_value = visited
+                ? child->mean_value()
+                : std::numeric_limits<double>::quiet_NaN();
+            const double normalized_q = visited
+                ? normalize_plain_child_value_for_selection(root, *child)
+                : 0.5;
+            const double exploration_raw =
+                puct_explore_plain(root, action_idx, visits);
+
+            RootPuctTraceStep step;
+            step.sim_iteration = completed_simulations;
+            step.action_index = action_idx;
+            step.visited = visited;
+            step.visits = visits;
+            step.q_value = q_value;
+            step.normalized_q = normalized_q;
+            step.prior = plain_action_prior(root, action_idx);
+            step.exploration_raw = exploration_raw;
+            step.exploration_weighted = c * exploration_raw;
+            step.puct_score = normalized_q + step.exploration_weighted;
+            step.parent_min_value = bound_min;
+            step.parent_max_value = bound_max;
+            trace->push_back(std::move(step));
+        }
+    }
+
     PlainPuctSelection puct_select_child_or_untried_plain(TreeNode* node) const {
         if (node == nullptr) {
             throw std::runtime_error("puct_select_child_or_untried_plain called with null node");
@@ -2678,6 +2780,8 @@ private:
         std::vector<int> compact_original_indices;
         std::vector<double> compact_priors;
         std::vector<int> canonical_indices;
+        bool markov_policy = false;
+        MarkovValueFeatures markov_features;
         std::vector<float> state_features;
         std::vector<float> flat_actions;
         std::vector<uint8_t> valid_rows;
@@ -2691,6 +2795,7 @@ private:
     struct RolloutPolicyBatchWorkspace {
         std::vector<std::size_t> selected;
         std::vector<float> flat_states;
+        std::vector<MarkovValueFeatures> markov_states;
         std::vector<float> flat_actions;
         std::vector<uint8_t> valid_rows;
         std::vector<int> group_offsets;
@@ -2727,6 +2832,8 @@ private:
         prepared->compact_original_indices.clear();
         prepared->compact_priors.clear();
         prepared->canonical_indices.clear();
+        prepared->markov_policy = false;
+        prepared->markov_features = MarkovValueFeatures{};
         prepared->state_features.clear();
         prepared->flat_actions.clear();
         prepared->valid_rows.clear();
@@ -2855,12 +2962,38 @@ private:
         const auto state_features_begin = detailed_perf
             ? std::chrono::steady_clock::now()
             : std::chrono::steady_clock::time_point{};
-        hgb_runtime_->build_features_into(
-            trajectory.state,
-            &env_.virtual_simulator(),
-            -1,
-            &prepared->state_features,
-            nullptr);
+        prepared->markov_policy = prior_runtime->is_markov_policy();
+        if (prepared->markov_policy) {
+            prepared->markov_features =
+                build_markov_value_features(trajectory.state);
+            prepared->state_features.reserve(
+                2U + prepared->markov_features.global_features.size() +
+                prepared->markov_features.request_features.size() +
+                prepared->markov_features.launch_features.size());
+            prepared->state_features.push_back(
+                static_cast<float>(prepared->markov_features.request_count));
+            prepared->state_features.push_back(
+                static_cast<float>(prepared->markov_features.launch_count));
+            prepared->state_features.insert(
+                prepared->state_features.end(),
+                prepared->markov_features.global_features.begin(),
+                prepared->markov_features.global_features.end());
+            prepared->state_features.insert(
+                prepared->state_features.end(),
+                prepared->markov_features.request_features.begin(),
+                prepared->markov_features.request_features.end());
+            prepared->state_features.insert(
+                prepared->state_features.end(),
+                prepared->markov_features.launch_features.begin(),
+                prepared->markov_features.launch_features.end());
+        } else {
+            hgb_runtime_->build_features_into(
+                trajectory.state,
+                &env_.virtual_simulator(),
+                -1,
+                &prepared->state_features,
+                nullptr);
+        }
         if (detailed_perf) {
             const auto state_features_end = std::chrono::steady_clock::now();
             prepared->state_features_sec = std::chrono::duration_cast<
@@ -2868,9 +3001,11 @@ private:
                     state_features_end - state_features_begin).count();
         }
         const int row_dim = prior_runtime->feature_dim();
-        prepared->action_dim =
-            row_dim - static_cast<int>(prepared->state_features.size());
-        if (row_dim <= 0 || prepared->action_dim <= 0) {
+        prepared->action_dim = prepared->markov_policy
+            ? prior_runtime->action_dim()
+            : row_dim - static_cast<int>(prepared->state_features.size());
+        if ((!prepared->markov_policy && row_dim <= 0) ||
+            prepared->action_dim <= 0) {
             if (!prepared->compact_mode) {
                 compute_policy_priors_plain(
                     &prepared->node,
@@ -3080,6 +3215,7 @@ private:
 
         auto& selected = workspace->selected;
         auto& flat_states = workspace->flat_states;
+        auto& markov_states = workspace->markov_states;
         auto& flat_actions = workspace->flat_actions;
         auto& valid_rows = workspace->valid_rows;
         auto& group_offsets = workspace->group_offsets;
@@ -3087,6 +3223,7 @@ private:
         std::vector<std::string> cache_keys;
         selected.clear();
         flat_states.clear();
+        markov_states.clear();
         flat_actions.clear();
         valid_rows.clear();
         group_offsets.clear();
@@ -3209,25 +3346,31 @@ private:
                 ++perf_rollout_policy_cache_misses_;
             }
 
-            if (state_dim == 0) {
+            if (state_dim == 0 && !item.markov_policy) {
                 state_dim = static_cast<int>(item.state_features.size());
                 action_dim = item.action_dim;
             }
-            if (static_cast<int>(item.state_features.size()) != state_dim ||
-                item.action_dim != action_dim) {
+            if ((!item.markov_policy &&
+                 static_cast<int>(item.state_features.size()) != state_dim) ||
+                (action_dim != 0 && item.action_dim != action_dim)) {
                 throw std::runtime_error(
                     "native grouped rollout policy split dimensions differ");
             }
+            if (action_dim == 0) action_dim = item.action_dim;
 
             selected.push_back(idx);
             cache_keys.push_back(std::move(cache_key));
             if (in_.rollout_optimized_execution) {
                 cache_hashes.push_back(fast_hash);
             }
-            flat_states.insert(
-                flat_states.end(),
-                item.state_features.begin(),
-                item.state_features.end());
+            if (item.markov_policy) {
+                markov_states.push_back(item.markov_features);
+            } else {
+                flat_states.insert(
+                    flat_states.end(),
+                    item.state_features.begin(),
+                    item.state_features.end());
+            }
             flat_actions.insert(
                 flat_actions.end(),
                 item.flat_actions.begin(),
@@ -3243,8 +3386,22 @@ private:
 
         perf_rollout_policy_scored_action_rows_ += total_rows;
 
-        std::vector<double> scores =
-            prior_runtime->predict_raw_grouped_split_batch_flat(
+        std::vector<double> scores = prior_runtime->is_markov_policy()
+            ? (in_.cross_game_inference_batcher != nullptr
+                ? in_.cross_game_inference_batcher->predict_markov_policy(
+                    *prior_runtime,
+                    player,
+                    markov_states,
+                    flat_actions,
+                    total_rows,
+                    group_offsets)
+                : prior_runtime->predict_markov_policy_grouped_batch(
+                    markov_states,
+                    flat_actions,
+                    total_rows,
+                    group_offsets,
+                    parallel_threads))
+            : prior_runtime->predict_raw_grouped_split_batch_flat(
                 flat_states,
                 flat_actions,
                 total_rows,
@@ -3724,8 +3881,23 @@ private:
                 const int row_count = static_cast<int>(
                     prepared.canonical_indices.size());
                 group_offsets[1] = row_count;
-                std::vector<double> scores =
-                    prior_runtime->predict_raw_grouped_split_batch_flat(
+                std::vector<double> scores = prepared.markov_policy
+                    ? (in_.cross_game_inference_batcher != nullptr
+                        ? in_.cross_game_inference_batcher->predict_markov_policy(
+                            *prior_runtime,
+                            prepared.controller_player
+                                ? "controller" : "adversary",
+                            {prepared.markov_features},
+                            prepared.flat_actions,
+                            row_count,
+                            group_offsets)
+                        : prior_runtime->predict_markov_policy_grouped_batch(
+                            {prepared.markov_features},
+                            prepared.flat_actions,
+                            row_count,
+                            group_offsets,
+                            std::max(1, policy_parallel_threads)))
+                    : prior_runtime->predict_raw_grouped_split_batch_flat(
                         prepared.state_features,
                         prepared.flat_actions,
                         row_count,
@@ -4359,6 +4531,10 @@ private:
             return out;
         }
 
+        if (in_.capture_root_puct_trace) {
+            capture_root_puct_snapshot(root, 0, &out.root_puct_trace_steps);
+        }
+
         const int iterations = std::max(1, in_.iterations);
         for (int sim = 0; sim < iterations; ++sim) {
             (void)sim;
@@ -4459,6 +4635,10 @@ private:
             const RolloutValueParts leaf_value = rollout_value_plain(
                 state, node->player, rollout_parent_time, rollout_deadline);
             backpropagate_plain(path, leaf_value);
+            if (in_.capture_root_puct_trace) {
+                capture_root_puct_snapshot(
+                    root, sim + 1, &out.root_puct_trace_steps);
+            }
         }
 
         out.root_visits = root.visits;
@@ -4910,10 +5090,11 @@ private:
         if (num_valid_actions <= 1) return;
         if (root->children.empty()) return;
 
-        const double alpha = in_.root_dirichlet_alpha;
+        const double fixed_alpha = in_.root_dirichlet_alpha;
+        const double total_concentration = in_.root_dirichlet_total_concentration;
         double eps = in_.root_dirichlet_epsilon;
 
-        if (alpha <= 0.0 || eps <= 0.0) return;
+        if ((fixed_alpha <= 0.0 && total_concentration <= 0.0) || eps <= 0.0) return;
         eps = clampv(eps, 0.0, 1.0);
 
         std::vector<int> child_indices;
@@ -4922,6 +5103,11 @@ private:
         std::sort(child_indices.begin(), child_indices.end());
 
         const int n = static_cast<int>(child_indices.size());
+        const double alpha = resolve_root_dirichlet_alpha(
+            fixed_alpha,
+            total_concentration,
+            n);
+        if (alpha <= 0.0) return;
         if (n <= 1) return;
 
         std::gamma_distribution<double> gamma(alpha, 1.0);

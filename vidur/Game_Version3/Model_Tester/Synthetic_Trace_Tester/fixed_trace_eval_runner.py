@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 import gc
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +46,7 @@ class FixedTraceEvalConfig:
     adversary_prior_model_path: Path | None = None
     model_version: int = 0
     mcts_iterations: int = 1000
+    discount_factor: float = 0.995
     puct_c: float = 1.0
     uct_c: float = 1.0
     policy_prior_temperature: float = 1.0
@@ -230,6 +231,16 @@ def _model_cpp_payload(
     bundle: Any,
 ) -> dict[str, Any]:
     pipeline_cfg = tester_cfg.to_pipeline_cfg()
+    pipeline_cfg = replace(
+        pipeline_cfg,
+        game_v2=replace(
+            pipeline_cfg.game_v2,
+            mcts_search=replace(
+                pipeline_cfg.game_v2.mcts_search,
+                discount_factor=float(cfg.discount_factor),
+            ),
+        ),
+    )
     payload = _cfg_payload(pipeline_cfg, torchscript_model_spec="")
     attach_execution_predictor_payload(payload, bundle.simulator)
     payload["use_model_bootstrap"] = bool(int(cfg.model_version) > 0) and not bool(cfg.disable_model_bootstrap)
@@ -815,6 +826,7 @@ class FixedTraceEvalRunner:
             "end_reason",
             "model_version",
             "mcts_iterations",
+            "discount_factor",
             "native_search_mode",
             "rollout_count",
             "rollout_parallel_threads",
@@ -845,6 +857,7 @@ class FixedTraceEvalRunner:
                     "end_reason": str(result.end_reason),
                     "model_version": int(self.cfg.model_version),
                     "mcts_iterations": int(self.cfg.mcts_iterations),
+                    "discount_factor": float(self.cfg.discount_factor),
                     "native_search_mode": str(self.cfg.native_search_mode),
                     "rollout_count": int(self.cfg.rollout_count),
                     "rollout_parallel_threads": int(self.cfg.rollout_parallel_threads),

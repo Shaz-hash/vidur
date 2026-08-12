@@ -18,6 +18,11 @@ from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any
 
+from vidur.AlphaGoZero.adaptive_rollout import (
+    activate_manifest_horizon,
+    active_rollout_horizon_sec,
+    ensure_runtime_search_config,
+)
 from vidur.AlphaGoZero.config import (
     ADVERSARY_POLICY_SAMPLE_CAP,
     AGZ_EVAL_MCTS_ITERATIONS,
@@ -50,6 +55,11 @@ from vidur.AlphaGoZero.durable_transfer import (
     replay_counts,
     utc_now,
     verify_sha256sums,
+)
+from vidur.AlphaGoZero.spot_work_protocol import (
+    configure_scheduler,
+    default_selfplay_config,
+    selfplay_config_sha256,
 )
 
 XL_REPLAY_FIELDS = [
@@ -155,6 +165,11 @@ TRAIN_MODEL_FIELDS = [
     "adversary_value_mse", "adversary_value_rmse", "adversary_value_max_abs_error", "adversary_value_p95_abs_error",
     "controller_policy_mse", "controller_policy_cross_entropy", "controller_policy_top1", "controller_policy_top3",
     "adversary_policy_mse", "adversary_policy_cross_entropy", "adversary_policy_top1", "adversary_policy_top3",
+    "rollout_horizon_used_sec", "rollout_horizon_source_controller_p95_abs_error",
+    "rollout_value_error_threshold", "rollout_discount_factor", "rollout_reference_step_sec",
+    "rollout_max_horizon_sec", "rollout_horizon_tick_sec", "next_rollout_horizon_raw_sec",
+    "next_rollout_horizon_calculated_sec", "next_rollout_horizon_rounded_sec",
+    "next_rollout_discounted_error",
 ]
 EVAL_FIELDS = [
     "promoted_controller_model_version", "promoted_adversary_model_version", "candidate_model_version",
@@ -175,6 +190,12 @@ def _train_failure_backoff_sec() -> int:
         return 600
 
 
+def _training_subprocess_env(root: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    env["AGZ_ROLLOUT_HORIZON_SEC"] = str(active_rollout_horizon_sec(Path(root)))
+    return env
+
+
 def _epoch_to_utc(ts: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(ts)))
 
@@ -184,6 +205,45 @@ def _read_json_dict(path: Path) -> dict[str, Any]:
         return json.loads(Path(path).read_text(encoding="utf-8"))
     except Exception:
         return {}
+
+
+def _active_spot_selfplay_config(root: Path) -> dict[str, Any]:
+    config = default_selfplay_config()
+    config["rollout_horizon_sec"] = float(active_rollout_horizon_sec(Path(root)))
+    return config
+
+
+def _refresh_spot_scheduler(
+    root: Path,
+    *,
+    selfplay_limit: int,
+    eval_limit: int,
+    selfplay_lease_sec: int,
+    worker_heartbeat_timeout_sec: int,
+) -> dict[str, Any]:
+    selfplay_config = _active_spot_selfplay_config(root)
+    expected_hash = selfplay_config_sha256(selfplay_config)
+    existing = _read_json_dict(
+        Path(root) / "spot_work" / "control" / "scheduler_config.json"
+    )
+    if (
+        int(existing.get("selfplay_total_parallel_games", -1)) == int(selfplay_limit)
+        and int(existing.get("eval_total_parallel_games", -1)) == int(eval_limit)
+        and int(existing.get("selfplay_lease_sec", -1))
+        == min(int(selfplay_lease_sec), int(worker_heartbeat_timeout_sec))
+        and int(existing.get("worker_heartbeat_timeout_sec", -1))
+        == int(worker_heartbeat_timeout_sec)
+        and str(existing.get("selfplay_config_sha256", "")) == expected_hash
+    ):
+        return existing
+    return configure_scheduler(
+        root,
+        selfplay_total_parallel_games=int(selfplay_limit),
+        eval_total_parallel_games=int(eval_limit),
+        selfplay_lease_sec=int(selfplay_lease_sec),
+        worker_heartbeat_timeout_sec=int(worker_heartbeat_timeout_sec),
+        selfplay_config=selfplay_config,
+    )
 
 
 def _tail_text(path: Path, *, max_chars: int = 6000) -> str:
@@ -1222,6 +1282,12 @@ def _controller_policy_sample_count(controller_states: int) -> int:
     return min(int(controller_states), int(XL_CONTROLLER_POLICY_SAMPLE_CAP))
 
 
+def _policy_sample_requirement(value_state_minimum: int, policy_sample_cap: int) -> int:
+    """Treat the policy cap as a maximum, not an additional replay gate."""
+
+    return min(max(0, int(value_state_minimum)), max(0, int(policy_sample_cap)))
+
+
 def write_training_gate_status(root: Path) -> dict[str, Any]:
     state = _load_state(root)
     raw_total_states = int(state.get("states", 0))
@@ -1243,6 +1309,14 @@ def write_training_gate_status(root: Path) -> dict[str, Any]:
     train_sample_floor = _training_sample_floor(total_states)
     controller_policy_samples = _controller_policy_sample_count(controller_states)
     adversary_policy_samples = _adversary_policy_sample_count(adversary_states)
+    controller_policy_requirement = _policy_sample_requirement(
+        MIN_CONTROLLER_STATES_FOR_EVAL,
+        XL_CONTROLLER_POLICY_SAMPLE_CAP,
+    )
+    adversary_policy_requirement = _policy_sample_requirement(
+        MIN_ADVERSARY_STATES_FOR_EVAL,
+        ADVERSARY_POLICY_SAMPLE_CAP,
+    )
     controller_promotions_completed = int(state.get("controller_promotions_completed", 0) or 0)
     adversary_promotions_completed = int(state.get("adversary_promotions_completed", 0) or 0)
     promotions_completed = max(
@@ -1254,8 +1328,8 @@ def write_training_gate_status(root: Path) -> dict[str, Any]:
     has_enough_new_replay = new_states >= int(TRAIN_TRIGGER_NEW_STATES)
     has_enough_controller = controller_states >= int(MIN_CONTROLLER_STATES_FOR_EVAL)
     has_enough_adversary = adversary_states >= int(MIN_ADVERSARY_STATES_FOR_EVAL)
-    has_enough_controller_policy = controller_policy_samples >= int(XL_CONTROLLER_POLICY_SAMPLE_CAP)
-    has_enough_adversary_policy = adversary_policy_samples >= int(ADVERSARY_POLICY_SAMPLE_CAP)
+    has_enough_controller_policy = controller_policy_samples >= int(controller_policy_requirement)
+    has_enough_adversary_policy = adversary_policy_samples >= int(adversary_policy_requirement)
     has_train_sample_floor = train_sample_floor > 0 and total_states >= train_sample_floor
     can_train = bool(
         (not promotion_cap_reached)
@@ -1293,8 +1367,10 @@ def write_training_gate_status(root: Path) -> dict[str, Any]:
         "min_adversary_states_for_eval": int(MIN_ADVERSARY_STATES_FOR_EVAL),
         "controller_policy_sample_count": int(controller_policy_samples),
         "controller_policy_sample_cap": int(XL_CONTROLLER_POLICY_SAMPLE_CAP),
+        "controller_policy_sample_requirement": int(controller_policy_requirement),
         "adversary_policy_sample_count": int(adversary_policy_samples),
         "adversary_policy_sample_cap": int(ADVERSARY_POLICY_SAMPLE_CAP),
+        "adversary_policy_sample_requirement": int(adversary_policy_requirement),
         "train_sample_floor": int(train_sample_floor),
         "has_enough_new_replay": bool(has_enough_new_replay),
         "has_enough_controller": bool(has_enough_controller),
@@ -1392,6 +1468,7 @@ def _launch_existing_candidate_eval(
     with log_path.open("w", encoding="utf-8") as log:
         proc = subprocess.Popen(
             cmd,
+            env=_training_subprocess_env(root),
             cwd=str(Path(__file__).resolve().parents[2]),
             stdout=log,
             stderr=subprocess.STDOUT,
@@ -1464,6 +1541,19 @@ def _finalize_completed_training_cycle_if_needed(root: Path, train_dir: Path) ->
         return False
     if str(manifest.get("eval_status", "") or "") != "complete":
         return False
+
+    if "next_rollout_horizon_rounded_sec" in manifest:
+        runtime_config = activate_manifest_horizon(
+            root,
+            candidate_version=int(version),
+            manifest=manifest,
+        )
+        from vidur.AlphaGoZero.agz_train_eval_promote import (
+            _broadcast_runtime_search_config_to_workers,
+        )
+
+        _broadcast_runtime_search_config_to_workers(root)
+        data["activated_runtime_search_config"] = runtime_config
 
     gate = dict(data.get("gate", {}) or {})
     consumed = int(gate.get("new_states_since_last_training", 0) or 0)
@@ -1610,7 +1700,14 @@ def maybe_launch_training(root: Path, gate: dict[str, Any]) -> dict[str, Any]:
     ]
     state_at_launch = _load_state(Path(root))
     with log_path.open("w", encoding="utf-8") as log:
-        proc = subprocess.Popen(cmd, cwd=str(Path(__file__).resolve().parents[2]), stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        proc = subprocess.Popen(
+            cmd,
+            env=_training_subprocess_env(root),
+            cwd=str(Path(__file__).resolve().parents[2]),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
     pid_path.write_text(str(int(proc.pid)) + "\n", encoding="utf-8")
     atomic_write_json(train_dir / "current_training.json", {
         "pid": int(proc.pid),
@@ -1648,12 +1745,65 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-ingest-shards", type=int, default=int(XL_MAX_INGEST_SHARDS_PER_LOOP))
     p.add_argument("--migrate-role-partitions-only", action="store_true")
     p.add_argument("--migration-workers", type=int, default=1)
+    p.add_argument(
+        "--spot-selfplay-total-parallel-games",
+        type=int,
+        default=(
+            int(os.environ["AGZ_SPOT_SELFPLAY_TOTAL_PARALLEL_GAMES"])
+            if os.environ.get("AGZ_SPOT_SELFPLAY_TOTAL_PARALLEL_GAMES")
+            else None
+        ),
+    )
+    p.add_argument(
+        "--spot-eval-total-parallel-games",
+        type=int,
+        default=(
+            int(os.environ["AGZ_SPOT_EVAL_TOTAL_PARALLEL_GAMES"])
+            if os.environ.get("AGZ_SPOT_EVAL_TOTAL_PARALLEL_GAMES")
+            else None
+        ),
+    )
+    p.add_argument(
+        "--spot-selfplay-lease-sec",
+        type=int,
+        default=int(os.environ.get("AGZ_SPOT_SELFPLAY_LEASE_SEC", "300")),
+    )
+    p.add_argument(
+        "--spot-worker-heartbeat-timeout-sec",
+        type=int,
+        default=int(
+            os.environ.get("AGZ_SPOT_WORKER_HEARTBEAT_TIMEOUT_SEC", "300")
+        ),
+    )
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     root = Path(args.output_root).expanduser()
+    ensure_runtime_search_config(root)
+    existing_scheduler = _read_json_dict(
+        root / "spot_work" / "control" / "scheduler_config.json"
+    )
+    selfplay_limit = (
+        int(args.spot_selfplay_total_parallel_games)
+        if args.spot_selfplay_total_parallel_games is not None
+        else int(existing_scheduler.get("selfplay_total_parallel_games", 0) or 0)
+    )
+    eval_limit = (
+        int(args.spot_eval_total_parallel_games)
+        if args.spot_eval_total_parallel_games is not None
+        else int(existing_scheduler.get("eval_total_parallel_games", 0) or 0)
+    )
+    _refresh_spot_scheduler(
+        root,
+        selfplay_limit=selfplay_limit,
+        eval_limit=eval_limit,
+        selfplay_lease_sec=int(args.spot_selfplay_lease_sec),
+        worker_heartbeat_timeout_sec=int(
+            args.spot_worker_heartbeat_timeout_sec
+        ),
+    )
     if args.init_eval_dir is not None:
         print(init_eval_dir(root, int(args.init_eval_dir)))
         return
@@ -1668,6 +1818,15 @@ def main() -> None:
         print(json.dumps({"migrated_partitions": int(migrated), "total_states": int(state.get("feature_states", 0))}, sort_keys=True))
         return
     while True:
+        _refresh_spot_scheduler(
+            root,
+            selfplay_limit=selfplay_limit,
+            eval_limit=eval_limit,
+            selfplay_lease_sec=int(args.spot_selfplay_lease_sec),
+            worker_heartbeat_timeout_sec=int(
+                args.spot_worker_heartbeat_timeout_sec
+            ),
+        )
         _drain_replay_index_builds()
         n = ingest_once(root, max_shards=int(args.max_ingest_shards))
         _drain_replay_index_builds()

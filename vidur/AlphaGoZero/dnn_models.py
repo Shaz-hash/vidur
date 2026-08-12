@@ -36,6 +36,7 @@ VALUE_MIN = -50.0
 VALUE_MAX = 0.0
 ARCHITECTURE_VERSION = "agz_residual_mlp_v1"
 MARKOV_ARCHITECTURE_VERSION = "agz_markov_value_deepset_v2"
+MARKOV_POLICY_ARCHITECTURE_VERSION = "agz_markov_policy_deepset_v3"
 NATIVE_EXPORT_VERSION = "agz_dnn_v1"
 MARKOV_NATIVE_EXPORT_VERSION = "agz_dnn_v2"
 def normalize_value(value: torch.Tensor) -> torch.Tensor:
@@ -438,8 +439,130 @@ class PolicyRankMLP(nn.Module):
         return out.astype(np.float32, copy=False)
 
 
+class MarkovPolicyRankDeepSet(nn.Module):
+    """Permutation-invariant policy ranker over Markov-v2 state sets.
+
+    A state is encoded once per root. All legal actions reuse that 192-D
+    embedding, avoiding the state-per-action expansion used by the legacy
+    226-D policy input.
+    """
+
+    model_kind = "policy_dnn"
+    architecture_version = MARKOV_POLICY_ARCHITECTURE_VERSION
+    feature_schema = MARKOV_VALUE_SCHEMA
+    feature_dim = 0
+    state_dim = 0
+    global_dim = MARKOV_GLOBAL_DIM
+    request_dim = MARKOV_REQUEST_DIM
+    launch_dim = MARKOV_LAUNCH_DIM
+
+    def __init__(self, action_dim: int, *, role: str) -> None:
+        super().__init__()
+        if int(action_dim) not in {CONTROLLER_ACTION_DIM, ADVERSARY_ACTION_DIM}:
+            raise ValueError(f"unsupported action dimension: {action_dim}")
+        self.role = str(role)
+        self.action_dim = int(action_dim)
+        # The compact set encoder keeps native rollout scoring close to the
+        # legacy policy cost while retaining the complete Markov-v2 inputs.
+        self.global_fc = nn.Linear(MARKOV_GLOBAL_DIM, 32)
+        self.global_norm = nn.LayerNorm(32)
+        self.request_fc1 = nn.Linear(MARKOV_REQUEST_DIM, 32)
+        self.request_fc2 = nn.Linear(32, 32)
+        self.request_norm = nn.LayerNorm(32)
+        self.launch_fc1 = nn.Linear(MARKOV_LAUNCH_DIM, 16)
+        self.launch_fc2 = nn.Linear(16, 16)
+        self.launch_norm = nn.LayerNorm(16)
+        self.state_fusion_fc = nn.Linear(128, 192)
+        self.action_fc = nn.Linear(self.action_dim, 64)
+        self.action_norm = nn.LayerNorm(64)
+        self.fusion_fc = nn.Linear(256, 128)
+        self.fusion_norm = nn.LayerNorm(128)
+        self.fusion_block = BottleneckResidual(128, 32)
+        self.head_norm = nn.LayerNorm(128)
+        self.head1 = nn.Linear(128, 64)
+        self.head2 = nn.Linear(64, 1)
+        self.optimizer_state: dict[str, Any] | None = None
+        self.training_metadata: dict[str, Any] = {}
+
+    def encode_state(
+        self,
+        global_features: torch.Tensor,
+        request_features: torch.Tensor,
+        request_mask: torch.Tensor,
+        launch_features: torch.Tensor,
+        launch_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        global_embedding = F.silu(self.global_norm(self.global_fc(global_features)))
+        request_embedding = F.silu(self.request_fc1(request_features))
+        request_embedding = F.silu(self.request_norm(self.request_fc2(request_embedding)))
+        request_sum, request_max = MarkovValueDeepSet._masked_sum_max(
+            request_embedding, request_mask
+        )
+        launch_embedding = F.silu(self.launch_fc1(launch_features))
+        launch_embedding = F.silu(self.launch_norm(self.launch_fc2(launch_embedding)))
+        launch_sum, launch_max = MarkovValueDeepSet._masked_sum_max(
+            launch_embedding, launch_mask
+        )
+        fused = torch.cat(
+            (global_embedding, request_sum, request_max, launch_sum, launch_max),
+            dim=-1,
+        )
+        return F.silu(self.state_fusion_fc(fused))
+
+    def forward_with_state_embedding(
+        self,
+        state_embedding: torch.Tensor,
+        action_features: torch.Tensor,
+    ) -> torch.Tensor:
+        action_embedding = F.silu(self.action_norm(self.action_fc(action_features)))
+        x = torch.cat((state_embedding, action_embedding), dim=-1)
+        x = F.silu(self.fusion_norm(self.fusion_fc(x)))
+        x = self.fusion_block(x)
+        x = F.silu(self.head1(self.head_norm(x)))
+        return self.head2(x).squeeze(-1)
+
+    def predict_root_structured(
+        self,
+        state_features: MarkovValueFeatures,
+        action_features: np.ndarray | Sequence[Sequence[float]],
+    ) -> np.ndarray:
+        actions = np.asarray(action_features, dtype=np.float32).reshape(-1, self.action_dim)
+        state_tensors = _collate_markov_features([state_features])
+        self.eval()
+        with torch.inference_mode():
+            state_embedding = self.encode_state(*state_tensors)
+            repeated = state_embedding.expand(actions.shape[0], -1)
+            logits = self.forward_with_state_embedding(
+                repeated,
+                torch.from_numpy(np.ascontiguousarray(actions)),
+            ).cpu().numpy()
+        return logits.astype(np.float32, copy=False)
+
+    def predict_structured(
+        self,
+        states: Sequence[MarkovValueFeatures],
+        action_features: np.ndarray,
+        offsets: Sequence[tuple[int, int]],
+    ) -> np.ndarray:
+        roots = list(states)
+        actions = np.ascontiguousarray(action_features, dtype=np.float32)
+        if len(roots) != len(offsets):
+            raise ValueError(f"Markov policy roots/offsets differ: {len(roots)} != {len(offsets)}")
+        output = np.empty(actions.shape[0], dtype=np.float32)
+        self.eval()
+        with torch.inference_mode():
+            for root, (begin, end) in zip(roots, offsets):
+                output[int(begin):int(end)] = self.predict_root_structured(
+                    root, actions[int(begin):int(end)]
+                )
+        return output
+
+
 def is_dnn_model(model: Any) -> bool:
-    return isinstance(model, (ValueResidualMLP, MarkovValueDeepSet, PolicyRankMLP))
+    return isinstance(
+        model,
+        (ValueResidualMLP, MarkovValueDeepSet, PolicyRankMLP, MarkovPolicyRankDeepSet),
+    )
 
 
 def model_parameter_count(model: nn.Module) -> int:
@@ -486,7 +609,9 @@ def export_dnn_to_native(model: nn.Module, path: Path, *, model_tag: str = "") -
     action_dim = int(getattr(model, "action_dim", 0))
     feature_dim = int(getattr(model, "feature_dim", VALUE_FEATURE_DIM))
     with tmp.open("w", encoding="utf-8", newline="") as f:
-        f.write(f"{MARKOV_NATIVE_EXPORT_VERSION if isinstance(model, MarkovValueDeepSet) else NATIVE_EXPORT_VERSION}\n")
+        f.write(
+            f"{MARKOV_NATIVE_EXPORT_VERSION if isinstance(model, (MarkovValueDeepSet, MarkovPolicyRankDeepSet)) else NATIVE_EXPORT_VERSION}\n"
+        )
         f.write(f"model_kind\t{model.model_kind}\n")
         f.write(f"architecture\t{getattr(model, 'architecture_version', ARCHITECTURE_VERSION)}\n")
         f.write(f"model_tag\t{str(model_tag or role)}\n")
@@ -805,6 +930,131 @@ def fit_policy_dnn(
         "cross_entropy": float(final_loss),
         "roots": int(len(roots)),
         "rows": int(x.shape[0]),
+        "warm_start": int(warm_start),
+        "parameters": model_parameter_count(model),
+    }
+
+
+def fit_markov_policy_dnn(
+    states: Sequence[MarkovValueFeatures],
+    action_features: np.ndarray,
+    target_probabilities: np.ndarray,
+    offsets: Sequence[tuple[int, int]],
+    *,
+    role: str,
+    action_dim: int,
+    initial_model_path: Path | None = None,
+    seed: int = 2026,
+    epochs: int = 5,
+    root_batch_size: int = 256,
+    lr: float = 3e-4,
+    weight_decay: float = 1e-4,
+    torch_threads: int = 24,
+) -> tuple[MarkovPolicyRankDeepSet, dict[str, float | int]]:
+    """Incrementally fit a Markov policy without duplicating state sets per action."""
+
+    _seed_all(seed)
+    torch.set_num_threads(max(1, int(torch_threads)))
+    roots = list(states)
+    actions = np.ascontiguousarray(action_features, dtype=np.float32)
+    targets = np.ascontiguousarray(target_probabilities, dtype=np.float32).reshape(-1)
+    ranges = [(int(a), int(b)) for a, b in offsets if int(b) > int(a)]
+    if len(roots) != len(ranges):
+        raise ValueError(f"Markov policy roots/offsets differ: {len(roots)} != {len(ranges)}")
+    if (
+        actions.ndim != 2
+        or actions.shape[1] != int(action_dim)
+        or actions.shape[0] != targets.shape[0]
+        or not roots
+    ):
+        raise ValueError(
+            f"invalid Markov policy arrays: roots={len(roots)} "
+            f"actions={actions.shape} targets={targets.shape}"
+        )
+    for sample in roots:
+        if not isinstance(sample, MarkovValueFeatures):
+            raise TypeError(f"expected MarkovValueFeatures, got {type(sample)!r}")
+
+    warm_start = bool(initial_model_path and Path(initial_model_path).is_file())
+    if warm_start:
+        model = load_dnn_model(Path(initial_model_path), MarkovPolicyRankDeepSet)
+        assert isinstance(model, MarkovPolicyRankDeepSet)
+        if model.action_dim != int(action_dim):
+            raise ValueError(f"warm-start action dim {model.action_dim} != {action_dim}")
+        model.role = str(role)
+    else:
+        model = MarkovPolicyRankDeepSet(int(action_dim), role=str(role))
+    model.train()
+    optimizer = _prepare_optimizer(
+        model,
+        lr=float(lr),
+        weight_decay=float(weight_decay),
+        preserve_optimizer=warm_start,
+    )
+    action_t = torch.from_numpy(actions)
+    target_t = torch.from_numpy(targets)
+    rng = np.random.default_rng(int(seed))
+    started = time.perf_counter()
+    final_loss = math.nan
+    for _ in range(max(1, int(epochs))):
+        root_order = rng.permutation(len(roots))
+        running = 0.0
+        seen_roots = 0
+        for begin in range(0, root_order.size, max(1, int(root_batch_size))):
+            chosen_indices = root_order[begin : begin + int(root_batch_size)]
+            chosen_roots = [roots[int(index)] for index in chosen_indices]
+            state_embedding = model.encode_state(*_collate_markov_features(chosen_roots))
+            chosen_ranges = [ranges[int(index)] for index in chosen_indices]
+            counts = torch.tensor(
+                [end - start for start, end in chosen_ranges], dtype=torch.int64
+            )
+            expanded_states = torch.repeat_interleave(state_embedding, counts, dim=0)
+            row_indices = np.concatenate(
+                [np.arange(start, end, dtype=np.int64) for start, end in chosen_ranges]
+            )
+            row_index_t = torch.from_numpy(row_indices)
+            logits = model.forward_with_state_embedding(
+                expanded_states,
+                action_t.index_select(0, row_index_t),
+            )
+            losses: list[torch.Tensor] = []
+            cursor = 0
+            for start, end in chosen_ranges:
+                count = end - start
+                root_target = target_t[start:end]
+                target_sum = torch.sum(root_target)
+                if float(target_sum) <= 0.0:
+                    root_target = torch.full_like(root_target, 1.0 / float(count))
+                else:
+                    root_target = root_target / target_sum
+                root_logits = logits[cursor : cursor + count]
+                losses.append(-(root_target * F.log_softmax(root_logits, dim=0)).sum())
+                cursor += count
+            loss = torch.stack(losses).mean()
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            running += float(loss.detach()) * len(chosen_ranges)
+            seen_roots += len(chosen_ranges)
+        final_loss = running / max(1, seen_roots)
+    elapsed = time.perf_counter() - started
+    model.optimizer_state = optimizer.state_dict()
+    model.training_metadata = {
+        "warm_start": warm_start,
+        "epochs": int(epochs),
+        "roots": int(len(roots)),
+        "rows": int(actions.shape[0]),
+        "cross_entropy": float(final_loss),
+        "feature_schema": MARKOV_VALUE_SCHEMA,
+        "state_encoded_once_per_root": True,
+    }
+    model.eval()
+    return model, {
+        "elapsed_s": float(elapsed),
+        "cross_entropy": float(final_loss),
+        "roots": int(len(roots)),
+        "rows": int(actions.shape[0]),
         "warm_start": int(warm_start),
         "parameters": model_parameter_count(model),
     }

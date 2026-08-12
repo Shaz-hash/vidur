@@ -64,6 +64,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--model-version", type=int, default=139)
     parser.add_argument("--mcts-iterations", type=int, default=1000)
+    parser.add_argument("--discount-factor", type=float, default=0.995)
     parser.add_argument("--puct-c", type=float, default=1.0)
     parser.add_argument("--uct-c", type=float, default=1.0)
     parser.add_argument("--policy-prior-temperature", type=float, default=1.0)
@@ -108,6 +109,7 @@ def main() -> None:
         adversary_prior_model_path=Path(args.adversary_prior_model_path).expanduser(),
         model_version=int(args.model_version),
         mcts_iterations=int(args.mcts_iterations),
+        discount_factor=float(args.discount_factor),
         puct_c=float(args.puct_c),
         uct_c=float(args.uct_c),
         policy_prior_temperature=float(args.policy_prior_temperature),

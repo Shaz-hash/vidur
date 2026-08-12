@@ -31,11 +31,18 @@ public:
         int num_rows,
         const std::vector<int>& group_offsets,
         int parallel_threads) const;
+    std::vector<double> predict_markov_policy_grouped_batch(
+        const std::vector<MarkovValueFeatures>& states,
+        const std::vector<float>& flat_actions,
+        int num_rows,
+        const std::vector<int>& group_offsets,
+        int parallel_threads) const;
 
     bool loaded() const;
     bool is_value() const;
     bool is_policy() const;
     bool is_markov_value() const;
+    bool is_markov_policy() const;
     int feature_dim() const;
     int state_dim() const;
     int action_dim() const;
@@ -127,6 +134,9 @@ private:
     double value_from_state(const float* state) const;
     void policy_state_embedding_into(const float* state, float* output) const;
     double markov_value_from_features(const MarkovValueFeatures& features) const;
+    void markov_policy_state_embedding_into(
+        const MarkovValueFeatures& features,
+        float* output) const;
     double policy_from_embeddings(
         const float* state_embedding,
         const float* action) const;

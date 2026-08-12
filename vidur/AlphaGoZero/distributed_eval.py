@@ -68,6 +68,7 @@ class ArenaChunk:
     parallel_games: int
     output_dir: Path
     command: tuple[str, ...]
+    wave_index: int = 0
 
 
 def _env_int(name: str, default: int) -> int:
@@ -226,11 +227,14 @@ def cpu_safe_hosts(
         one_wave_capacity = 2 * sum(host.parallel_games // 2 for host in resolved_hosts)
     else:
         one_wave_capacity = sum(host.parallel_games for host in resolved_hosts)
-    if one_wave_capacity < int(total_games):
-        raise RuntimeError(
-            f"insufficient one-wave CPU capacity for {phase}: "
-            f"capacity={one_wave_capacity} required={int(total_games)}"
-        )
+    if one_wave_capacity <= 0:
+        raise RuntimeError(f"no usable CPU capacity for distributed {phase} evaluation")
+    wave_count = int(math.ceil(int(total_games) / one_wave_capacity))
+    print(
+        f"[distributed-eval-cpu] phase={phase} one_wave_capacity={one_wave_capacity} "
+        f"required={int(total_games)} waves={wave_count}",
+        flush=True,
+    )
     return resolved_hosts
 
 
@@ -325,6 +329,10 @@ def memory_safe_hosts(
 
 def distributed_eval_enabled() -> bool:
     return bool(_env_int("AGZ_DISTRIBUTED_EVAL_ENABLED", 1))
+
+
+def spot_pull_eval_enabled() -> bool:
+    return bool(_env_int("AGZ_SPOT_PULL_EVAL_ENABLED", 0))
 
 
 def distributed_eval_pauses_selfplay() -> bool:
@@ -483,6 +491,23 @@ def _weighted_capacity_allocation(capacities: list[int], total: int) -> list[int
         allocations[index] += 1
     return allocations
 
+def _weighted_queue_allocation(weights: list[int], total: int) -> list[int]:
+    """Distribute queued work proportionally without treating weights as hard caps."""
+
+    weight_sum = sum(max(0, int(weight)) for weight in weights)
+    if weight_sum <= 0:
+        raise RuntimeError("distributed role hosts have no paired-game capacity")
+    targets = [float(total) * max(0, int(weight)) / weight_sum for weight in weights]
+    allocations = [int(math.floor(target)) for target in targets]
+    while sum(allocations) < int(total):
+        index = max(
+            range(len(weights)),
+            key=lambda item: (targets[item] - allocations[item], weights[item], -item),
+        )
+        allocations[index] += 1
+    return allocations
+
+
 
 def plan_role_chunks(
     block_commands: dict[str, list[str]],
@@ -514,54 +539,45 @@ def plan_role_chunks(
     if sorted(pair_sizes) != [2, 2]:
         raise ValueError("role evaluation requires exactly two paired baseline/candidate block groups")
 
-    # A pair unit runs matching baseline/candidate games concurrently on one host.
-    pair_capacities = [host.parallel_games // 2 for host in hosts]
-    host_pair_units = _weighted_capacity_allocation(pair_capacities, 2 * num_games)
-    pair_zero_units = [units // 2 for units in host_pair_units]
-    pair_zero_gap = num_games - sum(pair_zero_units)
-    odd_hosts = [index for index, units in enumerate(host_pair_units) if units % 2]
-    if pair_zero_gap < 0 or pair_zero_gap > len(odd_hosts):
-        raise RuntimeError("could not split role capacity evenly across paired blocks")
-    for index in odd_hosts[:pair_zero_gap]:
-        pair_zero_units[index] += 1
-    pair_one_units = [
-        total_units - first_pair
-        for total_units, first_pair in zip(host_pair_units, pair_zero_units, strict=True)
-    ]
-    if sum(pair_zero_units) != num_games or sum(pair_one_units) != num_games:
-        raise RuntimeError("role pair allocation did not cover each 100-game block")
+    # Assign all games in one launcher wave, but cap each block's live games.
+    # The arena launcher queues the excess locally, allowing a host that finishes
+    # early to drain its own queue instead of waiting at a cluster-wide barrier.
+    pair_parallel_by_host: dict[str, list[int]] = {}
+    for host_index, host in enumerate(hosts):
+        pair_slots = max(0, int(host.parallel_games) // 2)
+        base, extra = divmod(pair_slots, len(pair_keys))
+        pair_parallel = [base for _ in pair_keys]
+        for offset in range(extra):
+            pair_parallel[(host_index + offset) % len(pair_keys)] += 1
+        pair_parallel_by_host[host.label] = pair_parallel
 
-    pair_units_by_host = {
-        host.label: (pair_zero_units[index], pair_one_units[index])
-        for index, host in enumerate(hosts)
-    }
-    counts_by_host = {
-        host.label: [
-            pair_units_by_host[host.label][pair_index_by_block[block_name]]
-            for block_name in block_names
-        ]
-        for host in hosts
-    }
+    counts_by_pair: list[list[int]] = []
+    for pair_index in range(len(pair_keys)):
+        weights = [pair_parallel_by_host[host.label][pair_index] for host in hosts]
+        counts_by_pair.append(_weighted_queue_allocation(weights, num_games))
 
-    chunks: list[ArenaChunk] = []
     offsets = {name: 0 for name in block_names}
-    for host in hosts:
-        host_counts = counts_by_host[host.label]
-        if sum(host_counts) > host.parallel_games:
-            raise RuntimeError(f"role plan oversubscribes {host.label}")
-        for block_index, block_name in enumerate(block_names):
-            count = host_counts[block_index]
+    chunks: list[ArenaChunk] = []
+    for host_index, host in enumerate(hosts):
+        host_live_games = 0
+        for block_name in block_names:
+            pair_index = pair_index_by_block[block_name]
+            count = counts_by_pair[pair_index][host_index]
             if count <= 0:
                 continue
+            parallel = min(count, pair_parallel_by_host[host.label][pair_index])
+            if parallel <= 0:
+                raise RuntimeError(f"role queue assigned work without capacity on {host.label}")
+            host_live_games += parallel
             offset = offsets[block_name]
             offsets[block_name] += count
             part_command = list(block_commands[block_name])
             base_game_id = int(_command_value(part_command, "--game-id-start"))
-            part_dir = scratch_root / block_name / host.label
+            part_dir = scratch_root / "wave_000" / block_name / host.label
             _set_command_value(part_command, "--output-dir", str(part_dir))
             _set_command_value(part_command, "--game-id-start", base_game_id + offset)
             _set_command_value(part_command, "--num-games", count)
-            _set_command_value(part_command, "--num-parallel-games", count)
+            _set_command_value(part_command, "--num-parallel-games", parallel)
             _set_command_value(
                 part_command,
                 "--rollout-parallel-threads",
@@ -575,11 +591,18 @@ def plan_role_chunks(
                     host=host,
                     game_offset=offset,
                     num_games=count,
-                    parallel_games=count,
+                    parallel_games=parallel,
                     output_dir=part_dir,
                     command=tuple(part_command),
+                    wave_index=0,
                 )
             )
+        if host_live_games > int(host.parallel_games):
+            raise RuntimeError(
+                f"role queue oversubscribes {host.label}: "
+                f"{host_live_games} > {host.parallel_games}"
+            )
+
     for block_name, offset in offsets.items():
         if offset != num_games:
             raise ValueError(f"incomplete block plan for {block_name}: {offset} != {num_games}")
@@ -981,6 +1004,16 @@ def _merge_block(block_dir: Path, part_dirs: list[Path], expected_games: int) ->
             shutil.copy2(source, target)
 
 
+def merge_arena_block(
+    block_dir: Path,
+    part_dirs: list[Path],
+    expected_games: int,
+) -> None:
+    """Merge one-game arena parts using the established distributed-eval format."""
+
+    _merge_block(block_dir, part_dirs, expected_games)
+
+
 def merge_split_sjf_cycles(
     *,
     trivial_dir: Path,
@@ -1115,26 +1148,39 @@ def run_distributed_chunks(
     model_hashes = stage_models(chunks)
     staged_at = time.time()
     log_root = next(iter(final_dirs.values())).parent / "distributed_launcher_logs"
-    processes: list[tuple[ArenaChunk, subprocess.Popen[str]]] = []
-    for chunk in chunks:
-        log_path = log_root / f"{chunk.block_name}_{chunk.host.label}.log"
-        processes.append((chunk, _launch_chunk(chunk, log_path)))
+    wave_indices = sorted({int(chunk.wave_index) for chunk in chunks})
+    for wave_index in wave_indices:
+        wave_chunks = [chunk for chunk in chunks if int(chunk.wave_index) == wave_index]
+        processes: list[tuple[ArenaChunk, subprocess.Popen[str]]] = []
+        for chunk in wave_chunks:
+            log_path = log_root / (
+                f"wave_{wave_index:03d}_{chunk.block_name}_{chunk.host.label}.log"
+            )
+            processes.append((chunk, _launch_chunk(chunk, log_path)))
 
-    failures: list[str] = []
-    for chunk, process in processes:
-        returncode = process.wait()
-        handle = getattr(process, "_agz_log_handle", None)
-        if handle is not None:
-            handle.close()
-        if returncode != 0:
-            failures.append(f"{chunk.block_name}/{chunk.host.label}: rc={returncode}")
-    if failures:
-        raise RuntimeError("distributed arena launch failed: " + ", ".join(failures))
+        failures: list[str] = []
+        for chunk, process in processes:
+            returncode = process.wait()
+            handle = getattr(process, "_agz_log_handle", None)
+            if handle is not None:
+                handle.close()
+            if returncode != 0:
+                failures.append(
+                    f"wave={wave_index} {chunk.block_name}/{chunk.host.label}: "
+                    f"rc={returncode}"
+                )
+        if failures:
+            raise RuntimeError("distributed arena launch failed: " + ", ".join(failures))
     games_finished_at = time.time()
 
     parts_by_block: dict[str, list[Path]] = {name: [] for name in final_dirs}
     for chunk in chunks:
-        local_part = final_dirs[chunk.block_name] / "distributed_parts" / chunk.host.label
+        local_part = (
+            final_dirs[chunk.block_name]
+            / "distributed_parts"
+            / f"wave_{int(chunk.wave_index):03d}"
+            / chunk.host.label
+        )
         parts_by_block[chunk.block_name].append(_collect_remote_chunk(chunk, local_part))
     for block_name, final_dir in final_dirs.items():
         _merge_block(final_dir, parts_by_block[block_name], expected_games_by_block[block_name])
@@ -1143,7 +1189,7 @@ def run_distributed_chunks(
     cleaned_at = time.time()
 
     plan = {
-        "mode": "distributed_arena_v1",
+        "mode": "distributed_arena_v2_multi_wave",
         "started_at_epoch": started_at,
         "finished_at_epoch": cleaned_at,
         "elapsed_sec": cleaned_at - started_at,
@@ -1155,6 +1201,7 @@ def run_distributed_chunks(
         "chunks": [
             {
                 "block_name": chunk.block_name,
+                "wave_index": int(chunk.wave_index),
                 "host": chunk.host.label,
                 "ssh_host": chunk.host.ssh_host,
                 "game_offset": chunk.game_offset,

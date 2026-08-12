@@ -22,7 +22,10 @@ from vidur.AlphaGoZero.distributed_eval import (
     plan_role_chunks,
     plan_single_block_chunks,
 )
-from vidur.bellman_v4_adv.arena_mcts_value_runnerCPP import _planned_history_hops
+from vidur.bellman_v4_adv.arena_mcts_value_runnerCPP import (
+    _pin_single_game_history_hop,
+    _planned_history_hops,
+)
 from vidur.AlphaGoZero.xl_coordinator import _finalize_completed_training_cycle_if_needed
 
 
@@ -104,7 +107,7 @@ class DistributedEvalPlanTests(unittest.TestCase):
         self.assertTrue(all(host.rollout_parallel_threads == 8 for host in sjf_hosts))
         self.assertTrue(all(host.parallel_games == 11 for host in sjf_hosts))
 
-    def test_cpu_planner_fails_closed_without_one_wave_capacity(self) -> None:
+    def test_cpu_planner_allows_bounded_multiwave_capacity(self) -> None:
         hosts = [EvalHost("xl", None, 400, 8, "0-15")]
         with mock.patch.dict(
             "os.environ",
@@ -113,13 +116,14 @@ class DistributedEvalPlanTests(unittest.TestCase):
                 "AGZ_DISTRIBUTED_EVAL_CPU_RESERVE_CORES": "2",
             },
         ):
-            with self.assertRaisesRegex(RuntimeError, "insufficient one-wave CPU capacity"):
-                cpu_safe_hosts(
-                    hosts,
-                    phase="role",
-                    total_games=400,
-                    cpu_by_label={"xl": (16, 1.0)},
-                )
+            resolved = cpu_safe_hosts(
+                hosts,
+                phase="role",
+                total_games=400,
+                cpu_by_label={"xl": (16, 1.0)},
+            )
+        self.assertEqual(len(resolved), 1)
+        self.assertEqual(resolved[0].parallel_games, 7)
 
     def test_finalized_cycle_removes_stale_pid_without_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -186,9 +190,11 @@ class DistributedEvalPlanTests(unittest.TestCase):
         self.assertEqual(sum(chunk.num_games for chunk in chunks), 400)
         for host in hosts:
             host_chunks = [chunk for chunk in chunks if chunk.host == host]
-            assigned = sum(chunk.num_games for chunk in host_chunks)
-            self.assertEqual(sum(chunk.parallel_games for chunk in host_chunks), assigned)
-            self.assertLessEqual(assigned, host.parallel_games)
+            self.assertLessEqual(
+                sum(chunk.parallel_games for chunk in host_chunks),
+                host.parallel_games,
+            )
+        self.assertEqual({chunk.wave_index for chunk in chunks}, {0})
 
     def test_exp3_pair_safe_plan_starts_all_400_games_in_one_wave(self) -> None:
         blocks = {
@@ -221,12 +227,64 @@ class DistributedEvalPlanTests(unittest.TestCase):
         self.assertEqual(sum(chunk.num_games for chunk in chunks), 400)
         for host in hosts:
             host_chunks = [chunk for chunk in chunks if chunk.host == host]
-            assigned = sum(chunk.num_games for chunk in host_chunks)
-            self.assertEqual(sum(chunk.parallel_games for chunk in host_chunks), assigned)
-            self.assertLessEqual(assigned, host.parallel_games)
+            self.assertLessEqual(
+                sum(chunk.parallel_games for chunk in host_chunks),
+                host.parallel_games,
+            )
         for chunk in chunks:
             index = chunk.command.index("--rollout-parallel-threads")
             self.assertEqual(chunk.command[index + 1], "2")
+            index = chunk.command.index("--num-parallel-games")
+            self.assertEqual(int(chunk.command[index + 1]), chunk.parallel_games)
+
+    def test_exp3_140_game_role_eval_queues_all_hosts_in_one_wave(self) -> None:
+        blocks = {
+            f"block{i}": _arena_command(
+                f"block{i}",
+                71_030_000 + (i // 2) * 5_000,
+                games=140,
+            )
+            for i in range(4)
+        }
+        hosts = [
+            EvalHost(
+                f"host{i}",
+                None,
+                140,
+                45,
+                "0-89",
+                rollout_parallel_threads=2,
+            )
+            for i in range(9)
+        ]
+        chunks = plan_role_chunks(
+            blocks,
+            scratch_root=Path("/tmp/.distributed_eval_scratch/exp3_140"),
+            hosts=hosts,
+        )
+
+        self.assertEqual(sum(chunk.num_games for chunk in chunks), 560)
+        self.assertEqual({chunk.wave_index for chunk in chunks}, {0})
+        self.assertEqual({chunk.host.label for chunk in chunks}, {host.label for host in hosts})
+        self.assertTrue(any(chunk.num_games > chunk.parallel_games for chunk in chunks))
+        for host in hosts:
+            live_games = sum(
+                chunk.parallel_games for chunk in chunks if chunk.host == host
+            )
+            self.assertLessEqual(live_games, host.parallel_games)
+        for left, right in (("block0", "block1"), ("block2", "block3")):
+            left_plan = sorted(
+                (c.wave_index, c.host.label, c.game_offset, c.num_games)
+                for c in chunks
+                if c.block_name == left
+            )
+            right_plan = sorted(
+                (c.wave_index, c.host.label, c.game_offset, c.num_games)
+                for c in chunks
+                if c.block_name == right
+            )
+            self.assertEqual(left_plan, right_plan)
+
 
     def test_paired_blocks_preserve_identical_offsets_and_4k(self) -> None:
         blocks = {
@@ -278,6 +336,26 @@ class DistributedEvalPlanTests(unittest.TestCase):
         self.assertEqual(offset, 100)
         self.assertEqual(combined, planned(100, 0))
         self.assertEqual(len(set(combined)), 100)
+
+    def test_single_game_tasks_apply_distinct_history_offsets(self) -> None:
+        assigned: list[int] = []
+        for offset in range(140):
+            args = SimpleNamespace(
+                num_games=1,
+                history_hops_offset=offset,
+                history_hops_min=0,
+                history_hops_max=145,
+                history_seed=2134,
+                history_hops_unique=True,
+                history_hops_force_zero=False,
+                history_hops_prefix_stable=True,
+            )
+            assigned.append(_pin_single_game_history_hop(args))
+            self.assertEqual(args.history_hops_min, assigned[-1])
+            self.assertEqual(args.history_hops_max, assigned[-1])
+            self.assertEqual(args.history_hops_offset, 0)
+
+        self.assertEqual(len(set(assigned)), 140)
 
     def test_sjf_plan_is_one_wave_and_xl_has_most_games(self) -> None:
         with mock.patch.dict(

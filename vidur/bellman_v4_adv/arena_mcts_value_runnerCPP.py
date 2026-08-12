@@ -382,6 +382,7 @@ def _get_cfg_payload(args: argparse.Namespace, cfg: Any, bundle: Any) -> dict[st
     payload["use_policy_prior"] = bool(_NATIVE_CONTROLLER_PRIOR_RUNTIME is not None and _NATIVE_ADVERSARY_PRIOR_RUNTIME is not None)
     payload["root_dirichlet_noise_enabled"] = bool(args.root_dirichlet_noise_enabled)
     payload["root_dirichlet_alpha"] = float(args.root_dirichlet_alpha)
+    payload["root_dirichlet_total_concentration"] = float(args.root_dirichlet_total_concentration)
     payload["root_dirichlet_epsilon"] = float(args.root_dirichlet_epsilon)
     payload["pb_c_base"] = float(pipeline_cfg.game_v2.mcts_search.pb_c_base)
     payload["pb_c_init"] = float(pipeline_cfg.game_v2.mcts_search.pb_c_init)
@@ -1058,6 +1059,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--prior-min-prob", type=float, default=1e-8)
     parser.add_argument("--root-dirichlet-noise-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--root-dirichlet-alpha", type=float, default=0.03)
+    parser.add_argument("--root-dirichlet-total-concentration", type=float, default=0.0)
     parser.add_argument("--root-dirichlet-epsilon", type=float, default=0.25)
     parser.add_argument("--agz-sample-initial-moves", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--agz-sample-initial-move-count", type=int, default=30)
@@ -1118,6 +1120,21 @@ def _planned_history_hops(args: argparse.Namespace) -> list[int]:
     return [int(x) for x in hops[offset:]]
 
 
+def _pin_single_game_history_hop(args: argparse.Namespace) -> int:
+    """Resolve a distributed one-game task's offset before entering the tester."""
+
+    hops = _planned_history_hops(args)
+    if len(hops) != 1:
+        raise ValueError(f"expected exactly one planned history hop, got {len(hops)}")
+    hop = int(hops[0])
+    args.history_hops_min = hop
+    args.history_hops_max = hop
+    args.history_hops_offset = 0
+    args.history_hops_unique = True
+    args.history_hops_force_zero = False
+    return hop
+
+
 def _worker_command(args: argparse.Namespace, *, game_id: int, hop: int, job_dir: Path) -> list[str]:
     cmd = [
         sys.executable,
@@ -1170,6 +1187,8 @@ def _worker_command(args: argparse.Namespace, *, game_id: int, hop: int, job_dir
         "--root-dirichlet-noise-enabled" if bool(args.root_dirichlet_noise_enabled) else "--no-root-dirichlet-noise-enabled",
         "--root-dirichlet-alpha",
         str(float(args.root_dirichlet_alpha)),
+        "--root-dirichlet-total-concentration",
+        str(float(args.root_dirichlet_total_concentration)),
         "--root-dirichlet-epsilon",
         str(float(args.root_dirichlet_epsilon)),
         "--agz-sample-initial-moves" if bool(args.agz_sample_initial_moves) else "--no-agz-sample-initial-moves",
@@ -1607,6 +1626,8 @@ def main() -> None:
     if int(args.num_games) > 1 and not bool(args.launcher_worker):
         _run_parallel_launcher(args)
         return
+    if not bool(args.launcher_worker):
+        _pin_single_game_history_hop(args)
     _run_single_game(args)
 
 

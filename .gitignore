@@ -185,3 +185,8 @@ prefill_throughput_outputsimulator_output/backupMctsRootLogs/
 
 # GV3 native generated CMake builds
 vidur/mcts/Game_Versions/Game_Version3/native/build_*/
+vidur/Game_Version3_Cpp/build_*/
+
+# Local patch/recovery artifacts
+*.orig
+*.rej

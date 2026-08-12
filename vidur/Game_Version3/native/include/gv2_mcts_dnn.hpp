@@ -8,6 +8,16 @@
 #include <vector>
 
 namespace mcts_native_gv2 {
+inline double resolve_root_dirichlet_alpha(
+    double fixed_alpha,
+    double total_concentration,
+    int canonical_action_count) noexcept {
+    if (total_concentration > 0.0 && canonical_action_count > 0) {
+        return total_concentration / static_cast<double>(canonical_action_count);
+    }
+    return fixed_alpha;
+}
+
 
 struct SearchInput {
     std::string contract_version = kGV2NativeContractVersion;
@@ -34,6 +44,7 @@ struct SearchInput {
     // Root Dirichlet noise (AlphaZero style): root-only
     bool root_dirichlet_noise_enabled = false;
     double root_dirichlet_alpha = 0.1;
+    double root_dirichlet_total_concentration = 0.0;
     double root_dirichlet_epsilon = 0.35;
 
     // Environment/simulator config (optional overrides).

@@ -365,6 +365,7 @@ class MCTSSearchConfig:
     prior_value_mode: str = "model"  # "model" | "uniform"
     root_dirichlet_noise_enabled: bool = True
     root_dirichlet_alpha: float = 0.6
+    root_dirichlet_total_concentration: float = 0.0
     root_dirichlet_epsilon: float = 0.30
 
     # PUCT constants.
@@ -388,6 +389,8 @@ class MCTSSearchConfig:
             raise ValueError("prior_value_mode must be 'model' or 'uniform'")
         if self.root_dirichlet_alpha < 0.0:
             raise ValueError("root_dirichlet_alpha must be >= 0")
+        if self.root_dirichlet_total_concentration < 0.0:
+            raise ValueError("root_dirichlet_total_concentration must be >= 0")
         if not (0.0 <= self.root_dirichlet_epsilon <= 1.0):
             raise ValueError("root_dirichlet_epsilon must be in [0,1]")
         if self.pb_c_base <= 0.0:

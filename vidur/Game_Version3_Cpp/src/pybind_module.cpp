@@ -372,6 +372,7 @@ std::string build_native_config_json(
     oss << "    \"search_mode\": " << json_string(in.search_mode) << ",\n";
     oss << "    \"root_dirichlet_noise_enabled\": " << (in.root_dirichlet_noise_enabled ? "true" : "false") << ",\n";
     oss << "    \"root_dirichlet_alpha\": " << in.root_dirichlet_alpha << ",\n";
+    oss << "    \"root_dirichlet_total_concentration\": " << in.root_dirichlet_total_concentration << ",\n";
     oss << "    \"root_dirichlet_epsilon\": " << in.root_dirichlet_epsilon << "\n";
     oss << "  },\n";
     oss << "  \"environment\": {\n";
@@ -1498,6 +1499,9 @@ py::dict search_mcts_dnn_gv2_common(
     in.root_dirichlet_alpha = get_double(
         {"root_dirichlet_alpha"},
         in.root_dirichlet_alpha);
+    in.root_dirichlet_total_concentration = get_double(
+        {"root_dirichlet_total_concentration"},
+        in.root_dirichlet_total_concentration);
     in.root_dirichlet_epsilon = get_double(
         {"root_dirichlet_epsilon"},
         in.root_dirichlet_epsilon);
@@ -1528,6 +1532,8 @@ py::dict search_mcts_dnn_gv2_common(
         {"rollout_max_actions", "mcts_rollout_max_actions"}, in.rollout_max_actions);
     in.capture_rollout_trace = get_bool(
         {"capture_rollout_trace"}, in.capture_rollout_trace);
+    in.capture_root_puct_trace = get_bool(
+        {"capture_root_puct_trace"}, in.capture_root_puct_trace);
     in.rollout_optimized_execution = get_bool(
         {"rollout_optimized_execution"},
         in.rollout_optimized_execution);
@@ -1879,6 +1885,24 @@ py::dict search_mcts_dnn_gv2_common(
         py_rollout_trace_steps.append(std::move(row));
     }
     result["rollout_trace_steps"] = std::move(py_rollout_trace_steps);
+    py::list py_root_puct_trace_steps;
+    for (const auto& step : out.root_puct_trace_steps) {
+        py::dict row;
+        row["sim_iteration"] = step.sim_iteration;
+        row["action_index"] = step.action_index;
+        row["visited"] = step.visited;
+        row["visits"] = step.visits;
+        row["q_value"] = step.q_value;
+        row["normalized_q"] = step.normalized_q;
+        row["prior"] = step.prior;
+        row["exploration_raw"] = step.exploration_raw;
+        row["exploration_weighted"] = step.exploration_weighted;
+        row["puct_score"] = step.puct_score;
+        row["parent_min_value"] = step.parent_min_value;
+        row["parent_max_value"] = step.parent_max_value;
+        py_root_puct_trace_steps.append(std::move(row));
+    }
+    result["root_puct_trace_steps"] = std::move(py_root_puct_trace_steps);
     result["perf"] = py_perf;
 
     return result;
@@ -2091,6 +2115,197 @@ py::dict search_mcts_dnn_gv2_hgb226_value_prior_hgb(
                 controller_prior_runtime,
                 adversary_prior_runtime);
         });
+}
+
+py::dict benchmark_cross_game_mcts_hgb226(
+    NewFeatures226HGBRuntime& infer_runtime,
+    NativeHGBModelRuntime& controller_prior_runtime,
+    NativeHGBModelRuntime& adversary_prior_runtime,
+    py::dict root_state_payload,
+    py::dict cfg_payload,
+    int game_count,
+    int iterations,
+    const std::string& root_player,
+    int root_node_id,
+    int root_depth,
+    int root_id,
+    int seed,
+    int worker_threads,
+    int inference_threads,
+    int max_batch_requests,
+    int max_batch_wait_us) {
+    if (game_count <= 0 || iterations <= 0) {
+        throw std::invalid_argument(
+            "game_count and iterations must be positive");
+    }
+
+    SearchInput parsed;
+    std::unique_ptr<GV2VirtualEnvironment> parsed_env;
+    auto capture_input = [&](
+        const SearchInput& input,
+        GV2VirtualEnvironment& env,
+        NewFeatures226HGBRuntime&,
+        int) {
+        parsed = input;
+        parsed_env = std::make_unique<GV2VirtualEnvironment>(env);
+        return SearchOutput{};
+    };
+    (void)search_mcts_dnn_gv2_common(
+        infer_runtime,
+        0,
+        root_state_payload,
+        cfg_payload,
+        iterations,
+        root_player,
+        root_node_id,
+        root_depth,
+        0,
+        root_id,
+        seed,
+        false,
+        false,
+        "",
+        "",
+        capture_input);
+    if (parsed_env == nullptr) {
+        throw std::runtime_error(
+            "failed to construct cross-game benchmark input");
+    }
+
+    std::vector<SearchInput> inputs(
+        static_cast<std::size_t>(game_count), parsed);
+    for (int index = 0; index < game_count; ++index) {
+        SearchInput& input = inputs[static_cast<std::size_t>(index)];
+        input.game_id = index;
+        input.root_id = root_id + index;
+        input.root_node_id = root_node_id + index * 10000;
+        input.seed = seed + index * 104729;
+        input.log_events = false;
+        input.profile = false;
+        input.capture_rollout_trace = false;
+        input.capture_root_puct_trace = false;
+        input.cross_game_inference_batcher = nullptr;
+    }
+
+    double single_search_sec = 0.0;
+    CrossGameBatchResult baseline;
+    CrossGameBatchResult batched;
+    {
+        py::gil_scoped_release release;
+        const auto single_started = std::chrono::steady_clock::now();
+        (void)run_search_hgb226_value_prior_with_env(
+            inputs.front(),
+            *parsed_env,
+            infer_runtime,
+            controller_prior_runtime,
+            adversary_prior_runtime);
+        single_search_sec = std::chrono::duration_cast<
+            std::chrono::duration<double>>(
+                std::chrono::steady_clock::now() - single_started).count();
+
+        baseline = run_search_hgb226_value_prior_parallel_baseline(
+            inputs,
+            *parsed_env,
+            infer_runtime,
+            controller_prior_runtime,
+            adversary_prior_runtime,
+            worker_threads);
+        batched = run_search_hgb226_value_prior_cross_game_batch(
+            inputs,
+            *parsed_env,
+            infer_runtime,
+            controller_prior_runtime,
+            adversary_prior_runtime,
+            worker_threads,
+            inference_threads,
+            max_batch_requests,
+            max_batch_wait_us);
+    }
+
+    std::int64_t action_mismatches = 0;
+    std::int64_t visit_mismatches = 0;
+    std::int64_t q_mismatches = 0;
+    double max_root_value_abs_diff = 0.0;
+    double max_action_q_abs_diff = 0.0;
+    for (std::size_t index = 0; index < baseline.outputs.size(); ++index) {
+        const SearchOutput& expected = baseline.outputs[index];
+        const SearchOutput& actual = batched.outputs[index];
+        action_mismatches +=
+            expected.best_action_index != actual.best_action_index;
+        visit_mismatches += expected.root_visits != actual.root_visits;
+        max_root_value_abs_diff = std::max(
+            max_root_value_abs_diff,
+            std::abs(expected.root_value_sum - actual.root_value_sum));
+        const std::size_t action_count = std::min(
+            expected.root_action_values.size(),
+            actual.root_action_values.size());
+        q_mismatches += expected.root_action_values.size() !=
+            actual.root_action_values.size();
+        for (std::size_t action = 0; action < action_count; ++action) {
+            const double left = expected.root_action_values[action];
+            const double right = actual.root_action_values[action];
+            if (!std::isfinite(left) && !std::isfinite(right)) continue;
+            if (!std::isfinite(left) || !std::isfinite(right)) {
+                ++q_mismatches;
+                continue;
+            }
+            const double diff = std::abs(left - right);
+            max_action_q_abs_diff = std::max(max_action_q_abs_diff, diff);
+            q_mismatches += diff > 1e-9;
+        }
+    }
+
+    const double baseline_games_per_sec =
+        static_cast<double>(game_count) /
+        std::max(1e-12, baseline.elapsed_sec);
+    const double batched_games_per_sec =
+        static_cast<double>(game_count) /
+        std::max(1e-12, batched.elapsed_sec);
+    const CrossGameBatchStats& stats = batched.stats;
+
+    py::dict result;
+    result["game_count"] = game_count;
+    result["iterations_per_game"] = iterations;
+    result["worker_threads"] = worker_threads;
+    result["inference_threads"] = inference_threads;
+    result["max_batch_requests"] = max_batch_requests;
+    result["max_batch_wait_us"] = max_batch_wait_us;
+    result["single_search_sec"] = single_search_sec;
+    result["parallel_unbatched_sec"] = baseline.elapsed_sec;
+    result["cross_game_batched_sec"] = batched.elapsed_sec;
+    result["parallel_unbatched_games_per_sec"] = baseline_games_per_sec;
+    result["cross_game_batched_games_per_sec"] = batched_games_per_sec;
+    result["throughput_speedup"] =
+        batched_games_per_sec / std::max(1e-12, baseline_games_per_sec);
+    result["policy_requests"] = stats.policy_requests;
+    result["policy_batches"] = stats.policy_batches;
+    result["policy_action_rows"] = stats.policy_action_rows;
+    result["value_requests"] = stats.value_requests;
+    result["value_batches"] = stats.value_batches;
+    result["value_states"] = stats.value_states;
+    result["max_policy_batch_requests"] =
+        stats.max_policy_batch_requests;
+    result["max_value_batch_requests"] =
+        stats.max_value_batch_requests;
+    result["mean_policy_requests_per_batch"] =
+        static_cast<double>(stats.policy_requests) /
+        std::max<std::int64_t>(1, stats.policy_batches);
+    result["mean_value_requests_per_batch"] =
+        static_cast<double>(stats.value_requests) /
+        std::max<std::int64_t>(1, stats.value_batches);
+    result["policy_inference_sec"] = stats.policy_inference_sec;
+    result["value_inference_sec"] = stats.value_inference_sec;
+    result["action_mismatches"] = action_mismatches;
+    result["visit_mismatches"] = visit_mismatches;
+    result["q_mismatches"] = q_mismatches;
+    result["max_root_value_abs_diff"] = max_root_value_abs_diff;
+    result["max_action_q_abs_diff"] = max_action_q_abs_diff;
+    result["outputs_match"] =
+        action_mismatches == 0 &&
+        visit_mismatches == 0 &&
+        q_mismatches == 0 &&
+        max_root_value_abs_diff <= 1e-9;
+    return result;
 }
 
 py::dict generate_selfplay_gv3_torchscript(
@@ -2587,7 +2802,35 @@ PYBIND11_MODULE(mcts_native_gv2, m) {
             py::arg("flat_features"),
             py::arg("num_rows"),
             py::arg("row_dim"))
+        .def(
+            "predict_markov_policy_from_state",
+            [](const NativeHGBModelRuntime& self,
+               const py::dict& root_state_payload,
+               const std::vector<std::vector<float>>& action_rows) {
+                const MarkovValueFeatures state = build_markov_value_features(
+                    parse_root_state_payload(root_state_payload));
+                std::vector<float> flat_actions;
+                flat_actions.reserve(
+                    action_rows.size() *
+                    static_cast<std::size_t>(std::max(0, self.action_dim())));
+                for (const auto& row : action_rows) {
+                    if (static_cast<int>(row.size()) != self.action_dim()) {
+                        throw std::runtime_error(
+                            "Markov policy action row dimension mismatch");
+                    }
+                    flat_actions.insert(
+                        flat_actions.end(), row.begin(), row.end());
+                }
+                const int rows = static_cast<int>(action_rows.size());
+                return self.predict_markov_policy_grouped_batch(
+                    {state}, flat_actions, rows, {0, rows}, 1);
+            },
+            py::arg("root_state_payload"),
+            py::arg("action_rows"))
         .def_property_readonly("feature_dim", &NativeHGBModelRuntime::feature_dim)
+        .def_property_readonly("action_dim", &NativeHGBModelRuntime::action_dim)
+        .def_property_readonly(
+            "is_markov_policy", &NativeHGBModelRuntime::is_markov_policy)
         .def_property_readonly("num_trees", &NativeHGBModelRuntime::num_trees)
         .def_property_readonly("loaded", &NativeHGBModelRuntime::loaded)
         .def_property_readonly("model_tag", &NativeHGBModelRuntime::model_tag);
@@ -2766,6 +3009,27 @@ PYBIND11_MODULE(mcts_native_gv2, m) {
         py::arg("root_log_path") = ""
     );
 
+    m.def(
+        "benchmark_cross_game_mcts_hgb226",
+        &benchmark_cross_game_mcts_hgb226,
+        py::arg("infer_runtime"),
+        py::arg("controller_prior_runtime"),
+        py::arg("adversary_prior_runtime"),
+        py::arg("root_state_payload"),
+        py::arg("cfg_payload"),
+        py::arg("game_count"),
+        py::arg("iterations") = 1,
+        py::arg("root_player") = "controller",
+        py::arg("root_node_id") = 1,
+        py::arg("root_depth") = 0,
+        py::arg("root_id") = 1,
+        py::arg("seed") = 12345,
+        py::arg("worker_threads") = 32,
+        py::arg("inference_threads") = 32,
+        py::arg("max_batch_requests") = 32,
+        py::arg("max_batch_wait_us") = 500
+    );
+
 
     m.def(
         "debug_apply_root_action_hgb226",
@@ -2803,6 +3067,14 @@ PYBIND11_MODULE(mcts_native_gv2, m) {
         py::arg("eval_split_seed") = 0,
         py::arg("action_seed_base") = 0,
         py::arg("allow_duplicate_history_fallback") = true
+    );
+
+    m.def(
+        "resolve_root_dirichlet_alpha",
+        &resolve_root_dirichlet_alpha,
+        py::arg("fixed_alpha"),
+        py::arg("total_concentration"),
+        py::arg("canonical_action_count")
     );
 
     m.def(

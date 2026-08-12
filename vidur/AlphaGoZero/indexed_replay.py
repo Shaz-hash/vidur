@@ -67,6 +67,9 @@ class IndexedRoots(dict):
     def __init__(self) -> None:
         super().__init__()
         self.locators: dict[tuple[str, str, int, int, int, str], tuple[str, int]] = {}
+        self.structured: dict[
+            tuple[str, str, int, int, int, str], MarkovValueFeatures
+        ] = {}
 
 
 def _read_json_list(raw: str) -> list[float]:
@@ -532,7 +535,7 @@ def _load_selected_states_worker(
             else None
         )
         globals_array = requests = request_offsets = launches = launch_offsets = None
-        if str(value_feature_schema) == MARKOV_VALUE_SCHEMA and include_target:
+        if str(value_feature_schema) == MARKOV_VALUE_SCHEMA:
             globals_array = np.load(cache_dir / "value_globals.npy", mmap_mode="r", allow_pickle=False)
             request_offsets = np.load(cache_dir / "request_offsets.npy", mmap_mode="r", allow_pickle=False)
             requests = np.load(cache_dir / "request_features.npy", mmap_mode="r", allow_pickle=False)
@@ -544,19 +547,19 @@ def _load_selected_states_worker(
             if include_target:
                 assert targets is not None
                 target = float(targets[local_row])
-                if str(value_feature_schema) == MARKOV_VALUE_SCHEMA:
-                    assert globals_array is not None
-                    assert request_offsets is not None and requests is not None
-                    assert launch_offsets is not None and launches is not None
-                    request_begin = int(request_offsets[local_row])
-                    request_end = int(request_offsets[local_row + 1])
-                    launch_begin = int(launch_offsets[local_row])
-                    launch_end = int(launch_offsets[local_row + 1])
-                    structured = (
-                        np.asarray(globals_array[local_row], dtype=np.float32).copy(),
-                        np.asarray(requests[request_begin:request_end], dtype=np.float32).copy(),
-                        np.asarray(launches[launch_begin:launch_end], dtype=np.float32).copy(),
-                    )
+            if str(value_feature_schema) == MARKOV_VALUE_SCHEMA:
+                assert globals_array is not None
+                assert request_offsets is not None and requests is not None
+                assert launch_offsets is not None and launches is not None
+                request_begin = int(request_offsets[local_row])
+                request_end = int(request_offsets[local_row + 1])
+                launch_begin = int(launch_offsets[local_row])
+                launch_end = int(launch_offsets[local_row + 1])
+                structured = (
+                    np.asarray(globals_array[local_row], dtype=np.float32).copy(),
+                    np.asarray(requests[request_begin:request_end], dtype=np.float32).copy(),
+                    np.asarray(launches[launch_begin:launch_end], dtype=np.float32).copy(),
+                )
             output.append(
                 (
                     int(order),
@@ -659,11 +662,111 @@ def materialize_policy_roots(
                 records.extend(future.result())
     records.sort(key=lambda item: int(item[0]))
     roots = IndexedRoots()
-    for _order, raw_key, state, _target, _role, _structured, cache_dir, local_row in records:
+    for _order, raw_key, state, _target, _role, structured, cache_dir, local_row in records:
         key = key_from_string(raw_key)
         roots[key] = state
         roots.locators[key] = (str(cache_dir), int(local_row))
+        if structured is not None:
+            global_features, request_features, launch_features = structured
+            roots.structured[key] = MarkovValueFeatures(
+                global_features=global_features,
+                request_features=request_features,
+                launch_features=launch_features,
+                request_ids=tuple(range(int(request_features.shape[0]))),
+            )
     return roots
+
+
+def materialize_markov_policy_arrays(
+    roots: IndexedRoots,
+    *,
+    action_dim: int,
+    root_cap: int,
+) -> tuple[
+    tuple[
+        list[MarkovValueFeatures],
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        list[tuple[int, int]],
+    ],
+    dict[str, int | float],
+]:
+    """Materialize actions while retaining one structured state per root."""
+
+    selected_keys = list(roots.keys())[: max(0, int(root_cap))]
+    grouped: dict[str, list[tuple[tuple[str, str, int, int, int, str], int]]] = {}
+    for key in selected_keys:
+        if key not in roots.structured:
+            raise RuntimeError(f"indexed Markov policy root has no structured state: {key}")
+        cache_dir, local_row = roots.locators[key]
+        grouped.setdefault(cache_dir, []).append((key, int(local_row)))
+
+    records: list[
+        tuple[
+            tuple[str, str, int, int, int, str],
+            np.ndarray,
+            np.ndarray,
+            np.ndarray,
+        ]
+    ] = []
+    for cache_dir_raw, selected in grouped.items():
+        cache_dir = Path(cache_dir_raw)
+        policy_offsets = np.load(cache_dir / "policy_offsets.npy", mmap_mode="r", allow_pickle=False)
+        indices = np.load(cache_dir / "action_indices.npy", mmap_mode="r", allow_pickle=False)
+        visits = np.load(cache_dir / "visits.npy", mmap_mode="r", allow_pickle=False)
+        features = np.load(cache_dir / "action_features.npy", mmap_mode="r", allow_pickle=False)
+        if int(features.shape[1]) != int(action_dim):
+            raise RuntimeError(
+                f"indexed action dimension {features.shape[1]} != expected {action_dim}: {cache_dir}"
+            )
+        for key, local_row in selected:
+            begin = int(policy_offsets[local_row])
+            end = int(policy_offsets[local_row + 1])
+            if end <= begin:
+                continue
+            records.append(
+                (
+                    key,
+                    np.asarray(indices[begin:end], dtype=np.int32).copy(),
+                    np.asarray(visits[begin:end], dtype=np.int32).copy(),
+                    np.asarray(features[begin:end], dtype=np.float32).copy(),
+                )
+            )
+    records.sort(key=lambda item: item[0])
+    total_actions = sum(int(record[1].shape[0]) for record in records)
+    actions = np.empty((total_actions, int(action_dim)), dtype=np.float32)
+    logits = np.empty(total_actions, dtype=np.float32)
+    probabilities = np.empty(total_actions, dtype=np.float32)
+    offsets_out: list[tuple[int, int]] = []
+    states_out: list[MarkovValueFeatures] = []
+    position = 0
+    for key, action_indices, visit_counts, action_features in records:
+        order = np.argsort(action_indices, kind="stable")
+        action_features = action_features[order]
+        visit_values = np.maximum(0, visit_counts[order]).astype(np.float64, copy=False)
+        total = float(np.sum(visit_values))
+        probs = (
+            visit_values / total
+            if total > 0.0
+            else np.full(visit_values.size, 1.0 / float(visit_values.size), dtype=np.float64)
+        )
+        target_logits = np.log(visit_values + float(POLICY_ALPHA))
+        target_logits -= float(np.mean(target_logits))
+        count = int(action_features.shape[0])
+        end = position + count
+        actions[position:end] = action_features
+        logits[position:end] = target_logits.astype(np.float32, copy=False)
+        probabilities[position:end] = probs.astype(np.float32, copy=False)
+        offsets_out.append((position, end))
+        states_out.append(roots.structured[key])
+        position = end
+    return (states_out, actions, logits, probabilities, offsets_out), {
+        "roots_with_actions": int(len(records)),
+        "action_rows": int(total_actions),
+        "state_rows_materialized": int(len(states_out)),
+        "state_per_action_expansion": 0,
+    }
 
 
 def materialize_policy_arrays(

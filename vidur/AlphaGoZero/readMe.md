@@ -165,6 +165,9 @@ Sampling:
 - Value sampling defaults to `500,000` feature-complete replay states and can be raised with `AGZ_MAX_VALUE_STATES`.
 - Controller policy samples up to `AGZ_CONTROLLER_POLICY_SAMPLE_CAP` controller roots.
 - Adversary policy samples up to `AGZ_ADVERSARY_POLICY_SAMPLE_CAP` adversary roots.
+- Policy caps are maxima, not additional training minima. When fewer actionable
+  roots are available, policy training uses all available roots after the
+  corresponding controller/adversary value-state minimum has been satisfied.
 - The trainer uses streaming/reservoir sampling over replay partitions so it does not load the full replay buffer into memory.
 - Training is blocked if sampled adversary rows are below `MIN_ADVERSARY_STATES_FOR_EVAL`.
 

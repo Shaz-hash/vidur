@@ -14,6 +14,7 @@ from vidur.AlphaGoZero.indexed_replay import (
     CONTROLLER_ACTION_DIM,
     ensure_partition_indexes,
     indexed_sample_training_data,
+    materialize_markov_policy_arrays,
     materialize_policy_arrays,
     sample_addresses,
 )
@@ -184,6 +185,22 @@ def main() -> None:
         for begin, end in offsets:
             np.testing.assert_allclose(probabilities[begin:end], [0.3, 0.7], atol=1e-7)
             assert abs(float(np.sum(probabilities[begin:end])) - 1.0) < 1e-7
+
+        (markov_arrays, markov_policy) = materialize_markov_policy_arrays(
+            controller_roots,
+            action_dim=CONTROLLER_ACTION_DIM,
+            root_cap=15,
+        )
+        states, actions, _target_logits, markov_probabilities, markov_offsets = markov_arrays
+        assert len(states) == len(markov_offsets) == 15
+        assert actions.shape == (30, CONTROLLER_ACTION_DIM)
+        assert markov_probabilities.shape == (30,)
+        assert int(markov_policy["state_rows_materialized"]) == 15
+        assert int(markov_policy["state_per_action_expansion"]) == 0
+        for begin, end in markov_offsets:
+            np.testing.assert_allclose(
+                markov_probabilities[begin:end], [0.3, 0.7], atol=1e-7
+            )
 
     print(
         json.dumps(

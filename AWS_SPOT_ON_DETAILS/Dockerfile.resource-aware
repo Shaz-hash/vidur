@@ -1,0 +1,24 @@
+ARG BASE_IMAGE=vidur-agz-exp3-worker:spot-pull-v3-20260729
+FROM ${BASE_IMAGE}
+
+ARG BUILD_DATE=unknown
+ARG SCHEDULER_REVISION=resource-aware-v1
+
+LABEL org.opencontainers.image.description="Native GV3 AlphaGoZero worker with resource-aware XL scheduling" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      io.vidur.agz.scheduler.revision="${SCHEDULER_REVISION}"
+
+USER root
+COPY --chown=ubuntu:ubuntu repo/vidur/AlphaGoZero/spot_work_protocol.py /home/ubuntu/vidur-classical-search/vidur/AlphaGoZero/spot_work_protocol.py
+COPY --chown=ubuntu:ubuntu repo/vidur/AlphaGoZero/spot_work_cli.py /home/ubuntu/vidur-classical-search/vidur/AlphaGoZero/spot_work_cli.py
+COPY --chown=ubuntu:ubuntu repo/vidur/AlphaGoZero/spot_worker_daemon.py /home/ubuntu/vidur-classical-search/vidur/AlphaGoZero/spot_worker_daemon.py
+COPY --chown=ubuntu:ubuntu repo/vidur/AlphaGoZero/test_and_analysis/test_spot_work_protocol.py /home/ubuntu/vidur-classical-search/vidur/AlphaGoZero/test_and_analysis/test_spot_work_protocol.py
+COPY --chown=ubuntu:ubuntu repo/vidur/AlphaGoZero/test_and_analysis/test_spot_worker_dispatch.py /home/ubuntu/vidur-classical-search/vidur/AlphaGoZero/test_and_analysis/test_spot_worker_dispatch.py
+COPY container_smoke.py /usr/local/bin/agz-container-smoke
+RUN chmod 0755 /usr/local/bin/agz-container-smoke
+
+USER ubuntu
+RUN python -m unittest \
+      vidur.AlphaGoZero.test_and_analysis.test_spot_work_protocol \
+      vidur.AlphaGoZero.test_and_analysis.test_spot_worker_dispatch \
+    && /usr/local/bin/agz-container-smoke --build-check

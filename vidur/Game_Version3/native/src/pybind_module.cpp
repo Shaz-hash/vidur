@@ -368,6 +368,7 @@ std::string build_native_config_json(
     oss << "    \"reuse_root_infer_inputs\": " << (in.reuse_root_infer_inputs ? "true" : "false") << ",\n";
     oss << "    \"root_dirichlet_noise_enabled\": " << (in.root_dirichlet_noise_enabled ? "true" : "false") << ",\n";
     oss << "    \"root_dirichlet_alpha\": " << in.root_dirichlet_alpha << ",\n";
+    oss << "    \"root_dirichlet_total_concentration\": " << in.root_dirichlet_total_concentration << ",\n";
     oss << "    \"root_dirichlet_epsilon\": " << in.root_dirichlet_epsilon << "\n";
     oss << "  },\n";
     oss << "  \"environment\": {\n";
@@ -1413,6 +1414,9 @@ py::dict search_mcts_dnn_gv2_torchscript(
     in.root_dirichlet_alpha = get_double(
         {"root_dirichlet_alpha"},
         in.root_dirichlet_alpha);
+    in.root_dirichlet_total_concentration = get_double(
+        {"root_dirichlet_total_concentration"},
+        in.root_dirichlet_total_concentration);
     in.root_dirichlet_epsilon = get_double(
         {"root_dirichlet_epsilon"},
         in.root_dirichlet_epsilon);

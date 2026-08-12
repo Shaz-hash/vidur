@@ -14,6 +14,7 @@ import csv
 import gc
 import json
 import math
+import multiprocessing
 import os
 import random
 import shutil
@@ -42,14 +43,17 @@ from vidur.AlphaGoZero.config import (
     AGZ_DNN_VALUE_BATCH_SIZE,
     AGZ_BENCHMARK_GAMES,
     AGZ_EVAL_GAMES,
+    AGZ_EVAL_PUCT_C,
     AGZ_EVAL_ROLLOUT_COUNT,
     AGZ_EVAL_ROLLOUT_PARALLEL_THREADS,
     AGZ_REPLAY_EXTRACTION_WORKERS,
     AGZ_REPLAY_INDEX_BUILD_WORKERS,
     AGZ_REPLAY_SAMPLER,
+    AGZ_SJF_PUCT_C,
     AGZ_SJF_ROLLOUT_COUNT,
     AGZ_SJF_ROLLOUT_PARALLEL_THREADS,
     AGZ_MODEL_FAMILY,
+    AGZ_POLICY_FEATURE_SCHEMA,
     AGZ_NATIVE_SEARCH_MODE,
     AGZ_ROLLOUT_COUNT,
     AGZ_ROLLOUT_HORIZON_SEC,
@@ -67,6 +71,7 @@ from vidur.AlphaGoZero.config import (
     MIN_CONTROLLER_STATES_FOR_EVAL,
     MIN_ADVERSARY_STATES_FOR_EVAL,
     POLICY_CACHE_BUILD_WORKERS,
+    POLICY_METRICS_WORKERS,
     POLICY_ROOT_OVERSAMPLE_FACTOR,
     PROMOTION_WIN_RATE_THRESHOLD,
     ROLE_PROMOTION_WIN_THRESHOLD,
@@ -76,6 +81,7 @@ from vidur.AlphaGoZero.distributed_eval import (
     cpu_safe_hosts,
     default_role_hosts,
     default_sjf_hosts,
+    merge_arena_block,
     distributed_eval_enabled,
     memory_safe_hosts,
     merge_split_sjf_cycles,
@@ -84,8 +90,15 @@ from vidur.AlphaGoZero.distributed_eval import (
     plan_role_chunks,
     plan_single_block_chunks,
     run_distributed_chunks,
+    spot_pull_eval_enabled,
+)
+from vidur.AlphaGoZero.adaptive_rollout import (
+    active_rollout_horizon_sec,
+    configured_rollout_horizon,
+    runtime_search_config_path,
 )
 from vidur.AlphaGoZero.durable_transfer import append_csv_row, atomic_write_json, local_time_24h, utc_now
+from vidur.AlphaGoZero.spot_distributed_eval import run_spot_pull_commands
 from vidur.AlphaGoZero.markov_value_features import (
     GLOBAL_DIM as MARKOV_GLOBAL_DIM,
     LAUNCH_DIM as MARKOV_LAUNCH_DIM,
@@ -102,13 +115,26 @@ if AGZ_VALUE_FEATURE_SCHEMA not in {"legacy_226", MARKOV_VALUE_SCHEMA}:
     raise ValueError(f"unsupported AGZ_VALUE_FEATURE_SCHEMA={AGZ_VALUE_FEATURE_SCHEMA!r}")
 if AGZ_VALUE_FEATURE_SCHEMA == MARKOV_VALUE_SCHEMA and AGZ_MODEL_FAMILY != "dnn":
     raise ValueError("markov_v2 value features require AGZ_MODEL_FAMILY=dnn")
+if AGZ_POLICY_FEATURE_SCHEMA not in {"legacy_226", MARKOV_VALUE_SCHEMA}:
+    raise ValueError(f"unsupported AGZ_POLICY_FEATURE_SCHEMA={AGZ_POLICY_FEATURE_SCHEMA!r}")
+if AGZ_POLICY_FEATURE_SCHEMA == MARKOV_VALUE_SCHEMA:
+    if AGZ_MODEL_FAMILY != "dnn":
+        raise ValueError("markov_v2 policy features require AGZ_MODEL_FAMILY=dnn")
+    if AGZ_VALUE_FEATURE_SCHEMA != MARKOV_VALUE_SCHEMA:
+        raise ValueError("markov_v2 policy features require markov_v2 indexed state caches")
+    if AGZ_REPLAY_SAMPLER != "indexed_v1":
+        raise ValueError("markov_v2 policy features require AGZ_REPLAY_SAMPLER=indexed_v1")
 
 CONFIG_NAME = (
     "dnn_value_markov_deepset_192_v2"
     if AGZ_MODEL_FAMILY == "dnn" and AGZ_VALUE_FEATURE_SCHEMA == MARKOV_VALUE_SCHEMA
     else ("dnn_value_residual_192_v1" if AGZ_MODEL_FAMILY == "dnn" else HGB_CONFIG_NAME)
 )
-POLICY_CONFIG_NAME = "dnn_policy_rank_192_v1" if AGZ_MODEL_FAMILY == "dnn" else HGB_POLICY_CONFIG_NAME
+POLICY_CONFIG_NAME = (
+    "dnn_policy_markov_deepset_192_v3"
+    if AGZ_MODEL_FAMILY == "dnn" and AGZ_POLICY_FEATURE_SCHEMA == MARKOV_VALUE_SCHEMA
+    else ("dnn_policy_rank_192_v1" if AGZ_MODEL_FAMILY == "dnn" else HGB_POLICY_CONFIG_NAME)
+)
 VALUE_FEATURE_DIM = 226
 CTRL_ACTION_DIM = 43
 ADV_ACTION_DIM = 7
@@ -123,6 +149,11 @@ TRAIN_MODEL_FIELDS = [
     "adversary_value_mse", "adversary_value_rmse", "adversary_value_max_abs_error", "adversary_value_p95_abs_error",
     "controller_policy_mse", "controller_policy_cross_entropy", "controller_policy_top1", "controller_policy_top3",
     "adversary_policy_mse", "adversary_policy_cross_entropy", "adversary_policy_top1", "adversary_policy_top3",
+    "rollout_horizon_used_sec", "rollout_horizon_source_controller_p95_abs_error",
+    "rollout_value_error_threshold", "rollout_discount_factor", "rollout_reference_step_sec",
+    "rollout_max_horizon_sec", "rollout_horizon_tick_sec", "next_rollout_horizon_raw_sec",
+    "next_rollout_horizon_calculated_sec", "next_rollout_horizon_rounded_sec",
+    "next_rollout_discounted_error",
 ]
 
 
@@ -263,24 +294,39 @@ def _load_policy_rows(path: Path) -> dict[tuple[str, str, int, int, int, str], l
     return out
 
 
-def _feature_replay_paths(root: Path) -> list[Path]:
+def _replay_path_snapshot(root: Path) -> tuple[list[Path], list[Path]]:
+    """Return one consistent snapshot of fully committed replay partitions."""
+
     root = Path(root)
-    partitioned = sorted(
-        (root / "global_replay" / "partitions").glob("*/*/replay_target_runtime_feature_complete.csv")
-    )
-    if partitioned:
-        return partitioned
-    legacy = root / "global_replay" / "replay_target_runtime_feature_complete.csv"
-    return [legacy] if legacy.exists() else []
+    partitions = root / "global_replay" / "partitions"
+    feature_paths: list[Path] = []
+    policy_paths: list[Path] = []
+    # The coordinator writes the manifest last via atomic rename. Files visible
+    # before that point belong to an in-progress partition and must not be read.
+    for manifest_path in sorted(partitions.glob("*/*/partition_manifest.json")):
+        partition = manifest_path.parent
+        feature_path = partition / "replay_target_runtime_feature_complete.csv"
+        policy_path = partition / "replay_policy_rows.csv"
+        if not feature_path.is_file() or not policy_path.is_file():
+            continue
+        feature_paths.append(feature_path)
+        policy_paths.append(policy_path)
+    if feature_paths:
+        return feature_paths, policy_paths
+
+    legacy_feature = root / "global_replay" / "replay_target_runtime_feature_complete.csv"
+    legacy_policy = root / "global_replay" / "replay_policy_rows.csv"
+    if legacy_feature.is_file() and legacy_policy.is_file():
+        return [legacy_feature], [legacy_policy]
+    return [], []
+
+
+def _feature_replay_paths(root: Path) -> list[Path]:
+    return _replay_path_snapshot(root)[0]
 
 
 def _policy_replay_paths(root: Path) -> list[Path]:
-    root = Path(root)
-    partitioned = sorted((root / "global_replay" / "partitions").glob("*/*/replay_policy_rows.csv"))
-    if partitioned:
-        return partitioned
-    legacy = root / "global_replay" / "replay_policy_rows.csv"
-    return [legacy] if legacy.exists() else []
+    return _replay_path_snapshot(root)[1]
 
 
 STATE_CACHE_VERSION = 2
@@ -550,6 +596,12 @@ def _policy_root_sample_target(cap: int, *, explicit_target: int = 0) -> int:
         return max(int(cap), int(explicit_target))
     factor = max(1.0, float(POLICY_ROOT_OVERSAMPLE_FACTOR))
     return max(int(cap), int(math.ceil(float(cap) * factor)))
+
+
+def _available_policy_root_requirement(available_roots: int, sample_cap: int) -> int:
+    """Use every available actionable root up to the configured maximum."""
+
+    return min(max(0, int(available_roots)), max(0, int(sample_cap)))
 
 
 def _cap_actions_by_root_order(
@@ -1436,10 +1488,21 @@ def _policy_arrays(
     )
 
 
-def _policy_metrics(model: Any, X: np.ndarray, y: np.ndarray, probs: np.ndarray, offsets: list[tuple[int, int]]) -> dict[str, float]:
+def _policy_metrics(
+    model: Any,
+    X: np.ndarray,
+    y: np.ndarray,
+    probs: np.ndarray,
+    offsets: list[tuple[int, int]],
+    structured_states: list[MarkovValueFeatures] | None = None,
+) -> dict[str, float]:
     if X.shape[0] == 0:
         return {"mse": 0.0, "cross_entropy": 0.0, "top1": 0.0, "top3": 0.0}
-    pred = model.predict(X).astype(np.float64)
+    pred = (
+        model.predict_structured(structured_states, X, offsets).astype(np.float64)
+        if structured_states is not None
+        else model.predict(X).astype(np.float64)
+    )
     mse = float(np.mean((pred - y.astype(np.float64)) ** 2))
     ce_sum = 0.0
     top1 = 0
@@ -1463,6 +1526,254 @@ def _policy_metrics(model: Any, X: np.ndarray, y: np.ndarray, probs: np.ndarray,
         roots += 1
     denom = float(max(1, roots))
     return {"mse": mse, "cross_entropy": float(ce_sum / denom), "top1": float(top1 / denom), "top3": float(top3 / denom)}
+
+
+_POLICY_METRICS_PROCESS_DATA: dict[str, tuple[Any, ...]] = {}
+_POLICY_METRICS_PROCESS_READY = False
+
+
+def _policy_metric_root_ranges(
+    root_count: int,
+    *,
+    chunks: int,
+) -> list[tuple[int, int]]:
+    if int(root_count) <= 0:
+        return []
+    count = min(int(root_count), max(1, int(chunks)))
+    return [
+        (
+            (index * int(root_count)) // count,
+            ((index + 1) * int(root_count)) // count,
+        )
+        for index in range(count)
+    ]
+
+
+def _policy_metrics_process_chunk(
+    role: str,
+    root_begin: int,
+    root_end: int,
+) -> dict[str, float | int | str]:
+    global _POLICY_METRICS_PROCESS_READY
+
+    if not _POLICY_METRICS_PROCESS_READY:
+        try:
+            import torch
+
+            torch.set_num_threads(1)
+            try:
+                torch.set_num_interop_threads(1)
+            except RuntimeError:
+                pass
+        except ImportError:
+            pass
+        _POLICY_METRICS_PROCESS_READY = True
+
+    model, X, y, probs, offsets, structured_states = _POLICY_METRICS_PROCESS_DATA[
+        str(role)
+    ]
+    selected_offsets = offsets[int(root_begin):int(root_end)]
+    if not selected_offsets:
+        return {
+            "role": str(role),
+            "squared_error_sum": 0.0,
+            "action_count": 0,
+            "cross_entropy_sum": 0.0,
+            "top1_count": 0,
+            "top3_count": 0,
+            "root_count": 0,
+        }
+
+    action_begin = int(selected_offsets[0][0])
+    action_end = int(selected_offsets[-1][1])
+    local_offsets = [
+        (int(begin) - action_begin, int(end) - action_begin)
+        for begin, end in selected_offsets
+    ]
+    X_chunk = X[action_begin:action_end]
+    states_chunk = (
+        structured_states[int(root_begin):int(root_end)]
+        if structured_states is not None
+        else None
+    )
+    with threadpool_limits(limits=1):
+        pred = (
+            model.predict_structured(
+                states_chunk,
+                X_chunk,
+                local_offsets,
+            ).astype(np.float64)
+            if states_chunk is not None
+            else model.predict(X_chunk).astype(np.float64)
+        )
+
+    target = y[action_begin:action_end].astype(np.float64)
+    err = pred - target
+    squared_error_sum = float(np.sum(err * err, dtype=np.float64))
+    cross_entropy_sum = 0.0
+    top1_count = 0
+    top3_count = 0
+    root_count = 0
+    eps = 1e-12
+    local_probs = probs[action_begin:action_end]
+    for begin, end in local_offsets:
+        if end <= begin:
+            continue
+        p = local_probs[begin:end].astype(np.float64)
+        if p.sum() <= 0.0:
+            p = np.full(end - begin, 1.0 / float(end - begin), dtype=np.float64)
+        else:
+            p = p / p.sum()
+        q = _softmax(pred[begin:end])
+        best = int(np.argmax(p))
+        order = np.argsort(-pred[begin:end], kind="stable")
+        top1_count += int(order[0] == best)
+        top3_count += int(best in set(int(index) for index in order[: min(3, order.size)]))
+        cross_entropy_sum += -float(np.sum(p * np.log(np.maximum(q, eps))))
+        root_count += 1
+    return {
+        "role": str(role),
+        "squared_error_sum": squared_error_sum,
+        "action_count": int(action_end - action_begin),
+        "cross_entropy_sum": float(cross_entropy_sum),
+        "top1_count": int(top1_count),
+        "top3_count": int(top3_count),
+        "root_count": int(root_count),
+    }
+
+
+def _aggregate_policy_metric_parts(
+    parts: list[dict[str, float | int | str]],
+) -> dict[str, float]:
+    action_count = sum(int(part["action_count"]) for part in parts)
+    root_count = sum(int(part["root_count"]) for part in parts)
+    if action_count <= 0:
+        return {"mse": 0.0, "cross_entropy": 0.0, "top1": 0.0, "top3": 0.0}
+    root_denom = float(max(1, root_count))
+    return {
+        "mse": float(
+            sum(float(part["squared_error_sum"]) for part in parts)
+            / float(action_count)
+        ),
+        "cross_entropy": float(
+            sum(float(part["cross_entropy_sum"]) for part in parts) / root_denom
+        ),
+        "top1": float(
+            sum(int(part["top1_count"]) for part in parts) / root_denom
+        ),
+        "top3": float(
+            sum(int(part["top3_count"]) for part in parts) / root_denom
+        ),
+    }
+
+
+def _policy_metrics_parallel_pair(
+    controller_model: Any,
+    Xc: np.ndarray,
+    yc: np.ndarray,
+    pc: np.ndarray,
+    offc: list[tuple[int, int]],
+    adversary_model: Any,
+    Xa: np.ndarray,
+    ya: np.ndarray,
+    pa: np.ndarray,
+    offa: list[tuple[int, int]],
+    controller_states: list[MarkovValueFeatures] | None = None,
+    adversary_states: list[MarkovValueFeatures] | None = None,
+    *,
+    max_workers: int,
+) -> tuple[dict[str, float], dict[str, float], dict[str, float | int | str]]:
+    started = time.time()
+    total_roots = int(len(offc) + len(offa))
+    workers = min(max(1, int(max_workers)), max(1, total_roots))
+    if workers <= 1 or total_roots <= 1:
+        controller_metrics = _policy_metrics(
+            controller_model, Xc, yc, pc, offc, controller_states
+        )
+        adversary_metrics = _policy_metrics(
+            adversary_model, Xa, ya, pa, offa, adversary_states
+        )
+        return controller_metrics, adversary_metrics, {
+            "policy_metrics_mode": "serial",
+            "policy_metrics_workers": 1,
+            "policy_metrics_tasks": 2,
+            "policy_metrics_wall_elapsed_s": float(time.time() - started),
+        }
+
+    try:
+        context = multiprocessing.get_context("fork")
+    except ValueError as exc:
+        raise RuntimeError(
+            "parallel policy metrics require the Linux fork multiprocessing context"
+        ) from exc
+
+    task_target = min(total_roots, workers * 4)
+    controller_tasks = max(
+        1 if offc else 0,
+        int(round(task_target * len(offc) / float(total_roots))),
+    )
+    adversary_tasks = max(1 if offa else 0, task_target - controller_tasks)
+    tasks = [
+        ("controller", begin, end)
+        for begin, end in _policy_metric_root_ranges(
+            len(offc), chunks=controller_tasks
+        )
+    ]
+    tasks.extend(
+        ("adversary", begin, end)
+        for begin, end in _policy_metric_root_ranges(
+            len(offa), chunks=adversary_tasks
+        )
+    )
+
+    global _POLICY_METRICS_PROCESS_DATA
+    _POLICY_METRICS_PROCESS_DATA = {
+        "controller": (
+            controller_model,
+            Xc,
+            yc,
+            pc,
+            offc,
+            controller_states,
+        ),
+        "adversary": (
+            adversary_model,
+            Xa,
+            ya,
+            pa,
+            offa,
+            adversary_states,
+        ),
+    }
+    parts_by_role: dict[str, list[dict[str, float | int | str]]] = {
+        "controller": [],
+        "adversary": [],
+    }
+    try:
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=context,
+        ) as executor:
+            futures = [
+                executor.submit(_policy_metrics_process_chunk, role, begin, end)
+                for role, begin, end in tasks
+            ]
+            for future in as_completed(futures):
+                part = future.result()
+                parts_by_role[str(part["role"])].append(part)
+    finally:
+        _POLICY_METRICS_PROCESS_DATA = {}
+
+    return (
+        _aggregate_policy_metric_parts(parts_by_role["controller"]),
+        _aggregate_policy_metric_parts(parts_by_role["adversary"]),
+        {
+            "policy_metrics_mode": "multiprocess_fork_shared",
+            "policy_metrics_workers": int(workers),
+            "policy_metrics_tasks": int(len(tasks)),
+            "policy_metrics_wall_elapsed_s": float(time.time() - started),
+        },
+    )
 
 
 def _fit_value(X: np.ndarray, y: np.ndarray, *, seed: int, apply_thread_limit: bool = True) -> Any:
@@ -1742,28 +2053,41 @@ def _fit_dnn_policy_models_parallel(
     Xa: np.ndarray,
     pa: np.ndarray,
     offa: list[tuple[int, int]],
+    controller_states: list[MarkovValueFeatures] | None = None,
+    adversary_states: list[MarkovValueFeatures] | None = None,
     *,
     seed: int,
     version: int,
     training_parent: ModelBundle,
 ) -> tuple[Any, Any, dict[str, float | int | str]]:
-    from vidur.AlphaGoZero.dnn_models import PolicyRankMLP, fit_policy_dnn
+    from vidur.AlphaGoZero.dnn_models import (
+        MarkovPolicyRankDeepSet,
+        PolicyRankMLP,
+        fit_markov_policy_dnn,
+        fit_policy_dnn,
+    )
+
+    markov_policy = AGZ_POLICY_FEATURE_SCHEMA == MARKOV_VALUE_SCHEMA
+    expected_type = MarkovPolicyRankDeepSet if markov_policy else PolicyRankMLP
+    fit_fn = fit_markov_policy_dnn if markov_policy else fit_policy_dnn
+    if markov_policy and (controller_states is None or adversary_states is None):
+        raise RuntimeError("Markov policy training is missing structured policy roots")
 
     controller_parent, controller_sha = _require_incremental_dnn_parent(
         training_parent.controller_prior_model_path,
-        expected_type=PolicyRankMLP,
+        expected_type=expected_type,
         label="controller_prior",
     )
     adversary_parent, adversary_sha = _require_incremental_dnn_parent(
         training_parent.adversary_prior_model_path,
-        expected_type=PolicyRankMLP,
+        expected_type=expected_type,
         label="adversary_prior",
     )
     started = time.time()
     with ThreadPoolExecutor(max_workers=2, thread_name_prefix="agz_dnn_policy_fit") as executor:
         controller_future = executor.submit(
-            fit_policy_dnn,
-            Xc,
+            fit_fn,
+            *([controller_states, Xc] if markov_policy else [Xc]),
             pc,
             offc,
             role="controller",
@@ -1776,8 +2100,8 @@ def _fit_dnn_policy_models_parallel(
             torch_threads=int(AGZ_DNN_TORCH_THREADS_PER_MODEL),
         )
         adversary_future = executor.submit(
-            fit_policy_dnn,
-            Xa,
+            fit_fn,
+            *([adversary_states, Xa] if markov_policy else [Xa]),
             pa,
             offa,
             role="adversary",
@@ -2046,6 +2370,7 @@ def _arena_cmd(
     write_arena_game_logs: bool = True,
     role_controller: ModelBundle | None = None,
     role_adversary: ModelBundle | None = None,
+    puct_c: float | None = None,
 ) -> list[str]:
     if only_model_ctrl_cycle and skip_model_ctrl_cycle:
         raise ValueError("arena command cannot both skip and exclusively run the model cycle")
@@ -2065,6 +2390,15 @@ def _arena_cmd(
             AGZ_EVAL_ROLLOUT_PARALLEL_THREADS
             if only_model_ctrl_cycle
             else AGZ_SJF_ROLLOUT_PARALLEL_THREADS
+        )
+    )
+    resolved_puct_c = float(
+        puct_c
+        if puct_c is not None
+        else (
+            AGZ_EVAL_PUCT_C
+            if only_model_ctrl_cycle
+            else AGZ_SJF_PUCT_C
         )
     )
     cmd = [
@@ -2106,7 +2440,7 @@ def _arena_cmd(
         "--seed",
         str(int(history_seed) + int(game_id_start)),
         "--puct-c",
-        "1.0",
+        str(resolved_puct_c),
         "--policy-prior-temperature",
         "1.0",
         "--no-root-dirichlet-noise-enabled",
@@ -2237,6 +2571,59 @@ def _role_history(state: dict[str, Any], role: str, current_version: int) -> lis
     return history
 
 
+def _compose_role_bundle(
+    *,
+    current: ModelBundle,
+    candidate: ModelBundle,
+    use_candidate_controller: bool,
+    use_candidate_adversary: bool,
+) -> ModelBundle:
+    """Build a role combination without mutating promotion state."""
+
+    controller_version = int(
+        candidate.controller_model_version
+        if use_candidate_controller
+        else current.controller_model_version
+    )
+    adversary_version = int(
+        candidate.adversary_model_version
+        if use_candidate_adversary
+        else current.adversary_model_version
+    )
+    return ModelBundle(
+        model_version=int(
+            max(
+                controller_version,
+                adversary_version,
+                current.model_version,
+                candidate.model_version,
+            )
+        ),
+        controller_model_version=controller_version,
+        adversary_model_version=adversary_version,
+        controller_value_model_path=(
+            candidate.controller_value_model_path
+            if use_candidate_controller
+            else current.controller_value_model_path
+        ),
+        adversary_value_model_path=(
+            candidate.adversary_value_model_path
+            if use_candidate_adversary
+            else current.adversary_value_model_path
+        ),
+        controller_prior_model_path=(
+            candidate.controller_prior_model_path
+            if use_candidate_controller
+            else current.controller_prior_model_path
+        ),
+        adversary_prior_model_path=(
+            candidate.adversary_prior_model_path
+            if use_candidate_adversary
+            else current.adversary_prior_model_path
+        ),
+    )
+
+
 def _promote_candidate_roles(
     root: Path,
     *,
@@ -2345,6 +2732,29 @@ def _broadcast_current_bundle_to_workers(root: Path, bundle: ModelBundle, *, can
         _run(["ssh", worker.host, f"printf '%s\n' {payload!r} > {worker_current_dir!r}/current_model.json"])
 
 
+    _broadcast_runtime_search_config_to_workers(root)
+
+
+def _broadcast_runtime_search_config_to_workers(root: Path) -> None:
+    root = Path(root)
+    runtime_path = runtime_search_config_path(root)
+    if not runtime_path.exists():
+        return
+    remote_root = str(root).rstrip("/")
+    for worker in WORKERS:
+        worker_root = f"{remote_root}/worker_large/{worker.worker_id}"
+        _run(["ssh", worker.host, f"mkdir -p {worker_root!r}"])
+        _run([
+            "rsync",
+            "-az",
+            "--partial",
+            "--delay-updates",
+            "--timeout=120",
+            str(runtime_path),
+            f"{worker.host}:{worker_root}/runtime_search_config.json",
+        ])
+
+
 def _broadcast_candidate_to_workers(root: Path, candidate: ModelBundle) -> None:
     _broadcast_current_bundle_to_workers(root, candidate, candidate_version=int(candidate.model_version))
 
@@ -2398,6 +2808,7 @@ def _role_arena_command(
         history_hops_max=int(max_hop),
         only_model_ctrl_cycle=True,
         rollout_count=int(AGZ_EVAL_ROLLOUT_COUNT),
+        puct_c=float(AGZ_EVAL_PUCT_C),
         role_controller=controller,
         role_adversary=adversary,
     )
@@ -2428,7 +2839,7 @@ def _run_role_eval_blocks(
         ctrl_baseline_dir.name: (ctrl_baseline_dir, promoted, promoted, controller_start_gid, controller_seed),
         ctrl_candidate_dir.name: (ctrl_candidate_dir, candidate, promoted, controller_start_gid, controller_seed),
     }
-    if distributed_eval_enabled():
+    if spot_pull_eval_enabled() or distributed_eval_enabled():
         commands = {
             name: _role_arena_command(
                 output_dir=spec[0],
@@ -2444,6 +2855,20 @@ def _run_role_eval_blocks(
             for name, spec in specs.items()
         }
         final_dirs = {name: spec[0] for name, spec in specs.items()}
+        if spot_pull_eval_enabled():
+            results = run_spot_pull_commands(
+                root=root,
+                block_commands=commands,
+                final_dirs=final_dirs,
+                expected_games_by_block={name: int(eval_games) for name in specs},
+                merge_block=merge_arena_block,
+            )
+            return (
+                results[adv_baseline_dir.name],
+                results[adv_candidate_dir.name],
+                results[ctrl_baseline_dir.name],
+                results[ctrl_candidate_dir.name],
+            )
         scratch = root / ".distributed_eval_scratch" / eval_dir.name / "role"
         hosts = memory_safe_hosts(default_role_hosts(), active_blocks=len(commands))
         hosts = cpu_safe_hosts(
@@ -2492,6 +2917,59 @@ def _run_role_eval_blocks(
     )
 
 
+def _sjf_cycle_plan(
+    *,
+    output_dir: Path,
+    candidate: ModelBundle,
+    benchmark_games: int,
+    eval_parallel: int,
+    iterations: int,
+    history_seed: int,
+) -> tuple[dict[str, list[str]], dict[str, Path]]:
+    """Build the two independently executable halves of one SJF benchmark."""
+
+    output_dir = Path(output_dir)
+    trivial_dir = output_dir / "cycle1_trivial"
+    model_dir = output_dir / "cycle2_model"
+    common = dict(
+        model_path=candidate.controller_value_model_path,
+        model_version=int(candidate.controller_model_version),
+        controller_prior_path=candidate.controller_prior_model_path,
+        adversary_prior_path=candidate.adversary_prior_model_path,
+        num_games=int(benchmark_games),
+        parallel_games=int(eval_parallel),
+        game_id_start=80_000_000 + int(candidate.model_version) * 10_000,
+        iterations=int(iterations),
+        history_seed=int(history_seed) + 909,
+        history_hops_min=0,
+        history_hops_max=max(100, int(benchmark_games) + 5),
+        write_arena_game_logs=True,
+        role_controller=candidate,
+        role_adversary=candidate,
+        rollout_count=int(AGZ_SJF_ROLLOUT_COUNT),
+        rollout_parallel_threads=int(AGZ_SJF_ROLLOUT_PARALLEL_THREADS),
+        puct_c=float(AGZ_SJF_PUCT_C),
+    )
+    commands = {
+        trivial_dir.name: _arena_cmd(
+            output_dir=trivial_dir,
+            only_model_ctrl_cycle=False,
+            skip_model_ctrl_cycle=True,
+            **common,
+        ),
+        model_dir.name: _arena_cmd(
+            output_dir=model_dir,
+            only_model_ctrl_cycle=True,
+            skip_model_ctrl_cycle=False,
+            **common,
+        ),
+    }
+    return commands, {
+        trivial_dir.name: trivial_dir,
+        model_dir.name: model_dir,
+    }
+
+
 def _run_sjf_benchmark(
     *,
     root: Path,
@@ -2522,6 +3000,7 @@ def _run_sjf_benchmark(
         role_adversary=candidate,
         rollout_count=int(AGZ_SJF_ROLLOUT_COUNT),
         rollout_parallel_threads=int(AGZ_SJF_ROLLOUT_PARALLEL_THREADS),
+        puct_c=float(AGZ_SJF_PUCT_C),
     )
     trivial_command = _arena_cmd(
         output_dir=trivial_dir,
@@ -2535,7 +3014,18 @@ def _run_sjf_benchmark(
         skip_model_ctrl_cycle=False,
         **common,
     )
-    if distributed_eval_enabled():
+    commands = {trivial_dir.name: trivial_command, model_dir.name: model_command}
+    if spot_pull_eval_enabled():
+        run_spot_pull_commands(
+            root=root,
+            block_commands=commands,
+            final_dirs={trivial_dir.name: trivial_dir, model_dir.name: model_dir},
+            expected_games_by_block={
+                name: int(benchmark_games) for name in commands
+            },
+            merge_block=merge_arena_block,
+        )
+    elif distributed_eval_enabled():
         scratch = root / ".distributed_eval_scratch" / eval_dir.name / "sjf"
         total_cycle_jobs = 2 * int(benchmark_games)
         hosts = memory_safe_hosts(default_sjf_hosts(total_cycle_jobs), active_blocks=2)
@@ -2574,6 +3064,202 @@ def _run_sjf_benchmark(
         output_dir=sjf_dir,
         expected_games=int(benchmark_games),
     )
+
+
+def _run_spot_role_eval_with_speculative_sjf(
+    *,
+    root: Path,
+    eval_dir: Path,
+    promoted: ModelBundle,
+    candidate: ModelBundle,
+    eval_games: int,
+    eval_parallel: int,
+    benchmark_games: int,
+    iterations: int,
+    adversary_start_gid: int,
+    controller_start_gid: int,
+    adversary_seed: int,
+    controller_seed: int,
+    history_seed: int,
+    max_hop: int,
+) -> tuple[Path, Path, Path, Path, dict[str, Path]]:
+    """Run role evaluation and all possible promoted SJF combinations together."""
+
+    adv_baseline_dir = eval_dir / "promoted_adversary_vs_promoted_controller_for_adversary"
+    adv_candidate_dir = eval_dir / "candidate_adversary_vs_promoted_controller"
+    ctrl_baseline_dir = eval_dir / "promoted_adversary_vs_promoted_controller_for_controller"
+    ctrl_candidate_dir = eval_dir / "promoted_adversary_vs_candidate_controller"
+    role_specs = {
+        adv_baseline_dir.name: (
+            adv_baseline_dir,
+            promoted,
+            promoted,
+            adversary_start_gid,
+            adversary_seed,
+        ),
+        adv_candidate_dir.name: (
+            adv_candidate_dir,
+            promoted,
+            candidate,
+            adversary_start_gid,
+            adversary_seed,
+        ),
+        ctrl_baseline_dir.name: (
+            ctrl_baseline_dir,
+            promoted,
+            promoted,
+            controller_start_gid,
+            controller_seed,
+        ),
+        ctrl_candidate_dir.name: (
+            ctrl_candidate_dir,
+            candidate,
+            promoted,
+            controller_start_gid,
+            controller_seed,
+        ),
+    }
+    commands = {
+        name: _role_arena_command(
+            output_dir=spec[0],
+            controller=spec[1],
+            adversary=spec[2],
+            eval_games=int(eval_games),
+            eval_parallel=int(eval_parallel),
+            game_id_start=int(spec[3]),
+            iterations=int(iterations),
+            history_seed=int(spec[4]),
+            max_hop=int(max_hop),
+        )
+        for name, spec in role_specs.items()
+    }
+    final_dirs = {name: spec[0] for name, spec in role_specs.items()}
+    expected_games_by_block = {name: int(eval_games) for name in role_specs}
+
+    scenario_bundles = {
+        "controller_candidate": _compose_role_bundle(
+            current=promoted,
+            candidate=candidate,
+            use_candidate_controller=True,
+            use_candidate_adversary=False,
+        ),
+        "adversary_candidate": _compose_role_bundle(
+            current=promoted,
+            candidate=candidate,
+            use_candidate_controller=False,
+            use_candidate_adversary=True,
+        ),
+        "both_candidates": _compose_role_bundle(
+            current=promoted,
+            candidate=candidate,
+            use_candidate_controller=True,
+            use_candidate_adversary=True,
+        ),
+    }
+    speculative_root = eval_dir / "SJF_256_Speculative"
+    scenario_cycle_blocks: dict[str, dict[str, str]] = {}
+    for scenario, bundle in scenario_bundles.items():
+        scenario_dir = speculative_root / scenario
+        cycle_commands, cycle_dirs = _sjf_cycle_plan(
+            output_dir=scenario_dir,
+            candidate=bundle,
+            benchmark_games=int(benchmark_games),
+            eval_parallel=int(eval_parallel),
+            iterations=int(iterations),
+            history_seed=int(history_seed),
+        )
+        scenario_cycle_blocks[scenario] = {}
+        for cycle_name, command in cycle_commands.items():
+            block_name = f"sjf__{scenario}__{cycle_name}"
+            commands[block_name] = command
+            final_dirs[block_name] = cycle_dirs[cycle_name]
+            expected_games_by_block[block_name] = int(benchmark_games)
+            scenario_cycle_blocks[scenario][cycle_name] = block_name
+
+    merged = run_spot_pull_commands(
+        root=root,
+        block_commands=commands,
+        final_dirs=final_dirs,
+        expected_games_by_block=expected_games_by_block,
+        merge_block=merge_arena_block,
+    )
+    speculative_results: dict[str, Path] = {}
+    for scenario, cycle_blocks in scenario_cycle_blocks.items():
+        scenario_dir = speculative_root / scenario
+        speculative_results[scenario] = merge_split_sjf_cycles(
+            trivial_dir=final_dirs[cycle_blocks["cycle1_trivial"]],
+            model_dir=final_dirs[cycle_blocks["cycle2_model"]],
+            output_dir=scenario_dir,
+            expected_games=int(benchmark_games),
+        )
+
+    atomic_write_json(
+        speculative_root / "manifest.json",
+        {
+            "mode": "spot_role_and_speculative_sjf_single_batch_v1",
+            "candidate_model_version": int(candidate.model_version),
+            "promoted_controller_model_version": int(promoted.controller_model_version),
+            "promoted_adversary_model_version": int(promoted.adversary_model_version),
+            "promotion_inputs": "role_arena_results_only",
+            "scenarios": {
+                name: {
+                    "bundle": scenario_bundles[name].to_json(),
+                    "arena_results_csv": str(path),
+                }
+                for name, path in speculative_results.items()
+            },
+        },
+    )
+    return (
+        merged[adv_baseline_dir.name],
+        merged[adv_candidate_dir.name],
+        merged[ctrl_baseline_dir.name],
+        merged[ctrl_candidate_dir.name],
+        speculative_results,
+    )
+
+
+def _selected_speculative_sjf_scenario(
+    *,
+    promote_controller: bool,
+    promote_adversary: bool,
+) -> str:
+    if promote_controller and promote_adversary:
+        return "both_candidates"
+    if promote_controller:
+        return "controller_candidate"
+    if promote_adversary:
+        return "adversary_candidate"
+    return ""
+
+
+def _hardlink_or_copy(source: str, destination: str) -> str:
+    try:
+        os.link(source, destination)
+    except OSError:
+        shutil.copy2(source, destination)
+    return destination
+
+
+def _publish_speculative_sjf_as_standard(
+    *,
+    eval_dir: Path,
+    scenario: str,
+    source_results: Path,
+) -> Path:
+    source_dir = Path(source_results).parent
+    target_dir = Path(eval_dir) / "SJF_256_Game"
+    shutil.rmtree(target_dir, ignore_errors=True)
+    shutil.copytree(source_dir, target_dir, copy_function=_hardlink_or_copy)
+    atomic_write_json(
+        target_dir / "speculative_selection.json",
+        {
+            "scenario": str(scenario),
+            "source_dir": str(source_dir),
+            "arena_results_csv": str(target_dir / "arena_results.csv"),
+        },
+    )
+    return target_dir / "arena_results.csv"
 
 
 def _role_candidate_promoted(
@@ -2795,7 +3481,7 @@ def _evaluate_and_maybe_promote_unpaused(
             promote_adversary=bool(candidate_adversary_promoted),
         )
         _broadcast_current_bundle_to_workers(root, promoted_after, candidate_version=int(candidate.model_version))
-        _run_sjf_benchmark(
+        sjf_results = _run_sjf_benchmark(
             root=root,
             eval_dir=eval_dir,
             candidate=promoted_after,
@@ -2804,6 +3490,8 @@ def _evaluate_and_maybe_promote_unpaused(
             iterations=int(iterations),
             history_seed=int(history_seed),
         )
+        result["sjf_results_csv"] = str(sjf_results)
+        atomic_write_json(eval_dir / "eval_summary.json", result)
     return result
 
 
@@ -2846,8 +3534,7 @@ def train_candidate(root: Path, *, seed: int = 2026, max_value_states: int = 500
         benchmark_games=int(benchmark_games),
         mcts_iterations=int(mcts_iterations),
     )
-    replay_paths = _feature_replay_paths(root)
-    policy_paths = _policy_replay_paths(root)
+    replay_paths, policy_paths = _replay_path_snapshot(root)
     _progress(
         "train_candidate_replay_paths_ready",
         feature_replay_paths=int(len(replay_paths)),
@@ -2932,14 +3619,6 @@ def train_candidate(root: Path, *, seed: int = 2026, max_value_states: int = 500
         raise RuntimeError(
             f"not enough adversary feature rows: {replay_counts_sampled['adversary']} < {MIN_ADVERSARY_STATES_FOR_EVAL}"
         )
-    if len(controller_roots) < int(XL_CONTROLLER_POLICY_SAMPLE_CAP):
-        raise RuntimeError(
-            f"not enough controller policy root samples: {len(controller_roots)} < {XL_CONTROLLER_POLICY_SAMPLE_CAP}"
-        )
-    if len(adversary_roots) < int(ADVERSARY_POLICY_SAMPLE_CAP):
-        raise RuntimeError(
-            f"not enough adversary policy root samples: {len(adversary_roots)} < {ADVERSARY_POLICY_SAMPLE_CAP}"
-        )
 
     t0 = time.time()
     _progress(
@@ -2948,21 +3627,51 @@ def train_candidate(root: Path, *, seed: int = 2026, max_value_states: int = 500
         controller_roots=int(len(controller_roots)),
         adversary_roots=int(len(adversary_roots)),
     )
+    controller_policy_states: list[MarkovValueFeatures] | None = None
+    adversary_policy_states: list[MarkovValueFeatures] | None = None
     if use_indexed_replay:
-        from vidur.AlphaGoZero.indexed_replay import IndexedRoots, materialize_policy_arrays
+        from vidur.AlphaGoZero.indexed_replay import (
+            IndexedRoots,
+            materialize_markov_policy_arrays,
+            materialize_policy_arrays,
+        )
 
         if not isinstance(controller_roots, IndexedRoots) or not isinstance(adversary_roots, IndexedRoots):
             raise TypeError("indexed replay did not return direct policy-root locators")
-        (Xc, yc, pc, offc), controller_policy_index = materialize_policy_arrays(
-            controller_roots,
-            action_dim=int(CTRL_ACTION_DIM),
-            root_cap=int(XL_CONTROLLER_POLICY_SAMPLE_CAP),
-        )
-        (Xa, ya, pa, offa), adversary_policy_index = materialize_policy_arrays(
-            adversary_roots,
-            action_dim=int(ADV_ACTION_DIM),
-            root_cap=int(ADVERSARY_POLICY_SAMPLE_CAP),
-        )
+        if AGZ_POLICY_FEATURE_SCHEMA == MARKOV_VALUE_SCHEMA:
+            (
+                controller_policy_states,
+                Xc,
+                yc,
+                pc,
+                offc,
+            ), controller_policy_index = materialize_markov_policy_arrays(
+                controller_roots,
+                action_dim=int(CTRL_ACTION_DIM),
+                root_cap=int(XL_CONTROLLER_POLICY_SAMPLE_CAP),
+            )
+            (
+                adversary_policy_states,
+                Xa,
+                ya,
+                pa,
+                offa,
+            ), adversary_policy_index = materialize_markov_policy_arrays(
+                adversary_roots,
+                action_dim=int(ADV_ACTION_DIM),
+                root_cap=int(ADVERSARY_POLICY_SAMPLE_CAP),
+            )
+        else:
+            (Xc, yc, pc, offc), controller_policy_index = materialize_policy_arrays(
+                controller_roots,
+                action_dim=int(CTRL_ACTION_DIM),
+                root_cap=int(XL_CONTROLLER_POLICY_SAMPLE_CAP),
+            )
+            (Xa, ya, pa, offa), adversary_policy_index = materialize_policy_arrays(
+                adversary_roots,
+                action_dim=int(ADV_ACTION_DIM),
+                root_cap=int(ADVERSARY_POLICY_SAMPLE_CAP),
+            )
         selected_action_rows = int(controller_policy_index["action_rows"]) + int(adversary_policy_index["action_rows"])
         policy_scan_timings = {
             "policy_cache_files": int(state_cache_timings.get("indexed_cache_files", 0)),
@@ -3005,35 +3714,50 @@ def train_candidate(root: Path, *, seed: int = 2026, max_value_states: int = 500
     )
     if Xc.shape[0] == 0 or Xa.shape[0] == 0:
         raise RuntimeError(f"policy rows missing: controller_rows={Xc.shape[0]} adversary_rows={Xa.shape[0]}")
-    if int(policy_scan_timings["controller_policy_roots_with_actions"]) < int(XL_CONTROLLER_POLICY_SAMPLE_CAP):
+    controller_policy_roots_required = _available_policy_root_requirement(
+        int(policy_scan_timings.get("controller_policy_roots_with_actions_available", 0)),
+        int(XL_CONTROLLER_POLICY_SAMPLE_CAP),
+    )
+    adversary_policy_roots_required = _available_policy_root_requirement(
+        int(policy_scan_timings.get("adversary_policy_roots_with_actions_available", 0)),
+        int(ADVERSARY_POLICY_SAMPLE_CAP),
+    )
+    if controller_policy_roots_required <= 0 or adversary_policy_roots_required <= 0:
+        raise RuntimeError(
+            "policy roots with actions missing: "
+            f"controller={controller_policy_roots_required} adversary={adversary_policy_roots_required}"
+        )
+    if int(policy_scan_timings["controller_policy_roots_with_actions"]) < int(controller_policy_roots_required):
         _progress(
             "train_candidate_failed",
             reason="not_enough_controller_policy_roots_with_actions",
             controller_policy_roots_with_actions=int(policy_scan_timings["controller_policy_roots_with_actions"]),
             controller_policy_sample_cap=int(XL_CONTROLLER_POLICY_SAMPLE_CAP),
+            controller_policy_roots_required=int(controller_policy_roots_required),
             controller_policy_roots_sampled=int(len(controller_roots)),
             controller_policy_roots_available=int(policy_scan_timings.get("controller_policy_roots_with_actions_available", 0)),
         )
         raise RuntimeError(
             "not enough controller policy roots with actions: "
-            f"{policy_scan_timings['controller_policy_roots_with_actions']} < {XL_CONTROLLER_POLICY_SAMPLE_CAP} "
+            f"{policy_scan_timings['controller_policy_roots_with_actions']} < {controller_policy_roots_required} "
             f"(sampled={len(controller_roots)}, available={policy_scan_timings.get('controller_policy_roots_with_actions_available')}, "
-            f"target={controller_policy_root_sample_target})"
+            f"target={controller_policy_root_sample_target}, cap={XL_CONTROLLER_POLICY_SAMPLE_CAP})"
         )
-    if int(policy_scan_timings["adversary_policy_roots_with_actions"]) < int(ADVERSARY_POLICY_SAMPLE_CAP):
+    if int(policy_scan_timings["adversary_policy_roots_with_actions"]) < int(adversary_policy_roots_required):
         _progress(
             "train_candidate_failed",
             reason="not_enough_adversary_policy_roots_with_actions",
             adversary_policy_roots_with_actions=int(policy_scan_timings["adversary_policy_roots_with_actions"]),
             adversary_policy_sample_cap=int(ADVERSARY_POLICY_SAMPLE_CAP),
+            adversary_policy_roots_required=int(adversary_policy_roots_required),
             adversary_policy_roots_sampled=int(len(adversary_roots)),
             adversary_policy_roots_available=int(policy_scan_timings.get("adversary_policy_roots_with_actions_available", 0)),
         )
         raise RuntimeError(
             "not enough adversary policy roots with actions: "
-            f"{policy_scan_timings['adversary_policy_roots_with_actions']} < {ADVERSARY_POLICY_SAMPLE_CAP} "
+            f"{policy_scan_timings['adversary_policy_roots_with_actions']} < {adversary_policy_roots_required} "
             f"(sampled={len(adversary_roots)}, available={policy_scan_timings.get('adversary_policy_roots_with_actions_available')}, "
-            f"target={adversary_policy_root_sample_target})"
+            f"target={adversary_policy_root_sample_target}, cap={ADVERSARY_POLICY_SAMPLE_CAP})"
         )
 
     Xv, yv = _value_arrays_from_rows(sampled)
@@ -3154,6 +3878,8 @@ def train_candidate(root: Path, *, seed: int = 2026, max_value_states: int = 500
                 Xa,
                 pa,
                 offa,
+                controller_policy_states,
+                adversary_policy_states,
                 seed=int(seed),
                 version=int(version),
                 training_parent=training_parent,
@@ -3175,8 +3901,38 @@ def train_candidate(root: Path, *, seed: int = 2026, max_value_states: int = 500
             adversary_policy_fit_elapsed_s=float(policy_fit_timings.get("adversary_policy_fit_elapsed_s", 0.0)),
             policy_fit_wall_elapsed_s=float(policy_fit_timings.get("policy_fit_wall_elapsed_s", 0.0)),
         )
-        ctrl_metrics = _policy_metrics(ctrl_model, Xc, yc, pc, offc)
-        adv_metrics = _policy_metrics(adv_model, Xa, ya, pa, offa)
+        _progress(
+            "train_candidate_policy_metrics_start",
+            version=int(version),
+            configured_workers=int(POLICY_METRICS_WORKERS),
+            controller_policy_roots=int(len(offc)),
+            adversary_policy_roots=int(len(offa)),
+        )
+        ctrl_metrics, adv_metrics, policy_metric_timings = _policy_metrics_parallel_pair(
+            ctrl_model,
+            Xc,
+            yc,
+            pc,
+            offc,
+            adv_model,
+            Xa,
+            ya,
+            pa,
+            offa,
+            controller_policy_states,
+            adversary_policy_states,
+            max_workers=int(POLICY_METRICS_WORKERS),
+        )
+        _progress(
+            "train_candidate_policy_metrics_complete",
+            version=int(version),
+            policy_metrics_mode=str(policy_metric_timings["policy_metrics_mode"]),
+            policy_metrics_workers=int(policy_metric_timings["policy_metrics_workers"]),
+            policy_metrics_tasks=int(policy_metric_timings["policy_metrics_tasks"]),
+            policy_metrics_wall_elapsed_s=float(
+                policy_metric_timings["policy_metrics_wall_elapsed_s"]
+            ),
+        )
 
         ctrl_dir = tmp_out / "controller_prior" / POLICY_CONFIG_NAME
         adv_dir = tmp_out / "adversary_prior" / POLICY_CONFIG_NAME
@@ -3245,6 +4001,10 @@ def train_candidate(root: Path, *, seed: int = 2026, max_value_states: int = 500
                         f"(exit {completed.returncode}): {parity_output}"
                     )
                 dnn_parity[role] = json.loads(completed.stdout)
+        rollout_horizon_used = active_rollout_horizon_sec(root)
+        next_rollout_horizon = configured_rollout_horizon(
+            controller_value_metrics["p95_abs_error"]
+        )
         metrics = {
             "model_config": CONFIG_NAME,
             "model_version": int(version),
@@ -3271,6 +4031,27 @@ def train_candidate(root: Path, *, seed: int = 2026, max_value_states: int = 500
             "adversary_policy_cross_entropy": adv_metrics["cross_entropy"],
             "adversary_policy_top1": adv_metrics["top1"],
             "adversary_policy_top3": adv_metrics["top3"],
+            "rollout_horizon_used_sec": float(rollout_horizon_used),
+            "rollout_horizon_source_controller_p95_abs_error": float(
+                next_rollout_horizon.controller_p95_abs_error
+            ),
+            "rollout_value_error_threshold": float(
+                next_rollout_horizon.value_error_threshold
+            ),
+            "rollout_discount_factor": float(next_rollout_horizon.discount_factor),
+            "rollout_reference_step_sec": float(next_rollout_horizon.reference_step_sec),
+            "rollout_max_horizon_sec": float(next_rollout_horizon.max_horizon_sec),
+            "rollout_horizon_tick_sec": float(next_rollout_horizon.tick_sec),
+            "next_rollout_horizon_raw_sec": float(next_rollout_horizon.raw_horizon_sec),
+            "next_rollout_horizon_calculated_sec": float(
+                next_rollout_horizon.calculated_horizon_sec
+            ),
+            "next_rollout_horizon_rounded_sec": float(
+                next_rollout_horizon.rounded_horizon_sec
+            ),
+            "next_rollout_discounted_error": float(
+                next_rollout_horizon.discounted_error_at_rounded_horizon
+            ),
         }
         metrics_extra = {
             "mcts_iterations": int(mcts_iterations),
@@ -3294,6 +4075,8 @@ def train_candidate(root: Path, *, seed: int = 2026, max_value_states: int = 500
             "adversary_policy_root_sample_target": int(adversary_policy_root_sample_target),
             "controller_policy_roots_sampled": int(len(controller_roots)),
             "adversary_policy_roots_sampled": int(len(adversary_roots)),
+            "controller_policy_roots_required": int(controller_policy_roots_required),
+            "adversary_policy_roots_required": int(adversary_policy_roots_required),
             "controller_policy_sample_cap": int(XL_CONTROLLER_POLICY_SAMPLE_CAP),
             "adversary_policy_sample_cap": int(ADVERSARY_POLICY_SAMPLE_CAP),
             "value_fit_mode": str(value_fit_timings["value_fit_mode"]),
@@ -3324,6 +4107,12 @@ def train_candidate(root: Path, *, seed: int = 2026, max_value_states: int = 500
             "controller_policy_fit_elapsed_s": float(policy_fit_timings["controller_policy_fit_elapsed_s"]),
             "adversary_policy_fit_elapsed_s": float(policy_fit_timings["adversary_policy_fit_elapsed_s"]),
             "policy_fit_wall_elapsed_s": float(policy_fit_timings["policy_fit_wall_elapsed_s"]),
+            "policy_metrics_mode": str(policy_metric_timings["policy_metrics_mode"]),
+            "policy_metrics_workers": int(policy_metric_timings["policy_metrics_workers"]),
+            "policy_metrics_tasks": int(policy_metric_timings["policy_metrics_tasks"]),
+            "policy_metrics_wall_elapsed_s": float(
+                policy_metric_timings["policy_metrics_wall_elapsed_s"]
+            ),
         }
         manifest = {
             **metrics,

@@ -271,15 +271,32 @@ def rsync_dir_from(host: str, remote_dir: str, local_dir: Path) -> None:
 
 
 def remote_verify_and_publish(*, host: str, uploading_dir: str, incoming_dir: str, rejected_dir: str) -> None:
+    """Verify and atomically publish a transfer, including acknowledgement retries.
+
+    A transport can disappear after the move succeeds but before SSH returns. A
+    retry therefore treats an already-valid incoming directory as success and
+    never overwrites it with a second result.
+    """
+
     script = "\n".join([
         "set -euo pipefail",
-        f"UP={uploading_dir!r}",
-        f"IN={incoming_dir!r}",
-        f"RJ={rejected_dir!r}",
+        f"UP={shlex.quote(uploading_dir)}",
+        f"IN={shlex.quote(incoming_dir)}",
+        f"RJ={shlex.quote(rejected_dir)}",
         'mkdir -p "$(dirname "$IN")" "$(dirname "$RJ")"',
+        'verify_dir() { (cd "$1" && sha256sum -c SHA256SUMS); }',
+        'if [ -d "$IN" ]; then',
+        '  if verify_dir "$IN" >/tmp/agz_sha_verify.$$ 2>&1; then',
+        '    rm -rf "$UP"',
+        '    rm -f /tmp/agz_sha_verify.$$ || true',
+        '    echo already_published="$IN"',
+        '    exit 0',
+        '  fi',
+        '  rm -rf "$RJ"',
+        '  mv "$IN" "$RJ"',
+        'fi',
         'if [ ! -d "$UP" ]; then echo "missing_uploading=$UP"; exit 2; fi',
-        'cd "$UP"',
-        'if ! sha256sum -c SHA256SUMS >/tmp/agz_sha_verify.$$ 2>&1; then',
+        'if ! verify_dir "$UP" >/tmp/agz_sha_verify.$$ 2>&1; then',
         '  mkdir -p "$(dirname "$RJ")"',
         '  rm -rf "$RJ"',
         '  mv "$UP" "$RJ"',
@@ -288,7 +305,6 @@ def remote_verify_and_publish(*, host: str, uploading_dir: str, incoming_dir: st
         '  exit 3',
         'fi',
         'rm -f /tmp/agz_sha_verify.$$ || true',
-        'rm -rf "$IN"',
         'mv "$UP" "$IN"',
         'echo published="$IN"',
     ])

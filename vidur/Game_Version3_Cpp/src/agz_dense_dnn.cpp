@@ -238,7 +238,12 @@ bool NativeDenseDNNModel::load_model_export(const std::string& path) {
     }
 
     const bool legacy_architecture = architecture_ == "agz_residual_mlp_v1";
-    const bool markov_architecture = architecture_ == "agz_markov_value_deepset_v2";
+    const bool markov_value_architecture =
+        architecture_ == "agz_markov_value_deepset_v2";
+    const bool markov_policy_architecture =
+        architecture_ == "agz_markov_policy_deepset_v3";
+    const bool markov_architecture =
+        markov_value_architecture || markov_policy_architecture;
     if (!legacy_architecture && !markov_architecture) {
         throw std::runtime_error("unsupported native DNN architecture: " + architecture_);
     }
@@ -246,17 +251,26 @@ bool NativeDenseDNNModel::load_model_export(const std::string& path) {
         throw std::runtime_error("unsupported native DNN model kind: " + model_kind_);
     }
     if (markov_architecture) {
-        if (!is_value() || feature_schema_ != kMarkovValueFeatureSchema ||
-            feature_dim_ != 0 || state_dim_ != 0 || action_dim_ != 0 ||
+        if (feature_schema_ != kMarkovValueFeatureSchema ||
+            feature_dim_ != 0 || state_dim_ != 0 ||
             global_dim_ != kMarkovGlobalDim ||
             request_dim_ != kMarkovRequestDim ||
             launch_dim_ != kMarkovLaunchDim) {
-            throw std::runtime_error("invalid native Markov value DNN schema or dimensions");
+            throw std::runtime_error("invalid native Markov DNN schema or dimensions");
+        }
+        if (markov_value_architecture &&
+            (!is_value() || action_dim_ != 0)) {
+            throw std::runtime_error("invalid native Markov value DNN dimensions");
+        }
+        if (markov_policy_architecture &&
+            (!is_policy() || (action_dim_ != 43 && action_dim_ != 7))) {
+            throw std::runtime_error("invalid native Markov policy DNN dimensions");
         }
         tensor("global_fc.weight");
         tensor("request_fc1.weight");
         tensor("launch_fc1.weight");
         tensor("head2.bias");
+        if (markov_policy_architecture) tensor("state_fusion_fc.weight");
     } else {
         if (state_dim_ != 226) {
             throw std::runtime_error("native DNN state dimension must be 226");
@@ -320,31 +334,32 @@ bool NativeDenseDNNModel::load_model_export(const std::string& path) {
         }
         policy_fusion_zero_bias_.shape = {128};
         policy_fusion_zero_bias_.values.assign(128U, 0.0f);
-        policy_batch_refs_ = {
-            &tensor("state_fc.weight"),
-            &tensor("state_fc.bias"),
-            &tensor("state_norm.weight"),
-            &tensor("state_norm.bias"),
-            &tensor("fusion_fc.bias"),
-            &tensor("action_fc.weight"),
-            &tensor("action_fc.bias"),
-            &tensor("action_norm.weight"),
-            &tensor("action_norm.bias"),
-            &tensor("fusion_norm.weight"),
-            &tensor("fusion_norm.bias"),
-            &tensor("fusion_block.norm.weight"),
-            &tensor("fusion_block.norm.bias"),
-            &tensor("fusion_block.fc1.weight"),
-            &tensor("fusion_block.fc1.bias"),
-            &tensor("fusion_block.fc2.weight"),
-            &tensor("fusion_block.fc2.bias"),
-            &tensor("head_norm.weight"),
-            &tensor("head_norm.bias"),
-            &tensor("head1.weight"),
-            &tensor("head1.bias"),
-            &tensor("head2.weight"),
-            &tensor("head2.bias"),
-        };
+        policy_batch_refs_ = {};
+        if (!markov_policy_architecture) {
+            policy_batch_refs_.state_fc_weight = &tensor("state_fc.weight");
+            policy_batch_refs_.state_fc_bias = &tensor("state_fc.bias");
+            policy_batch_refs_.state_norm_weight = &tensor("state_norm.weight");
+            policy_batch_refs_.state_norm_bias = &tensor("state_norm.bias");
+        }
+        policy_batch_refs_.fusion_bias = &tensor("fusion_fc.bias");
+        policy_batch_refs_.action_fc_weight = &tensor("action_fc.weight");
+        policy_batch_refs_.action_fc_bias = &tensor("action_fc.bias");
+        policy_batch_refs_.action_norm_weight = &tensor("action_norm.weight");
+        policy_batch_refs_.action_norm_bias = &tensor("action_norm.bias");
+        policy_batch_refs_.fusion_norm_weight = &tensor("fusion_norm.weight");
+        policy_batch_refs_.fusion_norm_bias = &tensor("fusion_norm.bias");
+        policy_batch_refs_.block_norm_weight = &tensor("fusion_block.norm.weight");
+        policy_batch_refs_.block_norm_bias = &tensor("fusion_block.norm.bias");
+        policy_batch_refs_.block_fc1_weight = &tensor("fusion_block.fc1.weight");
+        policy_batch_refs_.block_fc1_bias = &tensor("fusion_block.fc1.bias");
+        policy_batch_refs_.block_fc2_weight = &tensor("fusion_block.fc2.weight");
+        policy_batch_refs_.block_fc2_bias = &tensor("fusion_block.fc2.bias");
+        policy_batch_refs_.head_norm_weight = &tensor("head_norm.weight");
+        policy_batch_refs_.head_norm_bias = &tensor("head_norm.bias");
+        policy_batch_refs_.head1_weight = &tensor("head1.weight");
+        policy_batch_refs_.head1_bias = &tensor("head1.bias");
+        policy_batch_refs_.head2_weight = &tensor("head2.weight");
+        policy_batch_refs_.head2_bias = &tensor("head2.bias");
     }
 
     if (model_tag_.empty()) model_tag_ = model_kind_ + ":" + role_;
@@ -654,6 +669,106 @@ double NativeDenseDNNModel::markov_value_from_features(
         static_cast<double>(value_max_ - value_min_);
 }
 
+void NativeDenseDNNModel::markov_policy_state_embedding_into(
+    const MarkovValueFeatures& features,
+    float* output) const {
+    if (static_cast<int>(features.global_features.size()) != global_dim_ ||
+        features.request_count < 0 || features.launch_count < 0 ||
+        static_cast<int>(features.request_features.size()) !=
+            features.request_count * request_dim_ ||
+        static_cast<int>(features.launch_features.size()) !=
+            features.launch_count * launch_dim_) {
+        throw std::runtime_error("native Markov policy feature dimensions mismatch");
+    }
+    std::array<float, 32> global_embedding{};
+    std::array<float, 32> request_hidden{};
+    std::array<float, 32> request_embedding{};
+    std::array<float, 32> request_sum{};
+    std::array<float, 32> request_max{};
+    std::array<float, 16> launch_hidden{};
+    std::array<float, 16> launch_embedding{};
+    std::array<float, 16> launch_sum{};
+    std::array<float, 16> launch_max{};
+    std::array<float, 128> fusion_input{};
+
+    linear_into(
+        features.global_features.data(), global_dim_,
+        tensor("global_fc.weight"), tensor("global_fc.bias"),
+        global_embedding.data());
+    layer_norm_into(
+        global_embedding.data(), 32,
+        tensor("global_norm.weight"), tensor("global_norm.bias"),
+        layer_norm_eps_, global_embedding.data());
+    silu_inplace(global_embedding.data(), 32);
+
+    request_max.fill(std::numeric_limits<float>::lowest());
+    for (int row = 0; row < features.request_count; ++row) {
+        const float* input = features.request_features.data() +
+            static_cast<std::size_t>(row) * static_cast<std::size_t>(request_dim_);
+        linear_into(
+            input, request_dim_,
+            tensor("request_fc1.weight"), tensor("request_fc1.bias"),
+            request_hidden.data());
+        silu_inplace(request_hidden.data(), 32);
+        linear_into(
+            request_hidden.data(), 32,
+            tensor("request_fc2.weight"), tensor("request_fc2.bias"),
+            request_embedding.data());
+        layer_norm_into(
+            request_embedding.data(), 32,
+            tensor("request_norm.weight"), tensor("request_norm.bias"),
+            layer_norm_eps_, request_embedding.data());
+        silu_inplace(request_embedding.data(), 32);
+        for (int i = 0; i < 32; ++i) {
+            request_sum[static_cast<std::size_t>(i)] +=
+                request_embedding[static_cast<std::size_t>(i)];
+            request_max[static_cast<std::size_t>(i)] = std::max(
+                request_max[static_cast<std::size_t>(i)],
+                request_embedding[static_cast<std::size_t>(i)]);
+        }
+    }
+    if (features.request_count == 0) request_max.fill(0.0f);
+
+    launch_max.fill(std::numeric_limits<float>::lowest());
+    for (int row = 0; row < features.launch_count; ++row) {
+        const float* input = features.launch_features.data() +
+            static_cast<std::size_t>(row) * static_cast<std::size_t>(launch_dim_);
+        linear_into(
+            input, launch_dim_,
+            tensor("launch_fc1.weight"), tensor("launch_fc1.bias"),
+            launch_hidden.data());
+        silu_inplace(launch_hidden.data(), 16);
+        linear_into(
+            launch_hidden.data(), 16,
+            tensor("launch_fc2.weight"), tensor("launch_fc2.bias"),
+            launch_embedding.data());
+        layer_norm_into(
+            launch_embedding.data(), 16,
+            tensor("launch_norm.weight"), tensor("launch_norm.bias"),
+            layer_norm_eps_, launch_embedding.data());
+        silu_inplace(launch_embedding.data(), 16);
+        for (int i = 0; i < 16; ++i) {
+            launch_sum[static_cast<std::size_t>(i)] +=
+                launch_embedding[static_cast<std::size_t>(i)];
+            launch_max[static_cast<std::size_t>(i)] = std::max(
+                launch_max[static_cast<std::size_t>(i)],
+                launch_embedding[static_cast<std::size_t>(i)]);
+        }
+    }
+    if (features.launch_count == 0) launch_max.fill(0.0f);
+
+    std::copy(global_embedding.begin(), global_embedding.end(), fusion_input.begin());
+    std::copy(request_sum.begin(), request_sum.end(), fusion_input.begin() + 32);
+    std::copy(request_max.begin(), request_max.end(), fusion_input.begin() + 64);
+    std::copy(launch_sum.begin(), launch_sum.end(), fusion_input.begin() + 96);
+    std::copy(launch_max.begin(), launch_max.end(), fusion_input.begin() + 112);
+    linear_into(
+        fusion_input.data(), 128,
+        tensor("state_fusion_fc.weight"), tensor("state_fusion_fc.bias"),
+        output);
+    silu_inplace(output, 192);
+}
+
 void NativeDenseDNNModel::policy_state_embedding_into(
     const float* state,
     float* output) const {
@@ -941,7 +1056,7 @@ std::vector<double> NativeDenseDNNModel::predict_policy_grouped_split_batch_flat
     int num_rows,
     const std::vector<int>& group_offsets,
     int parallel_threads) const {
-    if (!loaded_ || !is_policy()) {
+    if (!loaded_ || !is_policy() || is_markov_policy()) {
         throw std::runtime_error("native split policy DNN is not loaded");
     }
     if (num_rows < 0 || group_offsets.empty() || group_offsets.front() != 0 ||
@@ -1253,11 +1368,74 @@ std::vector<double> NativeDenseDNNModel::predict_policy_grouped_split_batch_flat
     }
     return output;
 }
+
+std::vector<double> NativeDenseDNNModel::predict_markov_policy_grouped_batch(
+    const std::vector<MarkovValueFeatures>& states,
+    const std::vector<float>& flat_actions,
+    int num_rows,
+    const std::vector<int>& group_offsets,
+    int parallel_threads) const {
+    if (!loaded_ || !is_markov_policy()) {
+        throw std::runtime_error("native Markov policy DNN is not loaded");
+    }
+    if (num_rows < 0 || group_offsets.empty() || group_offsets.front() != 0 ||
+        group_offsets.back() != num_rows ||
+        states.size() + 1U != group_offsets.size() ||
+        flat_actions.size() !=
+            static_cast<std::size_t>(num_rows) * static_cast<std::size_t>(action_dim_)) {
+        throw std::runtime_error("native Markov policy grouped dimensions mismatch");
+    }
+    for (std::size_t group = 1; group < group_offsets.size(); ++group) {
+        if (group_offsets[group] < group_offsets[group - 1]) {
+            throw std::runtime_error("native Markov policy offsets are not monotonic");
+        }
+    }
+    std::vector<double> output(static_cast<std::size_t>(num_rows), 0.0);
+    if (num_rows == 0) return output;
+
+    const int group_count = static_cast<int>(states.size());
+    const int threads = std::max(1, parallel_threads);
+    std::vector<std::array<float, 128>> fusion_state_bases(
+        static_cast<std::size_t>(group_count));
+    std::vector<int> row_groups(static_cast<std::size_t>(num_rows), 0);
+    #pragma omp parallel for if(group_count > 1) \
+        num_threads(threads) schedule(static)
+    for (int group = 0; group < group_count; ++group) {
+        std::array<float, 192> state_embedding{};
+        markov_policy_state_embedding_into(
+            states[static_cast<std::size_t>(group)], state_embedding.data());
+        policy_fusion_state_base_into(
+            state_embedding.data(),
+            fusion_state_bases[static_cast<std::size_t>(group)].data());
+        for (int row = group_offsets[static_cast<std::size_t>(group)];
+             row < group_offsets[static_cast<std::size_t>(group + 1)];
+             ++row) {
+            row_groups[static_cast<std::size_t>(row)] = group;
+        }
+    }
+    const PolicyActionTensorRefs refs = policy_action_tensor_refs();
+    #pragma omp parallel for if(num_rows >= 8) num_threads(threads) schedule(static)
+    for (int row = 0; row < num_rows; ++row) {
+        const int group = row_groups[static_cast<std::size_t>(row)];
+        output[static_cast<std::size_t>(row)] =
+            policy_from_fusion_state_base(
+                fusion_state_bases[static_cast<std::size_t>(group)].data(),
+                flat_actions.data() +
+                    static_cast<std::size_t>(row) *
+                    static_cast<std::size_t>(action_dim_),
+                refs);
+    }
+    return output;
+}
+
 bool NativeDenseDNNModel::loaded() const { return loaded_; }
 bool NativeDenseDNNModel::is_value() const { return model_kind_ == "value_dnn"; }
 bool NativeDenseDNNModel::is_policy() const { return model_kind_ == "policy_dnn"; }
 bool NativeDenseDNNModel::is_markov_value() const {
     return is_value() && architecture_ == "agz_markov_value_deepset_v2";
+}
+bool NativeDenseDNNModel::is_markov_policy() const {
+    return is_policy() && architecture_ == "agz_markov_policy_deepset_v3";
 }
 int NativeDenseDNNModel::feature_dim() const { return feature_dim_; }
 int NativeDenseDNNModel::state_dim() const { return state_dim_; }

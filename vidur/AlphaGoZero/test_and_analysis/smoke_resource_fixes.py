@@ -156,7 +156,57 @@ def _make_shard(
     return shard
 
 
+def _check_training_replay_snapshot(root: Path) -> None:
+    partitions = root / "global_replay" / "partitions" / "worker1"
+
+    complete = partitions / "complete__controller"
+    complete.mkdir(parents=True)
+    (complete / "replay_target_runtime_feature_complete.csv").write_text("state\n", encoding="utf-8")
+    (complete / "replay_policy_rows.csv").write_text("policy\n", encoding="utf-8")
+    atomic_write_json(complete / "partition_manifest.json", {"partition_role": "controller"})
+
+    publishing = partitions / "publishing__controller"
+    publishing.mkdir(parents=True)
+    publishing_state = publishing / "replay_target_runtime_feature_complete.csv"
+    publishing_policy = publishing / "replay_policy_rows.csv"
+    publishing_state.write_text("state\n", encoding="utf-8")
+
+    malformed = partitions / "malformed__controller"
+    malformed.mkdir(parents=True)
+    (malformed / "replay_target_runtime_feature_complete.csv").write_text("state\n", encoding="utf-8")
+    atomic_write_json(malformed / "partition_manifest.json", {"partition_role": "controller"})
+
+    feature_paths, policy_paths = trainer._replay_path_snapshot(root)
+    assert feature_paths == [complete / "replay_target_runtime_feature_complete.csv"]
+    assert policy_paths == [complete / "replay_policy_rows.csv"]
+
+    publishing_policy.write_text("policy\n", encoding="utf-8")
+    feature_paths, policy_paths = trainer._replay_path_snapshot(root)
+    assert publishing_state not in feature_paths, "files without the final manifest are not committed"
+    assert publishing_policy not in policy_paths
+
+    atomic_write_json(publishing / "partition_manifest.json", {"partition_role": "controller"})
+    feature_paths, policy_paths = trainer._replay_path_snapshot(root)
+    assert feature_paths == [
+        complete / "replay_target_runtime_feature_complete.csv",
+        publishing_state,
+    ]
+    assert policy_paths == [
+        complete / "replay_policy_rows.csv",
+        publishing_policy,
+    ]
+
+    legacy = root / "legacy" / "global_replay"
+    legacy.mkdir(parents=True)
+    legacy_feature = legacy / "replay_target_runtime_feature_complete.csv"
+    legacy_policy = legacy / "replay_policy_rows.csv"
+    legacy_feature.write_text("state\n", encoding="utf-8")
+    legacy_policy.write_text("policy\n", encoding="utf-8")
+    assert trainer._replay_path_snapshot(root / "legacy") == ([legacy_feature], [legacy_policy])
+
+
 def _check_xl_ingest_and_streaming(root: Path) -> None:
+    _check_training_replay_snapshot(root / "snapshot_contract")
     state = {"accepted_shards": [], "max_replay_states": 100}
     shard1 = _make_shard(root, worker_id="worker1", shard_id="worker1_000000", base_gid=1)
     assert xl._ingest_shard(root, shard1, state)
@@ -415,6 +465,50 @@ def _check_training_gate_consumes_only_launch_replay(root: Path) -> None:
     assert int(gate["new_states_since_last_training"]) == 400
 
 
+def _check_policy_caps_are_not_training_minima(root: Path) -> None:
+    original = (
+        xl.MIN_CONTROLLER_STATES_FOR_EVAL,
+        xl.MIN_ADVERSARY_STATES_FOR_EVAL,
+        xl.XL_CONTROLLER_POLICY_SAMPLE_CAP,
+        xl.ADVERSARY_POLICY_SAMPLE_CAP,
+        xl.TRAIN_TRIGGER_NEW_STATES,
+        xl.TRAIN_SAMPLE_MIN_LARGE_REPLAY,
+    )
+    try:
+        xl.MIN_CONTROLLER_STATES_FOR_EVAL = 100_000
+        xl.MIN_ADVERSARY_STATES_FOR_EVAL = 50_000
+        xl.XL_CONTROLLER_POLICY_SAMPLE_CAP = 500_000
+        xl.ADVERSARY_POLICY_SAMPLE_CAP = 300_000
+        xl.TRAIN_TRIGGER_NEW_STATES = 50_000
+        xl.TRAIN_SAMPLE_MIN_LARGE_REPLAY = 100_000
+        atomic_write_json(root / "xl_state.json", {
+            "feature_states": 150_000,
+            "feature_controller": 100_000,
+            "feature_adversary": 50_000,
+            "lifetime_admitted_states": 150_000,
+            "new_states_since_last_training": 150_000,
+        })
+        gate = xl.write_training_gate_status(root)
+        assert gate["can_train"] is True
+        assert int(gate["controller_policy_sample_count"]) == 100_000
+        assert int(gate["controller_policy_sample_requirement"]) == 100_000
+        assert int(gate["controller_policy_sample_cap"]) == 500_000
+        assert int(gate["adversary_policy_sample_count"]) == 50_000
+        assert int(gate["adversary_policy_sample_requirement"]) == 50_000
+        assert int(gate["adversary_policy_sample_cap"]) == 300_000
+        assert trainer._available_policy_root_requirement(73_000, 500_000) == 73_000
+        assert trainer._available_policy_root_requirement(700_000, 500_000) == 500_000
+    finally:
+        (
+            xl.MIN_CONTROLLER_STATES_FOR_EVAL,
+            xl.MIN_ADVERSARY_STATES_FOR_EVAL,
+            xl.XL_CONTROLLER_POLICY_SAMPLE_CAP,
+            xl.ADVERSARY_POLICY_SAMPLE_CAP,
+            xl.TRAIN_TRIGGER_NEW_STATES,
+            xl.TRAIN_SAMPLE_MIN_LARGE_REPLAY,
+        ) = original
+
+
 def _check_completed_cycle_recovery_without_pid(root: Path) -> None:
     atomic_write_json(root / "xl_state.json", {
         "feature_states": 1_000,
@@ -551,6 +645,7 @@ def _check_worker_cleanup(root: Path) -> None:
         iterations=4_000,
         puct_c=2.5,
         root_dirichlet_alpha=0.1,
+        root_dirichlet_total_concentration=0.0,
         root_dirichlet_epsilon=0.35,
     )
     st = WorkerState(model_version=100)
@@ -579,6 +674,7 @@ def main() -> None:
         _check_worker_fifo_upload_order(root / "upload_order")
         _check_parallel_role_partition_migration(root / "partition_migration")
         _check_training_gate_consumes_only_launch_replay(root / "gate_accounting")
+        _check_policy_caps_are_not_training_minima(root / "adaptive_policy_gate")
         _check_completed_cycle_recovery_without_pid(root / "cycle_recovery")
         _check_failed_eval_recovery_selection(root / "failed_eval_selection")
         _check_eval_retry_preserves_original_gate(root / "eval_retry_gate")
@@ -594,6 +690,7 @@ def main() -> None:
             _check_worker_fifo_upload_order(root / "upload_order")
             _check_parallel_role_partition_migration(root / "partition_migration")
             _check_training_gate_consumes_only_launch_replay(root / "gate_accounting")
+            _check_policy_caps_are_not_training_minima(root / "adaptive_policy_gate")
             _check_completed_cycle_recovery_without_pid(root / "cycle_recovery")
             _check_failed_eval_recovery_selection(root / "failed_eval_selection")
             _check_eval_retry_preserves_original_gate(root / "eval_retry_gate")
