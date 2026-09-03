@@ -1,0 +1,11 @@
+"""Run Vidur attention profiling with a Ray-safe timer wrapper."""
+
+from vidur.profiling.attention import main as attention_main
+from vidur_vllm_real_testing.mew1.attention_wrapper_profiled import AttentionWrapper
+
+
+attention_main.AttentionWrapper = AttentionWrapper
+
+
+if __name__ == "__main__":
+    attention_main.main()

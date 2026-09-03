@@ -1,0 +1,66 @@
+{
+  "canonical": {
+    "first_arrival_s": 0.0,
+    "last_arrival_s": 19.945197,
+    "path": "/home/shazer/Desktop/Research/Vidur/vidur-classical-search/vidur_vllm_real_testing/traces/splitwise_conv_20s_english_canonical.csv",
+    "row_count": 31,
+    "sha256": "d828e391751407d37d498db30e04923121efa9b154c04fad950c737cb3e52258"
+  },
+  "canonicalization": {
+    "decode_bounds": [
+      1,
+      864
+    ],
+    "decode_policy": "identity_with_strict_bounds",
+    "decode_slo_s": 0.05,
+    "derived_decode_slo_rows": 0,
+    "derived_prefill_slo_rows": 0,
+    "enforce_gv3_window": true,
+    "launch_window_prefill_cap": 7168,
+    "launch_window_request_cap": 7,
+    "launch_window_s": 1.0,
+    "prefill_bounds": [
+      128,
+      4096
+    ],
+    "prefill_grid_tokens": 128,
+    "prefill_rounding": "nearest_128_half_up",
+    "prefill_slo": "prefill_profile_time_s * 3.0",
+    "prefill_slowdown": 3.0
+  },
+  "model_contract": {
+    "actual_fields_drive": [
+      "vllm_execution",
+      "raw_slo_scoring"
+    ],
+    "canonical_fields_drive": [
+      "vidur_digital_twin",
+      "dnn_features",
+      "mcts"
+    ],
+    "policy_feature_schema": "legacy_226",
+    "value_feature_schema": "markov_v2"
+  },
+  "profiles": {
+    "prefill_path": "/home/shazer/Desktop/Research/Vidur/vidur-classical-search/simulator_output/prefill_profile.csv",
+    "prefill_sha256": "47f2ed85aca4a5ec47eacae8425d38284e76759b75f5c069852d393ecc62329b"
+  },
+  "prompt_artifacts": {
+    "add_special_tokens": true,
+    "aggregate_prompt_sha256": "f6f67d0b915148a1cb289858e6433aefc07f075cd597ff8b447bdd618aa7b7b1",
+    "bos_token_id": 128000,
+    "catalog_path": "/home/shazer/Desktop/Research/Vidur/vidur-classical-search/vidur_vllm_real_testing/prompts/splitwise_conv_20s/prompt_catalog.json",
+    "catalog_sha256": "f68383ab13b71b64695abd9bb18f04eb424bc1292babaa6b17bbf83c17ee7f44",
+    "mode": "token_ids_file_with_english_text",
+    "request_count": 31,
+    "token_count_semantics": "BOS plus English body tokens",
+    "tokenizer_json_sha256": "e134af98b985517b4f068e3755ae90d4e9cd2d45d328325dc503f1c6b2d06cc7",
+    "tokenizer_repository": "NousResearch/Meta-Llama-3-8B",
+    "tokenizer_revision": "315b20096dc791d381d514deb5f8bd9c8d6d3061"
+  },
+  "schema_version": "gv3_vllm_trace_v1",
+  "source": {
+    "path": "/home/shazer/Desktop/Research/Vidur/vidur-classical-search/vidur_vllm_real_testing/traces/splitwise_conv_20s_english_raw.csv",
+    "sha256": "9bcd5443d92298f5e701d57cca669c2f59713f16c381d0ae521a16bf9d78511f"
+  }
+}

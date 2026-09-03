@@ -1,0 +1,9 @@
+Prepare a precise technical response about digital library preservation. Use the following background to reason carefully and state a practical conclusion.
+
+Data quality matters as much as model capacity. Each request needs a stable arrival time, an exact prompt length, a bounded output length, and explicit service objectives. Tokenization must be deterministic, and every generated artifact should carry a checksum so a later run cannot silently use different prompts or model inputs.
+
+The final explanation should state limitations. A simulator can approximate hardware behavior but cannot guarantee identical timing, especially when memory pressure, kernel selection, or preemption changes. Calibration quantifies this gap; it should not silently rewrite the frozen assumptions used by a previously trained controller.
+
+A careful analysis begins by separating observations from assumptions. The report should identify the available resources, the requests waiting for service, and the deadlines that make one task more urgent than another. It should explain each conclusion in plain language and preserve enough detail for another engineer to reproduce the result.
+
+Key considerations include request queue model policy value search timing cost state action result capacity deadline process analysis evidence workload measurement system service request queue model policy value search timing cost state action result capacity deadline process analysis evidence workload measurement system service request queue model policy value search timing cost state action result capacity deadline process analysis evidence workload measurement system service.

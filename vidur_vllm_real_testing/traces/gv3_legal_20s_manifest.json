@@ -1,0 +1,53 @@
+{
+  "canonical": {
+    "first_arrival_s": 0.0,
+    "last_arrival_s": 19.2,
+    "path": "/home/shazer/Desktop/Research/Vidur/vidur-classical-search/vidur_vllm_real_testing/traces/gv3_legal_20s_canonical.csv",
+    "row_count": 79,
+    "sha256": "1e6a4147f3217d4ade5fe09a766437df533d90f614117c4dc443115d0dd76275"
+  },
+  "canonicalization": {
+    "decode_bounds": [
+      1,
+      864
+    ],
+    "decode_policy": "identity_with_strict_bounds",
+    "decode_slo_s": 0.05,
+    "derived_decode_slo_rows": 0,
+    "derived_prefill_slo_rows": 0,
+    "enforce_gv3_window": true,
+    "launch_window_prefill_cap": 7168,
+    "launch_window_request_cap": 7,
+    "launch_window_s": 1.0,
+    "prefill_bounds": [
+      128,
+      4096
+    ],
+    "prefill_grid_tokens": 128,
+    "prefill_rounding": "nearest_128_half_up",
+    "prefill_slo": "prefill_profile_time_s * 3.0",
+    "prefill_slowdown": 3.0
+  },
+  "model_contract": {
+    "actual_fields_drive": [
+      "vllm_execution",
+      "raw_slo_scoring"
+    ],
+    "canonical_fields_drive": [
+      "vidur_digital_twin",
+      "dnn_features",
+      "mcts"
+    ],
+    "policy_feature_schema": "legacy_226",
+    "value_feature_schema": "markov_v2"
+  },
+  "profiles": {
+    "prefill_path": "/home/shazer/Desktop/Research/Vidur/vidur-classical-search/simulator_output/prefill_profile.csv",
+    "prefill_sha256": "47f2ed85aca4a5ec47eacae8425d38284e76759b75f5c069852d393ecc62329b"
+  },
+  "schema_version": "gv3_vllm_trace_v1",
+  "source": {
+    "path": "/home/shazer/Desktop/Research/Vidur/vidur-classical-search/vidur_vllm_real_testing/traces/gv3_legal_20s_raw.csv",
+    "sha256": "fa94e6be45249747b04ca28d94ba9d550f0116885a0ca578e8bc01c9a7a40ca4"
+  }
+}

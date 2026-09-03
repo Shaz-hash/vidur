@@ -1,0 +1,16 @@
+profile_tag=mew1_a100_80gb_pcie_sarathi017_cu121_tp1_8k
+started_utc=20260816T025042Z
+hostname=mew1
+user=shaz
+physical_gpu=2
+vidur_commit=unavailable
+sarathi_commit=c94dbf438711a4670dbf7477175062e87748999d
+torch=2.3.0+cu121
+torch_cuda=12.1
+sarathi=0.1.7
+NVIDIA A100 80GB PCIe, GPU-3182996e-937c-617d-ffd4-394d08d6ad60, 81920 MiB, 300.00 W, 1410 MHz, 8.0, 580.178.04
+mlp_max_tokens=8192
+attention_max_seq_len=8192
+attention_max_batch_size=256
+attention_max_chunk_size=4096
+tensor_parallel_size=1

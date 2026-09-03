@@ -1,0 +1,15 @@
+{
+  "add_special_tokens": true,
+  "bos_token_id": 128000,
+  "files": {
+    "special_tokens_map.json": "462d91939dbc37178aa5a3eae7068d1990ccc92e09f288cc71f42cdf139d69cc",
+    "tokenizer.json": "e134af98b985517b4f068e3755ae90d4e9cd2d45d328325dc503f1c6b2d06cc7",
+    "tokenizer_config.json": "690727b4fed286383df1c7ca5e805124cb70c6eb4529f807c7b2e60ff741da7e"
+  },
+  "repository": "NousResearch/Meta-Llama-3-8B",
+  "revision": "315b20096dc791d381d514deb5f8bd9c8d6d3061",
+  "token_count_semantics": "BOS plus English body tokens",
+  "tokenizer_class": "PreTrainedTokenizerFast",
+  "vocab_size_with_added_tokens": 128256,
+  "vocab_size_without_added_tokens": 128000
+}

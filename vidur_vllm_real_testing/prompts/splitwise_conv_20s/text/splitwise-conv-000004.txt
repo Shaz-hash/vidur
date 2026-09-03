@@ -1,0 +1,5 @@
+Prepare a precise technical response about public transport coordination. Use the following background to reason carefully and state a practical conclusion.
+
+When a model guides search, its prediction is only one part of the decision. Immediate simulator rewards, discounted future outcomes, policy priors, and exploration all influence the final ranking. Diagnostics should therefore report each component independently and verify that Python and native implementations receive identical state features.
+
+Key considerations include model policy value search timing cost state.

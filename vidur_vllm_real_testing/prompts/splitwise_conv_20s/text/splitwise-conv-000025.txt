@@ -1,0 +1,7 @@
+Prepare a precise technical response about urban water conservation. Use the following background to reason carefully and state a practical conclusion.
+
+The system changes over time, so a useful plan must account for both immediate work and delayed consequences. Serving a short task may look efficient at first, yet repeatedly postponing larger tasks can create a backlog. A balanced decision considers current latency, future queue pressure, capacity limits, and uncertainty in new arrivals.
+
+Reliable evaluation requires consistent measurements. Record the starting state, selected action, execution duration, completed work, remaining work, and any service objective violation. Compare alternatives over the same interval, use the same inputs, and keep raw measurements separate from normalized features used by a predictive model.
+
+Key considerations include policy value search timing cost state action result capacity deadline process analysis evidence workload measurement system service request queue model policy value search timing cost state action result capacity deadline process analysis evidence workload measurement system service request queue model policy value search timing cost state action result capacity deadline process analysis evidence workload measurement system service request.

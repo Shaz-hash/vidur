@@ -1,0 +1,40 @@
+{
+  "amd64": {
+    "image_id": "sha256:4866eb4e4cd15afd3b10c450bd8e705ce8d5fbc8da2636dd04b757c0f3e68846",
+    "platform": "linux/amd64",
+    "size_bytes": 8946563176,
+    "tag": "vidur-vllm-real-testing:v0.13.0-token-gate-amd64-production"
+  },
+  "arm64": {
+    "image_id": "sha256:a63f600474ff7f0c26532965559611267c28d3cbe49455ff560fe4c8238a311c",
+    "platform": "linux/arm64",
+    "runtime_gate": {
+      "bundled_gate": "passed",
+      "incompatible_hash_rejection": "passed",
+      "model_repository_gate": "passed",
+      "prompt_count": 110,
+      "vllm_version": "0.13.0"
+    },
+    "size_bytes": 8293885609,
+    "tag": "vidur-vllm-real-testing:v0.13.0-token-gate-arm64-production"
+  },
+  "base_manifest": "vllm/vllm-openai:v0.13.0@sha256:d623253f2ba246378421c9642e20885e65257f38418ff26d48c81aea1702521b",
+  "scheduler_arm64": {
+    "image_id": "sha256:7f4ae594d6ff365117943e6c59b01294e01949a64a0fa2add53cc22302ebc9b8",
+    "platform": "linux/arm64",
+    "runtime_gate": {
+      "active_validation_stale_fallback": "passed",
+      "controller_exact_plan": "passed",
+      "mixed_decode_prefill": "passed",
+      "scheduler_patch": "passed",
+      "shadow_stock_equivalence": "passed",
+      "sjf256": "passed",
+      "sjf512": "passed",
+      "stock_equivalence": "passed",
+      "vllm_version": "0.13.0"
+    },
+    "size_bytes": 8317690610,
+    "tag": "vidur-vllm-real-testing:v0.13.0-scheduler-arm64-production"
+  },
+  "validated_at": "2026-08-13"
+}

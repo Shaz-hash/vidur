@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vidur.local/schemas/gv3-vllm-canonical-trace-row-v1.json",
+  "title": "GV3 real-vLLM canonical trace row v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "request_id",
+    "source_row",
+    "arrived_at_s",
+    "actual_prefill_tokens",
+    "canonical_prefill_tokens",
+    "prefill_rounding_delta_tokens",
+    "actual_decode_tokens",
+    "canonical_decode_tokens",
+    "actual_prefill_slo_s",
+    "canonical_prefill_slo_s",
+    "prefill_profile_time_s",
+    "actual_decode_slo_s",
+    "canonical_decode_slo_s",
+    "prompt_mode",
+    "prompt_ref",
+    "seed",
+    "ignore_eos"
+  ],
+  "properties": {
+    "schema_version": {"const": "gv3_vllm_trace_v1"},
+    "request_id": {"type": "string", "minLength": 1},
+    "source_row": {"type": "integer", "minimum": 2},
+    "arrived_at_s": {"type": "number", "minimum": 0},
+    "actual_prefill_tokens": {"type": "integer", "minimum": 1, "maximum": 4096},
+    "canonical_prefill_tokens": {
+      "type": "integer",
+      "minimum": 128,
+      "maximum": 4096,
+      "multipleOf": 128
+    },
+    "prefill_rounding_delta_tokens": {"type": "integer", "minimum": -63, "maximum": 127},
+    "actual_decode_tokens": {"type": "integer", "minimum": 1, "maximum": 864},
+    "canonical_decode_tokens": {"type": "integer", "minimum": 1, "maximum": 864},
+    "actual_prefill_slo_s": {"type": "number", "exclusiveMinimum": 0},
+    "canonical_prefill_slo_s": {"type": "number", "exclusiveMinimum": 0},
+    "prefill_profile_time_s": {"type": "number", "exclusiveMinimum": 0},
+    "actual_decode_slo_s": {"type": "number", "exclusiveMinimum": 0},
+    "canonical_decode_slo_s": {"const": 0.05},
+    "prompt_mode": {
+      "enum": ["synthetic_token_ids", "text_file", "token_ids_file"]
+    },
+    "prompt_ref": {"type": "string"},
+    "seed": {"type": "integer", "minimum": 0},
+    "ignore_eos": {"type": "boolean"}
+  }
+}

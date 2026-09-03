@@ -1,0 +1,5 @@
+Prepare a precise technical response about renewable energy planning. Use the following background to reason carefully and state a practical conclusion.
+
+Operational recommendations should remain general rather than depending on one trace. Prefer rules that respond to workload structure, such as urgency, remaining work, and available capacity. Avoid conclusions based only on a request identifier or its position in a file, because those details do not describe the underlying scheduling problem.
+
+Key considerations include process analysis evidence workload measurement system service request queue model policy value search timing cost state action result capacity deadline process analysis evidence workload measurement system service request queue model policy value search timing cost state action result capacity deadline process analysis.

@@ -1,0 +1,88 @@
+
+
+
+Ok so in the next phase 
+I want to seperate the value function model for both adversary 
+and controller
+initially they both will contain v100 as two copies as same value function models.
+In selfplay
+Then we will collect the samples as before, 
+and train both value models on the same select/sampled states for the value function. 
+
+But then in the eval, we will promote controller if , if the controller won more than 55% in 100 games
+and same for the adversary , 
+so it is possible that new controller value model gets promoted but not the adversary after producing new candidate adversary and controller policy and value models.
+
+Given this implment it . Also make sure that each time, both value model functions get trained on the same sampled states regardless they are adversary or controller .
+
+In the /home/ubuntu/vidur-classical-search/simulator_output/GV3_Agent/AlphaGoZero_.995_replay_diversity/replay_distribution.csv
+
+change the current_promoted_model_version,current_promoted_model_states,other_model_versions,other_model_states
+to controller and adversary seperate columns
+regarding distribution of the replay :
+we will have 15M states as before but 
+for controller they will be 10M, for adversary they will be 5M
+so now we need to ensure diversity accordingly for the controller and adversary models, . For the controller, 5M max states will be held by current promoted model and then 1M by remaining previous ones.
+for adversary 2.5 M max by currrent promoted and then  .5M states by the previous models.
+
+So have this change implmented. 
+it could be possible that controller models (policy and value) are at  v105 but adversary at v125 or vice versa. Essentially both models are learning value with respect to controller. The only reason we are doing is this to let value model learn and promote if a certain player's policy and value function is beating the current by above the threshold.
+
+
+
+Have these changes implemented and the test them correctly and then run for v101 to ensure all is going smoothly.
+
+
+Have proper test cases tried to check its not incorrect. 
+And also keep checking the logs and models till v101 to ensure the model progresses correctly.
+
+--------
+
+
+
+ok stop the experiment. 
+clear disk and memory from the previous experiment.
+The reason is that models dont progresss and get promoted even when one player gets more than 55% wins.
+heres the action plan now
+
+
+
+Ok so in the next phase 
+I want to seperate the value function model for both adversary 
+and controller
+initially they both will contain v100 as two copies as same value function models.
+In selfplay
+Then we will collect the samples as before, 
+and train both value models on the same select/sampled states for the value function. 
+
+But then in the eval, we will promote controller if , if the controller won more than 55% in 100 games
+and same for the adversary , 
+so it is possible that new controller value model gets promoted but not the adversary after producing new candidate adversary and controller policy and value models.
+
+Given this implment it . Also make sure that each time, both value model functions get trained on the same sampled states regardless they are adversary or controller .
+
+In the /home/ubuntu/vidur-classical-search/simulator_output/GV3_Agent/AlphaGoZero_.995_replay_diversity/replay_distribution.csv
+
+change the current_promoted_model_version,current_promoted_model_states,other_model_versions,other_model_states
+to controller and adversary seperate columns
+regarding distribution of the replay :
+we will have 15M states as before but 
+for controller they will be 10M, for adversary they will be 5M
+so now we need to ensure diversity accordingly for the controller and adversary models, . For the controller, 5M max states will be held by current promoted model and then 1M by remaining previous ones.
+for adversary 2.5 M max by currrent promoted and then  .5M states by the previous models.
+
+So have this change implmented. 
+it could be possible that controller models (policy and value) are at  v105 but adversary at v125 or vice versa. Essentially both models are learning value with respect to controller. The only reason we are doing is this to let value model learn and promote if a certain player's policy and value function is beating the current by above the threshold.
+
+
+
+Have these changes implemented and the test them correctly and then run for v101 to ensure all is going smoothly.
+
+
+Have proper test cases tried to check its not incorrect. 
+And also keep checking the logs and models till v101 to ensure the model progresses correctly.
+
+Have these additions into readMe.md
+
+
+

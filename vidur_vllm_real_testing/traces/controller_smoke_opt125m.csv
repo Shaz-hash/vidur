@@ -1,0 +1,2 @@
+schema_version,request_id,source_row,arrived_at_s,actual_prefill_tokens,canonical_prefill_tokens,prefill_rounding_delta_tokens,actual_decode_tokens,canonical_decode_tokens,actual_prefill_slo_s,canonical_prefill_slo_s,prefill_profile_time_s,actual_decode_slo_s,canonical_decode_slo_s,prompt_mode,prompt_ref,seed,ignore_eos
+gv3_vllm_trace_v1,cmpl-req-000000,2,0.0,9,128,119,8,8,0.04717739161296969,0.04717739161296969,0.015725797204323228,0.05,0.05,inline,controller-smoke,0,true

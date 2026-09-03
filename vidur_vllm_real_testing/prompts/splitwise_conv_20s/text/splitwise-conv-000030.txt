@@ -1,0 +1,143 @@
+Prepare a precise technical response about digital library preservation. Use the following background to reason carefully and state a practical conclusion.
+
+Data quality matters as much as model capacity. Each request needs a stable arrival time, an exact prompt length, a bounded output length, and explicit service objectives. Tokenization must be deterministic, and every generated artifact should carry a checksum so a later run cannot silently use different prompts or model inputs.
+
+The final explanation should state limitations. A simulator can approximate hardware behavior but cannot guarantee identical timing, especially when memory pressure, kernel selection, or preemption changes. Calibration quantifies this gap; it should not silently rewrite the frozen assumptions used by a previously trained controller.
+
+A careful analysis begins by separating observations from assumptions. The report should identify the available resources, the requests waiting for service, and the deadlines that make one task more urgent than another. It should explain each conclusion in plain language and preserve enough detail for another engineer to reproduce the result.
+
+The system changes over time, so a useful plan must account for both immediate work and delayed consequences. Serving a short task may look efficient at first, yet repeatedly postponing larger tasks can create a backlog. A balanced decision considers current latency, future queue pressure, capacity limits, and uncertainty in new arrivals.
+
+Reliable evaluation requires consistent measurements. Record the starting state, selected action, execution duration, completed work, remaining work, and any service objective violation. Compare alternatives over the same interval, use the same inputs, and keep raw measurements separate from normalized features used by a predictive model.
+
+Operational recommendations should remain general rather than depending on one trace. Prefer rules that respond to workload structure, such as urgency, remaining work, and available capacity. Avoid conclusions based only on a request identifier or its position in a file, because those details do not describe the underlying scheduling problem.
+
+When a model guides search, its prediction is only one part of the decision. Immediate simulator rewards, discounted future outcomes, policy priors, and exploration all influence the final ranking. Diagnostics should therefore report each component independently and verify that Python and native implementations receive identical state features.
+
+A production test must distinguish simulated time from wall clock time. The service executes real batches on an accelerator, while the planning layer may run on a CPU. Report the observed result and any adjusted result separately, subtracting only planning time that actually blocks useful execution rather than time hidden behind concurrent work.
+
+Data quality matters as much as model capacity. Each request needs a stable arrival time, an exact prompt length, a bounded output length, and explicit service objectives. Tokenization must be deterministic, and every generated artifact should carry a checksum so a later run cannot silently use different prompts or model inputs.
+
+The final explanation should state limitations. A simulator can approximate hardware behavior but cannot guarantee identical timing, especially when memory pressure, kernel selection, or preemption changes. Calibration quantifies this gap; it should not silently rewrite the frozen assumptions used by a previously trained controller.
+
+A careful analysis begins by separating observations from assumptions. The report should identify the available resources, the requests waiting for service, and the deadlines that make one task more urgent than another. It should explain each conclusion in plain language and preserve enough detail for another engineer to reproduce the result.
+
+The system changes over time, so a useful plan must account for both immediate work and delayed consequences. Serving a short task may look efficient at first, yet repeatedly postponing larger tasks can create a backlog. A balanced decision considers current latency, future queue pressure, capacity limits, and uncertainty in new arrivals.
+
+Reliable evaluation requires consistent measurements. Record the starting state, selected action, execution duration, completed work, remaining work, and any service objective violation. Compare alternatives over the same interval, use the same inputs, and keep raw measurements separate from normalized features used by a predictive model.
+
+Operational recommendations should remain general rather than depending on one trace. Prefer rules that respond to workload structure, such as urgency, remaining work, and available capacity. Avoid conclusions based only on a request identifier or its position in a file, because those details do not describe the underlying scheduling problem.
+
+When a model guides search, its prediction is only one part of the decision. Immediate simulator rewards, discounted future outcomes, policy priors, and exploration all influence the final ranking. Diagnostics should therefore report each component independently and verify that Python and native implementations receive identical state features.
+
+A production test must distinguish simulated time from wall clock time. The service executes real batches on an accelerator, while the planning layer may run on a CPU. Report the observed result and any adjusted result separately, subtracting only planning time that actually blocks useful execution rather than time hidden behind concurrent work.
+
+Data quality matters as much as model capacity. Each request needs a stable arrival time, an exact prompt length, a bounded output length, and explicit service objectives. Tokenization must be deterministic, and every generated artifact should carry a checksum so a later run cannot silently use different prompts or model inputs.
+
+The final explanation should state limitations. A simulator can approximate hardware behavior but cannot guarantee identical timing, especially when memory pressure, kernel selection, or preemption changes. Calibration quantifies this gap; it should not silently rewrite the frozen assumptions used by a previously trained controller.
+
+A careful analysis begins by separating observations from assumptions. The report should identify the available resources, the requests waiting for service, and the deadlines that make one task more urgent than another. It should explain each conclusion in plain language and preserve enough detail for another engineer to reproduce the result.
+
+The system changes over time, so a useful plan must account for both immediate work and delayed consequences. Serving a short task may look efficient at first, yet repeatedly postponing larger tasks can create a backlog. A balanced decision considers current latency, future queue pressure, capacity limits, and uncertainty in new arrivals.
+
+Reliable evaluation requires consistent measurements. Record the starting state, selected action, execution duration, completed work, remaining work, and any service objective violation. Compare alternatives over the same interval, use the same inputs, and keep raw measurements separate from normalized features used by a predictive model.
+
+Operational recommendations should remain general rather than depending on one trace. Prefer rules that respond to workload structure, such as urgency, remaining work, and available capacity. Avoid conclusions based only on a request identifier or its position in a file, because those details do not describe the underlying scheduling problem.
+
+When a model guides search, its prediction is only one part of the decision. Immediate simulator rewards, discounted future outcomes, policy priors, and exploration all influence the final ranking. Diagnostics should therefore report each component independently and verify that Python and native implementations receive identical state features.
+
+A production test must distinguish simulated time from wall clock time. The service executes real batches on an accelerator, while the planning layer may run on a CPU. Report the observed result and any adjusted result separately, subtracting only planning time that actually blocks useful execution rather than time hidden behind concurrent work.
+
+Data quality matters as much as model capacity. Each request needs a stable arrival time, an exact prompt length, a bounded output length, and explicit service objectives. Tokenization must be deterministic, and every generated artifact should carry a checksum so a later run cannot silently use different prompts or model inputs.
+
+The final explanation should state limitations. A simulator can approximate hardware behavior but cannot guarantee identical timing, especially when memory pressure, kernel selection, or preemption changes. Calibration quantifies this gap; it should not silently rewrite the frozen assumptions used by a previously trained controller.
+
+A careful analysis begins by separating observations from assumptions. The report should identify the available resources, the requests waiting for service, and the deadlines that make one task more urgent than another. It should explain each conclusion in plain language and preserve enough detail for another engineer to reproduce the result.
+
+The system changes over time, so a useful plan must account for both immediate work and delayed consequences. Serving a short task may look efficient at first, yet repeatedly postponing larger tasks can create a backlog. A balanced decision considers current latency, future queue pressure, capacity limits, and uncertainty in new arrivals.
+
+Reliable evaluation requires consistent measurements. Record the starting state, selected action, execution duration, completed work, remaining work, and any service objective violation. Compare alternatives over the same interval, use the same inputs, and keep raw measurements separate from normalized features used by a predictive model.
+
+Operational recommendations should remain general rather than depending on one trace. Prefer rules that respond to workload structure, such as urgency, remaining work, and available capacity. Avoid conclusions based only on a request identifier or its position in a file, because those details do not describe the underlying scheduling problem.
+
+When a model guides search, its prediction is only one part of the decision. Immediate simulator rewards, discounted future outcomes, policy priors, and exploration all influence the final ranking. Diagnostics should therefore report each component independently and verify that Python and native implementations receive identical state features.
+
+A production test must distinguish simulated time from wall clock time. The service executes real batches on an accelerator, while the planning layer may run on a CPU. Report the observed result and any adjusted result separately, subtracting only planning time that actually blocks useful execution rather than time hidden behind concurrent work.
+
+Data quality matters as much as model capacity. Each request needs a stable arrival time, an exact prompt length, a bounded output length, and explicit service objectives. Tokenization must be deterministic, and every generated artifact should carry a checksum so a later run cannot silently use different prompts or model inputs.
+
+The final explanation should state limitations. A simulator can approximate hardware behavior but cannot guarantee identical timing, especially when memory pressure, kernel selection, or preemption changes. Calibration quantifies this gap; it should not silently rewrite the frozen assumptions used by a previously trained controller.
+
+A careful analysis begins by separating observations from assumptions. The report should identify the available resources, the requests waiting for service, and the deadlines that make one task more urgent than another. It should explain each conclusion in plain language and preserve enough detail for another engineer to reproduce the result.
+
+The system changes over time, so a useful plan must account for both immediate work and delayed consequences. Serving a short task may look efficient at first, yet repeatedly postponing larger tasks can create a backlog. A balanced decision considers current latency, future queue pressure, capacity limits, and uncertainty in new arrivals.
+
+Reliable evaluation requires consistent measurements. Record the starting state, selected action, execution duration, completed work, remaining work, and any service objective violation. Compare alternatives over the same interval, use the same inputs, and keep raw measurements separate from normalized features used by a predictive model.
+
+Operational recommendations should remain general rather than depending on one trace. Prefer rules that respond to workload structure, such as urgency, remaining work, and available capacity. Avoid conclusions based only on a request identifier or its position in a file, because those details do not describe the underlying scheduling problem.
+
+When a model guides search, its prediction is only one part of the decision. Immediate simulator rewards, discounted future outcomes, policy priors, and exploration all influence the final ranking. Diagnostics should therefore report each component independently and verify that Python and native implementations receive identical state features.
+
+A production test must distinguish simulated time from wall clock time. The service executes real batches on an accelerator, while the planning layer may run on a CPU. Report the observed result and any adjusted result separately, subtracting only planning time that actually blocks useful execution rather than time hidden behind concurrent work.
+
+Data quality matters as much as model capacity. Each request needs a stable arrival time, an exact prompt length, a bounded output length, and explicit service objectives. Tokenization must be deterministic, and every generated artifact should carry a checksum so a later run cannot silently use different prompts or model inputs.
+
+The final explanation should state limitations. A simulator can approximate hardware behavior but cannot guarantee identical timing, especially when memory pressure, kernel selection, or preemption changes. Calibration quantifies this gap; it should not silently rewrite the frozen assumptions used by a previously trained controller.
+
+A careful analysis begins by separating observations from assumptions. The report should identify the available resources, the requests waiting for service, and the deadlines that make one task more urgent than another. It should explain each conclusion in plain language and preserve enough detail for another engineer to reproduce the result.
+
+The system changes over time, so a useful plan must account for both immediate work and delayed consequences. Serving a short task may look efficient at first, yet repeatedly postponing larger tasks can create a backlog. A balanced decision considers current latency, future queue pressure, capacity limits, and uncertainty in new arrivals.
+
+Reliable evaluation requires consistent measurements. Record the starting state, selected action, execution duration, completed work, remaining work, and any service objective violation. Compare alternatives over the same interval, use the same inputs, and keep raw measurements separate from normalized features used by a predictive model.
+
+Operational recommendations should remain general rather than depending on one trace. Prefer rules that respond to workload structure, such as urgency, remaining work, and available capacity. Avoid conclusions based only on a request identifier or its position in a file, because those details do not describe the underlying scheduling problem.
+
+When a model guides search, its prediction is only one part of the decision. Immediate simulator rewards, discounted future outcomes, policy priors, and exploration all influence the final ranking. Diagnostics should therefore report each component independently and verify that Python and native implementations receive identical state features.
+
+A production test must distinguish simulated time from wall clock time. The service executes real batches on an accelerator, while the planning layer may run on a CPU. Report the observed result and any adjusted result separately, subtracting only planning time that actually blocks useful execution rather than time hidden behind concurrent work.
+
+Data quality matters as much as model capacity. Each request needs a stable arrival time, an exact prompt length, a bounded output length, and explicit service objectives. Tokenization must be deterministic, and every generated artifact should carry a checksum so a later run cannot silently use different prompts or model inputs.
+
+The final explanation should state limitations. A simulator can approximate hardware behavior but cannot guarantee identical timing, especially when memory pressure, kernel selection, or preemption changes. Calibration quantifies this gap; it should not silently rewrite the frozen assumptions used by a previously trained controller.
+
+A careful analysis begins by separating observations from assumptions. The report should identify the available resources, the requests waiting for service, and the deadlines that make one task more urgent than another. It should explain each conclusion in plain language and preserve enough detail for another engineer to reproduce the result.
+
+The system changes over time, so a useful plan must account for both immediate work and delayed consequences. Serving a short task may look efficient at first, yet repeatedly postponing larger tasks can create a backlog. A balanced decision considers current latency, future queue pressure, capacity limits, and uncertainty in new arrivals.
+
+Reliable evaluation requires consistent measurements. Record the starting state, selected action, execution duration, completed work, remaining work, and any service objective violation. Compare alternatives over the same interval, use the same inputs, and keep raw measurements separate from normalized features used by a predictive model.
+
+Operational recommendations should remain general rather than depending on one trace. Prefer rules that respond to workload structure, such as urgency, remaining work, and available capacity. Avoid conclusions based only on a request identifier or its position in a file, because those details do not describe the underlying scheduling problem.
+
+When a model guides search, its prediction is only one part of the decision. Immediate simulator rewards, discounted future outcomes, policy priors, and exploration all influence the final ranking. Diagnostics should therefore report each component independently and verify that Python and native implementations receive identical state features.
+
+A production test must distinguish simulated time from wall clock time. The service executes real batches on an accelerator, while the planning layer may run on a CPU. Report the observed result and any adjusted result separately, subtracting only planning time that actually blocks useful execution rather than time hidden behind concurrent work.
+
+Data quality matters as much as model capacity. Each request needs a stable arrival time, an exact prompt length, a bounded output length, and explicit service objectives. Tokenization must be deterministic, and every generated artifact should carry a checksum so a later run cannot silently use different prompts or model inputs.
+
+The final explanation should state limitations. A simulator can approximate hardware behavior but cannot guarantee identical timing, especially when memory pressure, kernel selection, or preemption changes. Calibration quantifies this gap; it should not silently rewrite the frozen assumptions used by a previously trained controller.
+
+A careful analysis begins by separating observations from assumptions. The report should identify the available resources, the requests waiting for service, and the deadlines that make one task more urgent than another. It should explain each conclusion in plain language and preserve enough detail for another engineer to reproduce the result.
+
+The system changes over time, so a useful plan must account for both immediate work and delayed consequences. Serving a short task may look efficient at first, yet repeatedly postponing larger tasks can create a backlog. A balanced decision considers current latency, future queue pressure, capacity limits, and uncertainty in new arrivals.
+
+Reliable evaluation requires consistent measurements. Record the starting state, selected action, execution duration, completed work, remaining work, and any service objective violation. Compare alternatives over the same interval, use the same inputs, and keep raw measurements separate from normalized features used by a predictive model.
+
+Operational recommendations should remain general rather than depending on one trace. Prefer rules that respond to workload structure, such as urgency, remaining work, and available capacity. Avoid conclusions based only on a request identifier or its position in a file, because those details do not describe the underlying scheduling problem.
+
+When a model guides search, its prediction is only one part of the decision. Immediate simulator rewards, discounted future outcomes, policy priors, and exploration all influence the final ranking. Diagnostics should therefore report each component independently and verify that Python and native implementations receive identical state features.
+
+A production test must distinguish simulated time from wall clock time. The service executes real batches on an accelerator, while the planning layer may run on a CPU. Report the observed result and any adjusted result separately, subtracting only planning time that actually blocks useful execution rather than time hidden behind concurrent work.
+
+Data quality matters as much as model capacity. Each request needs a stable arrival time, an exact prompt length, a bounded output length, and explicit service objectives. Tokenization must be deterministic, and every generated artifact should carry a checksum so a later run cannot silently use different prompts or model inputs.
+
+The final explanation should state limitations. A simulator can approximate hardware behavior but cannot guarantee identical timing, especially when memory pressure, kernel selection, or preemption changes. Calibration quantifies this gap; it should not silently rewrite the frozen assumptions used by a previously trained controller.
+
+A careful analysis begins by separating observations from assumptions. The report should identify the available resources, the requests waiting for service, and the deadlines that make one task more urgent than another. It should explain each conclusion in plain language and preserve enough detail for another engineer to reproduce the result.
+
+The system changes over time, so a useful plan must account for both immediate work and delayed consequences. Serving a short task may look efficient at first, yet repeatedly postponing larger tasks can create a backlog. A balanced decision considers current latency, future queue pressure, capacity limits, and uncertainty in new arrivals.
+
+Reliable evaluation requires consistent measurements. Record the starting state, selected action, execution duration, completed work, remaining work, and any service objective violation. Compare alternatives over the same interval, use the same inputs, and keep raw measurements separate from normalized features used by a predictive model.
+
+Operational recommendations should remain general rather than depending on one trace. Prefer rules that respond to workload structure, such as urgency, remaining work, and available capacity. Avoid conclusions based only on a request identifier or its position in a file, because those details do not describe the underlying scheduling problem.
+
+Key considerations include state action result capacity deadline process analysis evidence workload measurement system service request queue model policy value search timing cost state action result capacity deadline process analysis evidence workload measurement system service request queue model policy value search timing cost state action result capacity deadline process.

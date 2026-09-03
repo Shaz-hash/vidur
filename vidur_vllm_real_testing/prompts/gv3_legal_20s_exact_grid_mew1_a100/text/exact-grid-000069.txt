@@ -1,0 +1,5 @@
+Prepare a precise technical response about scientific experiment design. Use the following background to reason carefully and state a practical conclusion.
+
+A production test must distinguish simulated time from wall clock time. The service executes real batches on an accelerator, while the planning layer may run on a CPU. Report the observed result and any adjusted result separately, subtracting only planning time that actually blocks useful execution rather than time hidden behind concurrent work.
+
+Key considerations include cost state action result capacity deadline process analysis evidence workload measurement system service request queue model policy value search timing cost state action result capacity deadline process analysis evidence workload measurement system service request queue model policy value search timing cost.

@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vidur.local/schemas/gv3-vllm-raw-trace-row-v1.json",
+  "title": "GV3 real-vLLM raw trace row v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "request_id",
+    "arrived_at_s",
+    "num_prefill_tokens",
+    "num_decode_tokens",
+    "prefill_slo_s",
+    "decode_slo_s",
+    "prompt_mode",
+    "prompt_ref",
+    "seed",
+    "ignore_eos"
+  ],
+  "properties": {
+    "request_id": {"type": "string", "minLength": 1},
+    "arrived_at_s": {"type": "number", "minimum": 0},
+    "num_prefill_tokens": {"type": "integer", "minimum": 1, "maximum": 4096},
+    "num_decode_tokens": {"type": "integer", "minimum": 1, "maximum": 864},
+    "prefill_slo_s": {"type": "number", "exclusiveMinimum": 0},
+    "decode_slo_s": {"type": "number", "exclusiveMinimum": 0},
+    "prompt_mode": {
+      "enum": ["synthetic_token_ids", "text_file", "token_ids_file"]
+    },
+    "prompt_ref": {"type": "string"},
+    "seed": {"type": "integer", "minimum": 0},
+    "ignore_eos": {"type": "boolean"}
+  }
+}

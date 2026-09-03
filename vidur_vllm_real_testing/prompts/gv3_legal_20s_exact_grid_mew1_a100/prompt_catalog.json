@@ -1,0 +1,733 @@
+{
+  "prompts": [
+    {
+      "declared_prefill_tokens": 1024,
+      "request_id": "exact-grid-000000",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000000.txt",
+      "text_sha256": "506967f5484cd30d4e0d0e584d00d65f84103a3ab75acb284625ef54ee5731da",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000000.json",
+      "token_ids_sha256": "e9a205b4a3c1546a86427fff55d914022daf6653189b42a822da3c25aab77d8e",
+      "verified_token_count": 1024
+    },
+    {
+      "declared_prefill_tokens": 1024,
+      "request_id": "exact-grid-000001",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000001.txt",
+      "text_sha256": "cabc9c320127e3b826d99aee8a08a0f8d829a4f53925d88d854989e962a21e71",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000001.json",
+      "token_ids_sha256": "fd4d3bd266c035691ae8b85cd470c201cb976bcb772f256f576d9dceb3414cde",
+      "verified_token_count": 1024
+    },
+    {
+      "declared_prefill_tokens": 1024,
+      "request_id": "exact-grid-000002",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000002.txt",
+      "text_sha256": "18b0a3cc9aaa58616faff555ccef57b9ee07a3aa03185fbddb14ece03f31d6eb",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000002.json",
+      "token_ids_sha256": "6e5a6d3f3217e818aa9030303c80209b1ae3e8707a3e16fe42198051314edba3",
+      "verified_token_count": 1024
+    },
+    {
+      "declared_prefill_tokens": 1024,
+      "request_id": "exact-grid-000003",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000003.txt",
+      "text_sha256": "85b3854c30dc20a9ea2dbdd75ef585bb000f6e166511d0fa8155333dcd4d7596",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000003.json",
+      "token_ids_sha256": "b480517719667f1c159111242444fd33bbe7d0654c6938832917929fa1f7d0c8",
+      "verified_token_count": 1024
+    },
+    {
+      "declared_prefill_tokens": 1024,
+      "request_id": "exact-grid-000004",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000004.txt",
+      "text_sha256": "a6de92092ede5719b78c0e0bad52480e71b2b25d4f376ede1ddeb653af1b7a57",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000004.json",
+      "token_ids_sha256": "2373da54cf27391e6fe4f437e0b1110c3b1071a626ddb618f2772fc4165ac0f2",
+      "verified_token_count": 1024
+    },
+    {
+      "declared_prefill_tokens": 1024,
+      "request_id": "exact-grid-000005",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000005.txt",
+      "text_sha256": "d12e655a5c2f8c8b6b8317432a75f4e8baf869e32dbf3c0f8214a9f5f42ea9de",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000005.json",
+      "token_ids_sha256": "00161bf8a94c8306b493332aa6c1195b229fa6283fd8114e557bae3e800d8bdb",
+      "verified_token_count": 1024
+    },
+    {
+      "declared_prefill_tokens": 1024,
+      "request_id": "exact-grid-000006",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000006.txt",
+      "text_sha256": "eff8b85a5197df538377f75efa1a9667ac254c1d6c24662ab7a79fc5ea42499c",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000006.json",
+      "token_ids_sha256": "26dd53f36134da8567493f88838bf912c0ac9d5d434da8b6e6bc58ed73d60c14",
+      "verified_token_count": 1024
+    },
+    {
+      "declared_prefill_tokens": 4096,
+      "request_id": "exact-grid-000007",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000007.txt",
+      "text_sha256": "99c8db4699f30590c42d7236ea8927663d7841906ea7587d2036c96982e836cd",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000007.json",
+      "token_ids_sha256": "52a86988769856baf4239f05cf6f88225c73854efd993a3feaf4b98e708e027e",
+      "verified_token_count": 4096
+    },
+    {
+      "declared_prefill_tokens": 2048,
+      "request_id": "exact-grid-000008",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000008.txt",
+      "text_sha256": "d08cb9e520e03dd64093050a128176df25842dac41ac1c08d34b453999b92f58",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000008.json",
+      "token_ids_sha256": "ac96f249d05fcd9b2e46d69112d4eb2aa6e1d60fc1a613284ec1a71104696016",
+      "verified_token_count": 2048
+    },
+    {
+      "declared_prefill_tokens": 2048,
+      "request_id": "exact-grid-000009",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000009.txt",
+      "text_sha256": "7f24727251f69e5e9a91b01cc0bddeabcde207d3e4564995b789ae14bd7b2929",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000009.json",
+      "token_ids_sha256": "26afcb0aa051a018427bc07fcaa12b71ae7be996f10ffefffe8ee5e4a55c6dff",
+      "verified_token_count": 2048
+    },
+    {
+      "declared_prefill_tokens": 2048,
+      "request_id": "exact-grid-000010",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000010.txt",
+      "text_sha256": "d50ebc902dbb142e22d8d26f85cd50333974f7404fcfc31162ca2c1f78eb4b2d",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000010.json",
+      "token_ids_sha256": "e5f11dc63f36a1886dd8276df550efcbee6130055e938c76c2972d77fb932bbe",
+      "verified_token_count": 2048
+    },
+    {
+      "declared_prefill_tokens": 3072,
+      "request_id": "exact-grid-000011",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000011.txt",
+      "text_sha256": "0b39deabff2f43b92a84637d1ad783d102a05917b401c42138cc81adfa1e229e",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000011.json",
+      "token_ids_sha256": "2e1cfb14c933c3e01774bfda89cc6125a8a5f4db787bc6acab5b4bac8523cf50",
+      "verified_token_count": 3072
+    },
+    {
+      "declared_prefill_tokens": 3072,
+      "request_id": "exact-grid-000012",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000012.txt",
+      "text_sha256": "dbd382516bd2d7d3659ba058fbd283651a76dd43760704476358e31c26a41d42",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000012.json",
+      "token_ids_sha256": "929b4f36732b1e7cb92b4127e5fe0665ea26800fdcc8c5cad72517fbf90d7042",
+      "verified_token_count": 3072
+    },
+    {
+      "declared_prefill_tokens": 128,
+      "request_id": "exact-grid-000013",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000013.txt",
+      "text_sha256": "00a681c0f709ce010628f6e84933b194222dc4038e592857cfa69b1229645d3e",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000013.json",
+      "token_ids_sha256": "e440129893d6fec1ca44d89ac5e37b717eed64263ab83dabf3385769d610a9e2",
+      "verified_token_count": 128
+    },
+    {
+      "declared_prefill_tokens": 128,
+      "request_id": "exact-grid-000014",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000014.txt",
+      "text_sha256": "e5d5668723884af4400219db38a277aca2cec45de5df2e34698605bb864544ec",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000014.json",
+      "token_ids_sha256": "3149f4a7cc2c3b853d0b70606996ad9e3c6cc26960857b920a82c832da8683f6",
+      "verified_token_count": 128
+    },
+    {
+      "declared_prefill_tokens": 128,
+      "request_id": "exact-grid-000015",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000015.txt",
+      "text_sha256": "2d2abcb1e78b2e1bfdf7d7ab979bda8f831fddd0bc52b430ebd363ff41831c87",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000015.json",
+      "token_ids_sha256": "57442bb7aeb0df7fdcc8ca9db3e6a11373100fa20ac7d5d1f95a163a091f3da0",
+      "verified_token_count": 128
+    },
+    {
+      "declared_prefill_tokens": 128,
+      "request_id": "exact-grid-000016",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000016.txt",
+      "text_sha256": "e16b067f0b2ce71327e91401949023001a42a59ea3f2dd189525872b8893f33e",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000016.json",
+      "token_ids_sha256": "a5202287f054134eeac1427324bb3401583f99e8fafad5ea106e4d80190d8803",
+      "verified_token_count": 128
+    },
+    {
+      "declared_prefill_tokens": 128,
+      "request_id": "exact-grid-000017",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000017.txt",
+      "text_sha256": "16c0bafe40b933d079ef76eb83d01b75d822f528dc2efe66c970ce007ce44446",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000017.json",
+      "token_ids_sha256": "047e4be47236f33a05aaa4cb612327ed70ee2fe191d5134cde08c3d44b91b333",
+      "verified_token_count": 128
+    },
+    {
+      "declared_prefill_tokens": 128,
+      "request_id": "exact-grid-000018",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000018.txt",
+      "text_sha256": "5b624111ef07fa06d28f26d84305b9741c56215e87af3285123b5d715484da95",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000018.json",
+      "token_ids_sha256": "01ed8a2790f70b4838871e3f3ca26bbef9ef416ff126cf6e73e64d8c1c221d96",
+      "verified_token_count": 128
+    },
+    {
+      "declared_prefill_tokens": 128,
+      "request_id": "exact-grid-000019",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000019.txt",
+      "text_sha256": "f0e9194da97d99a9396bd5fed1cd6127bd761ba1a95ed5273891ae638263ddcc",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000019.json",
+      "token_ids_sha256": "8addd8ff0fdd89a5d32634af14e7d41135c5c5090cd9d1a55f6513ea0727a823",
+      "verified_token_count": 128
+    },
+    {
+      "declared_prefill_tokens": 256,
+      "request_id": "exact-grid-000020",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000020.txt",
+      "text_sha256": "40340df17aad745b37bcd7332a1868900dd488bd743387b2438f7a3369da91ce",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000020.json",
+      "token_ids_sha256": "0718faf237eff9271cbac801b055b2c51eab7b2f7da6238199e312f1aab8ebd9",
+      "verified_token_count": 256
+    },
+    {
+      "declared_prefill_tokens": 256,
+      "request_id": "exact-grid-000021",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000021.txt",
+      "text_sha256": "001d3ccdc5ba4734908e7bddc8dfedb8b418a1360b4def5c2695b85cd4e4aac3",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000021.json",
+      "token_ids_sha256": "dcc228d393dc7a9303f4c42bc0ce805072db6fcf37e2925ecc15903ae7e984ff",
+      "verified_token_count": 256
+    },
+    {
+      "declared_prefill_tokens": 256,
+      "request_id": "exact-grid-000022",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000022.txt",
+      "text_sha256": "0d0284adde8bd639cb95af13d97b70ae39caea9e41f5a2982dcb18de8505dd83",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000022.json",
+      "token_ids_sha256": "a26b51240a3c5b175bf65371a596a11e37023d1d8711b920f6c821124fa5e948",
+      "verified_token_count": 256
+    },
+    {
+      "declared_prefill_tokens": 256,
+      "request_id": "exact-grid-000023",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000023.txt",
+      "text_sha256": "e0fad35bd841c2bf16ad8f2a69d5f6a67ed88179a52d3b64edf8c12a95ed88fe",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000023.json",
+      "token_ids_sha256": "da13e21883cec96818f7baf6d10d22c9f908e4e8e573e669ea2212b9ee6b44ac",
+      "verified_token_count": 256
+    },
+    {
+      "declared_prefill_tokens": 256,
+      "request_id": "exact-grid-000024",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000024.txt",
+      "text_sha256": "d79bb9bb3bc050c636eeea152b88d62a8a1bd83d9dfc4941d61c530af8b69f47",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000024.json",
+      "token_ids_sha256": "f5bf1e0bbd3f2f222d8ee9ba4e94865b95d40b5569f178c76c606c4f6fb03b51",
+      "verified_token_count": 256
+    },
+    {
+      "declared_prefill_tokens": 256,
+      "request_id": "exact-grid-000025",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000025.txt",
+      "text_sha256": "09dc11be176b6d9ff39eb5518df3b7f76743c3056efdfaa30ed1d9f42d290be5",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000025.json",
+      "token_ids_sha256": "c86b1dd1ee8b22795f8d649e4d717636747b667f9ca8f3c6ae2a7ef9aa768cb5",
+      "verified_token_count": 256
+    },
+    {
+      "declared_prefill_tokens": 256,
+      "request_id": "exact-grid-000026",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000026.txt",
+      "text_sha256": "fbdd4f8464c801a27d42163e863d6da820f8fd6bf0375d6934c45991fffbfce0",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000026.json",
+      "token_ids_sha256": "686b35b2d989212206cec7a5a8c992909f2e4722875819bfa87d7595484d7b1d",
+      "verified_token_count": 256
+    },
+    {
+      "declared_prefill_tokens": 512,
+      "request_id": "exact-grid-000027",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000027.txt",
+      "text_sha256": "6dfc980ff5c2a1e5cc089b4728d9f319bdbf888603210f77599d0bbc60ce0ce3",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000027.json",
+      "token_ids_sha256": "731e568a4655cf852dad3a7957bc6087fc49d3d63e6f8ab00edbfea5b0fbcdaf",
+      "verified_token_count": 512
+    },
+    {
+      "declared_prefill_tokens": 512,
+      "request_id": "exact-grid-000028",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000028.txt",
+      "text_sha256": "5a8c3faac6858f0fc93a13239952178cbc92d3e6ae89d07c2b53a0f487b1cae2",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000028.json",
+      "token_ids_sha256": "4bbe3cd9e5816ef22fd45653d6d6cc37e5b4c55a16e0b0c1248caf3972b35e11",
+      "verified_token_count": 512
+    },
+    {
+      "declared_prefill_tokens": 512,
+      "request_id": "exact-grid-000029",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000029.txt",
+      "text_sha256": "752359bd25f0e0ce59bb85f6c03ffb26402365280a0120d9205574d07179c6d7",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000029.json",
+      "token_ids_sha256": "522b49ee64eb30eed27215016c787f1de881fbb64af4bd0803b0cebdb737bd3d",
+      "verified_token_count": 512
+    },
+    {
+      "declared_prefill_tokens": 512,
+      "request_id": "exact-grid-000030",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000030.txt",
+      "text_sha256": "42229ba06fff6a5e63606e22f802bf46e891c652cd7a36d2acebfb21954039b6",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000030.json",
+      "token_ids_sha256": "659152bff9a6f0fd7b2ee6ef6030916262f8e616604aaff047377e89b168eae2",
+      "verified_token_count": 512
+    },
+    {
+      "declared_prefill_tokens": 512,
+      "request_id": "exact-grid-000031",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000031.txt",
+      "text_sha256": "f7ea26dd6ec92d082b226d8ca1f8089f5c6276241624ae6fa039453f73308d51",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000031.json",
+      "token_ids_sha256": "a99414803b662f99bdc82c4c516d6e63d9d1ed55e00abaf8e2b5852c148e0e29",
+      "verified_token_count": 512
+    },
+    {
+      "declared_prefill_tokens": 512,
+      "request_id": "exact-grid-000032",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000032.txt",
+      "text_sha256": "5ec1df2edb1686343fd16d73cf2c27344e9bdf3b98050ff7977942fe586dd2c0",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000032.json",
+      "token_ids_sha256": "6a3d2598ea0f66298b3cef843e297fd3dae86f3c6ff6fa1e5078e3363f5c6879",
+      "verified_token_count": 512
+    },
+    {
+      "declared_prefill_tokens": 512,
+      "request_id": "exact-grid-000033",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000033.txt",
+      "text_sha256": "4622d527871d32ff07769190b8ef0e49efe64dff567835436dc6a26086f45e67",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000033.json",
+      "token_ids_sha256": "f6ebcc5cf2a918c5da25c0c50f85a21dd9dc5715af5de01aacfa347276f79148",
+      "verified_token_count": 512
+    },
+    {
+      "declared_prefill_tokens": 1536,
+      "request_id": "exact-grid-000034",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000034.txt",
+      "text_sha256": "468793378e40bb6e4a03cecd66ffd9ce645040f14fdc1c283d3c06dacb1ca561",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000034.json",
+      "token_ids_sha256": "806977c7f05cce393ea118cc0818cacfdc424cda4bf7abc27faa510d6cb7670c",
+      "verified_token_count": 1536
+    },
+    {
+      "declared_prefill_tokens": 1536,
+      "request_id": "exact-grid-000035",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000035.txt",
+      "text_sha256": "8c638864381d46c335dd37f30a5f3193801d7d2e661cbebce62338bac44cd3ab",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000035.json",
+      "token_ids_sha256": "c33c33cf571fca2834cd5e25f9e690afe0ac7049a39be7f037e3de441d27ccb2",
+      "verified_token_count": 1536
+    },
+    {
+      "declared_prefill_tokens": 1536,
+      "request_id": "exact-grid-000036",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000036.txt",
+      "text_sha256": "8307f466ed90c9588e37c8544b3c7b9d08accb8bd75faad659ff4870900a0b36",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000036.json",
+      "token_ids_sha256": "ed364d3494a9e27518b7a13638961492ae8022f01756d11c112485adb576b022",
+      "verified_token_count": 1536
+    },
+    {
+      "declared_prefill_tokens": 1536,
+      "request_id": "exact-grid-000037",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000037.txt",
+      "text_sha256": "dd913fe1dad9d7d8637557dad0c82e525d0d876ac2512ea4b3485c1fd6045298",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000037.json",
+      "token_ids_sha256": "b906dfbe165b33439dd14c3fd2220db9fb790337d2eb366500b25ebf6d9ee7b2",
+      "verified_token_count": 1536
+    },
+    {
+      "declared_prefill_tokens": 2048,
+      "request_id": "exact-grid-000038",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000038.txt",
+      "text_sha256": "4d0c75e1328c073c5143be634327cb56b989222e280f71bb74e64215c56a95a1",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000038.json",
+      "token_ids_sha256": "6fbfac9d48ab1276cfedef1b9ed28d4814a05a72f3b6902ea292a4833ed6dab4",
+      "verified_token_count": 2048
+    },
+    {
+      "declared_prefill_tokens": 2048,
+      "request_id": "exact-grid-000039",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000039.txt",
+      "text_sha256": "79ddf3e19314ac0adb9d3faed10cb041227b4e1d2f9a8fa219d239ddf966e4c7",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000039.json",
+      "token_ids_sha256": "404d171954368ea1abbfbeb25e7fa66743995710cd02f8c734a195578912be48",
+      "verified_token_count": 2048
+    },
+    {
+      "declared_prefill_tokens": 2048,
+      "request_id": "exact-grid-000040",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000040.txt",
+      "text_sha256": "76246d39612884451d56be8858c5642529ee992876b47a8e37044d8087addaf7",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000040.json",
+      "token_ids_sha256": "5c28df86cd2b646c29738183e17e116aeaea4e0a883d292e5848eb7920ced0c4",
+      "verified_token_count": 2048
+    },
+    {
+      "declared_prefill_tokens": 3072,
+      "request_id": "exact-grid-000041",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000041.txt",
+      "text_sha256": "f3fa1060cc47e2cd81655d609fa81f62fd70f76f144def11696d4d1652e83567",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000041.json",
+      "token_ids_sha256": "2ade5a5a5389a592e5f38b65748cc743cdf60427487e9adfccff1fe1830ca1c3",
+      "verified_token_count": 3072
+    },
+    {
+      "declared_prefill_tokens": 3072,
+      "request_id": "exact-grid-000042",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000042.txt",
+      "text_sha256": "f0c5d0fca7d43c129c070d748e6fe4c4322342e97bb9c110908f480871859d21",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000042.json",
+      "token_ids_sha256": "4211f475db39c45735bf6735c95cf3254d17d182ecb233603dc61f569ace147c",
+      "verified_token_count": 3072
+    },
+    {
+      "declared_prefill_tokens": 4096,
+      "request_id": "exact-grid-000043",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000043.txt",
+      "text_sha256": "82c5310808fb0bbdb7652994e70fa333eb6db43ed17e2dd334e9bf504e93cd1b",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000043.json",
+      "token_ids_sha256": "1a6c7813a68dc29d262583d4fba7e9bac3465aedd0ca8c2c3d72e475a1284854",
+      "verified_token_count": 4096
+    },
+    {
+      "declared_prefill_tokens": 1024,
+      "request_id": "exact-grid-000044",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000044.txt",
+      "text_sha256": "a6de92092ede5719b78c0e0bad52480e71b2b25d4f376ede1ddeb653af1b7a57",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000044.json",
+      "token_ids_sha256": "02587d37c1371311cefb19a2f2dd2a9253c0395c572945c2440d937c3d3cc7fa",
+      "verified_token_count": 1024
+    },
+    {
+      "declared_prefill_tokens": 1024,
+      "request_id": "exact-grid-000045",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000045.txt",
+      "text_sha256": "d12e655a5c2f8c8b6b8317432a75f4e8baf869e32dbf3c0f8214a9f5f42ea9de",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000045.json",
+      "token_ids_sha256": "42afc50c943de133abd86725243a4b3d245f0b2d467cd6930b6c3d7a79d17875",
+      "verified_token_count": 1024
+    },
+    {
+      "declared_prefill_tokens": 1024,
+      "request_id": "exact-grid-000046",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000046.txt",
+      "text_sha256": "eff8b85a5197df538377f75efa1a9667ac254c1d6c24662ab7a79fc5ea42499c",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000046.json",
+      "token_ids_sha256": "6378f91021f8ace97c47d0902119187fbece8355e06cd3c83629fbe83a597b61",
+      "verified_token_count": 1024
+    },
+    {
+      "declared_prefill_tokens": 1024,
+      "request_id": "exact-grid-000047",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000047.txt",
+      "text_sha256": "15421b7b64fedb701d260e56bc8d4c80df237d6752c8edb8a2ad7496a54b265d",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000047.json",
+      "token_ids_sha256": "3243fb860ecbb332e6ac072467e5d71ae83333ec645da69b6f871e04ee77dd34",
+      "verified_token_count": 1024
+    },
+    {
+      "declared_prefill_tokens": 1024,
+      "request_id": "exact-grid-000048",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000048.txt",
+      "text_sha256": "587fc2565affc2ea6c0468258de2889cdeada58b397989fe458224bbf19ac0b1",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000048.json",
+      "token_ids_sha256": "9b3e9afa512274de72d1170d8959b05c277f78c06345ea2649e6c9add1aea2f4",
+      "verified_token_count": 1024
+    },
+    {
+      "declared_prefill_tokens": 1024,
+      "request_id": "exact-grid-000049",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000049.txt",
+      "text_sha256": "d476492b492ac87b2e4b83d6a05d36dd3863e4a245ae8c09bff420584b170e04",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000049.json",
+      "token_ids_sha256": "28826eaf8c37debd90d295343a344c7ca8381de5d1b5a46c739d9bec595e8d49",
+      "verified_token_count": 1024
+    },
+    {
+      "declared_prefill_tokens": 1024,
+      "request_id": "exact-grid-000050",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000050.txt",
+      "text_sha256": "d5b2aa3b21e9f9825889719a7d4b1a50d2b8ad203b2f18466de546bbf8121008",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000050.json",
+      "token_ids_sha256": "b4e79f6a8a622a6cfb073218a58024e5a6836433b8bac29702d04602c4e02680",
+      "verified_token_count": 1024
+    },
+    {
+      "declared_prefill_tokens": 1536,
+      "request_id": "exact-grid-000051",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000051.txt",
+      "text_sha256": "cccc516d32abe251758aa690b09a58759a3adf3679eb0d9ce182c32414c5c8bd",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000051.json",
+      "token_ids_sha256": "00a532caa2d24aed556553662a3b2486e570a5ff5eba1ca07c832140699c7053",
+      "verified_token_count": 1536
+    },
+    {
+      "declared_prefill_tokens": 1536,
+      "request_id": "exact-grid-000052",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000052.txt",
+      "text_sha256": "996434faf955cbcf52f58e68123a907d60af8336e821cbf9ead9b41c3087d6b5",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000052.json",
+      "token_ids_sha256": "75669d4a502d9ab08e3b3d81f07f300fbb3a0f6d1f36c73a4acbdf776f9f3b02",
+      "verified_token_count": 1536
+    },
+    {
+      "declared_prefill_tokens": 1536,
+      "request_id": "exact-grid-000053",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000053.txt",
+      "text_sha256": "5dd423ab86c53edafc84ef175db9b76342d10936b66954f7fe7025cc7e35635a",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000053.json",
+      "token_ids_sha256": "e3555aa175d50fb499d6a5e5328e67d5739f752bb995d96d8d0b6c6e4c9e79b2",
+      "verified_token_count": 1536
+    },
+    {
+      "declared_prefill_tokens": 1536,
+      "request_id": "exact-grid-000054",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000054.txt",
+      "text_sha256": "8bae86a160de676302b90aec4018ed42823d8c4f9f804f183e781c39cd50931d",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000054.json",
+      "token_ids_sha256": "cfeac398b18a3ea67d31184da7e9569757840f149927eae0ee203cb1c5c8a7f5",
+      "verified_token_count": 1536
+    },
+    {
+      "declared_prefill_tokens": 512,
+      "request_id": "exact-grid-000055",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000055.txt",
+      "text_sha256": "a5eb1f147dc25e1bbaa6014f6eae9419cfd838972e8fb2a9aca740f3d2575771",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000055.json",
+      "token_ids_sha256": "91d77bf3a2c5c1fbb2a70a6d7b806471d636f5f0b1ba3f85de36ce9af909424e",
+      "verified_token_count": 512
+    },
+    {
+      "declared_prefill_tokens": 512,
+      "request_id": "exact-grid-000056",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000056.txt",
+      "text_sha256": "37f3610dac7108efc7ed8a4a1830062a865f1dfd4bad83a8026309c18a34862b",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000056.json",
+      "token_ids_sha256": "8953fda3a7b63391f6c917f486e8b35e483679e25b9cac6dee8b2198cb07cc49",
+      "verified_token_count": 512
+    },
+    {
+      "declared_prefill_tokens": 512,
+      "request_id": "exact-grid-000057",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000057.txt",
+      "text_sha256": "f7ecd4609d69efc5c00c7f2cc986ed46a56fcd298639eea50daf4fb1c843f5f7",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000057.json",
+      "token_ids_sha256": "f1b2a5ce4eb346e534c2bd07a85bf8935627c591c69b4abaf59b9ef2bc154f92",
+      "verified_token_count": 512
+    },
+    {
+      "declared_prefill_tokens": 512,
+      "request_id": "exact-grid-000058",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000058.txt",
+      "text_sha256": "fbf38d4ecbb1a787204feecfb79ace711af8e1c2de679d5634e2238435a37fe2",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000058.json",
+      "token_ids_sha256": "0d444f2d01ac58f29b72db035f31069b4acea4dda5ccf893eabb384f46531d47",
+      "verified_token_count": 512
+    },
+    {
+      "declared_prefill_tokens": 512,
+      "request_id": "exact-grid-000059",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000059.txt",
+      "text_sha256": "33fe92e07daed4d9528a475bc04f2c4598b31b866d3d8976987e719f3a860feb",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000059.json",
+      "token_ids_sha256": "3a31436f24a306d6e4ba606a21d8660c116ed6cb9672cc55bd75b60c2401a33d",
+      "verified_token_count": 512
+    },
+    {
+      "declared_prefill_tokens": 512,
+      "request_id": "exact-grid-000060",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000060.txt",
+      "text_sha256": "a5bb7f83e7b4eceb52819475a5f0d5c8861c8a490691f043bf33bfdf48ac60f1",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000060.json",
+      "token_ids_sha256": "5f45fbb638c3303c4b457ba1d574f9ff5ee39afd456ec0c890044ca8387575c4",
+      "verified_token_count": 512
+    },
+    {
+      "declared_prefill_tokens": 512,
+      "request_id": "exact-grid-000061",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000061.txt",
+      "text_sha256": "ccb443bf8505ad794fb2ef795a0360259e68fca5d788e119f1b0b890e4cc1972",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000061.json",
+      "token_ids_sha256": "0dc9de459c8455d7d4c221240df3bfd3192e40041b4d4bd08258fa411f976bf9",
+      "verified_token_count": 512
+    },
+    {
+      "declared_prefill_tokens": 256,
+      "request_id": "exact-grid-000062",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000062.txt",
+      "text_sha256": "0d0284adde8bd639cb95af13d97b70ae39caea9e41f5a2982dcb18de8505dd83",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000062.json",
+      "token_ids_sha256": "205af22a67957a9767f9de5354171b45aef6af343087094bb572289fb9ff0e0e",
+      "verified_token_count": 256
+    },
+    {
+      "declared_prefill_tokens": 256,
+      "request_id": "exact-grid-000063",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000063.txt",
+      "text_sha256": "e0fad35bd841c2bf16ad8f2a69d5f6a67ed88179a52d3b64edf8c12a95ed88fe",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000063.json",
+      "token_ids_sha256": "d2890d39731dd8b11d9de380a10f8c1939959bab9d1eba4863e17af3d952ecb6",
+      "verified_token_count": 256
+    },
+    {
+      "declared_prefill_tokens": 256,
+      "request_id": "exact-grid-000064",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000064.txt",
+      "text_sha256": "d79bb9bb3bc050c636eeea152b88d62a8a1bd83d9dfc4941d61c530af8b69f47",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000064.json",
+      "token_ids_sha256": "7d711e0ea41fc3ed10843f5717763d8abeae452ca9fc52e712fb1daa928f8dd6",
+      "verified_token_count": 256
+    },
+    {
+      "declared_prefill_tokens": 256,
+      "request_id": "exact-grid-000065",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000065.txt",
+      "text_sha256": "09dc11be176b6d9ff39eb5518df3b7f76743c3056efdfaa30ed1d9f42d290be5",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000065.json",
+      "token_ids_sha256": "0dde76fb6b597c4d0cee87cd0a887d7a7f04c1525299533495cdf12e846e3584",
+      "verified_token_count": 256
+    },
+    {
+      "declared_prefill_tokens": 256,
+      "request_id": "exact-grid-000066",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000066.txt",
+      "text_sha256": "fbdd4f8464c801a27d42163e863d6da820f8fd6bf0375d6934c45991fffbfce0",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000066.json",
+      "token_ids_sha256": "1afe39574bee9671711c139415baa7038c9fdeff801a0f589dcd1b7a59ef5d5a",
+      "verified_token_count": 256
+    },
+    {
+      "declared_prefill_tokens": 256,
+      "request_id": "exact-grid-000067",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000067.txt",
+      "text_sha256": "487740d11b6232617e8098ab93d71ab8deb9977ae18b7b48f9f0d24ae248152b",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000067.json",
+      "token_ids_sha256": "934b156f8dd270ef6d20c8c39288c432848b4485810a596956a02ce3a0881159",
+      "verified_token_count": 256
+    },
+    {
+      "declared_prefill_tokens": 256,
+      "request_id": "exact-grid-000068",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000068.txt",
+      "text_sha256": "5988a528976e00b0d31178892105f7a4539a11a4f7516729b4f78a884d7998c8",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000068.json",
+      "token_ids_sha256": "6bd560ed38e15a6287165db5d311ef5ce0662de10715cadf06f28fedf0a98628",
+      "verified_token_count": 256
+    },
+    {
+      "declared_prefill_tokens": 128,
+      "request_id": "exact-grid-000069",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000069.txt",
+      "text_sha256": "48c8d4b644f02395f746ef13d3f7df4dd243c9bd1c3f80d32ca9a09857ce349a",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000069.json",
+      "token_ids_sha256": "091aede8be7fe3342f4cf7b8e024bd12c76398b3fc91d6bc527d83923804c5a2",
+      "verified_token_count": 128
+    },
+    {
+      "declared_prefill_tokens": 128,
+      "request_id": "exact-grid-000070",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000070.txt",
+      "text_sha256": "56b433f88e21ae55ac56ebcc840f81f3abab35d9f1381295b62009becfa79752",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000070.json",
+      "token_ids_sha256": "c910363b6701f6dfe9b59ff76238376ccdc7185b676d35ef0951fba34e7d24ae",
+      "verified_token_count": 128
+    },
+    {
+      "declared_prefill_tokens": 128,
+      "request_id": "exact-grid-000071",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000071.txt",
+      "text_sha256": "2707741a599cde386e0a07f01a72e12d23dbcb4a80702939852460e309580353",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000071.json",
+      "token_ids_sha256": "672f9231f8d41814616282d3d13eb81387413df947ac9c8c5cf9d10e73c867c2",
+      "verified_token_count": 128
+    },
+    {
+      "declared_prefill_tokens": 128,
+      "request_id": "exact-grid-000072",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000072.txt",
+      "text_sha256": "7242e5d7312ef5c504b6aa8defca710e8cfbc98f2b1e37bf98806e9fd080f31f",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000072.json",
+      "token_ids_sha256": "8b6eda547d71d96787df3d1b2a972025113895f6d1d0266bac9b96091d14e7d2",
+      "verified_token_count": 128
+    },
+    {
+      "declared_prefill_tokens": 128,
+      "request_id": "exact-grid-000073",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000073.txt",
+      "text_sha256": "89465cbe255c5add0bd80301db600453102a8b2af548cd5a8643ba6f69cb988a",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000073.json",
+      "token_ids_sha256": "64fd3f1f4dbac602930a48c7be0cefae43f2f36365d4d4d2cc1e93941bbc18d4",
+      "verified_token_count": 128
+    },
+    {
+      "declared_prefill_tokens": 128,
+      "request_id": "exact-grid-000074",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000074.txt",
+      "text_sha256": "08f8b3cc2d165013695e05546c2e50482ac0389df942c88e53c9b5928a2c4844",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000074.json",
+      "token_ids_sha256": "fc3f8c0e15819e23b63973935da51392517dab360c91b37876d7764bbc0140d9",
+      "verified_token_count": 128
+    },
+    {
+      "declared_prefill_tokens": 128,
+      "request_id": "exact-grid-000075",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000075.txt",
+      "text_sha256": "b7405ed8184f7bb07d5d3b925eec1bc1e0e2be02075e24b3585376111d3d0e03",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000075.json",
+      "token_ids_sha256": "182d3f2db1aefbed062ccb45f9cb112e1260e4efb74ee35afea73cf92563601d",
+      "verified_token_count": 128
+    },
+    {
+      "declared_prefill_tokens": 2048,
+      "request_id": "exact-grid-000076",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000076.txt",
+      "text_sha256": "482a2b3c7caf9354c52bb8969812944a63eed9bb5d6ea1cd52eb25e5852b58f4",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000076.json",
+      "token_ids_sha256": "d2fe8975f6be46e2a82d92edf91815aa44128c3422da6a1db883ceea1a61bdaf",
+      "verified_token_count": 2048
+    },
+    {
+      "declared_prefill_tokens": 2048,
+      "request_id": "exact-grid-000077",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000077.txt",
+      "text_sha256": "2b31889bad100942812d9db2a85858b9f5774448cb11a678d005bd42df491999",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000077.json",
+      "token_ids_sha256": "ffd752f68f669618bc373895d431d617c95328550c4cb066b45cf8722d6b6dba",
+      "verified_token_count": 2048
+    },
+    {
+      "declared_prefill_tokens": 2048,
+      "request_id": "exact-grid-000078",
+      "text_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/text/exact-grid-000078.txt",
+      "text_sha256": "4d0c75e1328c073c5143be634327cb56b989222e280f71bb74e64215c56a95a1",
+      "token_ids_ref": "../prompts/gv3_legal_20s_exact_grid_mew1_a100/token_ids/exact-grid-000078.json",
+      "token_ids_sha256": "02f0c94ff839c8a71fb62bd085c0db565611107c4f4472f56540f8e03daee269",
+      "verified_token_count": 2048
+    }
+  ],
+  "request_count": 79,
+  "schema_version": "gv3_llama3_english_prompt_v1",
+  "tokenizer": {
+    "add_special_tokens": true,
+    "bos_token_id": 128000,
+    "files": {
+      "special_tokens_map.json": "462d91939dbc37178aa5a3eae7068d1990ccc92e09f288cc71f42cdf139d69cc",
+      "tokenizer.json": "e134af98b985517b4f068e3755ae90d4e9cd2d45d328325dc503f1c6b2d06cc7",
+      "tokenizer_config.json": "690727b4fed286383df1c7ca5e805124cb70c6eb4529f807c7b2e60ff741da7e"
+    },
+    "repository": "NousResearch/Meta-Llama-3-8B",
+    "revision": "315b20096dc791d381d514deb5f8bd9c8d6d3061",
+    "token_count_semantics": "BOS plus English body tokens",
+    "tokenizer_class": "PreTrainedTokenizerFast",
+    "vocab_size_with_added_tokens": 128256,
+    "vocab_size_without_added_tokens": 128000
+  },
+  "trace_path": "/home/shazer/Desktop/Research/Vidur/vidur-classical-search/vidur_vllm_real_testing/traces/gv3_legal_20s_exact_grid_mew1_a100_raw.csv"
+}
