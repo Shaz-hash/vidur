@@ -99,6 +99,7 @@ def _validate(
         "launched_requests",
         "controller_actions",
         "controller_batches",
+        "controller_preemptions",
         "vidur_timed_batches",
     ):
         report.check(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 import sys
 import unittest
@@ -35,12 +36,20 @@ from GV4_Engine.transition_engine import (  # noqa: E402
 from state_test import make_config  # noqa: E402
 
 
-def controller_raw(config, rule: str, budget: int, heuristic: str = "SJF") -> int:
+def controller_raw(
+    config,
+    rule: str,
+    budget: int,
+    heuristic: str = "SJF",
+    *,
+    preemption: str = "preempt_none",
+) -> int:
     actions = config.controller_actions
     return actions.encode_raw_index(
         actions.eviction_rule_names.index(rule),
         actions.prefill_budget_options.index(budget),
         actions.ordering_heuristics.index(heuristic),
+        preemption_rule_index=actions.preemption_rule_names.index(preemption),
     )
 
 
@@ -101,6 +110,164 @@ def launch_requests(state, config, *, count: int = 1, tokens: int = 128):
 
 
 class ActionResolverTest(unittest.TestCase):
+    def test_preemption_feature_gate_masks_memory_effects(self) -> None:
+        base = make_config()
+        config = replace(
+            base,
+            scheduler=replace(
+                base.scheduler,
+                request_preemption_enabled=False,
+            ),
+        )
+        state = GV4State.initial(config, next_player=Player.CONTROLLER)
+        state.requests.append(
+            RequestState(
+                request_id=0,
+                owner_replica_id=0,
+                lifecycle=RequestLifecycle.WAITING_PREFILL,
+                arrival_time=0.0,
+                prefill_deadline=1.0,
+                decode_token_slo_sec=0.05,
+                original_prefill_tokens=256,
+                original_decode_tokens=864,
+                committed_prefill_tokens=128,
+                committed_kv_blocks=8,
+            )
+        )
+        state.next_request_id = 1
+        state.replica(0).rank_kv_committed_blocks[:] = [8]
+        state.objective.requests_generated = 1
+        state.assert_valid(config)
+
+        action = resolve_controller_action(
+            state,
+            config,
+            replica_id=0,
+            raw_action_index=controller_raw(
+                config,
+                "evict_none",
+                0,
+                preemption="preempt_largest_kv",
+            ),
+            prefill_time_estimator=lambda _request, _tokens: 0.1,
+        )
+        self.assertIsNone(action)
+
+    def test_all_four_preemption_policies_choose_one_deterministic_victim(self) -> None:
+        config = make_config()
+        state = GV4State.initial(config, next_player=Player.CONTROLLER)
+        state.next_adversary_tick = 0.2
+        contexts = (64, 160, 96)
+        deadlines = (2.0, 0.05, 1.0)
+        for request_id, (context_tokens, deadline) in enumerate(
+            zip(contexts, deadlines)
+        ):
+            state.requests.append(
+                RequestState(
+                    request_id=request_id,
+                    owner_replica_id=0,
+                    lifecycle=RequestLifecycle.WAITING_PREFILL,
+                    arrival_time=0.0,
+                    prefill_deadline=deadline,
+                    decode_token_slo_sec=0.05,
+                    original_prefill_tokens=256,
+                    original_decode_tokens=864,
+                    committed_prefill_tokens=context_tokens,
+                    committed_kv_blocks=context_tokens // 16,
+                )
+            )
+        state.next_request_id = 3
+        state.replica(0).rank_kv_committed_blocks[:] = [sum(contexts) // 16]
+        state.objective.requests_generated = 3
+        state.assert_valid(config)
+
+        expected = {
+            "preempt_min_recompute": 0,
+            "preempt_largest_kv": 1,
+            "preempt_max_recovery_slack": 0,
+            "preempt_best_relief_cost": 2,
+        }
+        for rule, request_id in expected.items():
+            with self.subTest(rule=rule):
+                action = resolve_controller_action(
+                    state,
+                    config,
+                    replica_id=0,
+                    raw_action_index=controller_raw(
+                        config,
+                        "evict_none",
+                        0,
+                        preemption=rule,
+                    ),
+                    prefill_time_estimator=lambda _request, _tokens: 0.1,
+                )
+                self.assertIsNotNone(action)
+                assert action is not None
+                self.assertEqual(action.preempted_request_ids, (request_id,))
+                self.assertEqual(
+                    action.transition_kind,
+                    ControllerTransitionKind.PREEMPT_ONLY,
+                )
+
+    def test_recompute_and_prefill_share_one_budget_and_sjf_queue(self) -> None:
+        config = make_config()
+        state = GV4State.initial(config, next_player=Player.CONTROLLER)
+        state.next_adversary_tick = 0.2
+        state.requests.extend(
+            (
+                RequestState(
+                    request_id=0,
+                    owner_replica_id=0,
+                    lifecycle=RequestLifecycle.WAITING_DECODE,
+                    arrival_time=0.0,
+                    prefill_deadline=0.1,
+                    decode_token_slo_sec=0.05,
+                    original_prefill_tokens=32,
+                    original_decode_tokens=864,
+                    decode_credit_minted=True,
+                    committed_prefill_tokens=32,
+                    committed_decode_tokens=32,
+                    kv_computed_tokens=0,
+                    next_decode_deadline=0.5,
+                ),
+                RequestState(
+                    request_id=1,
+                    owner_replica_id=0,
+                    lifecycle=RequestLifecycle.WAITING_PREFILL,
+                    arrival_time=0.0,
+                    prefill_deadline=1.0,
+                    decode_token_slo_sec=0.05,
+                    original_prefill_tokens=128,
+                    original_decode_tokens=864,
+                ),
+            )
+        )
+        state.next_request_id = 2
+        state.decode_credits_minted_total = 216
+        state.decode_tokens_committed_total = 32
+        state.decode_credits_available = 184
+        state.objective.requests_generated = 2
+        state.assert_valid(config)
+
+        action = resolve_controller_action(
+            state,
+            config,
+            replica_id=0,
+            raw_action_index=controller_raw(config, "evict_none", 128),
+            prefill_time_estimator=lambda _request, tokens: tokens / 1000.0,
+        )
+
+        self.assertIsNotNone(action)
+        assert action is not None
+        self.assertEqual(
+            [
+                (item.request_id, item.prefill_tokens, item.recompute_tokens)
+                for item in action.allocations
+            ],
+            [(0, 0, 64), (1, 64, 0)],
+        )
+        self.assertEqual(action.total_prefill_class_tokens, 128)
+
     def test_prefill_budget_is_split_in_heuristic_order_without_mutation(self) -> None:
         config = make_config()
         state = GV4State.initial(config, next_player=Player.CONTROLLER)
@@ -287,6 +454,241 @@ class ActionResolverTest(unittest.TestCase):
 
 
 class TransitionEngineTest(unittest.TestCase):
+    def test_inflight_recompute_preemption_drains_then_restarts_full_recovery(self) -> None:
+        config = make_config()
+        state = GV4State.initial(config, next_player=Player.CONTROLLER)
+        state.next_adversary_tick = 0.2
+        state.requests.append(
+            RequestState(
+                request_id=0,
+                owner_replica_id=0,
+                lifecycle=RequestLifecycle.WAITING_DECODE,
+                arrival_time=0.0,
+                prefill_deadline=0.1,
+                decode_token_slo_sec=0.05,
+                original_prefill_tokens=256,
+                original_decode_tokens=864,
+                decode_credit_minted=True,
+                committed_prefill_tokens=256,
+                kv_computed_tokens=0,
+                next_decode_deadline=0.15,
+            )
+        )
+        state.next_request_id = 1
+        state.decode_credits_available = 216
+        state.decode_credits_minted_total = 216
+        state.objective.requests_generated = 1
+        state.assert_valid(config)
+
+        recovery = canonical_for_raw(
+            state,
+            config,
+            controller_raw(config, "evict_none", 128),
+        )
+        state = apply_controller_action(
+            state,
+            config,
+            recovery,
+            stage_service_times=(0.1,),
+            pp_communication_times=(),
+        ).state
+        self.assertEqual(state.request(0).reserved_recompute_tokens, 128)
+
+        state.next_player = Player.CONTROLLER
+        preempt = canonical_for_raw(
+            state,
+            config,
+            controller_raw(
+                config,
+                "evict_none",
+                0,
+                preemption="preempt_largest_kv",
+            ),
+        )
+        state = apply_controller_action(state, config, preempt).state
+        self.assertEqual(state.request(0).lifecycle, RequestLifecycle.PREEMPT_PENDING)
+
+        state = advance_to(state, config, 0.1).state
+        request = state.request(0)
+        self.assertEqual(request.lifecycle, RequestLifecycle.WAITING_DECODE)
+        self.assertEqual(request.committed_prefill_tokens, 256)
+        self.assertEqual(request.committed_decode_tokens, 0)
+        self.assertEqual(request.kv_computed_tokens, 0)
+        self.assertEqual(request.remaining_recompute_tokens, 256)
+        self.assertEqual(request.committed_kv_blocks, 0)
+        self.assertEqual(state.decode_credits_available, 216)
+        self.assertEqual(state.decode_tokens_committed_total, 0)
+        state.assert_valid(config)
+
+    def test_waiting_decode_preemption_releases_then_reconstructs_kv(self) -> None:
+        config = make_config()
+        state = GV4State.initial(config, next_player=Player.CONTROLLER)
+        state.next_adversary_tick = 0.2
+        state.requests.append(
+            RequestState(
+                request_id=0,
+                owner_replica_id=0,
+                lifecycle=RequestLifecycle.WAITING_DECODE,
+                arrival_time=0.0,
+                prefill_deadline=0.1,
+                decode_token_slo_sec=0.05,
+                original_prefill_tokens=128,
+                original_decode_tokens=864,
+                decode_credit_minted=True,
+                committed_prefill_tokens=128,
+                committed_kv_blocks=8,
+                next_decode_deadline=0.15,
+            )
+        )
+        state.next_request_id = 1
+        state.decode_credits_available = 216
+        state.decode_credits_minted_total = 216
+        state.replica(0).rank_kv_committed_blocks[:] = [8]
+        state.objective.requests_generated = 1
+        state.assert_valid(config)
+
+        raw = controller_raw(
+            config,
+            "evict_none",
+            0,
+            preemption="preempt_largest_kv",
+        )
+        preempt = canonical_for_raw(state, config, raw)
+        state = apply_controller_action(state, config, preempt).state
+
+        request = state.request(0)
+        self.assertEqual(request.lifecycle, RequestLifecycle.WAITING_DECODE)
+        self.assertEqual(request.committed_prefill_tokens, 128)
+        self.assertEqual(request.kv_computed_tokens, 0)
+        self.assertEqual(request.remaining_recompute_tokens, 128)
+        self.assertEqual(request.committed_kv_blocks, 0)
+        self.assertEqual(state.replica(0).rank_kv_committed_blocks, [0])
+
+        state.next_player = Player.CONTROLLER
+        recovery_raw = controller_raw(config, "evict_none", 128)
+        recovery = canonical_for_raw(state, config, recovery_raw)
+        self.assertEqual(recovery.action.total_prefill_tokens, 0)
+        self.assertEqual(recovery.action.total_recompute_tokens, 128)
+        state = apply_controller_action(
+            state,
+            config,
+            recovery,
+            stage_service_times=(0.05,),
+            pp_communication_times=(),
+            prefill_time_estimator=lambda _request, tokens: tokens / 1000.0,
+        ).state
+        state = advance_to(state, config, 0.05).state
+
+        request = state.request(0)
+        self.assertEqual(request.lifecycle, RequestLifecycle.WAITING_DECODE)
+        self.assertEqual(request.kv_computed_tokens, 128)
+        self.assertEqual(request.remaining_recompute_tokens, 0)
+        self.assertEqual(request.committed_prefill_tokens, 128)
+        self.assertEqual(request.committed_decode_tokens, 0)
+        self.assertEqual(state.replica(0).rank_kv_committed_blocks, [8])
+        state.assert_valid(config)
+
+    def test_inflight_prefill_preemption_commits_mints_then_releases(self) -> None:
+        config = make_config()
+        state = launch_requests(GV4State.initial(config), config)
+        prefill = canonical_for_raw(
+            state, config, controller_raw(config, "evict_none", 128)
+        )
+        state = apply_controller_action(
+            state,
+            config,
+            prefill,
+            stage_service_times=(0.1,),
+            pp_communication_times=(),
+            prefill_time_estimator=lambda _request, tokens: tokens / 1000.0,
+        ).state
+        state.next_player = Player.CONTROLLER
+
+        raw = controller_raw(
+            config,
+            "evict_none",
+            0,
+            preemption="preempt_largest_kv",
+        )
+        preempt = canonical_for_raw(state, config, raw)
+        self.assertEqual(preempt.action.pending_preemption_request_ids, (0,))
+        state = apply_controller_action(state, config, preempt).state
+
+        self.assertEqual(state.request(0).lifecycle, RequestLifecycle.PREEMPT_PENDING)
+        self.assertEqual(state.replica(0).rank_kv_reserved_blocks, [8])
+        state = advance_to(state, config, 0.1).state
+
+        request = state.request(0)
+        self.assertEqual(request.lifecycle, RequestLifecycle.WAITING_DECODE)
+        self.assertEqual(request.committed_prefill_tokens, 128)
+        self.assertTrue(request.decode_credit_minted)
+        self.assertEqual(state.decode_credits_available, 216)
+        self.assertEqual(state.decode_credits_minted_total, 216)
+        self.assertEqual(request.kv_computed_tokens, 0)
+        self.assertEqual(request.remaining_recompute_tokens, 128)
+        self.assertEqual(state.replica(0).rank_kv_committed_blocks, [0])
+        self.assertEqual(state.replica(0).rank_kv_reserved_blocks, [0])
+        state.assert_valid(config)
+
+    def test_inflight_decode_preemption_commits_lateness_and_credit_first(self) -> None:
+        config = make_config()
+        state = GV4State.initial(config, next_player=Player.CONTROLLER)
+        state.next_adversary_tick = 0.2
+        state.requests.append(
+            RequestState(
+                request_id=0,
+                owner_replica_id=0,
+                lifecycle=RequestLifecycle.WAITING_DECODE,
+                arrival_time=0.0,
+                prefill_deadline=0.1,
+                decode_token_slo_sec=0.05,
+                original_prefill_tokens=128,
+                original_decode_tokens=10,
+                decode_credit_minted=True,
+                committed_prefill_tokens=128,
+                committed_kv_blocks=8,
+                next_decode_deadline=0.05,
+            )
+        )
+        state.next_request_id = 1
+        state.decode_credits_available = 216
+        state.decode_credits_minted_total = 216
+        state.replica(0).rank_kv_committed_blocks[:] = [8]
+        state.objective.requests_generated = 1
+        decode = canonical_for_raw(state, config, 0)
+        state = apply_controller_action(
+            state,
+            config,
+            decode,
+            stage_service_times=(0.1,),
+            pp_communication_times=(),
+        ).state
+        state.next_player = Player.CONTROLLER
+
+        raw = controller_raw(
+            config,
+            "evict_none",
+            0,
+            preemption="preempt_largest_kv",
+        )
+        preempt = canonical_for_raw(state, config, raw)
+        state = apply_controller_action(state, config, preempt).state
+        state = advance_to(state, config, 0.1).state
+
+        request = state.request(0)
+        self.assertEqual(request.lifecycle, RequestLifecycle.WAITING_DECODE)
+        self.assertEqual(request.committed_decode_tokens, 1)
+        self.assertAlmostEqual(request.decode_lateness_sec, 0.05)
+        self.assertTrue(request.violation_recorded)
+        self.assertEqual(request.next_decode_deadline, 0.15)
+        self.assertEqual(state.decode_credits_available, 215)
+        self.assertEqual(state.decode_credits_reserved, 0)
+        self.assertEqual(state.decode_tokens_committed_total, 1)
+        self.assertEqual(request.kv_computed_tokens, 0)
+        self.assertEqual(request.remaining_recompute_tokens, 129)
+        self.assertEqual(state.replica(0).rank_kv_committed_blocks, [0])
+        state.assert_valid(config)
+
     def test_launch_admission_and_prefill_completion_reconcile_all_ledgers(self) -> None:
         config = make_config()
         state = launch_requests(GV4State.initial(config), config)

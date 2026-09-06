@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iterator>
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -14,16 +15,29 @@ namespace gv4 {
 namespace {
 
 constexpr double kWorkloadWindowMultiplier = 20.0;
+constexpr RequestLifecycle kFeatureLifecycles[] = {
+    RequestLifecycle::WaitingPrefill,
+    RequestLifecycle::InflightPrefill,
+    RequestLifecycle::WaitingDecode,
+    RequestLifecycle::InflightDecode,
+    RequestLifecycle::StopPending,
+    RequestLifecycle::DropPending,
+    RequestLifecycle::InflightRecompute,
+    RequestLifecycle::PreemptPending,
+};
 
 std::vector<std::string> request_names(int stages) {
     std::vector<std::string> names{
         "decode_phase", "prefill_total", "prefill_committed", "prefill_remaining",
         "decode_total", "decode_committed", "decode_remaining", "committed_context",
+        "kv_computed_context", "recompute_remaining",
         "arrival_age", "current_lateness", "prefill_deadline_delta",
         "decode_deadline_present", "decode_deadline_delta", "violated",
         "lifecycle_waiting_prefill", "lifecycle_inflight_prefill",
         "lifecycle_waiting_decode", "lifecycle_inflight_decode",
-        "lifecycle_stop_pending", "lifecycle_drop_pending", "reserved_tokens",
+        "lifecycle_stop_pending", "lifecycle_drop_pending",
+        "lifecycle_inflight_recompute", "lifecycle_preempt_pending",
+        "reserved_tokens",
         "partial_block_used_fraction", "tokens_until_next_block_fraction",
         "has_inflight_work"};
     for (int stage = 0; stage < stages; ++stage) {
@@ -31,7 +45,8 @@ std::vector<std::string> request_names(int stages) {
     }
     names.insert(names.end(), {
         "pipeline_wait_or_transfer", "inflight_prefill_tokens",
-        "inflight_decode_token", "pending_stop", "pending_drop",
+        "inflight_decode_token", "inflight_recompute_tokens",
+        "pending_stop", "pending_drop",
         "pending_termination_age"});
     return names;
 }
@@ -55,9 +70,11 @@ std::vector<std::string> microbatch_names(int stages) {
     }
     names.insert(names.end(), {
         "waiting_or_transfer", "prefill_request_count", "decode_request_count",
-        "prefill_tokens", "decode_tokens", "prefill_reserved_kv_blocks",
-        "decode_reserved_kv_blocks", "violated_prefill_request_count",
-        "violated_decode_request_count"});
+        "recompute_request_count", "prefill_tokens", "decode_tokens",
+        "recompute_tokens", "prefill_reserved_kv_blocks",
+        "decode_reserved_kv_blocks", "recompute_reserved_kv_blocks",
+        "violated_prefill_request_count", "violated_decode_request_count",
+        "violated_recompute_request_count"});
     return names;
 }
 
@@ -73,24 +90,33 @@ FeatureLayout make_layout(const Config& config) {
         "decode_credits_reserved", "next_adversary_tick_delta",
         "logical_tokens_free_fraction", "waiting_prefill_count",
         "inflight_prefill_count", "waiting_decode_count", "inflight_decode_count",
-        "stop_pending_count", "drop_pending_count", "active_violation_fraction",
+        "stop_pending_count", "drop_pending_count", "inflight_recompute_count",
+        "preempt_pending_count",
+        "active_violation_fraction",
         "active_prefill_violation_fraction", "active_decode_violation_fraction",
         "waiting_prefill_violation_fraction", "inflight_prefill_violation_fraction",
         "waiting_decode_violation_fraction", "inflight_decode_violation_fraction",
-        "stop_pending_violation_fraction", "drop_pending_violation_fraction"};
+        "stop_pending_violation_fraction", "drop_pending_violation_fraction",
+        "inflight_recompute_violation_fraction",
+        "preempt_pending_violation_fraction"};
     result.request_names = request_names(config.pipeline_parallel_size);
     result.launch_names = {"launch_age", "request_count", "prefill_tokens"};
     result.replica_names = replica_names(config.pipeline_parallel_size);
     result.microbatch_names = microbatch_names(config.pipeline_parallel_size);
     result.controller_header_names = {
         "transition_wait", "transition_evict_only", "transition_batch",
-        "evicted_prefill_count", "evicted_decode_count", "decode_request_count",
-        "total_allocated_prefill_tokens"};
+        "transition_preempt_only", "transition_evict_and_preempt",
+        "evicted_prefill_count", "evicted_decode_count",
+        "preempted_prefill_count", "preempted_decode_count",
+        "preempted_inflight_count", "decode_request_count",
+        "total_allocated_prefill_tokens",
+        "total_allocated_recompute_tokens"};
     result.controller_request_names = {
-        "allocated_prefill", "evicted", "allocated_prefill_tokens",
-        "remaining_prefill_tokens", "total_prefill_tokens", "arrival_age",
-        "current_lateness", "violated", "new_reserved_kv_blocks",
-        "already_inflight"};
+        "allocated_prefill", "allocated_recompute", "evicted", "preempted",
+        "allocated_prefill_tokens", "allocated_recompute_tokens",
+        "remaining_prefill_tokens", "remaining_recompute_tokens",
+        "total_prefill_tokens", "arrival_age", "current_lateness",
+        "violated", "new_reserved_kv_blocks", "already_inflight"};
     result.adversary_header_names = {
         "launched_request_count", "prefill_tokens_per_launched_request",
         "total_launched_prefill_tokens", "stopped_decode_count",
@@ -172,9 +198,19 @@ bool decode_phase(const RequestState& request) {
         request.lifecycle == RequestLifecycle::InflightDecode) {
         return true;
     }
+    if (request.lifecycle == RequestLifecycle::InflightRecompute) {
+        return request.is_decode_phase();
+    }
+    if (request.lifecycle == RequestLifecycle::PreemptPending) {
+        return request.reserved_decode_tokens > 0 ||
+               (request.reserved_recompute_tokens > 0 &&
+                request.is_decode_phase());
+    }
     if (request.lifecycle == RequestLifecycle::StopPending ||
         request.lifecycle == RequestLifecycle::DropPending) {
-        return request.reserved_decode_tokens > 0;
+        return request.reserved_decode_tokens > 0 ||
+               (request.reserved_recompute_tokens > 0 &&
+                request.is_decode_phase());
     }
     return false;
 }
@@ -260,15 +296,19 @@ std::vector<double> request_row(
         request.remaining_decode_tokens() / scales.request_decode_scale,
         (request.committed_prefill_tokens + request.committed_decode_tokens) /
             (scales.request_prefill_scale + scales.request_decode_scale),
+        request.kv_computed_tokens /
+            (scales.request_prefill_scale + scales.request_decode_scale),
+        request.remaining_recompute_tokens() /
+            (scales.request_prefill_scale + scales.request_decode_scale),
         std::asinh((state.now - request.arrival_time) / scales.launch_age_scale),
         std::asinh(current_lateness(request, state.now) / scales.launch_age_scale),
         std::asinh((request.prefill_deadline - state.now) / scales.launch_age_scale),
         static_cast<double>(deadline_present),
         deadline_delta,
         static_cast<double>(request.violation_recorded)};
-    for (int lifecycle = 0; lifecycle < 6; ++lifecycle) {
+    for (const RequestLifecycle lifecycle : kFeatureLifecycles) {
         row.push_back(static_cast<double>(
-            static_cast<int>(request.lifecycle) == lifecycle));
+            request.lifecycle == lifecycle));
     }
     const int used = final_block_used(request, config.block_size_tokens);
     const int until =
@@ -276,7 +316,8 @@ std::vector<double> request_row(
             ? 0
             : config.block_size_tokens - used;
     row.push_back(
-        (request.reserved_prefill_tokens + request.reserved_decode_tokens) /
+        (request.reserved_prefill_tokens + request.reserved_decode_tokens +
+         request.reserved_recompute_tokens) /
         (scales.request_prefill_scale + scales.request_decode_scale));
     row.push_back(used / scales.block_token_scale);
     row.push_back(until / scales.block_token_scale);
@@ -287,6 +328,9 @@ std::vector<double> request_row(
     row.push_back(static_cast<double>(request.has_inflight_work() && stage < 0));
     row.push_back(request.reserved_prefill_tokens / scales.request_prefill_scale);
     row.push_back(static_cast<double>(request.reserved_decode_tokens));
+    row.push_back(
+        request.reserved_recompute_tokens /
+        (scales.request_prefill_scale + scales.request_decode_scale));
     row.push_back(static_cast<double>(request.lifecycle == RequestLifecycle::StopPending));
     row.push_back(static_cast<double>(request.lifecycle == RequestLifecycle::DropPending));
     row.push_back(pending_age);
@@ -351,8 +395,8 @@ StateFeatures FeatureBuilder::build_state(const State& state) const {
     int remaining_decode = 0;
     int committed_prefill = 0;
     int committed_decode = 0;
-    int lifecycle_counts[6]{};
-    int lifecycle_violations[6]{};
+    int lifecycle_counts[8]{};
+    int lifecycle_violations[8]{};
     int prefill_violations = 0;
     int decode_violations = 0;
     for (const RequestState* request : live) {
@@ -363,7 +407,14 @@ StateFeatures FeatureBuilder::build_state(const State& state) const {
         remaining_decode += request->remaining_decode_tokens();
         committed_prefill += request->committed_prefill_tokens;
         committed_decode += request->committed_decode_tokens;
-        const int lifecycle = static_cast<int>(request->lifecycle);
+        const auto lifecycle_it = std::find(
+            std::begin(kFeatureLifecycles), std::end(kFeatureLifecycles),
+            request->lifecycle);
+        if (lifecycle_it == std::end(kFeatureLifecycles)) {
+            throw std::logic_error("active request has an unsupported lifecycle");
+        }
+        const int lifecycle = static_cast<int>(
+            lifecycle_it - std::begin(kFeatureLifecycles));
         ++lifecycle_counts[lifecycle];
         if (request->violation_recorded) {
             ++violated;
@@ -472,35 +523,49 @@ StateFeatures FeatureBuilder::build_state(const State& state) const {
         }
         int prefill_count = 0;
         int decode_count = 0;
+        int recompute_count = 0;
         int prefill_tokens = 0;
         int decode_tokens = 0;
+        int recompute_tokens = 0;
         int prefill_blocks = 0;
         int decode_blocks = 0;
+        int recompute_blocks = 0;
         int prefill_violated = 0;
         int decode_violated = 0;
+        int recompute_violated = 0;
         for (const BatchAllocation& allocation : batch.allocations) {
             const bool prefill = allocation.prefill_tokens > 0;
+            const bool decode = allocation.decode_tokens > 0;
+            const bool recompute = allocation.recompute_tokens > 0;
             prefill_count += prefill;
-            decode_count += !prefill;
+            decode_count += decode;
+            recompute_count += recompute;
             prefill_tokens += allocation.prefill_tokens;
             decode_tokens += allocation.decode_tokens;
+            recompute_tokens += allocation.recompute_tokens;
             prefill_blocks += prefill ? allocation.new_kv_blocks : 0;
-            decode_blocks += prefill ? 0 : allocation.new_kv_blocks;
+            decode_blocks += decode ? allocation.new_kv_blocks : 0;
+            recompute_blocks += recompute ? allocation.new_kv_blocks : 0;
             const bool request_violated =
                 state.request(allocation.request_id).violation_recorded;
             prefill_violated += prefill && request_violated;
-            decode_violated += !prefill && request_violated;
+            decode_violated += decode && request_violated;
+            recompute_violated += recompute && request_violated;
         }
         row.insert(row.end(), {
             static_cast<double>(stage < 0),
             prefill_count / scales_.active_request_scale,
             decode_count / scales_.active_request_scale,
+            recompute_count / scales_.active_request_scale,
             prefill_tokens / scales_.system_prefill_scale,
             decode_tokens / scales_.system_decode_scale,
+            recompute_tokens / scales_.system_logical_tokens,
             prefill_blocks / scales_.system_logical_blocks,
             decode_blocks / scales_.system_logical_blocks,
+            recompute_blocks / scales_.system_logical_blocks,
             prefill_violated / scales_.active_request_scale,
-            decode_violated / scales_.active_request_scale});
+            decode_violated / scales_.active_request_scale,
+            recompute_violated / scales_.active_request_scale});
         microbatch_rows.push_back(std::move(row));
     }
 
@@ -532,49 +597,79 @@ ControllerActionFeatures FeatureBuilder::build_controller_action(
     const ResolvedControllerAction& action = edge.action;
     int evicted_prefill = 0;
     int evicted_decode = 0;
-    std::map<int, std::tuple<const RequestState*, int, int, bool>> affected;
+    int preempted_prefill = 0;
+    int preempted_decode = 0;
+    int preempted_inflight = 0;
+    using Affected = std::tuple<
+        const RequestState*, int, int, int, bool, bool>;
+    std::map<int, Affected> affected;
     for (const int request_id : action.evicted_request_ids) {
         const RequestState& request = state.request(request_id);
         evicted_decode += decode_phase(request);
         evicted_prefill += !decode_phase(request);
-        affected.emplace(request_id, std::tuple{&request, 0, 0, true});
+        affected.emplace(
+            request_id, Affected{&request, 0, 0, 0, true, false});
+    }
+    for (const int request_id : action.preempted_request_ids) {
+        const RequestState& request = state.request(request_id);
+        preempted_decode += decode_phase(request);
+        preempted_prefill += !decode_phase(request);
+        preempted_inflight += request.has_inflight_work();
+        if (!affected.emplace(
+                request_id,
+                Affected{&request, 0, 0, 0, false, true}).second) {
+            throw std::invalid_argument("action affects one request twice");
+        }
     }
     int decode_allocations = 0;
     for (const BatchAllocation& allocation : action.allocations) {
         decode_allocations += allocation.decode_tokens > 0;
-        if (allocation.prefill_tokens > 0) {
+        if (allocation.prefill_tokens > 0 || allocation.recompute_tokens > 0) {
             const RequestState& request = state.request(allocation.request_id);
             if (!affected.emplace(
                     request.request_id,
-                    std::tuple{
+                    Affected{
                         &request,
                         allocation.prefill_tokens,
+                        allocation.recompute_tokens,
                         allocation.new_kv_blocks,
+                        false,
                         false}).second) {
                 throw std::invalid_argument("action affects one request twice");
             }
         }
     }
     std::vector<double> header;
-    for (int kind = 0; kind < 3; ++kind) {
+    for (int kind = 0; kind < 5; ++kind) {
         header.push_back(static_cast<double>(
             static_cast<int>(action.transition_kind) == kind));
     }
     header.insert(header.end(), {
         evicted_prefill / scales_.active_request_scale,
         evicted_decode / scales_.active_request_scale,
+        preempted_prefill / scales_.active_request_scale,
+        preempted_decode / scales_.active_request_scale,
+        preempted_inflight / scales_.active_request_scale,
         decode_allocations / scales_.active_request_scale,
-        action.total_prefill_tokens() / scales_.controller_prefill_action_scale});
+        action.total_prefill_tokens() / scales_.controller_prefill_action_scale,
+        action.total_recompute_tokens() /
+            scales_.controller_prefill_action_scale});
 
     std::vector<std::vector<double>> rows;
     for (const auto& [request_id, values] : affected) {
         static_cast<void>(request_id);
-        const auto [request, allocated, blocks, evicted] = values;
+        const auto [request, prefill, recompute, blocks, evicted, preempted] =
+            values;
         rows.push_back({
-            static_cast<double>(allocated > 0),
+            static_cast<double>(prefill > 0),
+            static_cast<double>(recompute > 0),
             static_cast<double>(evicted),
-            allocated / scales_.controller_prefill_action_scale,
+            static_cast<double>(preempted),
+            prefill / scales_.controller_prefill_action_scale,
+            recompute / scales_.controller_prefill_action_scale,
             request->remaining_prefill_tokens() / scales_.request_prefill_scale,
+            request->remaining_recompute_tokens() /
+                (scales_.request_prefill_scale + scales_.request_decode_scale),
             request->original_prefill_tokens / scales_.request_prefill_scale,
             std::asinh((state.now - request->arrival_time) / scales_.launch_age_scale),
             std::asinh(current_lateness(*request, state.now) / scales_.launch_age_scale),

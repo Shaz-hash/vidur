@@ -30,7 +30,9 @@ struct TransitionOutcome {
     const RequestState& request,
     int prefill_tokens,
     int decode_tokens,
+    int recompute_tokens,
     int block_size_tokens);
+[[nodiscard]] int preempt_request_blocks(State& state, RequestState& request);
 [[nodiscard]] int free_logical_blocks(const ReplicaState& replica);
 
 [[nodiscard]] bool can_admit_microbatch(

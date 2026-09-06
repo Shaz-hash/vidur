@@ -38,14 +38,41 @@ def _has_active_prefill(state: GV4State) -> bool:
         not request.lifecycle.is_terminal
         and (
             request.remaining_prefill_tokens > 0
+            or request.remaining_recompute_tokens > 0
             or request.reserved_prefill_tokens > 0
+            or (
+                request.lifecycle == RequestLifecycle.INFLIGHT_RECOMPUTE
+                and not request.is_decode_phase
+            )
+            or (
+                request.lifecycle == RequestLifecycle.PREEMPT_PENDING
+                and not request.is_decode_phase
+                and request.reserved_decode_tokens == 0
+            )
         )
         for request in state.requests
     )
 
 
 def _has_inflight_decode(state: GV4State) -> bool:
-    return any(request.reserved_decode_tokens > 0 for request in state.requests)
+    return any(
+        request.reserved_decode_tokens > 0
+        or (
+            request.lifecycle == RequestLifecycle.INFLIGHT_RECOMPUTE
+            and request.is_decode_phase
+        )
+        or (
+            request.lifecycle == RequestLifecycle.PREEMPT_PENDING
+            and (
+                request.reserved_decode_tokens > 0
+                or (
+                    request.reserved_recompute_tokens > 0
+                    and request.is_decode_phase
+                )
+            )
+        )
+        for request in state.requests
+    )
 
 
 def _forced_adversary_noop(
@@ -95,7 +122,7 @@ def _next_decode_batch(
         if resolved is None:
             raise FastForwardError("decode-only raw action is unexpectedly masked")
         if resolved.transition_kind == ControllerTransitionKind.BATCH:
-            if resolved.total_prefill_tokens:
+            if resolved.total_prefill_class_tokens:
                 raise FastForwardError("decode fast-forward resolved prefill work")
             return CanonicalControllerAction(0, resolved, (0,)), False
         blocked_at_free_stage = True

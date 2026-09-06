@@ -25,6 +25,7 @@ __all__ = [
     "can_reserve_blocks",
     "commit_batch_blocks",
     "free_logical_blocks",
+    "preempt_request_blocks",
     "release_request_blocks",
     "reserve_batch_blocks",
 ]
@@ -93,6 +94,7 @@ def additional_blocks_for_work(
     *,
     prefill_tokens: int = 0,
     decode_tokens: int = 0,
+    recompute_tokens: int = 0,
     block_size_tokens: int,
 ) -> int:
     """Calculate exact new blocks needed by one pre-admission allocation.
@@ -104,16 +106,24 @@ def additional_blocks_for_work(
 
     _nonnegative_int("prefill_tokens", prefill_tokens)
     _nonnegative_int("decode_tokens", decode_tokens)
-    if prefill_tokens == 0 and decode_tokens == 0:
-        raise KVLedgerError("an allocation must contain prefill or decode work")
-    if prefill_tokens and decode_tokens:
-        raise KVLedgerError("one request cannot prefill and decode in one batch")
+    _nonnegative_int("recompute_tokens", recompute_tokens)
+    work_kinds = sum(
+        value > 0 for value in (prefill_tokens, decode_tokens, recompute_tokens)
+    )
+    if work_kinds != 1:
+        raise KVLedgerError("an allocation must contain exactly one kind of work")
     if prefill_tokens > request.remaining_prefill_tokens:
         raise KVLedgerError("prefill allocation exceeds remaining request work")
     if decode_tokens > request.remaining_decode_tokens:
         raise KVLedgerError("decode allocation exceeds remaining request work")
+    if recompute_tokens > request.remaining_recompute_tokens:
+        raise KVLedgerError("recompute allocation exceeds missing KV context")
+    if (prefill_tokens or decode_tokens) and request.remaining_recompute_tokens:
+        raise KVLedgerError("new work requires fully reconstructed KV context")
 
-    resident_after = request.resident_tokens + prefill_tokens + decode_tokens
+    resident_after = request.resident_tokens + (
+        prefill_tokens + decode_tokens + recompute_tokens
+    )
     needed_after = blocks_for_tokens(resident_after, block_size_tokens)
     currently_owned = request.committed_kv_blocks + request.reserved_kv_blocks
     return max(0, needed_after - currently_owned)
@@ -210,6 +220,7 @@ def reserve_batch_blocks(
             request,
             prefill_tokens=allocation.prefill_tokens,
             decode_tokens=allocation.decode_tokens,
+            recompute_tokens=allocation.recompute_tokens,
             block_size_tokens=block_size_tokens,
         )
         if allocation.new_kv_blocks != expected_blocks:
@@ -280,10 +291,10 @@ def commit_batch_blocks(
 
 
 def release_request_blocks(request: RequestState, replica: ReplicaState) -> int:
-    """Release all committed blocks for a non-in-flight terminal removal.
+    """Release all physical KV blocks owned by a non-in-flight request.
 
-    Call this before changing the request to a terminal lifecycle. Returning the
-    released logical count lets the transition engine log the exact KV delta.
+    Terminal cleanup and resumable preemption share this accounting operation.
+    Returning the released logical count lets the caller log the exact KV delta.
     """
 
     rank_count = _check_replica_shape(replica)
@@ -300,7 +311,20 @@ def release_request_blocks(request: RequestState, replica: ReplicaState) -> int:
             raise KVLedgerError("replica has fewer committed blocks than the request")
 
     request.committed_kv_blocks = 0
+    request.kv_computed_tokens = 0
     if released:
         for rank_index in range(rank_count):
             rank_committed[rank_index] -= released
     return released
+
+
+def preempt_request_blocks(request: RequestState, replica: ReplicaState) -> int:
+    """Evict physical KV while preserving completed prefill/decode progress."""
+
+    if request.lifecycle.is_terminal:
+        raise KVLedgerError("terminal requests cannot be preempted")
+    if request.has_inflight_work:
+        raise KVLedgerError("in-flight requests cannot be preempted")
+    if request.committed_kv_blocks == 0 or request.kv_computed_tokens == 0:
+        raise KVLedgerError("request has no resident KV to preempt")
+    return release_request_blocks(request, replica)

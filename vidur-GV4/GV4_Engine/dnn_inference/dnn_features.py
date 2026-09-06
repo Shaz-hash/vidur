@@ -56,6 +56,8 @@ GLOBAL_FEATURE_NAMES: Final[tuple[str, ...]] = (
     "inflight_decode_count",
     "stop_pending_count",
     "drop_pending_count",
+    "inflight_recompute_count",
+    "preempt_pending_count",
     "active_violation_fraction",
     "active_prefill_violation_fraction",
     "active_decode_violation_fraction",
@@ -65,6 +67,8 @@ GLOBAL_FEATURE_NAMES: Final[tuple[str, ...]] = (
     "inflight_decode_violation_fraction",
     "stop_pending_violation_fraction",
     "drop_pending_violation_fraction",
+    "inflight_recompute_violation_fraction",
+    "preempt_pending_violation_fraction",
 )
 
 LAUNCH_FEATURE_NAMES: Final[tuple[str, ...]] = (
@@ -77,17 +81,27 @@ CONTROLLER_HEADER_FEATURE_NAMES: Final[tuple[str, ...]] = (
     "transition_wait",
     "transition_evict_only",
     "transition_batch",
+    "transition_preempt_only",
+    "transition_evict_and_preempt",
     "evicted_prefill_count",
     "evicted_decode_count",
+    "preempted_prefill_count",
+    "preempted_decode_count",
+    "preempted_inflight_count",
     "decode_request_count",
     "total_allocated_prefill_tokens",
+    "total_allocated_recompute_tokens",
 )
 
 CONTROLLER_REQUEST_FEATURE_NAMES: Final[tuple[str, ...]] = (
     "allocated_prefill",
+    "allocated_recompute",
     "evicted",
+    "preempted",
     "allocated_prefill_tokens",
+    "allocated_recompute_tokens",
     "remaining_prefill_tokens",
+    "remaining_recompute_tokens",
     "total_prefill_tokens",
     "arrival_age",
     "current_lateness",
@@ -123,6 +137,8 @@ _NONTERMINAL_LIFECYCLES: Final[tuple[RequestLifecycle, ...]] = (
     RequestLifecycle.INFLIGHT_DECODE,
     RequestLifecycle.STOP_PENDING,
     RequestLifecycle.DROP_PENDING,
+    RequestLifecycle.INFLIGHT_RECOMPUTE,
+    RequestLifecycle.PREEMPT_PENDING,
 )
 
 
@@ -140,6 +156,8 @@ def _request_feature_names(stage_count: int) -> tuple[str, ...]:
         "decode_committed",
         "decode_remaining",
         "committed_context",
+        "kv_computed_context",
+        "recompute_remaining",
         "arrival_age",
         "current_lateness",
         "prefill_deadline_delta",
@@ -155,6 +173,7 @@ def _request_feature_names(stage_count: int) -> tuple[str, ...]:
         "pipeline_wait_or_transfer",
         "inflight_prefill_tokens",
         "inflight_decode_token",
+        "inflight_recompute_tokens",
         "pending_stop",
         "pending_drop",
         "pending_termination_age",
@@ -180,12 +199,16 @@ def _microbatch_feature_names(stage_count: int) -> tuple[str, ...]:
         "waiting_or_transfer",
         "prefill_request_count",
         "decode_request_count",
+        "recompute_request_count",
         "prefill_tokens",
         "decode_tokens",
+        "recompute_tokens",
         "prefill_reserved_kv_blocks",
         "decode_reserved_kv_blocks",
+        "recompute_reserved_kv_blocks",
         "violated_prefill_request_count",
         "violated_decode_request_count",
+        "violated_recompute_request_count",
     )
 
 
@@ -385,11 +408,23 @@ def _decode_phase(request: RequestState) -> bool:
         RequestLifecycle.INFLIGHT_DECODE,
     ):
         return True
+    if request.lifecycle == RequestLifecycle.INFLIGHT_RECOMPUTE:
+        return request.is_decode_phase
+    if request.lifecycle == RequestLifecycle.PREEMPT_PENDING:
+        return request.reserved_decode_tokens > 0 or (
+            request.reserved_recompute_tokens > 0 and request.is_decode_phase
+        )
     if request.lifecycle in (
         RequestLifecycle.STOP_PENDING,
         RequestLifecycle.DROP_PENDING,
     ):
-        return request.reserved_decode_tokens > 0
+        return (
+            request.reserved_decode_tokens > 0
+            or (
+                request.reserved_recompute_tokens > 0
+                and request.is_decode_phase
+            )
+        )
     return False
 
 
@@ -555,6 +590,10 @@ class GV4FeatureBuilder:
             request.remaining_decode_tokens / scales.request_decode_scale,
             (request.committed_prefill_tokens + request.committed_decode_tokens)
             / (scales.request_prefill_scale + scales.request_decode_scale),
+            request.kv_computed_tokens
+            / (scales.request_prefill_scale + scales.request_decode_scale),
+            request.remaining_recompute_tokens
+            / (scales.request_prefill_scale + scales.request_decode_scale),
             math.asinh((state.now - request.arrival_time) / scales.launch_age_scale),
             math.asinh(_current_lateness(request, state.now) / scales.launch_age_scale),
             math.asinh(
@@ -564,7 +603,11 @@ class GV4FeatureBuilder:
             decode_deadline_delta,
             float(request.violation_recorded),
             *lifecycle_bits,
-            (request.reserved_prefill_tokens + request.reserved_decode_tokens)
+            (
+                request.reserved_prefill_tokens
+                + request.reserved_decode_tokens
+                + request.reserved_recompute_tokens
+            )
             / (scales.request_prefill_scale + scales.request_decode_scale),
             request.tokens_used_in_final_kv_block(
                 self.config.kv_cache.block_size_tokens
@@ -577,6 +620,8 @@ class GV4FeatureBuilder:
             float(request.has_inflight_work and active_stage < 0),
             request.reserved_prefill_tokens / scales.request_prefill_scale,
             float(request.reserved_decode_tokens),
+            request.reserved_recompute_tokens
+            / (scales.request_prefill_scale + scales.request_decode_scale),
             float(request.lifecycle == RequestLifecycle.STOP_PENDING),
             float(request.lifecycle == RequestLifecycle.DROP_PENDING),
             pending_age,
@@ -717,6 +762,7 @@ class GV4FeatureBuilder:
         allocations = batch.allocations
         prefill = [item for item in allocations if item.prefill_tokens]
         decode = [item for item in allocations if item.decode_tokens]
+        recompute = [item for item in allocations if item.recompute_tokens]
         stage_bits = [
             float(active_stage == index)
             for index in range(self.layout.pipeline_stage_count)
@@ -726,17 +772,27 @@ class GV4FeatureBuilder:
             float(active_stage < 0),
             len(prefill) / self.scales.active_request_scale,
             len(decode) / self.scales.active_request_scale,
+            len(recompute) / self.scales.active_request_scale,
             sum(item.prefill_tokens for item in prefill)
             / self.scales.system_prefill_scale,
             sum(item.decode_tokens for item in decode)
             / self.scales.system_decode_scale,
+            sum(item.recompute_tokens for item in recompute)
+            / self.scales.system_logical_tokens,
             sum(item.new_kv_blocks for item in prefill)
             / self.scales.system_logical_blocks,
             sum(item.new_kv_blocks for item in decode)
             / self.scales.system_logical_blocks,
+            sum(item.new_kv_blocks for item in recompute)
+            / self.scales.system_logical_blocks,
             sum(state.request(item.request_id).violation_recorded for item in prefill)
             / self.scales.active_request_scale,
             sum(state.request(item.request_id).violation_recorded for item in decode)
+            / self.scales.active_request_scale,
+            sum(
+                state.request(item.request_id).violation_recorded
+                for item in recompute
+            )
             / self.scales.active_request_scale,
         ]
 
@@ -844,6 +900,15 @@ class GV4FeatureBuilder:
         ]
         if any(request.owner_replica_id != action.replica_id for request in evicted):
             raise DNNFeatureError("controller eviction targets another replica")
+        preempted = [
+            self._action_request(state, request_id)
+            for request_id in action.preempted_request_ids
+        ]
+        if any(
+            request.owner_replica_id != action.replica_id
+            for request in preempted
+        ):
+            raise DNNFeatureError("controller preemption targets another replica")
         decode_allocations = [item for item in action.allocations if item.decode_tokens]
         transition_bits = [
             float(action.transition_kind == kind) for kind in ControllerTransitionKind
@@ -854,13 +919,21 @@ class GV4FeatureBuilder:
             / self.scales.active_request_scale,
             sum(_decode_phase(request) for request in evicted)
             / self.scales.active_request_scale,
+            sum(not _decode_phase(request) for request in preempted)
+            / self.scales.active_request_scale,
+            sum(_decode_phase(request) for request in preempted)
+            / self.scales.active_request_scale,
+            sum(request.has_inflight_work for request in preempted)
+            / self.scales.active_request_scale,
             len(decode_allocations) / self.scales.active_request_scale,
             action.total_prefill_tokens / self.scales.controller_prefill_action_scale,
+            action.total_recompute_tokens
+            / self.scales.controller_prefill_action_scale,
         ]
 
-        affected: dict[int, tuple[RequestState, int, int, bool]] = {}
+        affected: dict[int, tuple[RequestState, int, int, int, bool, bool]] = {}
         for allocation in action.allocations:
-            if not allocation.prefill_tokens:
+            if not (allocation.prefill_tokens or allocation.recompute_tokens):
                 continue
             request = self._action_request(state, allocation.request_id)
             if request.owner_replica_id != action.replica_id:
@@ -870,24 +943,47 @@ class GV4FeatureBuilder:
             affected[request.request_id] = (
                 request,
                 allocation.prefill_tokens,
+                allocation.recompute_tokens,
                 allocation.new_kv_blocks,
+                False,
                 False,
             )
         for request in evicted:
             if request.request_id in affected:
                 raise DNNFeatureError("one edge cannot allocate and evict one request")
-            affected[request.request_id] = (request, 0, 0, True)
+            affected[request.request_id] = (request, 0, 0, 0, True, False)
+        for request in preempted:
+            if request.request_id in affected:
+                raise DNNFeatureError(
+                    "one edge cannot allocate, evict, and preempt one request"
+                )
+            affected[request.request_id] = (request, 0, 0, 0, False, True)
 
         rows = []
         for request_id in sorted(affected):
-            request, allocated_tokens, new_blocks, is_evicted = affected[request_id]
+            (
+                request,
+                prefill_tokens,
+                recompute_tokens,
+                new_blocks,
+                is_evicted,
+                is_preempted,
+            ) = affected[request_id]
             rows.append(
                 [
-                    float(allocated_tokens > 0),
+                    float(prefill_tokens > 0),
+                    float(recompute_tokens > 0),
                     float(is_evicted),
-                    allocated_tokens / self.scales.controller_prefill_action_scale,
+                    float(is_preempted),
+                    prefill_tokens / self.scales.controller_prefill_action_scale,
+                    recompute_tokens / self.scales.controller_prefill_action_scale,
                     request.remaining_prefill_tokens
                     / self.scales.request_prefill_scale,
+                    request.remaining_recompute_tokens
+                    / (
+                        self.scales.request_prefill_scale
+                        + self.scales.request_decode_scale
+                    ),
                     request.original_prefill_tokens / self.scales.request_prefill_scale,
                     math.asinh(
                         (state.now - request.arrival_time)

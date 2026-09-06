@@ -205,6 +205,7 @@ def _check_batch_edge(
                 str(item.request_id): {
                     "prefill_tokens": item.prefill_tokens,
                     "decode_tokens": item.decode_tokens,
+                    "recompute_tokens": item.recompute_tokens,
                     "total_tokens": item.total_tokens,
                 }
                 for item in action.allocations

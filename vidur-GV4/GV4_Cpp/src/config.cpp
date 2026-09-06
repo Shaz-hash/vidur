@@ -22,11 +22,11 @@ void require_unique(const std::vector<T>& values, const char* message) {
 }  // namespace
 
 int ControllerActionConfig::raw_action_count() const {
-    return static_cast<int>(eviction_rules.size() * prefill_budgets.size() *
-                            ordering_heuristics.size());
+    return static_cast<int>(preemption_rules.size() * eviction_rules.size() *
+                            prefill_budgets.size() * ordering_heuristics.size());
 }
 
-std::tuple<std::string, int, std::string>
+std::tuple<std::string, std::string, int, std::string>
 ControllerActionConfig::components(int raw_index) const {
     if (raw_index < 0 || raw_index >= raw_action_count()) {
         throw std::out_of_range("controller raw action index is out of range");
@@ -36,8 +36,12 @@ ControllerActionConfig::components(int raw_index) const {
     const int heuristic_index = raw_index % heuristics;
     const int rule_budget_index = raw_index / heuristics;
     const int budget_index = rule_budget_index % budgets;
-    const int rule_index = rule_budget_index / budgets;
-    return {eviction_rules[rule_index], prefill_budgets[budget_index],
+    const int preemption_eviction_index = rule_budget_index / budgets;
+    const int eviction_count = static_cast<int>(eviction_rules.size());
+    const int eviction_index = preemption_eviction_index % eviction_count;
+    const int preemption_index = preemption_eviction_index / eviction_count;
+    return {preemption_rules[preemption_index], eviction_rules[eviction_index],
+            prefill_budgets[budget_index],
             ordering_heuristics[heuristic_index]};
 }
 
@@ -115,6 +119,9 @@ void Config::validate() const {
     require(!controller_actions.eviction_rules.empty() &&
                 controller_actions.eviction_rules.front() == "evict_none",
             "controller rules must begin with evict_none");
+    require(!controller_actions.preemption_rules.empty() &&
+                controller_actions.preemption_rules.front() == "preempt_none",
+            "controller preemption rules must begin with preempt_none");
     require(!controller_actions.prefill_budgets.empty() &&
                 controller_actions.prefill_budgets.front() == 0,
             "controller budgets must begin with zero");
@@ -123,6 +130,8 @@ void Config::validate() const {
     require(std::is_sorted(controller_actions.prefill_budgets.begin(),
                            controller_actions.prefill_budgets.end()),
             "controller budgets must be sorted");
+    require_unique(controller_actions.preemption_rules,
+                   "duplicate preemption rule");
     require_unique(controller_actions.eviction_rules, "duplicate eviction rule");
     require_unique(controller_actions.prefill_budgets, "duplicate prefill budget");
     require_unique(controller_actions.ordering_heuristics,

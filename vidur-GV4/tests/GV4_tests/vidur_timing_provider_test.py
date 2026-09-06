@@ -92,13 +92,19 @@ def batch_action(*allocations: BatchAllocation) -> ResolvedControllerAction:
     return ResolvedControllerAction(
         raw_action_index=0,
         replica_id=0,
+        preemption_rule="preempt_none",
         eviction_rule="evict_none",
-        prefill_budget=sum(item.prefill_tokens for item in allocations),
+        prefill_budget=sum(
+            item.prefill_tokens + item.recompute_tokens for item in allocations
+        ),
         ordering_heuristic="SJF",
         transition_kind=ControllerTransitionKind.BATCH,
         evicted_request_ids=(),
+        preempted_request_ids=(),
+        pending_preemption_request_ids=(),
         allocations=tuple(allocations),
         released_kv_blocks=0,
+        preempted_kv_blocks=0,
         reserved_kv_blocks=sum(item.new_kv_blocks for item in allocations),
         rank_kv_delta=(),
     )

@@ -92,6 +92,10 @@ class RequestSummary:
     reserved_prefill_tokens: int
     committed_decode_tokens: int
     reserved_decode_tokens: int
+    logical_context_tokens: int
+    kv_computed_tokens: int
+    reserved_recompute_tokens: int
+    remaining_recompute_tokens: int
     committed_kv_blocks: int
     reserved_kv_blocks: int
     inflight_microbatch_id: int
@@ -109,6 +113,7 @@ class BatchAllocationSummary:
     request_id: int
     prefill_tokens: int
     decode_tokens: int
+    recompute_tokens: int
     new_kv_blocks: int
 
 
@@ -397,6 +402,10 @@ def _request_summary(request: Any) -> RequestSummary:
         reserved_prefill_tokens=int(request.reserved_prefill_tokens),
         committed_decode_tokens=int(request.committed_decode_tokens),
         reserved_decode_tokens=int(request.reserved_decode_tokens),
+        logical_context_tokens=int(request.logical_context_tokens),
+        kv_computed_tokens=int(request.kv_computed_tokens),
+        reserved_recompute_tokens=int(request.reserved_recompute_tokens),
+        remaining_recompute_tokens=int(request.remaining_recompute_tokens),
         committed_kv_blocks=int(request.committed_kv_blocks),
         reserved_kv_blocks=int(request.reserved_kv_blocks),
         inflight_microbatch_id=int(request.inflight_microbatch_id),
@@ -416,6 +425,7 @@ def _microbatch_summary(batch: Any) -> MicrobatchSummary:
             request_id=int(item.request_id),
             prefill_tokens=int(item.prefill_tokens),
             decode_tokens=int(item.decode_tokens),
+            recompute_tokens=int(item.recompute_tokens),
             new_kv_blocks=int(item.new_kv_blocks),
         )
         for item in batch.allocations

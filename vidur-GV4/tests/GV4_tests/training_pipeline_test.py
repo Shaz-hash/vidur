@@ -250,10 +250,15 @@ class TrainingPipelineTest(unittest.TestCase):
             selection.matched_raw_index,
             selection.action.equivalent_raw_indices,
         )
-        rule, budget, ordering = self.config.controller_actions.raw_action_components(
-            selection.matched_raw_index
+        preemption, rule, budget, ordering = (
+            self.config.controller_actions.raw_action_components(
+                selection.matched_raw_index
+            )
         )
-        self.assertEqual((rule, budget, ordering), ("evict_none", 256, "SJF"))
+        self.assertEqual(
+            (preemption, rule, budget, ordering),
+            ("preempt_none", "evict_none", 256, "SJF"),
+        )
 
     def test_partial_promotion_keeps_value_and_policy_versions_together(self) -> None:
         arena = ArenaResult(

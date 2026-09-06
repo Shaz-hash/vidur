@@ -74,6 +74,15 @@ _SUPPORTED_EVICTION_RULES = frozenset(
         "evict_decode_highest_lateness",
     }
 )
+_SUPPORTED_PREEMPTION_RULES = frozenset(
+    {
+        "preempt_none",
+        "preempt_min_recompute",
+        "preempt_largest_kv",
+        "preempt_max_recovery_slack",
+        "preempt_best_relief_cost",
+    }
+)
 _SUPPORTED_ORDERING_HEURISTICS = frozenset({"SJF", "EDF", "LST", "LJF"})
 _SUPPORTED_STOP_RULES = frozenset(
     {
@@ -562,7 +571,7 @@ class SchedulerConfig:
     decode_tokens_per_request_per_batch: int = 1
     fifo_stages: bool = True
     deterministic_service_times: bool = True
-    request_preemption_enabled: bool = False
+    request_preemption_enabled: bool = True
     inflight_eviction_enabled: bool = False
 
     def __post_init__(self) -> None:
@@ -589,10 +598,8 @@ class SchedulerConfig:
             raise GV4ConfigError("non-FIFO PP scheduling is deferred in GV4 v1")
         if not self.deterministic_service_times:
             raise GV4ConfigError("GV4 v1 requires deterministic stage service times")
-        if self.request_preemption_enabled:
-            raise GV4ConfigError(
-                "resumable request preemption is not part of the GV4 controller contract"
-            )
+        if not isinstance(self.request_preemption_enabled, bool):
+            raise GV4ConfigError("request_preemption_enabled must be bool")
         if self.inflight_eviction_enabled:
             raise GV4ConfigError("in-flight terminal eviction is illegal in GV4 v1")
         if self.max_prefill_chunk_tokens > self.max_batch_tokens:
@@ -731,6 +738,13 @@ class RewardConfig:
 
 @dataclass(frozen=True, slots=True)
 class ControllerActionConfig:
+    preemption_rule_names: tuple[str, ...] = (
+        "preempt_none",
+        "preempt_min_recompute",
+        "preempt_largest_kv",
+        "preempt_max_recovery_slack",
+        "preempt_best_relief_cost",
+    )
     eviction_rule_names: tuple[str, ...] = (
         "evict_none",
         "evict_largest_prefill",
@@ -756,23 +770,38 @@ class ControllerActionConfig:
     ordering_heuristics: tuple[str, ...] = ("SJF", "EDF", "LST", "LJF")
 
     def __post_init__(self) -> None:
+        preemption_rules = tuple(self.preemption_rule_names)
         rules = tuple(self.eviction_rule_names)
         budgets = tuple(int(value) for value in self.prefill_budget_options)
         heuristics = tuple(self.ordering_heuristics)
+        object.__setattr__(self, "preemption_rule_names", preemption_rules)
         object.__setattr__(self, "eviction_rule_names", rules)
         object.__setattr__(self, "prefill_budget_options", budgets)
         object.__setattr__(self, "ordering_heuristics", heuristics)
+        if not preemption_rules or preemption_rules[0] != "preempt_none":
+            raise GV4ConfigError(
+                "controller preemption rules must begin with preempt_none"
+            )
         if not rules or rules[0] != "evict_none":
             raise GV4ConfigError("controller eviction rules must begin with evict_none")
         if not budgets or budgets[0] != 0:
             raise GV4ConfigError("controller prefill budgets must begin with zero")
         if not heuristics:
             raise GV4ConfigError("controller ordering heuristics cannot be empty")
+        _unique("controller preemption rules", preemption_rules)
         _unique("controller eviction rules", rules)
         _unique("controller prefill budgets", budgets)
         _unique("controller ordering heuristics", heuristics)
+        unsupported_preemption = (
+            set(preemption_rules) - _SUPPORTED_PREEMPTION_RULES
+        )
         unsupported_rules = set(rules) - _SUPPORTED_EVICTION_RULES
         unsupported_heuristics = set(heuristics) - _SUPPORTED_ORDERING_HEURISTICS
+        if unsupported_preemption:
+            raise GV4ConfigError(
+                "unsupported preemption rules: "
+                f"{sorted(unsupported_preemption)}"
+            )
         if unsupported_rules:
             raise GV4ConfigError(
                 f"unsupported eviction rules: {sorted(unsupported_rules)}"
@@ -789,7 +818,8 @@ class ControllerActionConfig:
     @property
     def raw_action_count(self) -> int:
         return (
-            len(self.eviction_rule_names)
+            len(self.preemption_rule_names)
+            * len(self.eviction_rule_names)
             * len(self.prefill_budget_options)
             * len(self.ordering_heuristics)
         )
@@ -799,7 +829,11 @@ class ControllerActionConfig:
         eviction_rule_index: int,
         prefill_budget_index: int,
         ordering_heuristic_index: int,
+        *,
+        preemption_rule_index: int = 0,
     ) -> int:
+        if not 0 <= preemption_rule_index < len(self.preemption_rule_names):
+            raise GV4ConfigError("preemption_rule_index is out of range")
         if not 0 <= eviction_rule_index < len(self.eviction_rule_names):
             raise GV4ConfigError("eviction_rule_index is out of range")
         if not 0 <= prefill_budget_index < len(self.prefill_budget_options):
@@ -807,25 +841,38 @@ class ControllerActionConfig:
         if not 0 <= ordering_heuristic_index < len(self.ordering_heuristics):
             raise GV4ConfigError("ordering_heuristic_index is out of range")
         return (
-            eviction_rule_index * len(self.prefill_budget_options)
+            (
+                preemption_rule_index * len(self.eviction_rule_names)
+                + eviction_rule_index
+            )
+            * len(self.prefill_budget_options)
             + prefill_budget_index
         ) * len(self.ordering_heuristics) + ordering_heuristic_index
 
-    def decode_raw_index(self, raw_index: int) -> tuple[int, int, int]:
+    def decode_raw_index(self, raw_index: int) -> tuple[int, int, int, int]:
         if not 0 <= raw_index < self.raw_action_count:
             raise GV4ConfigError("controller raw action index is out of range")
         rule_budget_index, heuristic_index = divmod(
             raw_index, len(self.ordering_heuristics)
         )
-        rule_index, budget_index = divmod(
+        preemption_eviction_index, budget_index = divmod(
             rule_budget_index, len(self.prefill_budget_options)
         )
-        return rule_index, budget_index, heuristic_index
+        preemption_index, eviction_index = divmod(
+            preemption_eviction_index, len(self.eviction_rule_names)
+        )
+        return preemption_index, eviction_index, budget_index, heuristic_index
 
-    def raw_action_components(self, raw_index: int) -> tuple[str, int, str]:
-        rule_index, budget_index, heuristic_index = self.decode_raw_index(raw_index)
+    def raw_action_components(self, raw_index: int) -> tuple[str, str, int, str]:
+        (
+            preemption_index,
+            eviction_index,
+            budget_index,
+            heuristic_index,
+        ) = self.decode_raw_index(raw_index)
         return (
-            self.eviction_rule_names[rule_index],
+            self.preemption_rule_names[preemption_index],
+            self.eviction_rule_names[eviction_index],
             self.prefill_budget_options[budget_index],
             self.ordering_heuristics[heuristic_index],
         )
@@ -965,11 +1012,11 @@ class RoutingConfig:
 class NativeLayoutConfig:
     """Versioned fixed-array bounds shared by Python snapshots and native code."""
 
-    manifest_schema_version: str = "gv4_engine_manifest_v4"
-    state_schema_version: str = "gv4_state_v3"
-    action_schema_version: str = "gv4_actions_v1"
-    feature_schema_version: str = "gv4_markov_v3"
-    native_layout_version: str = "gv4_native_layout_v3"
+    manifest_schema_version: str = "gv4_engine_manifest_v7"
+    state_schema_version: str = "gv4_state_v5"
+    action_schema_version: str = "gv4_actions_v3"
+    feature_schema_version: str = "gv4_markov_v5"
+    native_layout_version: str = "gv4_native_layout_v5"
     max_requests: int = 512
     max_unassigned_requests: int = 512
     max_replicas: int = 8
@@ -977,7 +1024,7 @@ class NativeLayoutConfig:
     max_pipeline_parallel_size: int = 8
     max_inflight_microbatches_per_replica: int = 64
     max_launch_history_entries: int = 64
-    max_controller_raw_actions: int = 1024
+    max_controller_raw_actions: int = 2048
     max_adversary_raw_actions: int = 1024
     max_router_raw_actions: int = 16
 

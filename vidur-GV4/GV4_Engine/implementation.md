@@ -77,7 +77,7 @@ that schema v1 does not support.
 | SLOConfig | Defines the prefill slowdown target and per-token decode deadline interval. |
 | CostConfig | Defines violation, lateness, terminal-drop, and automatic-drop costs. |
 | RewardConfig | Defines elapsed-time discounting and the minimize-cost value convention used by MCTS and replay targets. |
-| ControllerActionConfig | Defines and indexes the fixed raw controller action product: terminal eviction rule, prefill budget, and ordering heuristic. |
+| ControllerActionConfig | Defines and indexes the fixed raw controller action product: resumable preemption rule, terminal eviction rule, shared prefill/recompute budget, and ordering heuristic. |
 | AdversaryActionConfig | Defines and indexes launch count, prefill-size template, and decode stop rule. |
 | RoutingConfig | Defines sequential assignment to replicas and forbids combinatorial multi-request routing actions. |
 | NativeLayoutConfig | Versions the manifest/state/action/feature/native schemas and fixes maximum array dimensions for a later native layout. |
@@ -260,18 +260,21 @@ memory_safety_margin_fraction once:
         hard KV bytes/rank // bytes per KV block on that stage
 
 The logical capacity of a replica is the minimum capacity across its ranks because a
-request logical KV block must be representable on every participating rank. GV4 v1 has
-no second allocator watermark, resumable preemption, prefix caching, or CPU/disk KV
-offload.
+request logical KV block must be representable on every participating rank. GV4 has
+no second allocator watermark, prefix caching, or CPU/disk KV offload. Resumable KV
+preemption is implemented in both Python and native GV4 using the same authoritative
+request and per-rank ledgers; no second allocator or KV-manager state is introduced.
 
 
 ### Scheduler and Action Bounds
 
-SchedulerConfig.max_batch_tokens bounds the total prefill and decode tokens admitted in
-one microbatch. max_sequences independently bounds the number of distinct requests in
-that microbatch. max_prefill_chunk_tokens bounds the prefill contribution of a
-request/action, and one batch may reserve at most one decode token per request in
-schema v1.
+SchedulerConfig.max_batch_tokens bounds the total ordinary prefill, reconstruction,
+and decode tokens admitted in one microbatch. max_sequences independently bounds the
+number of distinct requests in that microbatch. max_prefill_chunk_tokens bounds one
+prefill-class contribution, and one batch may reserve at most one decode token per
+request. request_preemption_enabled is a real default-on feature gate. Disabling it
+keeps the fixed raw policy width but removes all preemption effects through normal
+masking/canonicalization.
 
 max_inflight_microbatches limits all admitted but not yet pipeline-complete batches for
 one replica. inter_stage_queue_capacity limits work waiting between PP stages. Until
@@ -284,8 +287,10 @@ future native implementation. Legality and canonicalization of a raw action rema
 responsibility of action_resolver.py; config.py only defines the raw schema and bounds.
 
 The eviction names in ControllerActionConfig describe terminal removal policies. They
-must not be interpreted as vLLM-style resumable preemption. SchedulerConfig explicitly
-rejects resumable request preemption and in-flight terminal eviction in schema v1.
+must not be interpreted as resumable preemption: eviction permanently drops a request,
+whereas preemption preserves logical progress and discards only physical KV. Waiting
+preemption releases memory immediately. In-flight preemption is drain-before-release;
+in-flight terminal eviction remains deferred through DROP_PENDING.
 
 
 ### Timing, Launch Windows, Decode Credits, SLOs, Costs, and Rewards
@@ -396,15 +401,19 @@ RequestLifecycle describes the one authoritative phase of each request:
 | INFLIGHT_PREFILL | Prefill work and required resources are reserved in one admitted microbatch. |
 | WAITING_DECODE | Prefill is complete and decode work remains. |
 | INFLIGHT_DECODE | One decode step is reserved in an admitted microbatch. |
+| INFLIGHT_RECOMPUTE | A preempted request is rebuilding part of its missing physical KV context. Its committed logical progress does not change. |
+| PREEMPT_PENDING | The controller selected an in-flight request for preemption. Its already-admitted work must finish before all updated physical KV is released. |
 | STOP_PENDING | An adversary stop was requested while in-flight work prevents immediate removal. |
 | DROP_PENDING | A terminal drop was requested while in-flight work prevents immediate removal. |
 | COMPLETED | All requested work completed naturally. |
 | STOPPED | The adversary terminated the request. |
 | DROPPED | The controller or automatic SLO rule terminated the request. |
 
-TerminalReason records why a terminal or pending-terminal transition occurred. This is
-terminal bookkeeping, not resumable preemption: GV4 v1 never pauses an active request
-and later recomputes it.
+TerminalReason records why a terminal or pending-terminal transition occurred.
+Preemption is not terminal and therefore does not assign a terminal reason. It does
+not erase deadlines, accumulated lateness, completed tokens, or decode-credit history.
+For PREEMPT_PENDING, the admitted allocation can still update these fields normally
+before its physical KV is released.
 
 
 ### Runtime Records
@@ -412,9 +421,9 @@ and later recomputes it.
 | Record | Authoritative data retained |
 | --- | --- |
 | LaunchRecord | One adversary launch used by the sliding launch-window constraint. |
-| BatchAllocation | One request prefill/decode work and newly reserved logical KV blocks in one batch. |
+| BatchAllocation | Exactly one kind of request work: prefill, decode, or KV recomputation, plus newly reserved logical KV blocks. |
 | InflightMicrobatchState | Batch/action IDs, request allocations, and precomputed ready/start/finish time for every PP stage. |
-| RequestState | Request identity, owner, lifecycle, SLO data, token progress, KV ownership, in-flight link, one-time decode-credit mint flag, lateness, and terminal fields. |
+| RequestState | Request identity, owner, lifecycle, logical token progress, physical KV progress, KV ownership, SLO data, in-flight link, one-time decode-credit mint flag, lateness, and terminal fields. |
 | ObjectiveState | Cumulative completion, stop, drop, violation, lateness, terminal-cost, and total-cost counters. |
 | ReplicaState | Rank placement/capacity, committed and reserved KV ledgers, compact PP stage tails, and the ordered in-flight batch ring. |
 | GV4State | Global time/turn, deterministic ID and RNG counters, launch history, pooled available/reserved decode credit, cumulative minted/committed decode-token counters, all requests, all replicas, and objective totals. |
@@ -422,25 +431,45 @@ and later recomputes it.
 
 ### Committed, Reserved, and Remaining Work
 
-GV4 separates completed work from admitted work:
+GV4 separates logical request progress from physical KV state:
 
-- committed fields mean the work passed the final PP stage and permanently changed the request;
-- reserved fields mean the controller admitted the work and reserved its KV and, for decode, one already-funded token, but the batch has not completed the final PP stage;
+- committed prefill/decode fields mean useful request work passed the final PP stage;
+- reserved prefill/decode fields mean useful work is admitted but has not passed the final PP stage;
+- kv_computed_tokens is the logical context currently represented by physical GPU KV;
+- reserved_recompute_tokens is missing context being rebuilt by an in-flight batch;
 - remaining work is derived as original minus committed minus reserved and is not stored separately.
 
 For example, while one decode token is in flight, it is reserved but not committed. On
 final-stage completion, transition_engine.py will move that token and its new KV blocks
 from reserved to committed. If admission is rejected, no reservation is made.
 
-RequestState.resident_tokens is the sum of committed and reserved prefill/decode
-tokens. It excludes unscheduled remaining work because only completed or admitted work
-needs GPU KV storage. The minimum number of logical blocks is ceiling division:
+For every nonterminal request:
+
+    logical_context_tokens = committed_prefill_tokens + committed_decode_tokens
+    remaining_recompute_tokens =
+        logical_context_tokens - kv_computed_tokens - reserved_recompute_tokens
+    resident_tokens =
+        kv_computed_tokens
+        + reserved_recompute_tokens
+        + reserved_prefill_tokens
+        + reserved_decode_tokens
+
+Before preemption, kv_computed_tokens normally equals logical_context_tokens. A
+preemption releases all blocks and resets kv_computed_tokens to zero while preserving
+logical_context_tokens. RequestState.resident_tokens therefore means physical KV
+occupancy, not historical or logical progress. The minimum block count is:
 
     minimum blocks =
         (resident_tokens + block_size_tokens - 1) // block_size_tokens
 
-Terminal requests retain historical token counters for reporting but must release all
-committed and reserved KV blocks.
+Terminal requests retain historical token counters for reporting but must have zero
+physical KV tokens and zero committed/reserved KV blocks.
+
+Recomputation and ordinary prefill remain distinct accounting kinds, but they form one
+controller scheduling class. They use the same queue ordering, prefill action budget,
+batch token/sequence limits, pipeline stages, and Vidur prefill timing. One allocation
+contains exactly one of prefill, decode, or recompute work. If reconstruction remains,
+new prefill and decode work for that request are illegal.
 
 
 ### Compact Pipeline Calendar
@@ -473,10 +502,10 @@ and requires the rank ledgers to match exactly.
 
 An in-flight request points to exactly one microbatch. That microbatch must point back
 to the same request through a BatchAllocation, use the same replica, and contain the
-same token/KV reservations. Reserved decode credit must equal the sum of in-flight
-decode allocations. Prefill allocations have no credit reservation. These two-way
-checks prevent a branch from gaining decode work without funding or any work without
-KV capacity.
+same prefill, decode, recompute, and KV reservations. Reserved decode credit must equal
+the sum of in-flight decode allocations. Prefill and recompute allocations have no
+credit reservation. These two-way checks prevent a branch from gaining decode work
+without funding or any physical work without KV capacity.
 
 The global counters additionally enforce the conservation equation:
 
@@ -488,8 +517,9 @@ The global counters additionally enforce the conservation equation:
 Each request can set decode_credit_minted only once, after its final prefill token
 commits. This makes duplicate minting and double spending fail during state
 validation. Zero available credit cannot coexist with WAITING_DECODE or
-INFLIGHT_DECODE; only a STOP_PENDING request may retain its already-reserved final
-decode token.
+INFLIGHT_DECODE. A decode-phase INFLIGHT_RECOMPUTE request is also treated as active
+decode work. Only a STOP_PENDING request may retain its already-reserved final decode
+token.
 
 
 ### Initial State, Lookup, and MCTS Cloning
@@ -523,6 +553,7 @@ GV4State.assert_valid(config) is the expensive debug and parity checker. It veri
 - configured replica placement, PP width, rank capacities, and in-flight limits;
 - globally unique batch IDs and ordered FIFO pipeline calendars;
 - request lifecycle, progress, deadline, terminal, and KV invariants;
+- logical-context, physical-KV, and partial-recomputation invariants;
 - request-to-batch and batch-to-request links;
 - request KV ownership against every rank ledger;
 - in-flight decode reservations against the pooled decode-credit ledger;
@@ -540,7 +571,8 @@ selection step.
 
 kv_ledger.py is the only module that changes request KV ownership and the mirrored
 per-rank counters in ReplicaState. It has no block objects, free lists, dictionaries,
-event records, hidden allocator state, prefix cache, offload, or resumable preemption.
+event records, hidden allocator state, prefix cache, or offload. Resumable preemption
+uses this existing ledger rather than introducing a second KV manager.
 
 Every request owns a logical number of blocks. Reserving one logical block increments
 the reserved counter on every rank of that request's replica. Because rank capacities
@@ -553,19 +585,24 @@ same logical delta.
 | Operation | Responsibility |
 | --- | --- |
 | blocks_for_tokens() | Computes exact block demand with integer ceiling division. |
-| additional_blocks_for_work() | Computes incremental blocks after reusing existing partial or preallocated blocks. |
+| additional_blocks_for_work() | Computes incremental blocks for exactly one of prefill, decode, or recomputation after reusing existing partial blocks. |
 | free_logical_blocks() | Returns the least free-block count across all ranks. |
 | can_reserve_blocks() | Checks every rank without mutation and can include blocks from validated terminal evictions. |
 | reserve_batch_blocks() | Verifies exact block deltas, checks all ranks, and reserves the entire batch atomically. |
 | commit_batch_blocks() | Moves a completed batch from reserved to committed without changing total KV usage. |
-| release_request_blocks() | Releases committed blocks for a non-in-flight terminal completion, stop, or drop. |
+| release_request_blocks() | Releases all physical KV for non-in-flight terminal cleanup and resets physical computed-token state. |
+| preempt_request_blocks() | Validates a live, non-in-flight resident request, releases its blocks on every rank, and resets only its physical KV progress. |
 
 
 ### Incremental Demand
 
 For one pre-admission request allocation:
 
-    resident_after = resident_tokens + admitted_prefill + admitted_decode
+    resident_after =
+        resident_tokens
+        + admitted_prefill
+        + admitted_decode
+        + admitted_recompute
     blocks_after = ceil(resident_after / block_size_tokens)
     blocks_owned = committed_kv_blocks + reserved_kv_blocks
     new_blocks = max(0, blocks_after - blocks_owned)
@@ -573,11 +610,59 @@ For one pre-admission request allocation:
 This provides the required full-cache behavior. A decode inside an existing partial
 block has new_blocks equal to zero and remains feasible when global free capacity is
 zero. A decode at an exact block boundary requires one new block on every rank. A
-prefill may require multiple blocks.
+prefill or recomputation may require multiple blocks.
+
+The operation accepts exactly one positive work kind. If
+remaining_recompute_tokens is nonzero, ordinary prefill and decode are illegal: the
+request must rebuild its missing physical context first. Recomputation itself may be
+split across multiple batches and cannot exceed remaining_recompute_tokens.
 
 Already owned excess blocks are reused. The ledger itself does not decide when to add
 speculative preallocation; it only accounts for blocks already represented in the
 authoritative request state.
+
+
+### Preemption and Recomputation
+
+Preemption deliberately preserves the request rather than converting it into a new
+request. For an eligible waiting request, preempt_request_blocks() performs:
+
+    released_blocks = committed_kv_blocks
+    committed_kv_blocks = 0
+    kv_computed_tokens = 0
+
+The same released-block delta is subtracted from every TP/PP rank ledger in the
+request's replica. The request ID, lifecycle phase, committed prefill/decode counts,
+decode-credit mint state, deadlines, accumulated lateness, and violation state are
+unchanged. Consequently:
+
+    remaining_recompute_tokens == logical_context_tokens
+
+Recovery batches reserve recompute tokens and blocks just like other physical work.
+At final-stage completion they increase kv_computed_tokens and release the recompute
+reservation, but do not increase committed prefill/decode progress, consume decode
+credit, mint credit, or reset an SLO deadline. Partial recovery returns the request to
+its original waiting phase; normal work becomes legal only after the missing context
+reaches zero.
+
+The controller may preempt one eligible request whether or not KV is currently full.
+For a waiting request, the action calls preempt_request_blocks() immediately. For an
+in-flight request, no scheduled GPU work is cancelled and no reserved memory is made
+available early. The request becomes PREEMPT_PENDING and follows this final-stage
+order:
+
+1. Move the batch's block reservation from reserved to committed.
+2. Commit its prefill, decode, or recompute allocation normally.
+3. Record prefill/decode lateness and update the next decode deadline normally.
+4. Mint credit for final prefill or consume already-reserved decode credit normally.
+5. Release every physical block now owned by the request.
+6. Set kv_computed_tokens to zero and return to WAITING_PREFILL or WAITING_DECODE.
+
+The missing recovery after step 6 is the complete updated logical context. Thus an
+in-flight decode preemption includes the just-completed decode token, and an in-flight
+recompute preemption discards the partial reconstruction that just drained. This
+drain-before-release rule prevents impossible cancellation, early block reuse, lost
+logical progress, and decode-credit refunds.
 
 
 ### Atomicity and Transition Ordering
@@ -587,9 +672,10 @@ reserve_batch_blocks() follows validate-then-apply ordering:
 1. Validate the nonempty, sorted, unique request allocations.
 2. Resolve requests by O(1) array index and verify replica ownership.
 3. Reject terminal, unassigned, or already in-flight requests.
-4. Recalculate and verify every allocation's exact new_kv_blocks value.
-5. Sum the batch delta and check it independently against every rank.
-6. Only after every check passes, update request and rank reserved counters.
+4. Reject normal work until any missing KV context has been recomputed.
+5. Recalculate and verify every allocation's exact new_kv_blocks value.
+6. Sum the batch delta and check it independently against every rank.
+7. Only after every check passes, update request and rank reserved counters.
 
 Therefore a failed capacity or consistency check leaves every counter unchanged.
 The transition engine subsequently sets token reservations and in-flight links as one
@@ -608,7 +694,7 @@ The hot operations are linear only in ranks plus selected requests:
     block calculation: O(1)
     capacity check: O(number of ranks in one replica)
     reserve/commit: O(number of allocations + number of ranks)
-    release: O(number of ranks)
+    release/preempt: O(number of ranks)
 
 No operation scans unrelated requests or replicas. On the local Python environment,
 the measured best-of-five microbenchmarks were approximately:
@@ -714,15 +800,16 @@ The module exposes these compact immutable records:
 
 | Record | Meaning |
 | --- | --- |
-| ResolvedControllerAction | Exact eviction IDs, per-request work, KV effects, and transition kind for one legal raw index. |
+| ResolvedControllerAction | Exact preemption/eviction IDs, deferred in-flight victims, per-request work, KV effects, and transition kind for one legal raw index. |
 | CanonicalControllerAction | One MCTS edge, its smallest representative raw index, and every equivalent raw alias. |
 | ResolvedAdversaryAction | Exact launch count/template and deterministic decode-stop target IDs. |
 | CanonicalAdversaryAction | One adversary MCTS edge, its smallest representative raw index, and every equivalent raw alias. |
-| ControllerTransitionKind | BATCH, EVICT_ONLY, or WAIT. |
+| ControllerTransitionKind | WAIT, EVICT_ONLY, BATCH, PREEMPT_ONLY, or EVICT_AND_PREEMPT. BATCH takes precedence when the same action also admits work. |
 
-LST receives a PrefillTimeEstimator callback. The resolver does not load or guess a
-profile itself. The callback takes a request plus its remaining prefill tokens and
-returns predicted remaining service time. Invalid or missing LST timing fails closed.
+LST and the two timing-aware preemption policies receive a PrefillTimeEstimator
+callback. The resolver does not load or guess a profile itself. The callback takes a
+request plus a prefill-class token count and returns predicted service time. Invalid
+or missing timing fails closed.
 
 
 ### Controller Resolution
@@ -731,28 +818,60 @@ resolve_controller_action() resolves one raw index. resolve_controller_actions()
 reuses one cached context to resolve the entire dynamic raw action space and returns
 both the fixed raw-index array and the canonical edge tuple.
 
-For each raw action the resolver performs this deterministic sequence:
+The fixed raw product is:
 
-1. Decode the configured eviction rule, prefill budget, and ordering heuristic.
-2. Require a controller turn and an available stage-0/in-flight admission slot.
-3. Resolve only waiting, resident, same-replica terminal eviction targets.
-4. Exclude those targets and order remaining prefills by SJF, EDF, LST, or LJF.
-5. Apply inherited strict masks for ineffective eviction rules, zero-budget aliases,
-   missing prefill work, and invalid over-budget choices.
-6. Compute scratch free KV as current free logical blocks plus blocks released by the
-   validated evictions. No real ledger is changed.
-7. Allocate prefill tokens subject to the raw budget, max batch tokens, max
-   sequences, remaining work, and exact block capacity. No prefill credit is read.
-8. Add adversary-funded one-token decodes that need zero blocks first, followed by
-   boundary-crossing decodes in request-ID order while decode funding and KV capacity
-   remain. Credit selection is automatic and is not part of the raw controller action.
-9. Sort allocations by request ID and classify the result as BATCH, EVICT_ONLY, or
-   the unique canonical WAIT fallback.
+    preemption rule x eviction rule x prefill budget x ordering heuristic
+      = 5 x 9 x 9 x 4 = 1620 raw actions
+
+Preemption is the outermost index dimension and `preempt_none` is first, so the former
+0..323 controller indices retain their exact meanings. For each raw action the resolver
+performs this deterministic sequence:
+
+1. Decode preemption, terminal eviction, shared prefill-class budget, and ordering.
+2. Require a controller turn. Memory-only choices remain legal while stage 0 is busy;
+   only batch allocation requires a free admission slot.
+3. Resolve waiting terminal-eviction targets, then resolve at most one distinct
+   preemption target. Preemption is legal even when free KV exists.
+4. Split that victim into immediate or PREEMPT_PENDING according to whether it has an
+   in-flight allocation. Only immediate releases increase scratch free KV.
+5. Exclude eviction/preemption victims and jointly order ordinary waiting prefills and
+   missing-context reconstructions by SJF, EDF, LST, or LJF.
+6. Apply strict masks for ineffective memory rules, zero-budget aliases, unavailable
+   prefill-class work, invalid over-budget choices, and closed-pipeline batch fields.
+7. Allocate reconstruction or ordinary prefill from the same selected budget, max
+   batch tokens, max sequences, and exact block capacity. Reconstruction always wins
+   within one request; new work cannot bypass missing context.
+8. Add funded one-token decodes that need zero blocks first, then boundary-crossing
+   decodes in request-ID order. Decode credit remains feasibility accounting, not a
+   controller action dimension.
+9. Sort allocations by request ID. Any admitted work produces BATCH; otherwise classify
+   the concrete memory effects or use the unique WAIT fallback.
 
 Exact new_kv_blocks is stored in every BatchAllocation. The net KV effect is also
 stored per physical rank for the canonical key. Prefill allocation can consume unused
 space in an existing final block and can be shortened to the maximum exact amount
 that fits; it does not round request work up to an artificial token allocation.
+
+### Single-Victim Preemption Policies
+
+Every non-`none` rule selects one resumable resident request, including an in-flight
+request whose admitted work has not completed. The candidate's recompute size and
+released blocks are evaluated at the time preemption will actually take effect. For an
+in-flight candidate that is its final PP completion; for a waiting candidate it is
+`state.now`. A final in-flight decode token is excluded because it naturally completes
+the request and leaves nothing to resume.
+
+| Rule | Deterministic choice |
+| --- | --- |
+| `preempt_min_recompute` | Smallest updated logical context, then more released blocks, then lowest request ID. This minimizes recovery work. |
+| `preempt_largest_kv` | Most released blocks, then fewer recovery tokens, then lowest request ID. This maximizes immediate/eventual memory relief. |
+| `preempt_max_recovery_slack` | Largest `recovery_deadline - release_time - estimated_recompute_time`, then more blocks, then lowest ID. This chooses the request safest to delay. |
+| `preempt_best_relief_cost` | Largest released-blocks/recovery-cost ratio. Recovery cost combines predicted recompute time, any newly introduced violation base cost, and capped predicted lateness; ties prefer more blocks then lower ID. |
+
+For prefill-phase requests the recovery deadline is the original prefill deadline. For
+decode-phase requests it is the next-token deadline. If an in-flight allocation finishes
+prefill or decode and creates the next decode deadline, the candidate uses that updated
+deadline. Policy selection is cached while all raw actions for one state are expanded.
 
 
 ### Canonical Edges
@@ -762,7 +881,9 @@ The key is formed only from physical effects:
     (
         transition_kind,
         sorted_evicted_request_ids,
-        sorted(request_id, phase, prefill_tokens, decode_tokens),
+        sorted_preempted_request_ids,
+        sorted_pending_preemption_request_ids,
+        sorted(request_id, work_kind, prefill_tokens, decode_tokens, recompute_tokens),
         per_rank_net_kv_delta,
     )
 
@@ -808,11 +929,11 @@ prefill orderings are cached across the raw Cartesian product. Each physical pla
 uses bounded linear loops over selected prefills, eligible decodes, and replica ranks.
 No scratch GV4State clone is created. Canonical grouping uses immutable tuple keys.
 
-On the local Python environment, expanding all 324 raw actions for a seven-request
-test state measured approximately 0.67 ms per call over 200 repetitions. That run
-produced 13 legal raw actions and four canonical physical edges. This is a development
-measurement, not a performance guarantee; native translation can remove Python object
-construction while preserving the same cached resolution order.
+The prior 324-action performance measurement no longer applies because the raw product
+is now 1620. Python still scans requests once per controller context and caches eviction
+targets, preemption candidates/timing estimates, and prefill-class orderings across that
+product. Native parity preserves deterministic resolution order; performance should be
+remeasured before declaring a new benchmark.
 
 
 ## transition_engine.py: Atomic Time, Work, and Cost Transitions
@@ -822,16 +943,22 @@ construction while preserving the same cached resolution order.
 | Operation | Responsibility |
 | --- | --- |
 | apply_adversary_action() | Apply decode stops, create launch-window-bounded requests, and move to the controller turn. |
-| apply_controller_action() | Revalidate a canonical plan, apply terminal evictions, reserve work/KV and funded decode tokens, and admit one batch. |
+| apply_controller_action() | Revalidate a canonical plan, apply terminal evictions and immediate/deferred preemptions, reserve work/KV and funded decode tokens, and admit an optional batch. |
 | advance_to() | Process every due final-stage completion, prune launch history, update time, and apply automatic drops. |
 | next_internal_completion_time() | Return the earliest final-stage completion across replicas. |
 | next_wait_boundary_time() | Return the earliest future adversary, stage-0, or completion boundary that can change legality. |
 
 Every operation returns TransitionOutcome. It contains the resulting state, elapsed
 simulator time, objective before/after, edge_reward = before - after, and the exact
-time-dependent discount from RewardConfig. Zero-time BATCH admission and EVICT_ONLY
-transitions consequently receive discount exponent zero; a WAIT edge receives the
-elapsed boundary time.
+time-dependent discount from RewardConfig. Zero-time BATCH and memory-only transitions
+consequently receive discount exponent zero; a WAIT edge receives the elapsed boundary
+time.
+
+Controller application uses one fixed order: terminal evictions, preemption marking or
+release, batch KV/decode-credit reservation, and pipeline admission. Immediate
+preemption blocks may fund another request in the same action. PREEMPT_PENDING blocks
+may not, because they remain occupied until the victim's final-stage completion. The
+selected victim is excluded from the action's new batch in both cases.
 
 
 ### Adversary-Tick Replay Across In-Flight Work
@@ -936,18 +1063,20 @@ state and rejects stale plans. For BATCH it then builds the complete PP calendar
 without mutation. Only after action and timing validation succeed does it:
 
 1. Terminally drop resolved non-in-flight eviction targets and release their KV.
-2. Reserve exact KV blocks on every rank through kv_ledger.py.
-3. Move only the automatically included decode-token funding from available to the
+2. Release waiting preemption victims or mark in-flight victims PREEMPT_PENDING.
+3. Reserve exact KV blocks on every rank through kv_ledger.py.
+4. Move only the automatically included decode-token funding from available to the
    global reserved count. Prefill reserves no credit.
-4. Copy token reservations and the microbatch backlink into each request.
-5. Admit the batch through pipeline_calendar.py.
-6. If the reservation exhausts available decode credit, stop every waiting decode
+5. Copy token reservations and the microbatch backlink into each request.
+6. Admit the batch through pipeline_calendar.py.
+7. If the reservation exhausts available decode credit, stop every waiting decode
    across all replicas and mark every in-flight decode STOP_PENDING.
-7. Increment the monotonic microbatch ID.
+8. Increment the monotonic microbatch ID.
 
-All capacity and timing failures occur before the first mutation. EVICT_ONLY performs
-only step 1 at the current time. WAIT invokes next_wait_boundary_time(), advances to
-that boundary, and cannot silently spin at the same timestamp.
+All capacity and timing failures occur before the first mutation. Memory-only actions
+perform only their resolved release/marking at the current time. WAIT invokes
+next_wait_boundary_time(), advances to that boundary, and cannot silently spin at the
+same timestamp.
 
 
 ### Completion Commit
@@ -959,7 +1088,8 @@ after its final PP stage finishes. At final completion the engine:
 1. Moves reserved KV to committed KV without changing total occupied capacity.
 2. Charges each completed decode token by removing its reserved decode credit.
    Prefill completion has no credit to consume.
-3. Moves reserved request tokens to committed tokens and clears the batch backlink.
+3. Moves reserved request work to committed prefill/decode progress or restored
+   physical recompute progress, then clears the batch backlink.
 4. Transitions unfinished prefill back to WAITING_PREFILL.
 5. On prefill completion, records final prefill lateness, enters WAITING_DECODE, sets
    the first decode deadline, and mints the configured decode credits exactly once.
@@ -968,7 +1098,9 @@ after its final PP stage finishes. At final completion the engine:
 7. Naturally completes a finished decode request and releases all committed KV.
 8. Physically finalizes STOP_PENDING or DROP_PENDING after issued work drains,
    without returning it to WAITING_DECODE or assigning another deadline.
-9. Removes the batch from the bounded in-flight ring and reconciles objective totals.
+9. For PREEMPT_PENDING, performs the normal effects above, then releases all updated
+   KV and returns the request to its logical waiting phase with full reconstruction due.
+10. Removes the batch from the bounded in-flight ring and reconciles objective totals.
 
 An adversary stop charges no additional decode credit. A non-in-flight request stops
 immediately and cannot consume another token. An in-flight request becomes
@@ -1020,10 +1152,10 @@ fixed native structs later.
 ## fast_forward.py: Deterministic Internal Progression
 
 The fast-forward module does not own a simulator and does not implement another
-scheduler. It reuses raw controller action 0, which already means no eviction, zero
-prefill budget, and automatic inclusion of every feasible funded decode. The normal
-resolver therefore remains the only source of batching, sequence, KV, and credit
-legality.
+scheduler. It reuses raw controller action 0, which means no preemption, no eviction,
+zero prefill-class budget, and automatic inclusion of every feasible funded decode.
+The normal resolver therefore remains the only source of batching, sequence, KV, and
+credit legality.
 
 `fast_forward_decode_only_to_next_tick()` clones once unless the caller already owns
 the branch. It then repeats this bounded sequence:
@@ -1041,11 +1173,26 @@ reserved tokens, KV, and credit. Completion exactly on the tick is committed fir
 `advance_to()`, so the adversary sees the committed result. An empty terminal state
 jumps directly to the tick without invoking a predictor.
 
-Fast-forward deliberately yields without advancing when any prefill work is waiting or
-in flight. It also yields a controller state when stage 0 is free but a waiting decode
-cannot obtain its next KV block. That case may require a strategic terminal eviction,
-so it is not safe to hide from MCTS. The zero-time transition guard prevents an
-incorrect callback or turn cycle from spinning forever.
+Fast-forward deliberately yields without advancing when ordinary prefill or KV
+reconstruction is waiting/in flight, including reconstruction for a decode-phase
+request. It also yields a controller state when stage 0 is free but a waiting decode
+cannot obtain its next KV block. Those cases may require strategic eviction or
+preemption, so they are not safe to hide from MCTS. The zero-time transition guard
+prevents an incorrect callback or turn cycle from spinning forever.
+
+An explicit controller memory action is also an observable boundary. After any
+concrete eviction or resumable preemption, the virtual environment applies the KV,
+request, and optional batch effects but does not enter automatic decode fast-forward.
+This remains true when the same action automatically admits decode work. The resulting
+state is returned at the action timestamp so the adversary and then the controller can
+observe the new memory layout. The sole exception is a genuinely idle result with no
+nonterminal request and no in-flight batch; that state still jumps directly to the next
+adversary tick. Ordinary decode-only actions with no eviction/preemption retain the
+normal fast-forward behavior.
+
+This gameplay change advances the engine manifest contract to
+`gv4_engine_manifest_v7`. State, action, feature, and native-layout schema versions do
+not change because no serialized field or tensor shape changed.
 
 The timing callback contract is intentionally small:
 
@@ -1071,7 +1218,8 @@ The facade exposes the intended MCTS operations:
   action objects indexed by the fixed raw policy dimension plus a Boolean mask.
   Equivalent raw indices reference the same canonical edge.
 - `apply_controller_action_only()` obtains timing only for a real batch, delegates the
-  transition, and optionally invokes decode-only fast-forward.
+  transition, and optionally invokes decode-only fast-forward. Concrete eviction or
+  preemption suppresses that fast-forward unless the resulting system is fully idle.
 - `apply_adversary_action_only()` delegates launches and stops with the injected
   prefill estimate used to construct deadlines.
 - `evaluate_objective()` returns `(SLO violations, total cost)`.
@@ -1232,7 +1380,7 @@ committed/reserved semantics, followed by new GV4 aggregates.
 | `next_adversary_tick_delta` | `asinh((next_adversary_tick - now) / adversary_time_scale)`. Absolute simulator time is excluded. |
 | `logical_tokens_free_fraction` | Free logical KV tokens across replicas divided by `system_logical_tokens`. Each replica contributes its bottleneck free-block count, not a sum over mirrored ranks. |
 
-The six nonterminal lifecycle counts are separate features, each divided by
+The eight nonterminal lifecycle counts are separate features, each divided by
 `active_request_scale`:
 
 | Lifecycle feature | Requests counted |
@@ -1243,6 +1391,8 @@ The six nonterminal lifecycle counts are separate features, each divided by
 | `inflight_decode_count` | `INFLIGHT_DECODE` |
 | `stop_pending_count` | `STOP_PENDING` |
 | `drop_pending_count` | `DROP_PENDING` |
+| `inflight_recompute_count` | `INFLIGHT_RECOMPUTE` |
+| `preempt_pending_count` | `PREEMPT_PENDING` |
 
 Violation aggregates use only currently live requests. Historical terminal violations
 have already contributed transition reward and must not be counted again:
@@ -1258,6 +1408,8 @@ have already contributed transition reward and must not be counted again:
 | `inflight_decode_violation_fraction` | Violated `INFLIGHT_DECODE` requests divided by live request count. |
 | `stop_pending_violation_fraction` | Violated `STOP_PENDING` requests divided by live request count. |
 | `drop_pending_violation_fraction` | Violated `DROP_PENDING` requests divided by live request count. |
+| `inflight_recompute_violation_fraction` | Violated `INFLIGHT_RECOMPUTE` requests divided by live request count. |
+| `preempt_pending_violation_fraction` | Violated `PREEMPT_PENDING` requests divided by live request count. |
 
 ### Launch-History Rows
 
@@ -1290,14 +1442,16 @@ reserved work is encoded separately and is not treated as completed.
 | `decode_committed` | `committed_decode_tokens / request_decode_scale`. |
 | `decode_remaining` | `remaining_decode_tokens / request_decode_scale`. |
 | `committed_context` | Committed prefill plus decode divided by `request_prefill_scale + request_decode_scale`. |
+| `kv_computed_context` | Physical context currently represented by KV, divided by `request_prefill_scale + request_decode_scale`. |
+| `recompute_remaining` | Missing physical context, excluding reconstruction already in flight, divided by the combined request scale. |
 | `arrival_age` | `asinh((now - arrival_time) / launch_age_scale)`. |
 | `current_lateness` | For prefill, maximum of recorded lateness and current deadline overrun. For decode, accumulated prefill plus decode lateness. It uses `asinh(lateness / launch_age_scale)`; current signed deadline deltas remain separate. |
 | `prefill_deadline_delta` | `asinh((prefill_deadline - now) / launch_age_scale)`. Negative means overdue. |
 | `decode_deadline_present` | One when `next_decode_deadline` is set. |
 | `decode_deadline_delta` | `asinh((next_decode_deadline - now) / decode_token_slo_sec)` when present, otherwise zero. This avoids a hardcoded 0.05 seconds. |
 | `violated` | `violation_recorded` as zero or one. |
-| `lifecycle_one_hot` | Six positions for `WAITING_PREFILL`, `INFLIGHT_PREFILL`, `WAITING_DECODE`, `INFLIGHT_DECODE`, `STOP_PENDING`, and `DROP_PENDING`. |
-| `reserved_tokens` | Reserved prefill plus decode divided by `request_prefill_scale + request_decode_scale`. |
+| `lifecycle_one_hot` | Eight positions for the four normal waiting/in-flight phases, `STOP_PENDING`, `DROP_PENDING`, `INFLIGHT_RECOMPUTE`, and `PREEMPT_PENDING`. |
+| `reserved_tokens` | Reserved prefill, decode, and recompute work divided by `request_prefill_scale + request_decode_scale`. |
 | `partial_block_used_fraction` | Tokens used in the final owned block divided by `block_token_scale`; zero when there are no resident tokens. |
 | `tokens_until_next_block_fraction` | Tokens available in the partial block before another block is needed, divided by `block_token_scale`. |
 | `has_inflight_work` | One when `inflight_microbatch_id != NO_ID`. The numeric ID is excluded. |
@@ -1305,6 +1459,7 @@ reserved work is encoded separately and is not treated as completed.
 | `pipeline_wait_or_transfer` | One when the request is in flight but no PP stage is executing it, such as before stage 0 or during an inter-stage wait/transfer. |
 | `inflight_prefill_tokens` | `reserved_prefill_tokens / request_prefill_scale`. |
 | `inflight_decode_token` | `reserved_decode_tokens`, which must be zero or one. |
+| `inflight_recompute_tokens` | Reserved reconstruction divided by `request_prefill_scale + request_decode_scale`. |
 | `pending_stop` | One for `STOP_PENDING`. |
 | `pending_drop` | One for `DROP_PENDING`. |
 | `pending_termination_age` | `asinh((now - terminal_requested_at) / lateness_scale)` for pending states, otherwise zero. |
@@ -1350,12 +1505,16 @@ The model sees current placement and composition, not the future calendar.
 | `waiting_or_transfer` | One when the batch is in flight but currently executing on no stage. |
 | `prefill_request_count` | Prefill allocations divided by `active_request_scale`. |
 | `decode_request_count` | Decode allocations divided by `active_request_scale`. |
+| `recompute_request_count` | Reconstruction allocations divided by `active_request_scale`. |
 | `prefill_tokens` | Total batch prefill tokens divided by `system_prefill_scale`. |
 | `decode_tokens` | Total batch decode tokens divided by `system_decode_scale`. |
+| `recompute_tokens` | Total reconstruction divided by `system_prefill_scale`. |
 | `prefill_reserved_kv_blocks` | New blocks for prefill allocations divided by `system_logical_blocks`. |
 | `decode_reserved_kv_blocks` | New blocks for decode allocations divided by `system_logical_blocks`. |
+| `recompute_reserved_kv_blocks` | New blocks for reconstruction divided by `system_logical_blocks`. |
 | `violated_prefill_request_count` | Violated prefill allocations divided by `active_request_scale`. |
 | `violated_decode_request_count` | Violated decode allocations divided by `active_request_scale`. |
+| `violated_recompute_request_count` | Violated reconstruction allocations divided by `active_request_scale`. |
 
 The row excludes stage ready/start/finish arrays, final completion time, action
 indices, and microbatch ID. Hidden calendar times may only be used to derive current
@@ -1369,31 +1528,39 @@ Raw aliases must map to the same feature object.
 
 | Header feature | Definition and normalization |
 | --- | --- |
-| `transition_kind_one_hot` | Three positions for `WAIT`, `EVICT_ONLY`, and `BATCH`. |
+| `transition_kind_one_hot` | Five positions for `WAIT`, `EVICT_ONLY`, `BATCH`, `PREEMPT_ONLY`, and `EVICT_AND_PREEMPT`. |
 | `evicted_prefill_count` | Evicted prefills divided by `active_request_scale`. |
 | `evicted_decode_count` | Evicted decodes divided by `active_request_scale`. |
+| `preempted_prefill_count` | Concrete prefill-phase victims divided by `active_request_scale`. |
+| `preempted_decode_count` | Concrete decode-phase victims divided by `active_request_scale`. |
+| `preempted_inflight_count` | PREEMPT_PENDING victims divided by `active_request_scale`. |
 | `decode_request_count` | Decode allocations divided by `active_request_scale`. |
 | `total_allocated_prefill_tokens` | Total prefill allocation divided by `controller_prefill_action_scale`. |
+| `total_allocated_recompute_tokens` | Total reconstruction allocation divided by `controller_prefill_action_scale`. |
 
-One affected-request row is emitted for every prefill allocation and every evicted
-request:
+One affected-request row is emitted for every prefill/recompute allocation and every
+evicted or preempted request:
 
 | Affected-request feature | Definition and normalization |
 | --- | --- |
 | `allocated_prefill` | One when this request receives prefill work. |
+| `allocated_recompute` | One when this request rebuilds previously committed context. |
 | `evicted` | One when it is evicted. It cannot also be allocated by the same canonical edge. |
+| `preempted` | One when it is selected for resumable KV release. It cannot also be allocated by the same edge. |
 | `allocated_prefill_tokens` | Allocation divided by `controller_prefill_action_scale`; zero for eviction-only rows. |
+| `allocated_recompute_tokens` | Reconstruction divided by `controller_prefill_action_scale`; zero for other rows. |
 | `remaining_prefill_tokens` | Parent remaining prefill divided by `request_prefill_scale`. |
+| `remaining_recompute_tokens` | Parent missing physical context divided by `request_prefill_scale + request_decode_scale`. |
 | `total_prefill_tokens` | Original prefill divided by `request_prefill_scale`. |
 | `arrival_age` | Same transformation as the state request row. |
 | `current_lateness` | Same transformation as the state request row. |
 | `violated` | Parent request violation flag. |
 | `new_reserved_kv_blocks` | Required blocks divided by `ceil(controller_prefill_action_scale / block_token_scale)`; zero for eviction rows. |
-| `already_inflight` | Parent in-flight flag. It must be zero for allocated prefills and legal evictions under the current contract, so it also serves as an invariant check. |
+| `already_inflight` | Parent in-flight flag. It is zero for allocations and terminal evictions, but may be one for a deferred preemption victim. |
 
-Features describe physical allocations and evictions. They do not encode the
-representative eviction-rule name, budget label, ordering heuristic, raw index,
-canonical index, or alias count. Different raw labels producing the same
+Features describe physical allocations, evictions, and preemptions. They do not encode
+the symbolic victim-rule name, budget label, ordering heuristic, raw index, canonical
+index, or alias count. Different raw labels producing the same
 `ResolvedControllerAction.canonical_key` are one policy edge.
 
 Vidur service times, PP communication times, predicted stage-free times, and batch
@@ -1416,9 +1583,11 @@ Launch prefill size is mandatory. Launch count alone aliases, for example, one
 128-token request with one 4096-token request even though they create different
 states and SLOs.
 
-The current GV4 adversary cannot stop prefill requests. It selects only
-`WAITING_DECODE` and `INFLIGHT_DECODE` targets. A `stopped_prefill_count` would
-therefore be permanently zero and is omitted unless game semantics change first.
+The current GV4 adversary cannot stop prefill-phase requests. It can select ordinary
+waiting/in-flight decodes and decode-phase reconstruction/preempt-pending requests.
+Every in-flight target becomes STOP_PENDING, which supersedes deferred preemption and
+still lets admitted work drain. A `stopped_prefill_count` would therefore be
+permanently zero and is omitted unless game semantics change first.
 
 Stop count alone can alias actions that stop different decode requests. The
 implemented adversary representation therefore includes one affected-request row
@@ -1463,17 +1632,17 @@ The dimensions are topology-dependent only through the PP stage count `P`:
 
 | Matrix/vector | Width |
 | --- | ---: |
-| Global state | 27 |
-| Request row | `30 + P` |
+| Global state | 31 |
+| Request row | `35 + P` |
 | Launch row | 3 |
 | Replica row | `7 + P` |
-| Microbatch row | `9 + P` |
-| Controller action header | 7 |
-| Controller affected-request row | 10 |
+| Microbatch row | `13 + P` |
+| Controller action header | 13 |
+| Controller affected-request row | 14 |
 | Adversary action header | 5 |
 | Adversary affected-request row | 9 |
 
-Thus TP2/PP2 uses widths 27, 32, 3, 9, and 11 for the five state components.
+Thus TP2/PP2 uses widths 31, 37, 3, 9, and 15 for the five state components.
 TP affects KV capacities and normalized state values through the resolved config;
 it does not add one-hot rank IDs.
 
@@ -1520,11 +1689,13 @@ inference, replay serialization, and Python/native parity fixtures.
 
 ### Schema Freeze and Parity Requirements
 
-The initial Python reference uses `layout.feature_schema_version` (currently
-`gv4_markov_v3`) and `WORKLOAD_WINDOW_MULTIPLIER = 20`. The unavailable
-`age_since_prefill_completion` feature is omitted rather than reconstructed from a
-changing decode deadline. Adding that feature later requires authoritative runtime
-state plus a schema-version bump.
+The Python/native reference uses `layout.feature_schema_version` (currently
+`gv4_markov_v5`) and `WORKLOAD_WINDOW_MULTIPLIER = 20`. Version 5 adds
+PREEMPT_PENDING state plus preemption/recompute action and microbatch features while
+retaining deterministic row ordering. The
+unavailable `age_since_prefill_completion` feature is omitted rather than reconstructed
+from a changing decode deadline. Adding that feature later requires authoritative
+runtime state plus a schema-version bump.
 
 Native extraction is accepted only after the same samples produce identical row
 counts, replica offsets, ordering, categorical bits, and float values within a
@@ -1720,14 +1891,18 @@ the moment this path was logged.
 | `mcts_canonical_action_index` | Parent MCTS edge key, equal to the row's scalar `canonical_action_index`. |
 | `resolver_canonical_action_index` | Resolver's compact canonical ordinal, equal to the row's scalar field of the same name. |
 | `alias_indices` | Raw indices with identical physical effects. |
-| `replica_id` | Replica on which eviction/admission was resolved. |
+| `replica_id` | Replica on which memory effects and admission were resolved. |
+| `preemption_rule` | Raw resumable-preemption policy before its single concrete victim was resolved. |
 | `eviction_rule` | Raw controller eviction rule selected before concrete targets were resolved. |
-| `prefill_budget` | Maximum prefill tokens requested by this action. Decode tokens are scheduled independently and do not consume this budget. |
-| `ordering_heuristic` | Prefill ordering rule, such as SJF, EDF, LJF, or LST. |
-| `transition_kind` | `WAIT`, `EVICT_ONLY`, or `BATCH`. A `BATCH` may contain prefill, decode, or both across different requests. |
+| `prefill_budget` | Maximum ordinary prefill plus recompute tokens requested by this action. Decode tokens are scheduled independently. |
+| `ordering_heuristic` | Shared prefill/recompute ordering rule, such as SJF, EDF, LJF, or LST. |
+| `transition_kind` | `WAIT`, `EVICT_ONLY`, `BATCH`, `PREEMPT_ONLY`, or `EVICT_AND_PREEMPT`. A BATCH may also carry memory effects. |
 | `evicted_request_ids` | Concrete request IDs selected by the eviction rule. |
-| `allocations` | Ordered list of concrete per-request work included in the admitted batch. It is empty for `WAIT`/`EVICT_ONLY`. |
-| `released_kv_blocks` | Logical committed blocks released by the action's evictions. |
+| `preempted_request_ids` | Zero or one concrete request selected for resumable preemption. |
+| `pending_preemption_request_ids` | The selected victim when it was in flight and must drain before releasing KV; otherwise empty. |
+| `allocations` | Ordered list of concrete per-request work included in the admitted batch. It is empty for memory-only and WAIT transitions. |
+| `released_kv_blocks` | Logical blocks released immediately by terminal evictions plus waiting preemptions. Deferred victim blocks are excluded. |
+| `preempted_kv_blocks` | Immediate-release portion attributable only to waiting preemption. |
 | `reserved_kv_blocks` | New logical blocks reserved for the action's batch allocations. Existing partially occupied blocks do not appear as new blocks. |
 | `rank_kv_delta` | List of `[rank_id, net_block_delta]`, where the net delta is newly reserved blocks minus blocks released on that mirrored rank. |
 
@@ -1738,6 +1913,7 @@ Each object inside `allocations` has:
 | `request_id` | Request receiving work in this batch. |
 | `prefill_tokens` | Prefill tokens reserved for the request; zero for decode work. |
 | `decode_tokens` | Decode tokens reserved for the request; zero for prefill work and at most one in GV4 v1. |
+| `recompute_tokens` | Previously committed context rebuilt by this allocation; zero for new prefill/decode work. |
 | `new_kv_blocks` | Additional logical KV blocks needed for this allocation after reusing blocks already owned by the request. |
 
 #### `incoming_action_json` for an Adversary Edge
@@ -1767,7 +1943,7 @@ those lists.
 | Column | Exact meaning |
 | --- | --- |
 | `completed_count` | Number of request objects in `completed_requests_json`. |
-| `in_progress_count` | Number in `in_progress_requests_json`. This includes waiting, in-flight, `STOP_PENDING`, and `DROP_PENDING`. |
+| `in_progress_count` | Number in `in_progress_requests_json`. This includes waiting, in-flight, `PREEMPT_PENDING`, `STOP_PENDING`, and `DROP_PENDING`. |
 | `evicted_count` | Number in `evicted_requests_json`. Despite the historical column name, this includes every terminal `DROPPED` request; inspect `terminal_reason` to distinguish controller eviction from automatic SLO drop. |
 | `stopped_count` | Number in `stopped_requests_json`. `STOP_PENDING` remains in progress until its final batch drains. |
 | `completed_requests_json` | JSON list whose members have lifecycle `COMPLETED`. |
@@ -1796,7 +1972,11 @@ All four JSON columns use the same request-object schema:
 | `reserved_decode_tokens` | Decode tokens already in flight. GV4 v1 permits at most one per request. |
 | `remaining_decode_tokens` | `original_decode_tokens - committed_decode_tokens - reserved_decode_tokens`. |
 | `total_committed_tokens` | Committed prefill plus committed decode tokens. |
-| `resident_tokens` | Committed plus reserved prefill/decode tokens. For a nonterminal request this is the logical token occupancy that KV blocks must cover. Terminal rows retain it as historical progress even though their KV blocks are released. |
+| `logical_context_tokens` | Committed prefill plus committed decode tokens. This progress survives preemption. |
+| `kv_computed_tokens` | Logical context tokens whose KV is currently computed and resident on the replica. Preemption resets this to zero. |
+| `reserved_recompute_tokens` | Missing context currently being rebuilt by an in-flight recovery batch. |
+| `remaining_recompute_tokens` | Logical context still absent from physical KV after accounting for in-flight recovery. |
+| `resident_tokens` | Physical KV tokens: computed KV plus reserved recompute, prefill, and decode tokens. It becomes zero immediately after preemption. |
 | `committed_kv_blocks` | Logical KV blocks permanently owned by currently committed request context. Zero after terminal release. |
 | `reserved_kv_blocks` | Additional logical blocks reserved for in-flight work but not yet committed. |
 | `inflight_microbatch_id` | Microbatch currently carrying this request, or JSON `null`. |
@@ -1859,7 +2039,8 @@ Each value inside `request_tokens` has:
 | --- | --- |
 | `prefill_tokens` | Prefill tokens for this request in the microbatch. |
 | `decode_tokens` | Decode tokens for this request in the microbatch. |
-| `total_tokens` | Sum of the two values; one request cannot have both kinds in one batch. |
+| `recompute_tokens` | Previously committed context tokens whose evicted KV is being rebuilt. |
+| `total_tokens` | Sum of the three values; exactly one work kind is positive per request allocation. |
 
 All PP stages carry the same microbatch allocations, but each stage has its own ready,
 start, finish, and status. Keeping all in-flight calendars is necessary even though
@@ -1888,7 +2069,7 @@ request block is counted once in aggregate columns rather than four times.
 | `total_consumed_blocks` | Sum of logical committed block ownership over replicas. `consumed` and `committed` mean the same thing in this CSV. |
 | `total_reserved_blocks` | Sum of logical blocks reserved for in-flight work but not yet committed. |
 | `total_occupied_blocks` | `total_consumed_blocks + total_reserved_blocks`. |
-| `total_tokens_in_memory` | Sum of `resident_tokens` for nonterminal assigned requests, counted once per request rather than once per rank. It includes committed and in-flight reserved tokens. |
+| `total_tokens_in_memory` | Sum of physical `resident_tokens` for nonterminal assigned requests, counted once per request rather than once per rank. It excludes preempted logical context until recomputation is reserved/completed. |
 | `total_available_tokens` | `total_capacity_blocks * block_size_tokens - total_tokens_in_memory`. This includes unused slots inside request-owned partial blocks, so it is a geometry diagnostic rather than a promise that all slots can be reassigned to arbitrary requests. |
 | `total_free_block_token_slots` | `total_available_blocks * block_size_tokens`. This counts only wholly free logical blocks and excludes slack inside occupied blocks. |
 
@@ -1909,7 +2090,7 @@ The file creates `rank_<rank_id>_json` for every configured GPU rank. Each objec
 | `consumed_blocks` | Committed block ownership mirrored onto this rank. |
 | `reserved_blocks` | In-flight block reservations mirrored onto this rank. |
 | `occupied_blocks` | `consumed_blocks + reserved_blocks`. |
-| `resident_tokens` | Logical resident-token total of this rank's replica. It is intentionally repeated on every rank because every PP/TP rank must hold its portion of the same request contexts. |
+| `resident_tokens` | Physical resident-token total of this rank's replica. It is intentionally repeated on every rank because every PP/TP rank must hold its portion of the same resident contexts. |
 | `capacity_token_slots` | `capacity_blocks * block_size_tokens`. |
 | `available_token_slots` | `capacity_token_slots - resident_tokens`, including slack in partial blocks. |
 | `free_block_token_slots` | `available_blocks * block_size_tokens`, counting only fully free blocks. |
@@ -2006,6 +2187,10 @@ The environment/fast-forward suite covers:
 - active prefill disabling decode fast-forward;
 - KV-blocked decode yielding a controller decision instead of hiding eviction;
 - PP stage-0 release admitting a second batch while earlier work is downstream;
+- preemption with no decode retaining the exact controller-action timestamp;
+- eviction plus an admitted decode batch remaining visible at that timestamp;
+- fully idle eviction still jumping to the next adversary tick;
+- ordinary decode-only actions retaining automatic fast-forward;
 - raw/canonical action sampling, parent/child isolation, and occupied-stage WAIT.
 
 The MCTS integration suite covers:
@@ -2179,15 +2364,17 @@ request_tests.py checks:
 1. Completed, in-progress, dropped/evicted, and stopped JSON lists form a disjoint
    partition and match lifecycle membership.
 2. Request IDs remain contiguous and append-only.
-3. Committed plus reserved prefill/decode never exceeds original work.
-4. Decode never begins before full prefill completion.
-5. At most one decode token is reserved per request per batch.
-6. Logged prefill/decode phase follows remaining and reserved work.
+3. Committed plus reserved prefill/decode never exceeds original work, and physical
+   computed plus reserved reconstruction never exceeds logical context.
+4. New prefill/decode never begins while reconstruction remains.
+5. At most one decode token is reserved per request per batch, and exactly one work
+   kind is reserved for each in-flight request.
+6. Logged logical prefill/decode phase remains stable while KV is reconstructed.
 7. Every request uses the configured maximum 864-token decode bound.
 8. Available plus reserved plus committed decode tokens equals 216 times the number
    of requests that minted credit.
-9. Zero available credit leaves no WAITING_DECODE or INFLIGHT_DECODE; the final
-   issued token may remain only as STOP_PENDING until its batch drains.
+9. Zero available credit leaves no active decode, including decode-phase reconstruction
+   or preempt-pending work; the final issued token may remain STOP_PENDING while it drains.
 10. Every adversary raw index decodes to the logged launch count, template, and stop
     rule.
 11. Longest, shortest, 216-threshold, and 512-threshold stop targets are recomputed
@@ -2197,21 +2384,27 @@ request_tests.py checks:
     WAITING_PREFILL, and receive the profile-derived prefill deadline.
 14. Waiting stop targets become STOPPED; in-flight decode targets become
     STOP_PENDING.
-15. Every controller raw index decodes to the logged eviction rule, prefill budget,
-    and ordering heuristic.
+15. Every controller raw index decodes to the logged preemption rule, eviction rule,
+    shared prefill-class budget, and ordering heuristic.
 16. Every eviction rule independently recomputes its target from parent waiting
     requests, deadlines, progress, and lateness.
-17. Batch request IDs are sorted/unique and obey token and sequence limits.
-18. Prefill allocation is no larger than the selected prefill budget.
-19. A zero prefill budget forbids prefill but may still schedule decode. The budget
-    is a cap, not unconditional equality, because remaining work or KV can be lower.
-20. Every allocation targets an existing waiting request in the matching phase.
-21. New KV blocks equal the request's exact post-allocation ceiling demand.
-22. Transition kind is BATCH, EVICT_ONLY, or WAIT according to concrete effects.
-23. Reserved/released aggregate blocks equal allocation and eviction records.
-24. Evicted requests become terminal DROPPED records.
-25. If the new batch remains visible, child request reservations and in-flight ID
-    exactly match the controller allocation.
+17. A preemption selects at most one resident request, never overlaps an eviction,
+    and identifies an in-flight target exactly as pending.
+18. Batch request IDs are sorted/unique and obey token and sequence limits.
+19. Ordinary prefill plus recomputation is no larger than the selected shared budget.
+20. A zero prefill budget forbids both prefill-class kinds but may still schedule
+    decode. The budget is a cap because remaining work or KV can be lower.
+21. Every allocation targets an existing waiting request in the matching logical and
+    reconstruction phase.
+22. New KV blocks equal the request's exact post-allocation ceiling demand.
+23. All five transition kinds agree with concrete batch/eviction/preemption effects.
+24. Reserved/released block totals include immediate preemption but exclude deferred
+    in-flight release.
+25. Evicted requests become terminal DROPPED records; immediate preemption preserves
+    logical progress with zero physical KV, while visible in-flight victims become
+    PREEMPT_PENDING.
+26. If the new batch remains visible, child prefill/decode/recompute reservations and
+    the in-flight ID exactly match the controller allocation.
 
 ### KV-Cache Tests
 
@@ -2231,6 +2424,26 @@ kv_cache_tests.py independently recomputes:
    same time or the newly admitted batch remains visible.
 10. WAIT or fast-forward edges are not falsely treated as action-only deltas; their
     node-level ledgers are still checked completely after all intervening commits.
+
+The focused `kv_ledger_test.py` and `action_transition_test.py` coverage additionally
+verifies the complete preemption contract:
+
+1. Preemption releases the same logical block count on every rank while preserving
+   request progress, deadlines, lateness, violation state, and decode-credit state.
+2. A preempted request reports zero physical resident tokens and the full logical
+   context as missing recomputation.
+3. Ordinary prefill/decode allocation is rejected while context is missing.
+4. Recomputation can complete across multiple pipeline batches, restores physical KV,
+   and never changes useful token progress or consumes/mints decode credit.
+5. All four deterministic victim rules choose the expected single request.
+6. Recomputation and ordinary prefill share one SJF queue and one action budget while
+   retaining distinct allocation fields.
+7. In-flight prefill and decode work commits lateness/credit effects before release.
+8. In-flight reconstruction commits physically, is then discarded, and restarts the
+   full updated logical-context recovery.
+9. Disabling request_preemption_enabled masks preemption effects.
+10. Python and native engines produce identical state/action results for primitive,
+    immediate, deferred, and mixed recovery cases.
 
 ### Pipeline and Vidur Timing Tests
 
@@ -2358,11 +2571,11 @@ The source is split by responsibility:
 - `include/gv4/state.hpp` and `src/state.cpp` hold requests, replicas,
   microbatches, launch history, decode credit, objective state, and validation.
 - `src/action_resolver.cpp` reproduces GV4 raw-action expansion,
-  canonicalization, aliasing, scheduling heuristics, KV feasibility, and stop or
-  eviction target selection.
-- `src/engine.cpp` owns controller/adversary transitions, completion commits,
-  decode-credit exhaustion, adversary tick replay, fast-forward, KV updates,
-  and compact PP-calendar advancement.
+  canonicalization, aliasing, shared prefill/recompute scheduling, KV feasibility,
+  and stop, eviction, or four-policy preemption target selection.
+- `src/engine.cpp` owns controller/adversary transitions, immediate/deferred
+  preemption, completion commits, reconstruction, decode-credit exhaustion,
+  adversary tick replay, fast-forward, KV updates, and compact PP advancement.
 - `src/features.cpp` builds the same structured state and action tensors as the
   Python GV4 feature builder. The permanent parity test compares every float32
   byte and every ragged offset.
@@ -2404,11 +2617,12 @@ Each trajectory follows these steps:
    seeding.
 5. Apply the action through the normal native environment. Record
    `parent_cost-child_cost` and the standard elapsed-time discount.
-6. Continue until state time reaches or passes the fixed deadline, no legal
-   action remains, or `rollout_max_actions` detects a zero-time loop.
-7. Use zero bootstrap by default. With `use_model_bootstrap=true`, query the
-   value model for the final state and reject non-finite or positive
-   controller-valued output.
+6. Continue until state time reaches or passes the fixed deadline, no legal action
+   remains, or `rollout_max_actions` is reached. Because preemption is legal without
+   memory pressure, the cap is a valid truncation boundary rather than an exception.
+7. Bootstrap the reached state, including an action-capped state. Use zero by default;
+   with `use_model_bootstrap=true`, query the value model and reject non-finite or
+   positive controller-valued output.
 8. Compose the trajectory backward as
    `reward + discount * continuation`, then average all trajectory returns and
    back up that mean through the MCTS path.
@@ -2442,6 +2656,8 @@ spaces and transitions. `GV4_Cpp/tests/test_mcts_feature_parity.py` checks:
    first action-history hash, root visits, value sums, and best action.
 6. Policy-guided rollouts can use both controller/adversary policy models and
    final-state value bootstrap.
+7. Resolved preemption fields, immediate release, PREEMPT_PENDING drain, and mixed
+   reconstruction/prefill batches match Python exactly.
 
 The fixed seeded parity case produced four trajectories, eight internal actions,
 and first-history hash `84696351` identically in Python and C++. Repeated native

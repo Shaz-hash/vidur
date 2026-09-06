@@ -451,24 +451,37 @@ class VidurTimingProvider:
                 raise VidurTimingProviderError(
                     "batch contains a request from another replica"
                 )
-            if request.reserved_prefill_tokens or request.reserved_decode_tokens:
+            if (
+                request.reserved_prefill_tokens
+                or request.reserved_decode_tokens
+                or request.reserved_recompute_tokens
+            ):
                 raise VidurTimingProviderError(
                     "in-flight request cannot enter another batch"
                 )
 
-            is_decode = allocation.decode_tokens > 0
-            if is_decode != (
-                request.committed_prefill_tokens == request.original_prefill_tokens
-            ):
-                raise VidurTimingProviderError(
-                    "allocation phase disagrees with request progress"
-                )
+            if allocation.recompute_tokens:
+                if allocation.recompute_tokens > request.remaining_recompute_tokens:
+                    raise VidurTimingProviderError(
+                        "recompute allocation exceeds missing KV context"
+                    )
+                processed = request.kv_computed_tokens
+                is_decode = False
+            else:
+                if request.remaining_recompute_tokens:
+                    raise VidurTimingProviderError(
+                        "new work requires fully reconstructed KV context"
+                    )
+                is_decode = allocation.decode_tokens > 0
+                if is_decode != request.is_decode_phase:
+                    raise VidurTimingProviderError(
+                        "allocation phase disagrees with request progress"
+                    )
+                processed = request.logical_context_tokens
 
-            processed = (
-                request.committed_prefill_tokens + request.committed_decode_tokens
-            )
             shape.append((processed, allocation.total_tokens, is_decode))
-            prefill_square_sum += allocation.prefill_tokens**2
+            prefill_tokens = allocation.prefill_tokens + allocation.recompute_tokens
+            prefill_square_sum += prefill_tokens**2
 
         max_chunk = predictor.prediction_max_prefill_chunk_size
         if prefill_square_sum > max_chunk * max_chunk:

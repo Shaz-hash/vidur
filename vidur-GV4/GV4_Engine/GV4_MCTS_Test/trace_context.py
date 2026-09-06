@@ -137,19 +137,29 @@ class TraceNode:
                 prefill_tokens=int(item["prefill_tokens"]),
                 decode_tokens=int(item["decode_tokens"]),
                 new_kv_blocks=int(item["new_kv_blocks"]),
+                recompute_tokens=int(item.get("recompute_tokens", 0)),
             )
             for item in payload["allocations"]
         )
         return ResolvedControllerAction(
             raw_action_index=int(payload["raw_action_index"]),
             replica_id=int(payload["replica_id"]),
+            preemption_rule=str(payload.get("preemption_rule", "preempt_none")),
             eviction_rule=str(payload["eviction_rule"]),
             prefill_budget=int(payload["prefill_budget"]),
             ordering_heuristic=str(payload["ordering_heuristic"]),
             transition_kind=ControllerTransitionKind[payload["transition_kind"]],
             evicted_request_ids=tuple(int(value) for value in payload["evicted_request_ids"]),
+            preempted_request_ids=tuple(
+                int(value) for value in payload.get("preempted_request_ids", ())
+            ),
+            pending_preemption_request_ids=tuple(
+                int(value)
+                for value in payload.get("pending_preemption_request_ids", ())
+            ),
             allocations=allocations,
             released_kv_blocks=int(payload["released_kv_blocks"]),
+            preempted_kv_blocks=int(payload.get("preempted_kv_blocks", 0)),
             reserved_kv_blocks=int(payload["reserved_kv_blocks"]),
             rank_kv_delta=tuple(
                 (int(rank_id), int(delta)) for rank_id, delta in payload["rank_kv_delta"]
@@ -268,6 +278,7 @@ class TraceNode:
                         prefill_tokens=int(work["prefill_tokens"]),
                         decode_tokens=int(work["decode_tokens"]),
                         new_kv_blocks=new_blocks,
+                        recompute_tokens=int(work.get("recompute_tokens", 0)),
                     )
                 )
             batches.append(
@@ -346,6 +357,8 @@ def _request_state(payload: dict[str, Any]) -> RequestState:
         terminal_reason=TerminalReason[payload["terminal_reason"]],
         terminal_requested_at=_optional_time(payload["terminal_requested_at"]),
         terminal_time=_optional_time(payload["completion_time"]),
+        kv_computed_tokens=int(payload.get("kv_computed_tokens", NO_ID)),
+        reserved_recompute_tokens=int(payload.get("reserved_recompute_tokens", 0)),
     )
 
 

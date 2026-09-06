@@ -13,25 +13,37 @@ namespace gv4 {
 
 using PrefillTimeEstimator = std::function<double(int)>;
 
-enum class ControllerTransitionKind : int { Wait = 0, EvictOnly = 1, Batch = 2 };
+enum class ControllerTransitionKind : int {
+    Wait = 0,
+    EvictOnly = 1,
+    Batch = 2,
+    PreemptOnly = 3,
+    EvictAndPreempt = 4,
+};
 
 [[nodiscard]] const char* transition_kind_name(ControllerTransitionKind kind);
 
 struct ResolvedControllerAction {
     int raw_action_index = 0;
     int replica_id = 0;
+    std::string preemption_rule;
     std::string eviction_rule;
     int prefill_budget = 0;
     std::string ordering_heuristic;
     ControllerTransitionKind transition_kind = ControllerTransitionKind::Wait;
     std::vector<int> evicted_request_ids;
+    std::vector<int> preempted_request_ids;
+    std::vector<int> pending_preemption_request_ids;
     std::vector<BatchAllocation> allocations;
     int released_kv_blocks = 0;
+    int preempted_kv_blocks = 0;
     int reserved_kv_blocks = 0;
     std::vector<std::pair<int, int>> rank_kv_delta;
 
     [[nodiscard]] int total_prefill_tokens() const;
     [[nodiscard]] int total_decode_tokens() const;
+    [[nodiscard]] int total_recompute_tokens() const;
+    [[nodiscard]] int total_prefill_class_tokens() const;
     [[nodiscard]] bool same_effect(const ResolvedControllerAction& other) const;
 };
 

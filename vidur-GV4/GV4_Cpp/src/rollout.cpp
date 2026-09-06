@@ -394,9 +394,8 @@ double UniformMCTS::one_rollout(
         ++rollout_stats_.actions;
         player = state.next_player;
     }
-    if (action_count == config_.rollout_max_actions && state.now < target_time) {
-        throw std::runtime_error("rollout exceeded rollout_max_actions");
-    }
+    // Always-legal preemption can produce several zero-time memory actions.
+    // Hitting the action cap is a valid rollout truncation; bootstrap here.
 
     double value = bootstrap_value(state, player);
     ++rollout_stats_.bootstrap_calls;

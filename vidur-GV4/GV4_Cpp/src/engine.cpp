@@ -79,7 +79,7 @@ void prune_launch_history(State& state, const Config& config, double at_time) {
         state.launch_history.end());
 }
 
-void release_request_blocks(State& state, RequestState& request) {
+int release_request_blocks_unchecked(State& state, RequestState& request) {
     if (request.has_inflight_work() || request.reserved_kv_blocks != 0) {
         throw std::logic_error("cannot release in-flight or reserved request KV");
     }
@@ -89,6 +89,8 @@ void release_request_blocks(State& state, RequestState& request) {
         value -= released;
     }
     request.committed_kv_blocks = 0;
+    request.kv_computed_tokens = 0;
+    return released;
 }
 
 void release_and_finish(
@@ -100,7 +102,7 @@ void release_and_finish(
     if (request.has_inflight_work()) {
         throw std::logic_error("cannot physically remove in-flight request");
     }
-    release_request_blocks(state, request);
+    release_request_blocks_unchecked(state, request);
     request.lifecycle = lifecycle;
     request.terminal_reason = reason;
     request.terminal_time = at_time;
@@ -142,11 +144,35 @@ void mark_stop(
     }
 }
 
+int mark_preempt(State& state, RequestState& request) {
+    if (is_terminal(request.lifecycle) ||
+        request.lifecycle == RequestLifecycle::StopPending ||
+        request.lifecycle == RequestLifecycle::DropPending ||
+        request.lifecycle == RequestLifecycle::PreemptPending) {
+        throw std::logic_error("request cannot be preempted in this lifecycle");
+    }
+    if (request.has_inflight_work()) {
+        request.lifecycle = RequestLifecycle::PreemptPending;
+        return 0;
+    }
+    const int released = preempt_request_blocks(state, request);
+    request.lifecycle = request.is_decode_phase()
+        ? RequestLifecycle::WaitingDecode
+        : RequestLifecycle::WaitingPrefill;
+    return released;
+}
+
 void stop_decodes_after_credit_exhaustion(State& state, double at_time) {
     if (state.decode_credits_available != 0) return;
     for (auto& request : state.requests) {
         if (request.lifecycle == RequestLifecycle::WaitingDecode ||
-            request.lifecycle == RequestLifecycle::InflightDecode) {
+            request.lifecycle == RequestLifecycle::InflightDecode ||
+            (request.lifecycle == RequestLifecycle::InflightRecompute &&
+             request.is_decode_phase()) ||
+            (request.lifecycle == RequestLifecycle::PreemptPending &&
+             (request.reserved_decode_tokens > 0 ||
+              (request.reserved_recompute_tokens > 0 &&
+               request.is_decode_phase())))) {
             mark_stop(state, request, at_time, TerminalReason::DecodeCreditExhausted);
         }
     }
@@ -200,10 +226,14 @@ void complete_microbatch(State& state, const Config& config, int microbatch_id) 
     for (const auto& allocation : batch.allocations) {
         auto& request = state.request(allocation.request_id);
         const RequestLifecycle pending_lifecycle = request.lifecycle;
+        const bool preempt_after_completion =
+            pending_lifecycle == RequestLifecycle::PreemptPending;
         request.committed_prefill_tokens += allocation.prefill_tokens;
         request.reserved_prefill_tokens -= allocation.prefill_tokens;
         request.committed_decode_tokens += allocation.decode_tokens;
         request.reserved_decode_tokens -= allocation.decode_tokens;
+        request.kv_computed_tokens += allocation.total_tokens();
+        request.reserved_recompute_tokens -= allocation.recompute_tokens;
         request.inflight_microbatch_id = kNoId;
 
         if (pending_lifecycle == RequestLifecycle::DropPending) {
@@ -224,7 +254,11 @@ void complete_microbatch(State& state, const Config& config, int microbatch_id) 
             continue;
         }
 
-        if (allocation.prefill_tokens > 0) {
+        if (allocation.recompute_tokens > 0) {
+            request.lifecycle = request.is_decode_phase()
+                ? RequestLifecycle::WaitingDecode
+                : RequestLifecycle::WaitingPrefill;
+        } else if (allocation.prefill_tokens > 0) {
             if (request.remaining_prefill_tokens() > 0) {
                 request.lifecycle = RequestLifecycle::WaitingPrefill;
             } else {
@@ -258,6 +292,17 @@ void complete_microbatch(State& state, const Config& config, int microbatch_id) 
                 finish_naturally(state, request, completion_time);
             }
         }
+
+        if (preempt_after_completion) {
+            if (is_terminal(request.lifecycle)) {
+                throw std::logic_error(
+                    "naturally completed request remained preempt-pending");
+            }
+            static_cast<void>(preempt_request_blocks(state, request));
+            request.lifecycle = request.is_decode_phase()
+                ? RequestLifecycle::WaitingDecode
+                : RequestLifecycle::WaitingPrefill;
+        }
     }
 
     auto& batches = state.replica.inflight_microbatches;
@@ -275,7 +320,12 @@ void complete_microbatch(State& state, const Config& config, int microbatch_id) 
 void apply_automatic_drops(State& state, const Config& config, double at_time) {
     for (auto& request : state.requests) {
         if (request.lifecycle == RequestLifecycle::WaitingPrefill ||
-            request.lifecycle == RequestLifecycle::InflightPrefill) {
+            request.lifecycle == RequestLifecycle::InflightPrefill ||
+            (request.lifecycle == RequestLifecycle::InflightRecompute &&
+             !request.is_decode_phase()) ||
+            (request.lifecycle == RequestLifecycle::PreemptPending &&
+             !request.is_decode_phase() &&
+             request.reserved_decode_tokens == 0)) {
             record_prefill_lateness(request, at_time, config);
         }
     }
@@ -380,6 +430,7 @@ void reserve_batch_blocks(
         }
         const int expected = additional_blocks_for_work(
             request, allocation.prefill_tokens, allocation.decode_tokens,
+            allocation.recompute_tokens,
             config.block_size_tokens);
         if (expected != allocation.new_kv_blocks) {
             throw std::logic_error("allocation block demand is stale");
@@ -437,7 +488,13 @@ bool has_active_prefill(const State& state) {
     for (const auto& request : state.requests) {
         if (!is_terminal(request.lifecycle) &&
             (request.remaining_prefill_tokens() > 0 ||
-             request.reserved_prefill_tokens > 0)) return true;
+             request.remaining_recompute_tokens() > 0 ||
+             request.reserved_prefill_tokens > 0 ||
+             (request.lifecycle == RequestLifecycle::InflightRecompute &&
+              !request.is_decode_phase()) ||
+             (request.lifecycle == RequestLifecycle::PreemptPending &&
+              !request.is_decode_phase() &&
+              request.reserved_decode_tokens == 0))) return true;
     }
     return false;
 }
@@ -445,7 +502,15 @@ bool has_active_prefill(const State& state) {
 bool has_inflight_decode(const State& state) {
     return std::any_of(
         state.requests.begin(), state.requests.end(),
-        [](const RequestState& request) { return request.reserved_decode_tokens > 0; });
+        [](const RequestState& request) {
+            return request.reserved_decode_tokens > 0 ||
+                   (request.lifecycle == RequestLifecycle::InflightRecompute &&
+                    request.is_decode_phase()) ||
+                   (request.lifecycle == RequestLifecycle::PreemptPending &&
+                    (request.reserved_decode_tokens > 0 ||
+                     (request.reserved_recompute_tokens > 0 &&
+                      request.is_decode_phase())));
+        });
 }
 
 bool has_active_request(const State& state) {
@@ -467,21 +532,48 @@ int additional_blocks_for_work(
     const RequestState& request,
     int prefill_tokens,
     int decode_tokens,
+    int recompute_tokens,
     int block_size_tokens) {
-    if (prefill_tokens < 0 || decode_tokens < 0 ||
-        (prefill_tokens == 0 && decode_tokens == 0) ||
-        (prefill_tokens > 0 && decode_tokens > 0)) {
-        throw std::invalid_argument("allocation must contain one nonnegative work type");
+    const int work_kinds = (prefill_tokens > 0 ? 1 : 0) +
+                           (decode_tokens > 0 ? 1 : 0) +
+                           (recompute_tokens > 0 ? 1 : 0);
+    if (prefill_tokens < 0 || decode_tokens < 0 || recompute_tokens < 0 ||
+        work_kinds != 1) {
+        throw std::invalid_argument("allocation must contain exactly one work type");
     }
     if (prefill_tokens > request.remaining_prefill_tokens() ||
         decode_tokens > request.remaining_decode_tokens()) {
         throw std::logic_error("allocation exceeds remaining request work");
     }
+    if (recompute_tokens > request.remaining_recompute_tokens()) {
+        throw std::logic_error("allocation exceeds missing KV context");
+    }
+    if ((prefill_tokens > 0 || decode_tokens > 0) &&
+        request.remaining_recompute_tokens() > 0) {
+        throw std::logic_error("new work requires fully reconstructed KV context");
+    }
     const int needed = blocks_for_tokens(
-        request.resident_tokens() + prefill_tokens + decode_tokens,
+        request.resident_tokens() + prefill_tokens + decode_tokens + recompute_tokens,
         block_size_tokens);
     const int owned = request.committed_kv_blocks + request.reserved_kv_blocks;
     return std::max(0, needed - owned);
+}
+
+int preempt_request_blocks(State& state, RequestState& request) {
+    if (request.request_id < 0 ||
+        &state.request(request.request_id) != &request) {
+        throw std::logic_error("request does not belong to this state");
+    }
+    if (is_terminal(request.lifecycle)) {
+        throw std::logic_error("terminal requests cannot be preempted");
+    }
+    if (request.has_inflight_work()) {
+        throw std::logic_error("in-flight requests cannot be preempted");
+    }
+    if (request.committed_kv_blocks == 0 || request.kv_computed_tokens == 0) {
+        throw std::logic_error("request has no resident KV to preempt");
+    }
+    return release_request_blocks_unchecked(state, request);
 }
 
 int free_logical_blocks(const ReplicaState& replica) {
@@ -583,6 +675,22 @@ TransitionOutcome apply_controller_action(
                   TerminalReason::ControllerEviction, state.now);
     }
 
+    int released_by_preemption = 0;
+    for (int request_id : resolved.preempted_request_ids) {
+        auto& request = state.request(request_id);
+        const bool expected_pending = std::find(
+            resolved.pending_preemption_request_ids.begin(),
+            resolved.pending_preemption_request_ids.end(),
+            request_id) != resolved.pending_preemption_request_ids.end();
+        if (request.has_inflight_work() != expected_pending) {
+            throw std::logic_error("resolved preemption timing is stale");
+        }
+        released_by_preemption += mark_preempt(state, request);
+    }
+    if (released_by_preemption != resolved.preempted_kv_blocks) {
+        throw std::logic_error("resolved preemption KV release is stale");
+    }
+
     if (resolved.transition_kind == ControllerTransitionKind::Batch) {
         reserve_batch_blocks(state, resolved.allocations, config);
         const int decode_tokens = resolved.total_decode_tokens();
@@ -595,10 +703,15 @@ TransitionOutcome apply_controller_action(
             auto& request = state.request(allocation.request_id);
             request.reserved_prefill_tokens = allocation.prefill_tokens;
             request.reserved_decode_tokens = allocation.decode_tokens;
+            request.reserved_recompute_tokens = allocation.recompute_tokens;
             request.inflight_microbatch_id = state.next_microbatch_id;
-            request.lifecycle = allocation.prefill_tokens > 0
-                ? RequestLifecycle::InflightPrefill
-                : RequestLifecycle::InflightDecode;
+            if (allocation.recompute_tokens > 0) {
+                request.lifecycle = RequestLifecycle::InflightRecompute;
+            } else if (allocation.prefill_tokens > 0) {
+                request.lifecycle = RequestLifecycle::InflightPrefill;
+            } else {
+                request.lifecycle = RequestLifecycle::InflightDecode;
+            }
         }
         state.replica.stage_tail_finish_times = calendar.stage_finish_times;
         std::fill(state.replica.stage_last_microbatch_ids.begin(),
@@ -702,7 +815,8 @@ void fast_forward_decode_only_to_next_tick(
 
         bool has_waiting_decode = false;
         for (const auto& request : state.requests) {
-            if (request.lifecycle == RequestLifecycle::WaitingDecode) {
+            if (request.lifecycle == RequestLifecycle::WaitingDecode &&
+                request.remaining_recompute_tokens() == 0) {
                 has_waiting_decode = true;
                 break;
             }
@@ -716,7 +830,7 @@ void fast_forward_decode_only_to_next_tick(
             if (canonical < 0) throw std::logic_error("decode-only raw action is masked");
             const auto& action = actions.canonical_actions[canonical];
             if (action.action.transition_kind == ControllerTransitionKind::Batch) {
-                if (action.action.total_prefill_tokens() != 0) {
+                if (action.action.total_prefill_class_tokens() != 0) {
                     throw std::logic_error("decode fast-forward resolved prefill work");
                 }
                 apply_controller_action(
@@ -781,13 +895,18 @@ State Environment::apply_controller_action_only(
     const CanonicalControllerAction& action,
     bool fast_forward) const {
     State result = state;
+    const bool has_memory_action =
+        !action.action.evicted_request_ids.empty() ||
+        !action.action.preempted_request_ids.empty();
     BatchTiming timing;
     if (action.action.transition_kind == ControllerTransitionKind::Batch) {
         timing = batch_timing_provider_(result, action.action);
     }
     apply_controller_action(
         result, config_, action, timing, prefill_time_estimator_);
-    if (fast_forward) {
+    const bool fully_idle =
+        !has_active_request(result) && result.replica.inflight_microbatches.empty();
+    if (fast_forward && (!has_memory_action || fully_idle)) {
         fast_forward_decode_only_to_next_tick(
             result, config_, batch_timing_provider_, prefill_time_estimator_);
     }

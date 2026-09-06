@@ -248,8 +248,9 @@ class VidurMCTSPolicyRollout(VidurMCTS):
             )
             self.rollout_stats.actions += 1
             player = _player_name(state.next_player)
-        else:
-            raise RuntimeError(f"rollout exceeded {max_actions} actions")
+        # Preemption is legal without memory pressure, so a rollout may take
+        # several zero-time memory decisions. The action cap is therefore a
+        # valid truncation boundary; bootstrap from the reached state.
         bootstrap = self._bootstrap_value(
             state,
             player,

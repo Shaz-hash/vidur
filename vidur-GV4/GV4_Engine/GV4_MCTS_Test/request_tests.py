@@ -107,7 +107,14 @@ def _expected_stops(parent: TraceNode, rule: str) -> tuple[int, ...]:
     decodes = [
         request
         for request in parent.requests_by_id().values()
-        if request["lifecycle"] in {"WAITING_DECODE", "INFLIGHT_DECODE"}
+        if request["current_phase"] == "decode"
+        and request["lifecycle"]
+        in {
+            "WAITING_DECODE",
+            "INFLIGHT_DECODE",
+            "INFLIGHT_RECOMPUTE",
+            "PREEMPT_PENDING",
+        }
     ]
     if rule == "stop_none" or not decodes:
         return ()
@@ -168,6 +175,7 @@ def _check_request_snapshot(
         reserved_prefill = int(request["reserved_prefill_tokens"])
         committed_decode = int(request["committed_decode_tokens"])
         reserved_decode = int(request["reserved_decode_tokens"])
+        reserved_recompute = int(request["reserved_recompute_tokens"])
         original_prefill = int(request["original_prefill_tokens"])
         original_decode = int(request["original_decode_tokens"])
         report.check(
@@ -201,6 +209,16 @@ def _check_request_snapshot(
             reserved_decode in {0, 1},
             node,
         )
+        report.check(
+            GROUP,
+            "new work waits for KV reconstruction",
+            not (reserved_prefill or reserved_decode)
+            or (
+                int(request["remaining_recompute_tokens"]) == 0
+                and reserved_recompute == 0
+            ),
+            node,
+        )
         expected_phase = (
             "prefill" if int(request["remaining_prefill_tokens"]) or reserved_prefill else "decode"
         )
@@ -227,8 +245,14 @@ def _check_request_snapshot(
             GROUP,
             "credit exhaustion stops every decode",
             all(
-                request["lifecycle"]
-                not in {"WAITING_DECODE", "INFLIGHT_DECODE"}
+                request["current_phase"] != "decode"
+                or request["lifecycle"]
+                not in {
+                    "WAITING_DECODE",
+                    "INFLIGHT_DECODE",
+                    "INFLIGHT_RECOMPUTE",
+                    "PREEMPT_PENDING",
+                }
                 for request in requests.values()
             ),
             node,
@@ -307,7 +331,7 @@ def _check_adversary_edge(
         after_request = after[request_id]
         expected_lifecycle = (
             "STOP_PENDING"
-            if before_request["lifecycle"] == "INFLIGHT_DECODE"
+            if int(before_request["inflight_microbatch_id"]) >= 0
             else "STOPPED"
         )
         report.check(
@@ -335,7 +359,12 @@ def _check_controller_edge(
         GROUP,
         "controller raw index maps to payload",
         components
-        == (action.eviction_rule, action.prefill_budget, action.ordering_heuristic),
+        == (
+            action.preemption_rule,
+            action.eviction_rule,
+            action.prefill_budget,
+            action.ordering_heuristic,
+        ),
         child,
     )
     expected_evictions = _expected_evictions(parent, action.eviction_rule, context.epsilon)
@@ -347,8 +376,30 @@ def _check_controller_edge(
     )
     if action.evicted_request_ids:
         report.cover("controller_evictions", len(action.evicted_request_ids))
+    if action.preempted_request_ids:
+        report.cover("controller_preemptions", len(action.preempted_request_ids))
+    if action.pending_preemption_request_ids:
+        report.cover(
+            "controller_inflight_preemptions",
+            len(action.pending_preemption_request_ids),
+        )
+    report.check(
+        GROUP,
+        "a preemption rule selects at most one request",
+        len(action.preempted_request_ids) <= 1,
+        child,
+    )
+    report.check(
+        GROUP,
+        "eviction and preemption targets are disjoint",
+        not set(action.evicted_request_ids) & set(action.preempted_request_ids),
+        child,
+    )
 
     allocations = action.allocations
+    recompute_allocations = sum(bool(item.recompute_tokens) for item in allocations)
+    if recompute_allocations:
+        report.cover("controller_recomputations", recompute_allocations)
     request_ids = [allocation.request_id for allocation in allocations]
     report.check(
         GROUP,
@@ -372,30 +423,51 @@ def _check_controller_edge(
     report.check(
         GROUP,
         "prefill budget is an upper bound",
-        sum(item.prefill_tokens for item in allocations) <= action.prefill_budget,
+        sum(item.prefill_tokens + item.recompute_tokens for item in allocations)
+        <= action.prefill_budget,
         child,
     )
     if action.prefill_budget == 0:
         report.check(
             GROUP,
-            "zero prefill budget schedules no prefill",
-            all(item.prefill_tokens == 0 for item in allocations),
+            "zero prefill budget schedules no prefill-class work",
+            all(
+                item.prefill_tokens == 0 and item.recompute_tokens == 0
+                for item in allocations
+            ),
             child,
         )
 
     parent_requests = parent.requests_by_id()
+    expected_pending = tuple(
+        request_id
+        for request_id in action.preempted_request_ids
+        if int(parent_requests[request_id]["inflight_microbatch_id"]) >= 0
+    )
+    report.check(
+        GROUP,
+        "pending preemption IDs are exactly the in-flight victims",
+        action.pending_preemption_request_ids == expected_pending,
+        child,
+    )
     for allocation in allocations:
         request = parent_requests.get(allocation.request_id)
         report.check(GROUP, "allocation targets an existing request", request is not None, child)
         if request is None:
             continue
-        expected_lifecycle = (
-            "WAITING_PREFILL" if allocation.prefill_tokens else "WAITING_DECODE"
-        )
+        if allocation.recompute_tokens:
+            expected_lifecycles = {"WAITING_PREFILL", "WAITING_DECODE"}
+            phase_is_legal = int(request["remaining_recompute_tokens"]) > 0
+        elif allocation.prefill_tokens:
+            expected_lifecycles = {"WAITING_PREFILL"}
+            phase_is_legal = int(request["remaining_recompute_tokens"]) == 0
+        else:
+            expected_lifecycles = {"WAITING_DECODE"}
+            phase_is_legal = int(request["remaining_recompute_tokens"]) == 0
         report.check(
             GROUP,
             "allocation targets the matching waiting phase",
-            request["lifecycle"] == expected_lifecycle,
+            request["lifecycle"] in expected_lifecycles and phase_is_legal,
             child,
         )
         resident_after = int(request["resident_tokens"]) + allocation.total_tokens
@@ -413,8 +485,12 @@ def _check_controller_edge(
     expected_kind = (
         ControllerTransitionKind.BATCH
         if allocations
+        else ControllerTransitionKind.EVICT_AND_PREEMPT
+        if action.evicted_request_ids and action.preempted_request_ids
         else ControllerTransitionKind.EVICT_ONLY
         if action.evicted_request_ids
+        else ControllerTransitionKind.PREEMPT_ONLY
+        if action.preempted_request_ids
         else ControllerTransitionKind.WAIT
     )
     report.check(GROUP, "controller transition kind matches effects", action.transition_kind == expected_kind, child)
@@ -426,9 +502,28 @@ def _check_controller_edge(
     )
     report.check(
         GROUP,
-        "released block total matches evictions",
+        "released block total matches immediate memory actions",
         action.released_kv_blocks
-        == sum(int(parent_requests[request_id]["committed_kv_blocks"]) for request_id in action.evicted_request_ids),
+        == sum(
+            int(parent_requests[request_id]["committed_kv_blocks"])
+            for request_id in action.evicted_request_ids
+        )
+        + action.preempted_kv_blocks,
+        child,
+    )
+    immediate_preemptions = tuple(
+        request_id
+        for request_id in action.preempted_request_ids
+        if request_id not in action.pending_preemption_request_ids
+    )
+    report.check(
+        GROUP,
+        "preempted block total excludes in-flight victims",
+        action.preempted_kv_blocks
+        == sum(
+            int(parent_requests[request_id]["committed_kv_blocks"])
+            for request_id in immediate_preemptions
+        ),
         child,
     )
 
@@ -440,6 +535,25 @@ def _check_controller_edge(
             child_requests[request_id]["lifecycle"] == "DROPPED",
             child,
         )
+    if abs(child.now - parent.now) <= context.epsilon:
+        for request_id in immediate_preemptions:
+            request = child_requests[request_id]
+            report.check(
+                GROUP,
+                "immediate preemption releases physical KV",
+                int(request["committed_kv_blocks"]) == 0
+                and int(request["kv_computed_tokens"]) == 0
+                and int(request["remaining_recompute_tokens"])
+                == int(request["logical_context_tokens"]),
+                child,
+            )
+        for request_id in action.pending_preemption_request_ids:
+            report.check(
+                GROUP,
+                "in-flight preemption is marked pending",
+                child_requests[request_id]["lifecycle"] == "PREEMPT_PENDING",
+                child,
+            )
     if action.transition_kind == ControllerTransitionKind.BATCH:
         report.cover("controller_batches")
         microbatch_id = int(parent.mcts["next_microbatch_id"])
@@ -451,6 +565,8 @@ def _check_controller_edge(
                     "in-flight request reservations match batch",
                     int(request["reserved_prefill_tokens"]) == allocation.prefill_tokens
                     and int(request["reserved_decode_tokens"]) == allocation.decode_tokens
+                    and int(request["reserved_recompute_tokens"])
+                    == allocation.recompute_tokens
                     and int(request["reserved_kv_blocks"]) == allocation.new_kv_blocks,
                     child,
                 )

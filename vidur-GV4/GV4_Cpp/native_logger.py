@@ -40,6 +40,7 @@ def _allocation(item: Any) -> BatchAllocation:
         prefill_tokens=int(item.prefill_tokens),
         decode_tokens=int(item.decode_tokens),
         new_kv_blocks=int(item.new_kv_blocks),
+        recompute_tokens=int(item.recompute_tokens),
     )
 
 
@@ -68,6 +69,8 @@ def _request(item: Any) -> RequestState:
         terminal_reason=TerminalReason[item.terminal_reason.name],
         terminal_requested_at=float(item.terminal_requested_at),
         terminal_time=float(item.terminal_time),
+        kv_computed_tokens=int(item.kv_computed_tokens),
+        reserved_recompute_tokens=int(item.reserved_recompute_tokens),
     )
 
 
@@ -159,6 +162,7 @@ def _canonical_action(action: Any) -> CanonicalControllerAction | CanonicalAdver
             action=ResolvedControllerAction(
                 raw_action_index=int(resolved.raw_action_index),
                 replica_id=int(resolved.replica_id),
+                preemption_rule=str(resolved.preemption_rule),
                 eviction_rule=str(resolved.eviction_rule),
                 prefill_budget=int(resolved.prefill_budget),
                 ordering_heuristic=str(resolved.ordering_heuristic),
@@ -168,8 +172,16 @@ def _canonical_action(action: Any) -> CanonicalControllerAction | CanonicalAdver
                 evicted_request_ids=tuple(
                     int(value) for value in resolved.evicted_request_ids
                 ),
+                preempted_request_ids=tuple(
+                    int(value) for value in resolved.preempted_request_ids
+                ),
+                pending_preemption_request_ids=tuple(
+                    int(value)
+                    for value in resolved.pending_preemption_request_ids
+                ),
                 allocations=tuple(_allocation(value) for value in resolved.allocations),
                 released_kv_blocks=int(resolved.released_kv_blocks),
+                preempted_kv_blocks=int(resolved.preempted_kv_blocks),
                 reserved_kv_blocks=int(resolved.reserved_kv_blocks),
                 rank_kv_delta=tuple(
                     (int(rank_id), int(delta))

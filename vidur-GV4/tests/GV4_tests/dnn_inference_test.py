@@ -101,11 +101,11 @@ class GV4DNNFeatureTest(unittest.TestCase):
         request_names = builder.layout.request_names
         microbatch_names = builder.layout.microbatch_names
 
-        self.assertEqual(features.global_features.shape, (27,))
-        self.assertEqual(features.request_rows.shape, (2, 32))
+        self.assertEqual(features.global_features.shape, (31,))
+        self.assertEqual(features.request_rows.shape, (2, 37))
         self.assertEqual(features.launch_rows.shape, (1, 3))
         self.assertEqual(features.replica_rows.shape, (1, 9))
-        self.assertEqual(features.microbatch_rows.shape, (1, 11))
+        self.assertEqual(features.microbatch_rows.shape, (1, 15))
         self.assertEqual(features.request_replica_offsets.tolist(), [0, 2])
         self.assertEqual(features.microbatch_replica_offsets.tolist(), [0, 1])
         self.assertEqual(
@@ -195,7 +195,7 @@ class GV4DNNFeatureTest(unittest.TestCase):
         np.testing.assert_array_equal(
             first.affected_request_rows, second.affected_request_rows
         )
-        self.assertEqual(first.affected_request_rows.shape, (1, 10))
+        self.assertEqual(first.affected_request_rows.shape, (1, 14))
         self.assertEqual(first.header[2], 1.0)  # BATCH one-hot position.
 
     def test_adversary_stop_action_identifies_the_concrete_decode(self) -> None:

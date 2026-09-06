@@ -19,9 +19,11 @@ from GV4_Engine.kv_ledger import (  # noqa: E402
     can_reserve_blocks,
     commit_batch_blocks,
     free_logical_blocks,
+    preempt_request_blocks,
     release_request_blocks,
     reserve_batch_blocks,
 )
+from GV4_Engine.pipeline_calendar import admit_microbatch  # noqa: E402
 from GV4_Engine.state import (  # noqa: E402
     BatchAllocation,
     GV4State,
@@ -30,6 +32,7 @@ from GV4_Engine.state import (  # noqa: E402
     RequestLifecycle,
     RequestState,
 )
+from GV4_Engine.transition_engine import advance_to  # noqa: E402
 from state_test import make_config  # noqa: E402
 
 
@@ -285,6 +288,7 @@ class KVLedgerTest(unittest.TestCase):
         commit_batch_blocks(replica, state.requests, allocations)
         request.reserved_prefill_tokens = 0
         request.committed_prefill_tokens = 128
+        request.kv_computed_tokens = 128
         request.lifecycle = RequestLifecycle.WAITING_PREFILL
         request.inflight_microbatch_id = -1
         replica.inflight_microbatches.clear()
@@ -335,6 +339,128 @@ class KVLedgerTest(unittest.TestCase):
         self.assertEqual(child.replica(0).rank_kv_committed_blocks, [0])
         self.assertEqual(parent.request(0).committed_kv_blocks, 8)
         self.assertEqual(parent.replica(0).rank_kv_committed_blocks, [8])
+
+    def test_preemption_releases_physical_kv_but_preserves_progress(self) -> None:
+        replica = small_replica(capacity=(16, 16))
+        replica.rank_kv_committed_blocks[:] = [10, 10]
+        request = waiting_decode(
+            0,
+            committed_decode_tokens=20,
+            committed_blocks=10,
+        )
+        request.prefill_lateness_sec = 0.2
+        request.decode_lateness_sec = 0.1
+
+        released = preempt_request_blocks(request, replica)
+
+        self.assertEqual(released, 10)
+        self.assertEqual(replica.rank_kv_committed_blocks, [0, 0])
+        self.assertEqual(request.committed_prefill_tokens, 128)
+        self.assertEqual(request.committed_decode_tokens, 20)
+        self.assertEqual(request.kv_computed_tokens, 0)
+        self.assertEqual(request.remaining_recompute_tokens, 148)
+        self.assertEqual(request.next_decode_deadline, 0.05)
+        self.assertEqual(request.prefill_lateness_sec, 0.2)
+        self.assertEqual(request.decode_lateness_sec, 0.1)
+
+    def test_partial_recomputation_restores_kv_without_new_progress(self) -> None:
+        config = make_config(tensor_parallel_size=2)
+        state = GV4State.initial(config)
+        request = waiting_decode(
+            0,
+            committed_decode_tokens=20,
+            committed_blocks=10,
+        )
+        state.requests.append(request)
+        state.next_request_id = 1
+        state.next_adversary_tick = 1.0
+        state.decode_credits_available = 196
+        state.decode_credits_minted_total = 216
+        state.decode_tokens_committed_total = 20
+        state.objective.requests_generated = 1
+        state.replica(0).rank_kv_committed_blocks[:] = [10, 10]
+        state.assert_valid(config)
+
+        preempt_request_blocks(request, state.replica(0))
+        with self.assertRaisesRegex(KVLedgerError, "fully reconstructed"):
+            additional_blocks_for_work(
+                request,
+                decode_tokens=1,
+                block_size_tokens=16,
+            )
+
+        for recompute_tokens, new_blocks, finish in (
+            (64, 4, 0.1),
+            (84, 6, 0.2),
+        ):
+            allocation = BatchAllocation(
+                request_id=0,
+                recompute_tokens=recompute_tokens,
+                new_kv_blocks=new_blocks,
+            )
+            allocations = (allocation,)
+            reserve_batch_blocks(
+                state.replica(0),
+                state.requests,
+                allocations,
+                block_size_tokens=16,
+            )
+            request.reserved_recompute_tokens = recompute_tokens
+            request.inflight_microbatch_id = state.next_microbatch_id
+            request.lifecycle = RequestLifecycle.INFLIGHT_RECOMPUTE
+            admit_microbatch(
+                state.replica(0),
+                microbatch_id=state.next_microbatch_id,
+                raw_action_index=0,
+                canonical_action_index=0,
+                allocations=allocations,
+                admitted_at=state.now,
+                stage_service_times=(finish - state.now,),
+                pp_communication_times=(),
+                scheduler=config.scheduler,
+                timing=config.timing,
+            )
+            state.next_microbatch_id += 1
+            advance_to(state, config, finish, inplace=True)
+
+        self.assertEqual(request.lifecycle, RequestLifecycle.WAITING_DECODE)
+        self.assertEqual(request.logical_context_tokens, 148)
+        self.assertEqual(request.kv_computed_tokens, 148)
+        self.assertEqual(request.remaining_recompute_tokens, 0)
+        self.assertEqual(request.committed_prefill_tokens, 128)
+        self.assertEqual(request.committed_decode_tokens, 20)
+        self.assertEqual(state.decode_credits_available, 196)
+        self.assertEqual(state.decode_tokens_committed_total, 20)
+        self.assertEqual(state.replica(0).rank_kv_committed_blocks, [10, 10])
+        self.assertEqual(
+            additional_blocks_for_work(
+                request,
+                decode_tokens=1,
+                block_size_tokens=16,
+            ),
+            0,
+        )
+        state.assert_valid(config)
+
+    def test_recompute_allocation_is_exclusive_and_bounded(self) -> None:
+        replica = small_replica(capacity=(16,))
+        replica.rank_kv_committed_blocks[:] = [8]
+        request = waiting_decode(0, committed_blocks=8)
+        preempt_request_blocks(request, replica)
+
+        with self.assertRaisesRegex(KVLedgerError, "exactly one"):
+            additional_blocks_for_work(
+                request,
+                decode_tokens=1,
+                recompute_tokens=1,
+                block_size_tokens=16,
+            )
+        with self.assertRaisesRegex(KVLedgerError, "missing KV"):
+            additional_blocks_for_work(
+                request,
+                recompute_tokens=129,
+                block_size_tokens=16,
+            )
 
 
 if __name__ == "__main__":

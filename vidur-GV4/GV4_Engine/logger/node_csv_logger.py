@@ -221,13 +221,19 @@ def _action_payload(action: Any) -> dict[str, Any] | None:
             "canonical_action_index": action.canonical_action_index,
             "alias_indices": list(action.equivalent_raw_indices),
             "replica_id": resolved.replica_id,
+            "preemption_rule": resolved.preemption_rule,
             "eviction_rule": resolved.eviction_rule,
             "prefill_budget": resolved.prefill_budget,
             "ordering_heuristic": resolved.ordering_heuristic,
             "transition_kind": resolved.transition_kind.name,
             "evicted_request_ids": list(resolved.evicted_request_ids),
+            "preempted_request_ids": list(resolved.preempted_request_ids),
+            "pending_preemption_request_ids": list(
+                resolved.pending_preemption_request_ids
+            ),
             "allocations": [_to_plain_data(item) for item in resolved.allocations],
             "released_kv_blocks": resolved.released_kv_blocks,
+            "preempted_kv_blocks": resolved.preempted_kv_blocks,
             "reserved_kv_blocks": resolved.reserved_kv_blocks,
             "rank_kv_delta": [list(item) for item in resolved.rank_kv_delta],
         }
@@ -277,6 +283,10 @@ def _request_payload(request: RequestState) -> dict[str, Any]:
         "total_committed_tokens": (
             request.committed_prefill_tokens + request.committed_decode_tokens
         ),
+        "logical_context_tokens": request.logical_context_tokens,
+        "kv_computed_tokens": request.kv_computed_tokens,
+        "reserved_recompute_tokens": request.reserved_recompute_tokens,
+        "remaining_recompute_tokens": request.remaining_recompute_tokens,
         "resident_tokens": request.resident_tokens,
         "committed_kv_blocks": request.committed_kv_blocks,
         "reserved_kv_blocks": request.reserved_kv_blocks,
@@ -747,6 +757,7 @@ class GV4NodeCSVLogger:
                 str(item.request_id): {
                     "prefill_tokens": item.prefill_tokens,
                     "decode_tokens": item.decode_tokens,
+                    "recompute_tokens": item.recompute_tokens,
                     "total_tokens": item.total_tokens,
                 }
                 for item in batch.allocations

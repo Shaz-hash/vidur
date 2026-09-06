@@ -51,6 +51,8 @@ class ControllerTransitionKind(IntEnum):
     WAIT = 0
     EVICT_ONLY = 1
     BATCH = 2
+    PREEMPT_ONLY = 3
+    EVICT_AND_PREEMPT = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,13 +61,17 @@ class ResolvedControllerAction:
 
     raw_action_index: int
     replica_id: int
+    preemption_rule: str
     eviction_rule: str
     prefill_budget: int
     ordering_heuristic: str
     transition_kind: ControllerTransitionKind
     evicted_request_ids: tuple[int, ...]
+    preempted_request_ids: tuple[int, ...]
+    pending_preemption_request_ids: tuple[int, ...]
     allocations: tuple[BatchAllocation, ...]
     released_kv_blocks: int
+    preempted_kv_blocks: int
     reserved_kv_blocks: int
     rank_kv_delta: tuple[tuple[int, int], ...]
 
@@ -74,15 +80,24 @@ class ResolvedControllerAction:
         work = tuple(
             (
                 allocation.request_id,
-                0 if allocation.prefill_tokens else 1,
+                (
+                    0
+                    if allocation.prefill_tokens
+                    else 1
+                    if allocation.decode_tokens
+                    else 2
+                ),
                 allocation.prefill_tokens,
                 allocation.decode_tokens,
+                allocation.recompute_tokens,
             )
             for allocation in self.allocations
         )
         return (
             int(self.transition_kind),
             self.evicted_request_ids,
+            self.preempted_request_ids,
+            self.pending_preemption_request_ids,
             work,
             self.rank_kv_delta,
         )
@@ -94,6 +109,28 @@ class ResolvedControllerAction:
     @property
     def total_decode_tokens(self) -> int:
         return sum(item.decode_tokens for item in self.allocations)
+
+    @property
+    def total_recompute_tokens(self) -> int:
+        return sum(item.recompute_tokens for item in self.allocations)
+
+    @property
+    def total_prefill_class_tokens(self) -> int:
+        """Tokens charged to the shared prefill/recomputation budget."""
+
+        return self.total_prefill_tokens + self.total_recompute_tokens
+
+
+@dataclass(frozen=True, slots=True)
+class _PreemptionCandidate:
+    """One request and the state it will have when preemption takes effect."""
+
+    request: RequestState
+    release_time: float
+    released_blocks: int
+    recompute_tokens: int
+    recovery_deadline: float
+    pending: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +188,18 @@ def _decode_lateness(request: RequestState) -> float:
     return max(0.0, request.prefill_lateness_sec + request.decode_lateness_sec)
 
 
+def _prefill_class_tokens(request: RequestState) -> int:
+    """Return reconstruction work first, otherwise ordinary prefill work."""
+
+    return request.remaining_recompute_tokens or request.remaining_prefill_tokens
+
+
+def _prefill_class_deadline(request: RequestState) -> float:
+    if request.remaining_recompute_tokens and request.is_decode_phase:
+        return request.next_decode_deadline
+    return request.prefill_deadline
+
+
 class _ControllerContext:
     """Caches state-derived orderings while all raw actions are expanded."""
 
@@ -163,6 +212,9 @@ class _ControllerContext:
         "prefills",
         "decodes",
         "targets_by_rule",
+        "preemption_targets_by_rule",
+        "preemption_candidates",
+        "recompute_estimates",
         "orders",
     )
 
@@ -193,6 +245,11 @@ class _ControllerContext:
             and request.lifecycle == RequestLifecycle.WAITING_DECODE
         )
         self.targets_by_rule: dict[str, tuple[int, ...]] = {}
+        self.preemption_targets_by_rule: dict[
+            tuple[str, tuple[int, ...]], tuple[int, ...]
+        ] = {}
+        self.preemption_candidates: tuple[_PreemptionCandidate, ...] | None = None
+        self.recompute_estimates: dict[int, float] = {}
         self.orders: dict[tuple[tuple[int, ...], str], tuple[RequestState, ...]] = {}
 
     @property
@@ -277,28 +334,210 @@ class _ControllerContext:
         self.targets_by_rule[rule] = targets
         return targets
 
-    def ordered_prefills(
-        self, heuristic: str, evicted_ids: tuple[int, ...]
+    def _build_preemption_candidates(self) -> tuple[_PreemptionCandidate, ...]:
+        if self.preemption_candidates is not None:
+            return self.preemption_candidates
+
+        candidates: list[_PreemptionCandidate] = []
+        for request in self.state.requests:
+            if request.owner_replica_id != self.replica_id:
+                continue
+            if request.lifecycle.is_terminal or request.lifecycle in (
+                RequestLifecycle.STOP_PENDING,
+                RequestLifecycle.DROP_PENDING,
+                RequestLifecycle.PREEMPT_PENDING,
+            ):
+                continue
+
+            if request.has_inflight_work:
+                batch = self.replica.find_microbatch(request.inflight_microbatch_id)
+                if batch is None:
+                    raise ActionResolutionError(
+                        "in-flight preemption candidate has no microbatch"
+                    )
+                allocation = next(
+                    (
+                        item
+                        for item in batch.allocations
+                        if item.request_id == request.request_id
+                    ),
+                    None,
+                )
+                if allocation is None:
+                    raise ActionResolutionError(
+                        "in-flight preemption candidate has no allocation"
+                    )
+                # A final decode token completes the request; there is nothing to resume.
+                if allocation.decode_tokens and request.remaining_decode_tokens == 0:
+                    continue
+                release_time = batch.final_completion_time
+                logical_after = (
+                    request.logical_context_tokens
+                    + allocation.prefill_tokens
+                    + allocation.decode_tokens
+                )
+                released_blocks = (
+                    request.committed_kv_blocks + request.reserved_kv_blocks
+                )
+                prefill_after = (
+                    request.committed_prefill_tokens + allocation.prefill_tokens
+                )
+                if prefill_after < request.original_prefill_tokens:
+                    deadline = request.prefill_deadline
+                elif allocation.prefill_tokens or allocation.decode_tokens:
+                    deadline = release_time + request.decode_token_slo_sec
+                else:
+                    deadline = request.next_decode_deadline
+                pending = True
+            else:
+                release_time = self.state.now
+                logical_after = request.logical_context_tokens
+                released_blocks = request.committed_kv_blocks
+                deadline = (
+                    request.next_decode_deadline
+                    if request.is_decode_phase
+                    else request.prefill_deadline
+                )
+                pending = False
+
+            if logical_after > 0 and released_blocks > 0:
+                candidates.append(
+                    _PreemptionCandidate(
+                        request=request,
+                        release_time=release_time,
+                        released_blocks=released_blocks,
+                        recompute_tokens=logical_after,
+                        recovery_deadline=deadline,
+                        pending=pending,
+                    )
+                )
+
+        self.preemption_candidates = tuple(candidates)
+        return self.preemption_candidates
+
+    def _recompute_time(self, candidate: _PreemptionCandidate) -> float:
+        cached = self.recompute_estimates.get(candidate.request.request_id)
+        if cached is not None:
+            return cached
+        if self.prefill_time_estimator is None:
+            raise ActionResolutionError(
+                "timing-based preemption requires a prefill_time_estimator"
+            )
+        estimate = float(
+            self.prefill_time_estimator(candidate.request, candidate.recompute_tokens)
+        )
+        if not math.isfinite(estimate) or estimate < 0.0:
+            raise ActionResolutionError(
+                "prefill_time_estimator returned an invalid duration"
+            )
+        self.recompute_estimates[candidate.request.request_id] = estimate
+        return estimate
+
+    def preemption_targets(
+        self, rule: str, excluded_ids: tuple[int, ...]
+    ) -> tuple[int, ...]:
+        key = (rule, excluded_ids)
+        cached = self.preemption_targets_by_rule.get(key)
+        if cached is not None:
+            return cached
+        if rule == "preempt_none":
+            self.preemption_targets_by_rule[key] = ()
+            return ()
+
+        excluded = set(excluded_ids)
+        candidates = [
+            item
+            for item in self._build_preemption_candidates()
+            if item.request.request_id not in excluded
+        ]
+        if not candidates:
+            self.preemption_targets_by_rule[key] = ()
+            return ()
+
+        if rule == "preempt_min_recompute":
+            selected = min(
+                candidates,
+                key=lambda item: (
+                    item.recompute_tokens,
+                    -item.released_blocks,
+                    item.request.request_id,
+                ),
+            )
+        elif rule == "preempt_largest_kv":
+            selected = min(
+                candidates,
+                key=lambda item: (
+                    -item.released_blocks,
+                    item.recompute_tokens,
+                    item.request.request_id,
+                ),
+            )
+        elif rule == "preempt_max_recovery_slack":
+            selected = max(
+                candidates,
+                key=lambda item: (
+                    item.recovery_deadline
+                    - item.release_time
+                    - self._recompute_time(item),
+                    item.released_blocks,
+                    -item.request.request_id,
+                ),
+            )
+        elif rule == "preempt_best_relief_cost":
+            epsilon = self.config.timing.epsilon
+
+            def relief_cost(item: _PreemptionCandidate) -> tuple[float, int, int]:
+                recompute_time = self._recompute_time(item)
+                lateness = max(
+                    0.0,
+                    item.release_time + recompute_time - item.recovery_deadline,
+                )
+                new_violation_cost = (
+                    self.config.cost.violation_base_cost
+                    if lateness > epsilon and not item.request.violation_recorded
+                    else 0.0
+                )
+                recovery_cost = (
+                    recompute_time
+                    + new_violation_cost
+                    + min(lateness, self.config.cost.lateness_cap_sec)
+                )
+                score = item.released_blocks / max(epsilon, recovery_cost)
+                return score, item.released_blocks, -item.request.request_id
+
+            selected = max(candidates, key=relief_cost)
+        else:
+            raise ActionResolutionError(f"unsupported preemption rule {rule!r}")
+
+        targets = (selected.request.request_id,)
+        self.preemption_targets_by_rule[key] = targets
+        return targets
+
+    def ordered_prefill_class(
+        self, heuristic: str, excluded_ids: tuple[int, ...]
     ) -> tuple[RequestState, ...]:
-        key = (evicted_ids, heuristic)
+        key = (excluded_ids, heuristic)
         cached = self.orders.get(key)
         if cached is not None:
             return cached
 
-        evicted = set(evicted_ids)
+        excluded = set(excluded_ids)
         requests = [
-            request for request in self.prefills if request.request_id not in evicted
+            request
+            for request in (*self.prefills, *self.decodes)
+            if request.request_id not in excluded
+            and _prefill_class_tokens(request) > 0
+            and (
+                request.remaining_recompute_tokens > 0
+                or request.lifecycle == RequestLifecycle.WAITING_PREFILL
+            )
         ]
         if heuristic == "SJF":
-            requests.sort(
-                key=lambda item: (item.remaining_prefill_tokens, item.request_id)
-            )
+            requests.sort(key=lambda item: (_prefill_class_tokens(item), item.request_id))
         elif heuristic == "EDF":
-            requests.sort(key=lambda item: (item.prefill_deadline, item.request_id))
+            requests.sort(key=lambda item: (_prefill_class_deadline(item), item.request_id))
         elif heuristic == "LJF":
-            requests.sort(
-                key=lambda item: (-item.remaining_prefill_tokens, item.request_id)
-            )
+            requests.sort(key=lambda item: (-_prefill_class_tokens(item), item.request_id))
         elif heuristic == "LST":
             estimator = self.prefill_time_estimator
             if estimator is None and requests:
@@ -308,13 +547,13 @@ class _ControllerContext:
 
             def least_slack(request: RequestState) -> tuple[float, int]:
                 assert estimator is not None
-                estimate = float(estimator(request, request.remaining_prefill_tokens))
+                estimate = float(estimator(request, _prefill_class_tokens(request)))
                 if not math.isfinite(estimate) or estimate < 0.0:
                     raise ActionResolutionError(
                         "prefill_time_estimator returned an invalid duration"
                     )
                 return (
-                    request.prefill_deadline - self.state.now - estimate,
+                    _prefill_class_deadline(request) - self.state.now - estimate,
                     request.request_id,
                 )
 
@@ -327,25 +566,33 @@ class _ControllerContext:
         return ordered
 
 
-def _fit_prefill_to_kv(
+def _fit_prefill_class_to_kv(
     request: RequestState,
     desired_tokens: int,
     free_blocks: int,
     block_size_tokens: int,
-) -> tuple[int, int]:
-    """Return the largest desired prefix and its exact new-block demand."""
+) -> tuple[int, int, bool]:
+    """Fit ordinary prefill or reconstruction into the same KV budget."""
 
     owned_blocks = request.committed_kv_blocks + request.reserved_kv_blocks
     maximum_resident = (owned_blocks + free_blocks) * block_size_tokens
     tokens = min(desired_tokens, max(0, maximum_resident - request.resident_tokens))
     if tokens <= 0:
-        return 0, 0
-    blocks = additional_blocks_for_work(
-        request,
-        prefill_tokens=tokens,
-        block_size_tokens=block_size_tokens,
-    )
-    return tokens, blocks
+        return 0, 0, False
+    is_recompute = request.remaining_recompute_tokens > 0
+    if is_recompute:
+        blocks = additional_blocks_for_work(
+            request,
+            recompute_tokens=tokens,
+            block_size_tokens=block_size_tokens,
+        )
+    else:
+        blocks = additional_blocks_for_work(
+            request,
+            prefill_tokens=tokens,
+            block_size_tokens=block_size_tokens,
+        )
+    return tokens, blocks, is_recompute
 
 
 def _resolve_controller_raw(
@@ -356,65 +603,76 @@ def _resolve_controller_raw(
     config = context.config
     action_config = config.controller_actions
     try:
-        eviction_rule, budget, heuristic = action_config.raw_action_components(
-            raw_action_index
+        preemption_rule, eviction_rule, budget, heuristic = (
+            action_config.raw_action_components(raw_action_index)
         )
     except ValueError as error:
         raise ActionResolutionError(str(error)) from error
 
     if state.next_player != Player.CONTROLLER:
         return None
-    if not can_admit_microbatch(
+
+    if not config.scheduler.request_preemption_enabled:
+        preemption_rule = "preempt_none"
+
+    # Memory decisions remain legal while stage zero is busy. Only the batch
+    # portion of an action depends on pipeline admission.
+    pipeline_open = can_admit_microbatch(
         context.replica,
         admitted_at=state.now,
         scheduler=config.scheduler,
         timing=config.timing,
-    ):
-        if raw_action_index != 0:
-            return None
-        return ResolvedControllerAction(
-            raw_action_index=0,
-            replica_id=context.replica_id,
-            eviction_rule=eviction_rule,
-            prefill_budget=budget,
-            ordering_heuristic=heuristic,
-            transition_kind=ControllerTransitionKind.WAIT,
-            evicted_request_ids=(),
-            allocations=(),
-            released_kv_blocks=0,
-            reserved_kv_blocks=0,
-            rank_kv_delta=tuple(
-                (rank_id, 0) for rank_id in context.replica.rank_ids
-            ),
-        )
-
-    # Preserve GV3's strict duplicate masks around empty and zero-budget actions.
-    if not context.has_waiting_work and raw_action_index != 0:
-        return None
+    )
     if budget == 0 and heuristic != action_config.ordering_heuristics[0]:
         return None
 
     evicted_ids = context.eviction_targets(eviction_rule)
     if eviction_rule != "evict_none" and not evicted_ids:
         return None
+    preempted_ids = context.preemption_targets(preemption_rule, evicted_ids)
+    if preemption_rule != "preempt_none" and not preempted_ids:
+        return None
 
-    evicted = set(evicted_ids)
-    ordered_prefills = context.ordered_prefills(heuristic, evicted_ids)
-    total_prefill = sum(item.remaining_prefill_tokens for item in ordered_prefills)
-    if budget > 0:
-        if total_prefill == 0:
+    pending_preemption_ids = tuple(
+        request_id
+        for request_id in preempted_ids
+        if state.request(request_id).has_inflight_work
+    )
+    immediate_preemption_ids = tuple(
+        request_id
+        for request_id in preempted_ids
+        if not state.request(request_id).has_inflight_work
+    )
+    excluded_ids = tuple(sorted((*evicted_ids, *preempted_ids)))
+
+    ordered_prefill_class = context.ordered_prefill_class(heuristic, excluded_ids)
+    total_prefill_class = sum(
+        _prefill_class_tokens(item) for item in ordered_prefill_class
+    )
+
+    if not pipeline_open:
+        # Avoid aliases whose scheduling fields cannot take effect at this time.
+        if budget != 0 or heuristic != action_config.ordering_heuristics[0]:
+            return None
+    elif budget > 0:
+        if total_prefill_class == 0:
             return None
         minimum_positive = next(
             value for value in action_config.prefill_budget_options if value > 0
         )
-        if budget > total_prefill and not (
-            total_prefill < minimum_positive and budget == minimum_positive
+        if budget > total_prefill_class and not (
+            total_prefill_class < minimum_positive and budget == minimum_positive
         ):
             return None
 
-    released_blocks = sum(
+    evicted_blocks = sum(
         state.request(request_id).committed_kv_blocks for request_id in evicted_ids
     )
+    preempted_blocks = sum(
+        state.request(request_id).committed_kv_blocks
+        for request_id in immediate_preemption_ids
+    )
+    released_blocks = evicted_blocks + preempted_blocks
     free_blocks = free_logical_blocks(context.replica) + released_blocks
     block_size = config.kv_cache.block_size_tokens
     tokens_left = config.scheduler.max_batch_tokens
@@ -422,65 +680,69 @@ def _resolve_controller_raw(
     desired_left = min(budget, tokens_left)
 
     allocations: list[BatchAllocation] = []
-    for request in ordered_prefills:
-        if desired_left <= 0 or sequences_left <= 0:
-            break
-        desired = min(request.remaining_prefill_tokens, desired_left)
-        tokens, blocks = _fit_prefill_to_kv(
-            request, desired, free_blocks, block_size
-        )
-        if tokens <= 0:
-            continue
-        allocations.append(
-            BatchAllocation(
-                request.request_id,
-                prefill_tokens=tokens,
-                new_kv_blocks=blocks,
+    if pipeline_open:
+        for request in ordered_prefill_class:
+            if desired_left <= 0 or sequences_left <= 0:
+                break
+            desired = min(_prefill_class_tokens(request), desired_left)
+            tokens, blocks, is_recompute = _fit_prefill_class_to_kv(
+                request, desired, free_blocks, block_size
             )
-        )
-        desired_left -= tokens
-        tokens_left -= tokens
-        sequences_left -= 1
-        free_blocks -= blocks
+            if tokens <= 0:
+                continue
+            allocations.append(
+                BatchAllocation(
+                    request.request_id,
+                    prefill_tokens=0 if is_recompute else tokens,
+                    recompute_tokens=tokens if is_recompute else 0,
+                    new_kv_blocks=blocks,
+                )
+            )
+            desired_left -= tokens
+            tokens_left -= tokens
+            sequences_left -= 1
+            free_blocks -= blocks
 
-    funded_decode_slots = state.decode_credits_available
-    decode_candidates = [
-        request
-        for request in context.decodes
-        if request.request_id not in evicted
-    ]
-    zero_block_decodes: list[RequestState] = []
-    boundary_decodes: list[RequestState] = []
-    for request in decode_candidates:
-        blocks = additional_blocks_for_work(
-            request,
-            decode_tokens=1,
-            block_size_tokens=block_size,
-        )
-        (zero_block_decodes if blocks == 0 else boundary_decodes).append(request)
-
-    for request in (*zero_block_decodes, *boundary_decodes):
-        # Credit limits adversary-funded work; it is not a controller choice.
-        if funded_decode_slots <= 0 or tokens_left <= 0 or sequences_left <= 0:
-            break
-        blocks = additional_blocks_for_work(
-            request,
-            decode_tokens=1,
-            block_size_tokens=block_size,
-        )
-        if blocks > free_blocks:
-            continue
-        allocations.append(
-            BatchAllocation(
-                request.request_id,
+        funded_decode_slots = state.decode_credits_available
+        excluded = set(excluded_ids)
+        decode_candidates = [
+            request
+            for request in context.decodes
+            if request.request_id not in excluded
+            and request.remaining_recompute_tokens == 0
+        ]
+        zero_block_decodes: list[RequestState] = []
+        boundary_decodes: list[RequestState] = []
+        for request in decode_candidates:
+            blocks = additional_blocks_for_work(
+                request,
                 decode_tokens=1,
-                new_kv_blocks=blocks,
+                block_size_tokens=block_size,
             )
-        )
-        funded_decode_slots -= 1
-        tokens_left -= 1
-        sequences_left -= 1
-        free_blocks -= blocks
+            (zero_block_decodes if blocks == 0 else boundary_decodes).append(request)
+
+        for request in (*zero_block_decodes, *boundary_decodes):
+            # Credit limits adversary-funded work; it is not a controller choice.
+            if funded_decode_slots <= 0 or tokens_left <= 0 or sequences_left <= 0:
+                break
+            blocks = additional_blocks_for_work(
+                request,
+                decode_tokens=1,
+                block_size_tokens=block_size,
+            )
+            if blocks > free_blocks:
+                continue
+            allocations.append(
+                BatchAllocation(
+                    request.request_id,
+                    decode_tokens=1,
+                    new_kv_blocks=blocks,
+                )
+            )
+            funded_decode_slots -= 1
+            tokens_left -= 1
+            sequences_left -= 1
+            free_blocks -= blocks
 
     allocations.sort(key=lambda item: item.request_id)
     allocation_tuple = tuple(allocations)
@@ -488,8 +750,12 @@ def _resolve_controller_raw(
 
     if allocation_tuple:
         kind = ControllerTransitionKind.BATCH
+    elif evicted_ids and preempted_ids:
+        kind = ControllerTransitionKind.EVICT_AND_PREEMPT
     elif evicted_ids:
         kind = ControllerTransitionKind.EVICT_ONLY
+    elif preempted_ids:
+        kind = ControllerTransitionKind.PREEMPT_ONLY
     else:
         kind = ControllerTransitionKind.WAIT
         if raw_action_index != 0:
@@ -500,13 +766,17 @@ def _resolve_controller_raw(
     return ResolvedControllerAction(
         raw_action_index=raw_action_index,
         replica_id=context.replica_id,
+        preemption_rule=preemption_rule,
         eviction_rule=eviction_rule,
         prefill_budget=budget,
         ordering_heuristic=heuristic,
         transition_kind=kind,
         evicted_request_ids=evicted_ids,
+        preempted_request_ids=preempted_ids,
+        pending_preemption_request_ids=pending_preemption_ids,
         allocations=allocation_tuple,
         released_kv_blocks=released_blocks,
+        preempted_kv_blocks=preempted_blocks,
         reserved_kv_blocks=reserved_blocks,
         rank_kv_delta=rank_delta,
     )
@@ -571,8 +841,24 @@ def _adversary_stop_ids(
     decodes = [
         request
         for request in state.requests
-        if request.lifecycle
-        in (RequestLifecycle.WAITING_DECODE, RequestLifecycle.INFLIGHT_DECODE)
+        if (
+            request.lifecycle
+            in (RequestLifecycle.WAITING_DECODE, RequestLifecycle.INFLIGHT_DECODE)
+            or (
+                request.lifecycle == RequestLifecycle.INFLIGHT_RECOMPUTE
+                and request.is_decode_phase
+            )
+            or (
+                request.lifecycle == RequestLifecycle.PREEMPT_PENDING
+                and (
+                    request.reserved_decode_tokens > 0
+                    or (
+                        request.reserved_recompute_tokens > 0
+                        and request.is_decode_phase
+                    )
+                )
+            )
+        )
     ]
     if rule == "stop_none":
         return ()

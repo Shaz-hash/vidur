@@ -83,7 +83,9 @@ PYBIND11_MODULE(gv4_native, module) {
         .value("DROP_PENDING", RequestLifecycle::DropPending)
         .value("COMPLETED", RequestLifecycle::Completed)
         .value("STOPPED", RequestLifecycle::Stopped)
-        .value("DROPPED", RequestLifecycle::Dropped);
+        .value("DROPPED", RequestLifecycle::Dropped)
+        .value("INFLIGHT_RECOMPUTE", RequestLifecycle::InflightRecompute)
+        .value("PREEMPT_PENDING", RequestLifecycle::PreemptPending);
     py::enum_<TerminalReason>(module, "TerminalReason")
         .value("NONE", TerminalReason::None)
         .value("NATURAL_COMPLETION", TerminalReason::NaturalCompletion)
@@ -94,10 +96,13 @@ PYBIND11_MODULE(gv4_native, module) {
     py::enum_<ControllerTransitionKind>(module, "ControllerTransitionKind")
         .value("WAIT", ControllerTransitionKind::Wait)
         .value("EVICT_ONLY", ControllerTransitionKind::EvictOnly)
-        .value("BATCH", ControllerTransitionKind::Batch);
+        .value("BATCH", ControllerTransitionKind::Batch)
+        .value("PREEMPT_ONLY", ControllerTransitionKind::PreemptOnly)
+        .value("EVICT_AND_PREEMPT", ControllerTransitionKind::EvictAndPreempt);
 
     py::class_<ControllerActionConfig>(module, "ControllerActionConfig")
         .def(py::init<>())
+        .def_readwrite("preemption_rules", &ControllerActionConfig::preemption_rules)
         .def_readwrite("eviction_rules", &ControllerActionConfig::eviction_rules)
         .def_readwrite("prefill_budgets", &ControllerActionConfig::prefill_budgets)
         .def_readwrite("ordering_heuristics", &ControllerActionConfig::ordering_heuristics)
@@ -122,6 +127,7 @@ PYBIND11_MODULE(gv4_native, module) {
         .def_readwrite("max_prefill_chunk_tokens", &Config::max_prefill_chunk_tokens)
         .def_readwrite("max_inflight_microbatches", &Config::max_inflight_microbatches)
         .def_readwrite("inter_stage_queue_capacity", &Config::inter_stage_queue_capacity)
+        .def_readwrite("request_preemption_enabled", &Config::request_preemption_enabled)
         .def_readwrite("adversary_tick_sec", &Config::adversary_tick_sec)
         .def_readwrite("launch_window_sec", &Config::launch_window_sec)
         .def_readwrite("max_requests_per_launch_window", &Config::max_requests_per_launch_window)
@@ -166,6 +172,7 @@ PYBIND11_MODULE(gv4_native, module) {
         .def_readwrite("prefill_tokens", &BatchAllocation::prefill_tokens)
         .def_readwrite("decode_tokens", &BatchAllocation::decode_tokens)
         .def_readwrite("new_kv_blocks", &BatchAllocation::new_kv_blocks)
+        .def_readwrite("recompute_tokens", &BatchAllocation::recompute_tokens)
         .def_property_readonly("total_tokens", &BatchAllocation::total_tokens);
     py::class_<InflightMicrobatch>(module, "InflightMicrobatch")
         .def(py::init<>())
@@ -180,7 +187,8 @@ PYBIND11_MODULE(gv4_native, module) {
         .def_readwrite("completion_applied", &InflightMicrobatch::completion_applied)
         .def_property_readonly("final_completion_time", &InflightMicrobatch::final_completion_time)
         .def_property_readonly("total_prefill_tokens", &InflightMicrobatch::total_prefill_tokens)
-        .def_property_readonly("total_decode_tokens", &InflightMicrobatch::total_decode_tokens);
+        .def_property_readonly("total_decode_tokens", &InflightMicrobatch::total_decode_tokens)
+        .def_property_readonly("total_recompute_tokens", &InflightMicrobatch::total_recompute_tokens);
     py::class_<RequestState>(module, "RequestState")
         .def(py::init<>())
         .def_readwrite("request_id", &RequestState::request_id)
@@ -196,6 +204,8 @@ PYBIND11_MODULE(gv4_native, module) {
         .def_readwrite("reserved_prefill_tokens", &RequestState::reserved_prefill_tokens)
         .def_readwrite("committed_decode_tokens", &RequestState::committed_decode_tokens)
         .def_readwrite("reserved_decode_tokens", &RequestState::reserved_decode_tokens)
+        .def_readwrite("kv_computed_tokens", &RequestState::kv_computed_tokens)
+        .def_readwrite("reserved_recompute_tokens", &RequestState::reserved_recompute_tokens)
         .def_readwrite("committed_kv_blocks", &RequestState::committed_kv_blocks)
         .def_readwrite("reserved_kv_blocks", &RequestState::reserved_kv_blocks)
         .def_readwrite("inflight_microbatch_id", &RequestState::inflight_microbatch_id)
@@ -208,6 +218,9 @@ PYBIND11_MODULE(gv4_native, module) {
         .def_readwrite("terminal_time", &RequestState::terminal_time)
         .def_property_readonly("remaining_prefill_tokens", &RequestState::remaining_prefill_tokens)
         .def_property_readonly("remaining_decode_tokens", &RequestState::remaining_decode_tokens)
+        .def_property_readonly("logical_context_tokens", &RequestState::logical_context_tokens)
+        .def_property_readonly("remaining_recompute_tokens", &RequestState::remaining_recompute_tokens)
+        .def_property_readonly("is_decode_phase", &RequestState::is_decode_phase)
         .def_property_readonly("resident_tokens", &RequestState::resident_tokens)
         .def_property_readonly("has_inflight_work", &RequestState::has_inflight_work);
     py::class_<ObjectiveState>(module, "ObjectiveState")
@@ -264,17 +277,23 @@ PYBIND11_MODULE(gv4_native, module) {
         .def(py::init<>())
         .def_readwrite("raw_action_index", &ResolvedControllerAction::raw_action_index)
         .def_readwrite("replica_id", &ResolvedControllerAction::replica_id)
+        .def_readwrite("preemption_rule", &ResolvedControllerAction::preemption_rule)
         .def_readwrite("eviction_rule", &ResolvedControllerAction::eviction_rule)
         .def_readwrite("prefill_budget", &ResolvedControllerAction::prefill_budget)
         .def_readwrite("ordering_heuristic", &ResolvedControllerAction::ordering_heuristic)
         .def_readwrite("transition_kind", &ResolvedControllerAction::transition_kind)
         .def_readwrite("evicted_request_ids", &ResolvedControllerAction::evicted_request_ids)
+        .def_readwrite("preempted_request_ids", &ResolvedControllerAction::preempted_request_ids)
+        .def_readwrite("pending_preemption_request_ids", &ResolvedControllerAction::pending_preemption_request_ids)
         .def_readwrite("allocations", &ResolvedControllerAction::allocations)
         .def_readwrite("released_kv_blocks", &ResolvedControllerAction::released_kv_blocks)
+        .def_readwrite("preempted_kv_blocks", &ResolvedControllerAction::preempted_kv_blocks)
         .def_readwrite("reserved_kv_blocks", &ResolvedControllerAction::reserved_kv_blocks)
         .def_readwrite("rank_kv_delta", &ResolvedControllerAction::rank_kv_delta)
         .def_property_readonly("total_prefill_tokens", &ResolvedControllerAction::total_prefill_tokens)
-        .def_property_readonly("total_decode_tokens", &ResolvedControllerAction::total_decode_tokens);
+        .def_property_readonly("total_decode_tokens", &ResolvedControllerAction::total_decode_tokens)
+        .def_property_readonly("total_recompute_tokens", &ResolvedControllerAction::total_recompute_tokens)
+        .def_property_readonly("total_prefill_class_tokens", &ResolvedControllerAction::total_prefill_class_tokens);
     py::class_<CanonicalControllerAction>(module, "CanonicalControllerAction")
         .def(py::init<>())
         .def_readwrite("canonical_action_index", &CanonicalControllerAction::canonical_action_index)
@@ -423,6 +442,12 @@ PYBIND11_MODULE(gv4_native, module) {
 
     module.def("blocks_for_tokens", &blocks_for_tokens);
     module.def("additional_blocks_for_work", &additional_blocks_for_work);
+    module.def(
+        "preempt_request_blocks",
+        [](State& state, int request_id) {
+            return preempt_request_blocks(state, state.request(request_id));
+        },
+        py::arg("state"), py::arg("request_id"));
     module.def("free_logical_blocks", &free_logical_blocks);
     module.def("next_pipeline_admission_time", &next_pipeline_admission_time);
     module.def("next_wait_boundary_time", &next_wait_boundary_time);

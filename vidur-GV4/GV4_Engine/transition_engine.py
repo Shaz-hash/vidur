@@ -22,6 +22,7 @@ from .action_resolver import (
 from .config import GV4EngineConfig
 from .kv_ledger import (
     commit_batch_blocks,
+    preempt_request_blocks,
     release_request_blocks,
     reserve_batch_blocks,
 )
@@ -262,6 +263,30 @@ def _mark_stop(
     )
 
 
+def _mark_preempt(state: GV4State, request: RequestState) -> int:
+    """Apply preemption now, or defer it until admitted work completes."""
+
+    if request.lifecycle.is_terminal or request.lifecycle in (
+        RequestLifecycle.STOP_PENDING,
+        RequestLifecycle.DROP_PENDING,
+        RequestLifecycle.PREEMPT_PENDING,
+    ):
+        raise TransitionError("request cannot be preempted in its current lifecycle")
+    if request.has_inflight_work:
+        request.lifecycle = RequestLifecycle.PREEMPT_PENDING
+        return 0
+
+    released = preempt_request_blocks(
+        request, state.replica(request.owner_replica_id)
+    )
+    request.lifecycle = (
+        RequestLifecycle.WAITING_DECODE
+        if request.is_decode_phase
+        else RequestLifecycle.WAITING_PREFILL
+    )
+    return released
+
+
 def _stop_active_decodes_after_credit_exhaustion(
     state: GV4State, at_time: float
 ) -> None:
@@ -273,6 +298,18 @@ def _stop_active_decodes_after_credit_exhaustion(
         if request.lifecycle in (
             RequestLifecycle.WAITING_DECODE,
             RequestLifecycle.INFLIGHT_DECODE,
+        ) or (
+            request.lifecycle == RequestLifecycle.INFLIGHT_RECOMPUTE
+            and request.is_decode_phase
+        ) or (
+            request.lifecycle == RequestLifecycle.PREEMPT_PENDING
+            and (
+                request.reserved_decode_tokens > 0
+                or (
+                    request.reserved_recompute_tokens > 0
+                    and request.is_decode_phase
+                )
+            )
         ):
             _mark_stop(
                 state,
@@ -313,10 +350,15 @@ def _complete_microbatch(
     for allocation in batch.allocations:
         request = state.request(allocation.request_id)
         pending_lifecycle = request.lifecycle
+        preempt_after_completion = (
+            pending_lifecycle == RequestLifecycle.PREEMPT_PENDING
+        )
         request.committed_prefill_tokens += allocation.prefill_tokens
         request.reserved_prefill_tokens -= allocation.prefill_tokens
         request.committed_decode_tokens += allocation.decode_tokens
         request.reserved_decode_tokens -= allocation.decode_tokens
+        request.kv_computed_tokens += allocation.total_tokens
+        request.reserved_recompute_tokens -= allocation.recompute_tokens
         request.inflight_microbatch_id = -1
 
         if pending_lifecycle == RequestLifecycle.DROP_PENDING:
@@ -343,7 +385,13 @@ def _complete_microbatch(
             )
             continue
 
-        if allocation.prefill_tokens:
+        if allocation.recompute_tokens:
+            request.lifecycle = (
+                RequestLifecycle.WAITING_DECODE
+                if request.is_decode_phase
+                else RequestLifecycle.WAITING_PREFILL
+            )
+        elif allocation.prefill_tokens:
             if request.remaining_prefill_tokens:
                 request.lifecycle = RequestLifecycle.WAITING_PREFILL
             else:
@@ -369,6 +417,18 @@ def _complete_microbatch(
             else:
                 _finish_naturally(state, request, completion_time)
 
+        if preempt_after_completion:
+            if request.lifecycle.is_terminal:
+                raise TransitionError(
+                    "a naturally completed request cannot remain preempt-pending"
+                )
+            preempt_request_blocks(request, replica)
+            request.lifecycle = (
+                RequestLifecycle.WAITING_DECODE
+                if request.is_decode_phase
+                else RequestLifecycle.WAITING_PREFILL
+            )
+
     batch.completion_applied = True
     replica.inflight_microbatches.remove(batch)
     _prune_launch_history(state, config, completion_time)
@@ -384,6 +444,13 @@ def _apply_automatic_drops(
         if request.lifecycle in (
             RequestLifecycle.WAITING_PREFILL,
             RequestLifecycle.INFLIGHT_PREFILL,
+        ) or (
+            request.lifecycle == RequestLifecycle.INFLIGHT_RECOMPUTE
+            and not request.is_decode_phase
+        ) or (
+            request.lifecycle == RequestLifecycle.PREEMPT_PENDING
+            and not request.is_decode_phase
+            and request.reserved_decode_tokens == 0
         ):
             _record_prefill_lateness(request, at_time, config)
 
@@ -546,6 +613,16 @@ def apply_controller_action(
             at_time=target.now,
         )
 
+    pending_ids = set(resolved.pending_preemption_request_ids)
+    released_by_preemption = 0
+    for request_id in resolved.preempted_request_ids:
+        request = target.request(request_id)
+        if request.has_inflight_work != (request_id in pending_ids):
+            raise TransitionError("resolved preemption timing is stale")
+        released_by_preemption += _mark_preempt(target, request)
+    if released_by_preemption != resolved.preempted_kv_blocks:
+        raise TransitionError("resolved preemption KV release is stale")
+
     if resolved.transition_kind == ControllerTransitionKind.BATCH:
         replica = target.replica(resolved.replica_id)
         reserve_batch_blocks(
@@ -562,12 +639,14 @@ def apply_controller_action(
             request = target.request(allocation.request_id)
             request.reserved_prefill_tokens = allocation.prefill_tokens
             request.reserved_decode_tokens = allocation.decode_tokens
+            request.reserved_recompute_tokens = allocation.recompute_tokens
             request.inflight_microbatch_id = microbatch_id
-            request.lifecycle = (
-                RequestLifecycle.INFLIGHT_PREFILL
-                if allocation.prefill_tokens
-                else RequestLifecycle.INFLIGHT_DECODE
-            )
+            if allocation.recompute_tokens:
+                request.lifecycle = RequestLifecycle.INFLIGHT_RECOMPUTE
+            elif allocation.prefill_tokens:
+                request.lifecycle = RequestLifecycle.INFLIGHT_PREFILL
+            else:
+                request.lifecycle = RequestLifecycle.INFLIGHT_DECODE
 
         admit_microbatch(
             replica,

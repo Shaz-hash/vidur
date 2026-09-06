@@ -8,6 +8,9 @@
 namespace gv4 {
 
 struct ControllerActionConfig {
+    std::vector<std::string> preemption_rules{
+        "preempt_none", "preempt_min_recompute", "preempt_largest_kv",
+        "preempt_max_recovery_slack", "preempt_best_relief_cost"};
     std::vector<std::string> eviction_rules{
         "evict_none", "evict_largest_prefill", "evict_earliest_prefill_deadline",
         "evict_prefill_missed_deadline", "evict_prefill_lateness_over_0p5",
@@ -17,7 +20,8 @@ struct ControllerActionConfig {
     std::vector<std::string> ordering_heuristics{"SJF", "EDF", "LST", "LJF"};
 
     [[nodiscard]] int raw_action_count() const;
-    [[nodiscard]] std::tuple<std::string, int, std::string> components(int raw_index) const;
+    [[nodiscard]] std::tuple<std::string, std::string, int, std::string>
+    components(int raw_index) const;
 };
 
 struct AdversaryActionConfig {
@@ -44,6 +48,7 @@ struct Config {
     int max_prefill_chunk_tokens = 4096;
     int max_inflight_microbatches = 2;
     int inter_stage_queue_capacity = 2;
+    bool request_preemption_enabled = true;
 
     double adversary_tick_sec = 0.2;
     double launch_window_sec = 1.0;
@@ -75,8 +80,8 @@ struct Config {
     int max_launch_history_entries = 64;
     std::uint64_t global_seed = 6;
     bool enable_debug_asserts = true;
-    std::string state_schema_version = "gv4_state_v3";
-    std::string feature_schema_version = "gv4_markov_v3";
+    std::string state_schema_version = "gv4_state_v5";
+    std::string feature_schema_version = "gv4_markov_v5";
     std::string manifest_sha256;
 
     void validate() const;

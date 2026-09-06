@@ -21,6 +21,178 @@ double decode_lateness(const RequestState& request) {
                     request.prefill_lateness_sec + request.decode_lateness_sec);
 }
 
+int prefill_class_tokens(const RequestState& request) {
+    const int recompute = request.remaining_recompute_tokens();
+    return recompute > 0 ? recompute : request.remaining_prefill_tokens();
+}
+
+double prefill_class_deadline(const RequestState& request) {
+    if (request.remaining_recompute_tokens() > 0 && request.is_decode_phase()) {
+        return request.next_decode_deadline;
+    }
+    return request.prefill_deadline;
+}
+
+struct PreemptionCandidate {
+    const RequestState* request = nullptr;
+    double release_time = 0.0;
+    int released_blocks = 0;
+    int recompute_tokens = 0;
+    double recovery_deadline = 0.0;
+    bool pending = false;
+};
+
+std::vector<PreemptionCandidate> preemption_candidates(const State& state) {
+    std::vector<PreemptionCandidate> result;
+    for (const auto& request : state.requests) {
+        if (is_terminal(request.lifecycle) ||
+            request.lifecycle == RequestLifecycle::StopPending ||
+            request.lifecycle == RequestLifecycle::DropPending ||
+            request.lifecycle == RequestLifecycle::PreemptPending) {
+            continue;
+        }
+
+        PreemptionCandidate candidate;
+        candidate.request = &request;
+        if (request.has_inflight_work()) {
+            const auto* batch = state.replica.find_microbatch(
+                request.inflight_microbatch_id);
+            if (batch == nullptr) {
+                throw std::logic_error(
+                    "in-flight preemption candidate has no microbatch");
+            }
+            const auto allocation = std::find_if(
+                batch->allocations.begin(), batch->allocations.end(),
+                [&](const BatchAllocation& item) {
+                    return item.request_id == request.request_id;
+                });
+            if (allocation == batch->allocations.end()) {
+                throw std::logic_error(
+                    "in-flight preemption candidate has no allocation");
+            }
+            if (allocation->decode_tokens > 0 &&
+                request.remaining_decode_tokens() == 0) {
+                continue;
+            }
+            candidate.release_time = batch->final_completion_time();
+            candidate.recompute_tokens = request.logical_context_tokens() +
+                                         allocation->prefill_tokens +
+                                         allocation->decode_tokens;
+            candidate.released_blocks = request.committed_kv_blocks +
+                                        request.reserved_kv_blocks;
+            const int prefill_after = request.committed_prefill_tokens +
+                                      allocation->prefill_tokens;
+            if (prefill_after < request.original_prefill_tokens) {
+                candidate.recovery_deadline = request.prefill_deadline;
+            } else if (allocation->prefill_tokens > 0 ||
+                       allocation->decode_tokens > 0) {
+                candidate.recovery_deadline = candidate.release_time +
+                                              request.decode_token_slo_sec;
+            } else {
+                candidate.recovery_deadline = request.next_decode_deadline;
+            }
+            candidate.pending = true;
+        } else {
+            candidate.release_time = state.now;
+            candidate.recompute_tokens = request.logical_context_tokens();
+            candidate.released_blocks = request.committed_kv_blocks;
+            candidate.recovery_deadline = request.is_decode_phase()
+                ? request.next_decode_deadline
+                : request.prefill_deadline;
+        }
+        if (candidate.recompute_tokens > 0 && candidate.released_blocks > 0) {
+            result.push_back(candidate);
+        }
+    }
+    return result;
+}
+
+double recompute_time(
+    const PreemptionCandidate& candidate,
+    const PrefillTimeEstimator& estimator) {
+    const double duration = estimator(candidate.recompute_tokens);
+    if (!std::isfinite(duration) || duration < 0.0) {
+        throw std::runtime_error("prefill estimator returned invalid duration");
+    }
+    return duration;
+}
+
+std::vector<int> preemption_targets(
+    const State& state,
+    const Config& config,
+    const std::string& rule,
+    const std::vector<int>& excluded_ids,
+    const PrefillTimeEstimator& estimator) {
+    if (rule == "preempt_none") return {};
+    const std::unordered_set<int> excluded(
+        excluded_ids.begin(), excluded_ids.end());
+    auto candidates = preemption_candidates(state);
+    candidates.erase(
+        std::remove_if(
+            candidates.begin(), candidates.end(),
+            [&](const PreemptionCandidate& item) {
+                return excluded.count(item.request->request_id) != 0;
+            }),
+        candidates.end());
+    if (candidates.empty()) return {};
+
+    const PreemptionCandidate* selected = &candidates.front();
+    if (rule == "preempt_min_recompute") {
+        for (const auto& item : candidates) {
+            const auto key = std::tuple{
+                item.recompute_tokens, -item.released_blocks,
+                item.request->request_id};
+            const auto selected_key = std::tuple{
+                selected->recompute_tokens, -selected->released_blocks,
+                selected->request->request_id};
+            if (key < selected_key) selected = &item;
+        }
+    } else if (rule == "preempt_largest_kv") {
+        for (const auto& item : candidates) {
+            const auto key = std::tuple{
+                -item.released_blocks, item.recompute_tokens,
+                item.request->request_id};
+            const auto selected_key = std::tuple{
+                -selected->released_blocks, selected->recompute_tokens,
+                selected->request->request_id};
+            if (key < selected_key) selected = &item;
+        }
+    } else if (rule == "preempt_max_recovery_slack") {
+        auto key = [&](const PreemptionCandidate& item) {
+            return std::tuple{
+                item.recovery_deadline - item.release_time -
+                    recompute_time(item, estimator),
+                item.released_blocks,
+                -item.request->request_id};
+        };
+        for (const auto& item : candidates) {
+            if (key(item) > key(*selected)) selected = &item;
+        }
+    } else if (rule == "preempt_best_relief_cost") {
+        auto key = [&](const PreemptionCandidate& item) {
+            const double duration = recompute_time(item, estimator);
+            const double lateness = std::max(
+                0.0, item.release_time + duration - item.recovery_deadline);
+            const double violation_cost =
+                lateness > config.epsilon && !item.request->violation_recorded
+                ? config.violation_base_cost
+                : 0.0;
+            const double recovery_cost = duration + violation_cost +
+                std::min(lateness, config.lateness_cap_sec);
+            const double score = item.released_blocks /
+                std::max(config.epsilon, recovery_cost);
+            return std::tuple{
+                score, item.released_blocks, -item.request->request_id};
+        };
+        for (const auto& item : candidates) {
+            if (key(item) > key(*selected)) selected = &item;
+        }
+    } else {
+        throw std::runtime_error("unsupported preemption rule");
+    }
+    return {selected->request->request_id};
+}
+
 std::vector<const RequestState*> waiting_prefills(const State& state) {
     std::vector<const RequestState*> result;
     for (const auto& request : state.requests) {
@@ -139,7 +311,7 @@ std::vector<int> eviction_targets(
     return result;
 }
 
-std::vector<const RequestState*> order_prefills(
+std::vector<const RequestState*> order_prefill_class(
     std::vector<const RequestState*> requests,
     const std::string& heuristic,
     const State& state,
@@ -147,40 +319,42 @@ std::vector<const RequestState*> order_prefills(
     if (heuristic == "SJF") {
         std::sort(requests.begin(), requests.end(),
                   [](const RequestState* left, const RequestState* right) {
-                      if (left->remaining_prefill_tokens() !=
-                          right->remaining_prefill_tokens()) {
-                          return left->remaining_prefill_tokens() <
-                                 right->remaining_prefill_tokens();
+                      if (prefill_class_tokens(*left) !=
+                          prefill_class_tokens(*right)) {
+                          return prefill_class_tokens(*left) <
+                                 prefill_class_tokens(*right);
                       }
                       return left->request_id < right->request_id;
                   });
     } else if (heuristic == "EDF") {
         std::sort(requests.begin(), requests.end(),
                   [](const RequestState* left, const RequestState* right) {
-                      if (left->prefill_deadline != right->prefill_deadline) {
-                          return left->prefill_deadline < right->prefill_deadline;
+                      if (prefill_class_deadline(*left) !=
+                          prefill_class_deadline(*right)) {
+                          return prefill_class_deadline(*left) <
+                                 prefill_class_deadline(*right);
                       }
                       return left->request_id < right->request_id;
                   });
     } else if (heuristic == "LJF") {
         std::sort(requests.begin(), requests.end(),
                   [](const RequestState* left, const RequestState* right) {
-                      if (left->remaining_prefill_tokens() !=
-                          right->remaining_prefill_tokens()) {
-                          return left->remaining_prefill_tokens() >
-                                 right->remaining_prefill_tokens();
+                      if (prefill_class_tokens(*left) !=
+                          prefill_class_tokens(*right)) {
+                          return prefill_class_tokens(*left) >
+                                 prefill_class_tokens(*right);
                       }
                       return left->request_id < right->request_id;
                   });
     } else if (heuristic == "LST") {
         std::unordered_map<int, double> slack;
         for (const RequestState* request : requests) {
-            const double duration = estimator(request->remaining_prefill_tokens());
+            const double duration = estimator(prefill_class_tokens(*request));
             if (!std::isfinite(duration) || duration < 0.0) {
                 throw std::runtime_error("prefill estimator returned invalid duration");
             }
             slack[request->request_id] =
-                request->prefill_deadline - state.now - duration;
+                prefill_class_deadline(*request) - state.now - duration;
         }
         std::sort(requests.begin(), requests.end(),
                   [&](const RequestState* left, const RequestState* right) {
@@ -195,7 +369,7 @@ std::vector<const RequestState*> order_prefills(
     return requests;
 }
 
-std::pair<int, int> fit_prefill_to_kv(
+std::tuple<int, int, bool> fit_prefill_class_to_kv(
     const RequestState& request,
     int desired_tokens,
     int free_blocks,
@@ -205,9 +379,14 @@ std::pair<int, int> fit_prefill_to_kv(
     const int tokens = std::min(
         desired_tokens,
         std::max(0, maximum_resident - request.resident_tokens()));
-    if (tokens <= 0) return {0, 0};
-    return {tokens, additional_blocks_for_work(
-                        request, tokens, 0, block_size_tokens)};
+    if (tokens <= 0) return {0, 0, false};
+    const bool is_recompute = request.remaining_recompute_tokens() > 0;
+    const int blocks = is_recompute
+        ? additional_blocks_for_work(
+              request, 0, 0, tokens, block_size_tokens)
+        : additional_blocks_for_work(
+              request, tokens, 0, 0, block_size_tokens);
+    return {tokens, blocks, is_recompute};
 }
 
 std::optional<ResolvedControllerAction> resolve_controller_raw(
@@ -215,25 +394,17 @@ std::optional<ResolvedControllerAction> resolve_controller_raw(
     const Config& config,
     int raw_index,
     const PrefillTimeEstimator& estimator) {
-    const auto [eviction_rule, budget, heuristic] =
+    auto [preemption_rule, eviction_rule, budget, heuristic] =
         config.controller_actions.components(raw_index);
     if (state.next_player != Player::Controller) return std::nullopt;
-
-    if (!can_admit_microbatch(state.replica, state.now, config)) {
-        if (raw_index != 0) return std::nullopt;
-        ResolvedControllerAction action;
-        action.raw_action_index = 0;
-        action.eviction_rule = eviction_rule;
-        action.prefill_budget = budget;
-        action.ordering_heuristic = heuristic;
-        action.rank_kv_delta.reserve(state.replica.rank_ids.size());
-        for (int rank_id : state.replica.rank_ids) action.rank_kv_delta.emplace_back(rank_id, 0);
-        return action;
+    if (!config.request_preemption_enabled) {
+        preemption_rule = "preempt_none";
     }
 
     const auto prefills = waiting_prefills(state);
     const auto decodes = waiting_decodes(state);
-    if (prefills.empty() && decodes.empty() && raw_index != 0) return std::nullopt;
+    const bool pipeline_open = can_admit_microbatch(
+        state.replica, state.now, config);
     if (budget == 0 && heuristic != config.controller_actions.ordering_heuristics.front()) {
         return std::nullopt;
     }
@@ -241,20 +412,54 @@ std::optional<ResolvedControllerAction> resolve_controller_raw(
     const std::vector<int> evicted_ids =
         eviction_targets(state, config, eviction_rule, prefills, decodes);
     if (eviction_rule != "evict_none" && evicted_ids.empty()) return std::nullopt;
-    const std::unordered_set<int> evicted(evicted_ids.begin(), evicted_ids.end());
+    const std::vector<int> preempted_ids = preemption_targets(
+        state, config, preemption_rule, evicted_ids, estimator);
+    if (preemption_rule != "preempt_none" && preempted_ids.empty()) {
+        return std::nullopt;
+    }
 
-    std::vector<const RequestState*> eligible_prefills;
+    std::vector<int> pending_preemption_ids;
+    std::vector<int> immediate_preemption_ids;
+    for (int request_id : preempted_ids) {
+        (state.request(request_id).has_inflight_work()
+             ? pending_preemption_ids
+             : immediate_preemption_ids)
+            .push_back(request_id);
+    }
+    std::vector<int> excluded_ids = evicted_ids;
+    excluded_ids.insert(
+        excluded_ids.end(), preempted_ids.begin(), preempted_ids.end());
+    std::sort(excluded_ids.begin(), excluded_ids.end());
+    const std::unordered_set<int> excluded(
+        excluded_ids.begin(), excluded_ids.end());
+
+    std::vector<const RequestState*> eligible_prefill_class;
     for (const RequestState* request : prefills) {
-        if (!evicted.count(request->request_id)) eligible_prefills.push_back(request);
+        if (!excluded.count(request->request_id) &&
+            prefill_class_tokens(*request) > 0) {
+            eligible_prefill_class.push_back(request);
+        }
     }
-    const auto ordered_prefills =
-        order_prefills(std::move(eligible_prefills), heuristic, state, estimator);
-    int total_prefill = 0;
-    for (const auto* request : ordered_prefills) {
-        total_prefill += request->remaining_prefill_tokens();
+    for (const RequestState* request : decodes) {
+        if (!excluded.count(request->request_id) &&
+            request->remaining_recompute_tokens() > 0) {
+            eligible_prefill_class.push_back(request);
+        }
     }
-    if (budget > 0) {
-        if (total_prefill == 0) return std::nullopt;
+    const auto ordered_prefill_work = order_prefill_class(
+        std::move(eligible_prefill_class), heuristic, state, estimator);
+    int total_prefill_class = 0;
+    for (const auto* request : ordered_prefill_work) {
+        total_prefill_class += prefill_class_tokens(*request);
+    }
+
+    if (!pipeline_open) {
+        if (budget != 0 ||
+            heuristic != config.controller_actions.ordering_heuristics.front()) {
+            return std::nullopt;
+        }
+    } else if (budget > 0) {
+        if (total_prefill_class == 0) return std::nullopt;
         const auto positive = std::find_if(
             config.controller_actions.prefill_budgets.begin(),
             config.controller_actions.prefill_budgets.end(),
@@ -262,55 +467,74 @@ std::optional<ResolvedControllerAction> resolve_controller_raw(
         if (positive == config.controller_actions.prefill_budgets.end()) {
             throw std::runtime_error("controller has no positive prefill budget");
         }
-        if (budget > total_prefill && !(total_prefill < *positive && budget == *positive)) {
+        if (budget > total_prefill_class &&
+            !(total_prefill_class < *positive && budget == *positive)) {
             return std::nullopt;
         }
     }
 
-    int released_blocks = 0;
+    int evicted_blocks = 0;
     for (int request_id : evicted_ids) {
-        released_blocks += state.request(request_id).committed_kv_blocks;
+        evicted_blocks += state.request(request_id).committed_kv_blocks;
     }
+    int preempted_blocks = 0;
+    for (int request_id : immediate_preemption_ids) {
+        preempted_blocks += state.request(request_id).committed_kv_blocks;
+    }
+    const int released_blocks = evicted_blocks + preempted_blocks;
     int free_blocks = free_logical_blocks(state.replica) + released_blocks;
     int tokens_left = config.max_batch_tokens;
     int sequences_left = config.max_sequences;
     int desired_left = std::min(budget, tokens_left);
     std::vector<BatchAllocation> allocations;
 
-    for (const RequestState* request : ordered_prefills) {
-        if (desired_left <= 0 || sequences_left <= 0) break;
-        const int desired = std::min(request->remaining_prefill_tokens(), desired_left);
-        const auto [tokens, blocks] = fit_prefill_to_kv(
-            *request, desired, free_blocks, config.block_size_tokens);
-        if (tokens <= 0) continue;
-        allocations.push_back({request->request_id, tokens, 0, blocks});
-        desired_left -= tokens;
-        tokens_left -= tokens;
-        --sequences_left;
-        free_blocks -= blocks;
-    }
+    if (pipeline_open) {
+        for (const RequestState* request : ordered_prefill_work) {
+            if (desired_left <= 0 || sequences_left <= 0) break;
+            const int desired = std::min(
+                prefill_class_tokens(*request), desired_left);
+            const auto [tokens, blocks, is_recompute] =
+                fit_prefill_class_to_kv(
+                    *request, desired, free_blocks, config.block_size_tokens);
+            if (tokens <= 0) continue;
+            BatchAllocation allocation;
+            allocation.request_id = request->request_id;
+            allocation.prefill_tokens = is_recompute ? 0 : tokens;
+            allocation.recompute_tokens = is_recompute ? tokens : 0;
+            allocation.new_kv_blocks = blocks;
+            allocations.push_back(allocation);
+            desired_left -= tokens;
+            tokens_left -= tokens;
+            --sequences_left;
+            free_blocks -= blocks;
+        }
 
-    std::vector<const RequestState*> zero_block_decodes;
-    std::vector<const RequestState*> boundary_decodes;
-    for (const RequestState* request : decodes) {
-        if (evicted.count(request->request_id)) continue;
-        const int blocks = additional_blocks_for_work(
-            *request, 0, 1, config.block_size_tokens);
-        (blocks == 0 ? zero_block_decodes : boundary_decodes).push_back(request);
-    }
-    zero_block_decodes.insert(zero_block_decodes.end(),
-                              boundary_decodes.begin(), boundary_decodes.end());
-    int funded_decode_slots = state.decode_credits_available;
-    for (const RequestState* request : zero_block_decodes) {
-        if (funded_decode_slots <= 0 || tokens_left <= 0 || sequences_left <= 0) break;
-        const int blocks = additional_blocks_for_work(
-            *request, 0, 1, config.block_size_tokens);
-        if (blocks > free_blocks) continue;
-        allocations.push_back({request->request_id, 0, 1, blocks});
-        --funded_decode_slots;
-        --tokens_left;
-        --sequences_left;
-        free_blocks -= blocks;
+        std::vector<const RequestState*> zero_block_decodes;
+        std::vector<const RequestState*> boundary_decodes;
+        for (const RequestState* request : decodes) {
+            if (excluded.count(request->request_id) ||
+                request->remaining_recompute_tokens() > 0) continue;
+            const int blocks = additional_blocks_for_work(
+                *request, 0, 1, 0, config.block_size_tokens);
+            (blocks == 0 ? zero_block_decodes : boundary_decodes)
+                .push_back(request);
+        }
+        zero_block_decodes.insert(
+            zero_block_decodes.end(),
+            boundary_decodes.begin(), boundary_decodes.end());
+        int funded_decode_slots = state.decode_credits_available;
+        for (const RequestState* request : zero_block_decodes) {
+            if (funded_decode_slots <= 0 || tokens_left <= 0 ||
+                sequences_left <= 0) break;
+            const int blocks = additional_blocks_for_work(
+                *request, 0, 1, 0, config.block_size_tokens);
+            if (blocks > free_blocks) continue;
+            allocations.push_back({request->request_id, 0, 1, blocks});
+            --funded_decode_slots;
+            --tokens_left;
+            --sequences_left;
+            free_blocks -= blocks;
+        }
     }
     std::sort(allocations.begin(), allocations.end(),
               [](const BatchAllocation& left, const BatchAllocation& right) {
@@ -321,18 +545,26 @@ std::optional<ResolvedControllerAction> resolve_controller_raw(
 
     ControllerTransitionKind kind = ControllerTransitionKind::Wait;
     if (!allocations.empty()) kind = ControllerTransitionKind::Batch;
+    else if (!evicted_ids.empty() && !preempted_ids.empty()) {
+        kind = ControllerTransitionKind::EvictAndPreempt;
+    }
     else if (!evicted_ids.empty()) kind = ControllerTransitionKind::EvictOnly;
+    else if (!preempted_ids.empty()) kind = ControllerTransitionKind::PreemptOnly;
     else if (raw_index != 0) return std::nullopt;
 
     ResolvedControllerAction result;
     result.raw_action_index = raw_index;
+    result.preemption_rule = preemption_rule;
     result.eviction_rule = eviction_rule;
     result.prefill_budget = budget;
     result.ordering_heuristic = heuristic;
     result.transition_kind = kind;
     result.evicted_request_ids = evicted_ids;
+    result.preempted_request_ids = preempted_ids;
+    result.pending_preemption_request_ids = pending_preemption_ids;
     result.allocations = std::move(allocations);
     result.released_kv_blocks = released_blocks;
+    result.preempted_kv_blocks = preempted_blocks;
     result.reserved_kv_blocks = reserved_blocks;
     const int net_blocks = reserved_blocks - released_blocks;
     for (int rank_id : state.replica.rank_ids) {
@@ -345,7 +577,13 @@ std::vector<int> stop_ids(const State& state, const std::string& rule) {
     std::vector<const RequestState*> decodes;
     for (const auto& request : state.requests) {
         if (request.lifecycle == RequestLifecycle::WaitingDecode ||
-            request.lifecycle == RequestLifecycle::InflightDecode) {
+            request.lifecycle == RequestLifecycle::InflightDecode ||
+            (request.lifecycle == RequestLifecycle::InflightRecompute &&
+             request.is_decode_phase()) ||
+            (request.lifecycle == RequestLifecycle::PreemptPending &&
+             (request.reserved_decode_tokens > 0 ||
+              (request.reserved_recompute_tokens > 0 &&
+               request.is_decode_phase())))) {
             decodes.push_back(&request);
         }
     }
@@ -421,6 +659,9 @@ const char* transition_kind_name(ControllerTransitionKind kind) {
         case ControllerTransitionKind::Wait: return "WAIT";
         case ControllerTransitionKind::EvictOnly: return "EVICT_ONLY";
         case ControllerTransitionKind::Batch: return "BATCH";
+        case ControllerTransitionKind::PreemptOnly: return "PREEMPT_ONLY";
+        case ControllerTransitionKind::EvictAndPreempt:
+            return "EVICT_AND_PREEMPT";
     }
     throw std::logic_error("unknown controller transition kind");
 }
@@ -437,10 +678,23 @@ int ResolvedControllerAction::total_decode_tokens() const {
     return total;
 }
 
+int ResolvedControllerAction::total_recompute_tokens() const {
+    int total = 0;
+    for (const auto& allocation : allocations) total += allocation.recompute_tokens;
+    return total;
+}
+
+int ResolvedControllerAction::total_prefill_class_tokens() const {
+    return total_prefill_tokens() + total_recompute_tokens();
+}
+
 bool ResolvedControllerAction::same_effect(
     const ResolvedControllerAction& other) const {
     return transition_kind == other.transition_kind &&
            evicted_request_ids == other.evicted_request_ids &&
+           preempted_request_ids == other.preempted_request_ids &&
+           pending_preemption_request_ids ==
+               other.pending_preemption_request_ids &&
            allocations == other.allocations && rank_kv_delta == other.rank_kv_delta;
 }
 

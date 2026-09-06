@@ -106,6 +106,10 @@ class GV4VirtualVidurMCTSEnvironment:
         inplace: bool = False,
         fast_forward: bool = True,
     ) -> GV4State:
+        has_memory_action = bool(
+            action.action.evicted_request_ids
+            or action.action.preempted_request_ids
+        )
         service = communication = None
         if action.action.transition_kind == ControllerTransitionKind.BATCH:
             service, communication = self._batch_timing(state, action.action)
@@ -120,7 +124,10 @@ class GV4VirtualVidurMCTSEnvironment:
             prefill_time_estimator=self._request_prefill_time,
             inplace=inplace,
         ).state
-        if fast_forward:
+        fully_idle = all(
+            request.lifecycle.is_terminal for request in result.requests
+        ) and all(not replica.inflight_microbatches for replica in result.replicas)
+        if fast_forward and (not has_memory_action or fully_idle):
             result = fast_forward_decode_only_to_next_tick(
                 result,
                 self.config,

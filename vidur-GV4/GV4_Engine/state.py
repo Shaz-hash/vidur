@@ -60,12 +60,15 @@ class RequestLifecycle(IntEnum):
     STOPPED = 7
     DROPPED = 8
     INFLIGHT_RECOMPUTE = 9
+    PREEMPT_PENDING = 10
 
     @property
     def is_inflight(self) -> bool:
         return self in (
             RequestLifecycle.INFLIGHT_PREFILL,
             RequestLifecycle.INFLIGHT_DECODE,
+            RequestLifecycle.INFLIGHT_RECOMPUTE,
+            RequestLifecycle.PREEMPT_PENDING,
             RequestLifecycle.STOP_PENDING,
             RequestLifecycle.DROP_PENDING,
         )
@@ -122,27 +125,35 @@ class LaunchRecord:
 
 @dataclass(frozen=True, slots=True)
 class BatchAllocation:
-    """Work and logical KV blocks reserved for one request in one batch."""
+    """One kind of request work and its newly reserved logical KV blocks."""
 
     request_id: int
     prefill_tokens: int = 0
     decode_tokens: int = 0
     new_kv_blocks: int = 0
+    recompute_tokens: int = 0
 
     @property
     def total_tokens(self) -> int:
-        return self.prefill_tokens + self.decode_tokens
+        return self.prefill_tokens + self.decode_tokens + self.recompute_tokens
 
     def assert_valid(self) -> None:
         _nonnegative_int("allocation request_id", self.request_id)
         _nonnegative_int("allocation prefill_tokens", self.prefill_tokens)
         _nonnegative_int("allocation decode_tokens", self.decode_tokens)
+        _nonnegative_int("allocation recompute_tokens", self.recompute_tokens)
         _nonnegative_int("allocation new_kv_blocks", self.new_kv_blocks)
-        if self.total_tokens == 0:
-            raise GV4StateError("a batch allocation must contain work")
-        if self.prefill_tokens and self.decode_tokens:
+        work_kinds = sum(
+            value > 0
+            for value in (
+                self.prefill_tokens,
+                self.decode_tokens,
+                self.recompute_tokens,
+            )
+        )
+        if work_kinds != 1:
             raise GV4StateError(
-                "one request cannot prefill and decode in the same batch"
+                "a batch allocation must contain exactly one kind of work"
             )
 
 
@@ -171,6 +182,10 @@ class InflightMicrobatchState:
     @property
     def total_decode_tokens(self) -> int:
         return sum(item.decode_tokens for item in self.allocations)
+
+    @property
+    def total_recompute_tokens(self) -> int:
+        return sum(item.recompute_tokens for item in self.allocations)
 
     def assert_valid(self, *, expected_stage_count: int | None = None) -> None:
         for name, value in (
@@ -234,7 +249,7 @@ class InflightMicrobatchState:
 
 @dataclass(slots=True)
 class RequestState:
-    """Authoritative progress, SLO, and logical KV ownership for one request."""
+    """Logical request progress, SLO state, and physical KV residency."""
 
     request_id: int
     owner_replica_id: int
@@ -259,6 +274,15 @@ class RequestState:
     terminal_reason: TerminalReason = TerminalReason.NONE
     terminal_requested_at: float = UNSET_TIME
     terminal_time: float = UNSET_TIME
+    # Omitted in old fixtures means all committed context is physically resident.
+    kv_computed_tokens: int = NO_ID
+    reserved_recompute_tokens: int = 0
+
+    def __post_init__(self) -> None:
+        if self.kv_computed_tokens == NO_ID:
+            self.kv_computed_tokens = (
+                0 if self.lifecycle.is_terminal else self.logical_context_tokens
+            )
 
     @property
     def remaining_prefill_tokens(self) -> int:
@@ -277,11 +301,33 @@ class RequestState:
         )
 
     @property
-    def resident_tokens(self) -> int:
+    def logical_context_tokens(self) -> int:
+        """Tokens whose model work completed, whether their KV remains or not."""
+
+        return self.committed_prefill_tokens + self.committed_decode_tokens
+
+    @property
+    def remaining_recompute_tokens(self) -> int:
+        """Committed context whose evicted KV still needs to be rebuilt."""
+
         return (
-            self.committed_prefill_tokens
+            self.logical_context_tokens
+            - self.kv_computed_tokens
+            - self.reserved_recompute_tokens
+        )
+
+    @property
+    def is_decode_phase(self) -> bool:
+        return self.committed_prefill_tokens == self.original_prefill_tokens
+
+    @property
+    def resident_tokens(self) -> int:
+        """Physical KV tokens, including capacity reserved by in-flight work."""
+
+        return (
+            self.kv_computed_tokens
+            + self.reserved_recompute_tokens
             + self.reserved_prefill_tokens
-            + self.committed_decode_tokens
             + self.reserved_decode_tokens
         )
 
@@ -337,12 +383,20 @@ class RequestState:
             ("reserved_prefill_tokens", self.reserved_prefill_tokens),
             ("committed_decode_tokens", self.committed_decode_tokens),
             ("reserved_decode_tokens", self.reserved_decode_tokens),
+            ("kv_computed_tokens", self.kv_computed_tokens),
+            ("reserved_recompute_tokens", self.reserved_recompute_tokens),
             ("committed_kv_blocks", self.committed_kv_blocks),
             ("reserved_kv_blocks", self.reserved_kv_blocks),
         ):
             _nonnegative_int(name, value)
         if self.remaining_prefill_tokens < 0 or self.remaining_decode_tokens < 0:
             raise GV4StateError("committed plus reserved work exceeds original work")
+        if self.remaining_recompute_tokens < 0:
+            raise GV4StateError("computed plus reserved KV exceeds logical context")
+        if (self.reserved_prefill_tokens or self.reserved_decode_tokens) and (
+            self.remaining_recompute_tokens or self.reserved_recompute_tokens
+        ):
+            raise GV4StateError("new work cannot run before KV recomputation finishes")
 
         if self.decode_credit_minted:
             if (
@@ -364,12 +418,15 @@ class RequestState:
         if self.lifecycle.is_inflight != self.has_inflight_work:
             raise GV4StateError("lifecycle and in-flight batch link disagree")
         if self.has_inflight_work and not (
-            self.reserved_prefill_tokens or self.reserved_decode_tokens
+            self.reserved_prefill_tokens
+            or self.reserved_decode_tokens
+            or self.reserved_recompute_tokens
         ):
             raise GV4StateError("an in-flight request must reserve work")
         if not self.has_inflight_work and (
             self.reserved_prefill_tokens
             or self.reserved_decode_tokens
+            or self.reserved_recompute_tokens
             or self.reserved_kv_blocks
         ):
             raise GV4StateError("a non-in-flight request cannot retain reservations")
@@ -378,28 +435,84 @@ class RequestState:
             if self.remaining_prefill_tokens == 0:
                 raise GV4StateError("WAITING_PREFILL requires unfinished prefill")
         elif self.lifecycle == RequestLifecycle.INFLIGHT_PREFILL:
-            if self.reserved_prefill_tokens == 0 or self.reserved_decode_tokens:
+            if (
+                self.reserved_prefill_tokens == 0
+                or self.reserved_decode_tokens
+                or self.reserved_recompute_tokens
+            ):
                 raise GV4StateError("INFLIGHT_PREFILL must reserve only prefill work")
         elif self.lifecycle == RequestLifecycle.WAITING_DECODE:
             if self.remaining_prefill_tokens or self.remaining_decode_tokens == 0:
                 raise GV4StateError("WAITING_DECODE requires unfinished decode only")
         elif self.lifecycle == RequestLifecycle.INFLIGHT_DECODE:
-            if self.reserved_decode_tokens != 1 or self.reserved_prefill_tokens:
-                raise GV4StateError("INFLIGHT_DECODE must reserve only decode work, and per request only one decode token can be reserved at a time in a batch")
+            if (
+                self.reserved_decode_tokens != 1
+                or self.reserved_prefill_tokens
+                or self.reserved_recompute_tokens
+            ):
+                raise GV4StateError(
+                    "INFLIGHT_DECODE must reserve exactly one decode token"
+                )
+        elif self.lifecycle == RequestLifecycle.INFLIGHT_RECOMPUTE:
+            if (
+                self.reserved_recompute_tokens == 0
+                or self.reserved_prefill_tokens
+                or self.reserved_decode_tokens
+            ):
+                raise GV4StateError(
+                    "INFLIGHT_RECOMPUTE must reserve only recomputation"
+                )
+        elif self.lifecycle == RequestLifecycle.PREEMPT_PENDING:
+            # The admitted allocation drains normally before its KV is released.
+            work_kinds = sum(
+                value > 0
+                for value in (
+                    self.reserved_prefill_tokens,
+                    self.reserved_decode_tokens,
+                    self.reserved_recompute_tokens,
+                )
+            )
+            if work_kinds != 1:
+                raise GV4StateError(
+                    "PREEMPT_PENDING must retain exactly one in-flight work kind"
+                )
         elif self.lifecycle == RequestLifecycle.COMPLETED:
             if self.remaining_prefill_tokens or self.remaining_decode_tokens:
                 raise GV4StateError("COMPLETED requires all work to be committed")
 
-        decode_is_active = self.lifecycle in (
-            RequestLifecycle.WAITING_DECODE,
-            RequestLifecycle.INFLIGHT_DECODE,
-        ) or self.reserved_decode_tokens > 0
+        decode_is_active = (
+            self.lifecycle
+            in (
+                RequestLifecycle.WAITING_DECODE,
+                RequestLifecycle.INFLIGHT_DECODE,
+            )
+            or (
+                self.lifecycle == RequestLifecycle.INFLIGHT_RECOMPUTE
+                and self.is_decode_phase
+            )
+            or (
+                self.lifecycle == RequestLifecycle.PREEMPT_PENDING
+                and (
+                    self.reserved_decode_tokens > 0
+                    or (
+                        self.reserved_recompute_tokens > 0
+                        and self.is_decode_phase
+                    )
+                )
+            )
+            or self.reserved_decode_tokens > 0
+        )
         if decode_is_active and self.next_decode_deadline == UNSET_TIME:
             raise GV4StateError("active decode requires next_decode_deadline")
 
         if self.lifecycle.is_terminal:
-            if self.committed_kv_blocks or self.reserved_kv_blocks:
-                raise GV4StateError("terminal requests cannot retain KV blocks")
+            if (
+                self.committed_kv_blocks
+                or self.reserved_kv_blocks
+                or self.kv_computed_tokens
+                or self.reserved_recompute_tokens
+            ):
+                raise GV4StateError("terminal requests cannot retain physical KV")
             if self.terminal_reason == TerminalReason.NONE:
                 raise GV4StateError("terminal requests require a terminal reason")
             if self.terminal_time == UNSET_TIME:
@@ -427,6 +540,8 @@ class RequestState:
             self.has_inflight_work
             or self.committed_prefill_tokens
             or self.committed_decode_tokens
+            or self.kv_computed_tokens
+            or self.reserved_recompute_tokens
             or self.committed_kv_blocks
         ):
             raise GV4StateError("unassigned request cannot own work or KV")
@@ -442,29 +557,31 @@ class RequestState:
 
     def clone(self) -> "RequestState":
         return RequestState(
-            self.request_id,
-            self.owner_replica_id,
-            self.lifecycle,
-            self.arrival_time,
-            self.prefill_deadline,
-            self.decode_token_slo_sec,
-            self.original_prefill_tokens,
-            self.original_decode_tokens,
-            self.decode_credit_minted,
-            self.committed_prefill_tokens,
-            self.reserved_prefill_tokens,
-            self.committed_decode_tokens,
-            self.reserved_decode_tokens,
-            self.committed_kv_blocks,
-            self.reserved_kv_blocks,
-            self.inflight_microbatch_id,
-            self.next_decode_deadline,
-            self.prefill_lateness_sec,
-            self.decode_lateness_sec,
-            self.violation_recorded,
-            self.terminal_reason,
-            self.terminal_requested_at,
-            self.terminal_time,
+            request_id=self.request_id,
+            owner_replica_id=self.owner_replica_id,
+            lifecycle=self.lifecycle,
+            arrival_time=self.arrival_time,
+            prefill_deadline=self.prefill_deadline,
+            decode_token_slo_sec=self.decode_token_slo_sec,
+            original_prefill_tokens=self.original_prefill_tokens,
+            original_decode_tokens=self.original_decode_tokens,
+            decode_credit_minted=self.decode_credit_minted,
+            committed_prefill_tokens=self.committed_prefill_tokens,
+            reserved_prefill_tokens=self.reserved_prefill_tokens,
+            committed_decode_tokens=self.committed_decode_tokens,
+            reserved_decode_tokens=self.reserved_decode_tokens,
+            committed_kv_blocks=self.committed_kv_blocks,
+            reserved_kv_blocks=self.reserved_kv_blocks,
+            inflight_microbatch_id=self.inflight_microbatch_id,
+            next_decode_deadline=self.next_decode_deadline,
+            prefill_lateness_sec=self.prefill_lateness_sec,
+            decode_lateness_sec=self.decode_lateness_sec,
+            violation_recorded=self.violation_recorded,
+            terminal_reason=self.terminal_reason,
+            terminal_requested_at=self.terminal_requested_at,
+            terminal_time=self.terminal_time,
+            kv_computed_tokens=self.kv_computed_tokens,
+            reserved_recompute_tokens=self.reserved_recompute_tokens,
         )
 
 
@@ -881,6 +998,7 @@ class GV4State:
             if (
                 allocation.prefill_tokens != request.reserved_prefill_tokens
                 or allocation.decode_tokens != request.reserved_decode_tokens
+                or allocation.recompute_tokens != request.reserved_recompute_tokens
                 or allocation.new_kv_blocks != request.reserved_kv_blocks
             ):
                 raise GV4StateError("request reservations differ from allocation")
@@ -922,6 +1040,20 @@ class GV4State:
             request.lifecycle in (
                 RequestLifecycle.WAITING_DECODE,
                 RequestLifecycle.INFLIGHT_DECODE,
+            )
+            or (
+                request.lifecycle == RequestLifecycle.INFLIGHT_RECOMPUTE
+                and request.is_decode_phase
+            )
+            or (
+                request.lifecycle == RequestLifecycle.PREEMPT_PENDING
+                and (
+                    request.reserved_decode_tokens > 0
+                    or (
+                        request.reserved_recompute_tokens > 0
+                        and request.is_decode_phase
+                    )
+                )
             )
             for request in self.requests
         ):

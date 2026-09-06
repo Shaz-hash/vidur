@@ -12,6 +12,7 @@ GV4_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(GV4_ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from GV4_Engine.action_resolver import ControllerTransitionKind  # noqa: E402
 from GV4_Engine.fast_forward import (  # noqa: E402
     fast_forward_decode_only_to_next_tick,
 )
@@ -78,6 +79,29 @@ def seed_decodes(
     state.replica(0).rank_kv_committed_blocks[:] = [total_blocks] * len(
         state.replica(0).rank_ids
     )
+
+
+def controller_edge(
+    environment: GV4VirtualVidurMCTSEnvironment,
+    state: GV4State,
+    *,
+    eviction: str = "evict_none",
+    preemption: str = "preempt_none",
+):
+    """Resolve a zero-prefill controller edge by its readable policy names."""
+
+    config = environment.config
+    action_config = config.controller_actions
+    raw_index = action_config.encode_raw_index(
+        action_config.eviction_rule_names.index(eviction),
+        0,
+        0,
+        preemption_rule_index=action_config.preemption_rule_names.index(preemption),
+    )
+    actions, mask = environment.sample_controller_actions(state)
+    if not mask[raw_index] or actions[raw_index] is None:
+        raise AssertionError(f"controller action {raw_index} is unexpectedly masked")
+    return actions[raw_index]
 
 
 class FastForwardTest(unittest.TestCase):
@@ -234,6 +258,142 @@ class FastForwardTest(unittest.TestCase):
 
 
 class VirtualEnvironmentTest(unittest.TestCase):
+    def test_preemption_without_decodes_stays_at_the_same_time(self) -> None:
+        config = make_config()
+        environment = GV4VirtualVidurMCTSEnvironment(
+            config,
+            batch_timing_provider=timing_provider(0.05),
+            prefill_time_estimator=lambda _tokens: 0.1,
+        )
+        state = GV4State.initial(config, next_player=Player.CONTROLLER)
+        state.next_adversary_tick = 0.2
+        state.requests.append(
+            RequestState(
+                request_id=0,
+                owner_replica_id=0,
+                lifecycle=RequestLifecycle.WAITING_PREFILL,
+                arrival_time=0.0,
+                prefill_deadline=1.0,
+                decode_token_slo_sec=0.05,
+                original_prefill_tokens=256,
+                original_decode_tokens=864,
+                committed_prefill_tokens=128,
+                committed_kv_blocks=8,
+            )
+        )
+        state.next_request_id = 1
+        state.objective.requests_generated = 1
+        state.replica(0).rank_kv_committed_blocks[:] = [8]
+
+        action = controller_edge(
+            environment,
+            state,
+            preemption="preempt_largest_kv",
+        )
+        child = environment.apply_controller_action_only(state, action)
+
+        self.assertIs(
+            action.action.transition_kind,
+            ControllerTransitionKind.PREEMPT_ONLY,
+        )
+        self.assertEqual(child.now, 0.0)
+        self.assertIs(child.next_player, Player.ADVERSARY)
+        self.assertEqual(child.request(0).remaining_recompute_tokens, 128)
+        self.assertEqual(child.request(0).committed_kv_blocks, 0)
+        child.assert_valid(config)
+
+    def test_eviction_that_empties_the_system_still_jumps_to_the_tick(self) -> None:
+        config = make_config()
+        environment = GV4VirtualVidurMCTSEnvironment(
+            config,
+            batch_timing_provider=timing_provider(0.05),
+            prefill_time_estimator=lambda _tokens: 0.1,
+        )
+        state = GV4State.initial(config, next_player=Player.CONTROLLER)
+        state.next_adversary_tick = 0.2
+        state.requests.append(
+            RequestState(
+                request_id=0,
+                owner_replica_id=0,
+                lifecycle=RequestLifecycle.WAITING_PREFILL,
+                arrival_time=0.0,
+                prefill_deadline=1.0,
+                decode_token_slo_sec=0.05,
+                original_prefill_tokens=256,
+                original_decode_tokens=864,
+                committed_prefill_tokens=128,
+                committed_kv_blocks=8,
+            )
+        )
+        state.next_request_id = 1
+        state.objective.requests_generated = 1
+        state.replica(0).rank_kv_committed_blocks[:] = [8]
+
+        action = controller_edge(
+            environment,
+            state,
+            eviction="evict_largest_prefill",
+        )
+        child = environment.apply_controller_action_only(state, action)
+
+        self.assertIs(
+            action.action.transition_kind,
+            ControllerTransitionKind.EVICT_ONLY,
+        )
+        self.assertEqual(child.now, 0.2)
+        self.assertIs(child.next_player, Player.ADVERSARY)
+        self.assertIs(child.request(0).lifecycle, RequestLifecycle.DROPPED)
+        child.assert_valid(config)
+
+    def test_eviction_with_a_decode_batch_stays_at_the_same_time(self) -> None:
+        config = make_config()
+        environment = GV4VirtualVidurMCTSEnvironment(
+            config,
+            batch_timing_provider=timing_provider(0.05),
+            prefill_time_estimator=lambda _tokens: 0.1,
+        )
+        state = GV4State.initial(config, next_player=Player.CONTROLLER)
+        state.next_adversary_tick = 0.2
+        seed_decodes(state, config, count=2)
+
+        action = controller_edge(
+            environment,
+            state,
+            eviction="evict_longest_decode",
+        )
+        child = environment.apply_controller_action_only(state, action)
+
+        self.assertIs(action.action.transition_kind, ControllerTransitionKind.BATCH)
+        self.assertEqual(action.action.evicted_request_ids, (0,))
+        self.assertEqual(action.action.total_decode_tokens, 1)
+        self.assertEqual(child.now, 0.0)
+        self.assertIs(child.next_player, Player.ADVERSARY)
+        self.assertIs(child.request(0).lifecycle, RequestLifecycle.DROPPED)
+        self.assertIs(child.request(1).lifecycle, RequestLifecycle.INFLIGHT_DECODE)
+        child.assert_valid(config)
+
+    def test_ordinary_decode_only_action_still_fast_forwards(self) -> None:
+        config = make_config()
+        environment = GV4VirtualVidurMCTSEnvironment(
+            config,
+            batch_timing_provider=timing_provider(0.03),
+            prefill_time_estimator=lambda _tokens: 0.1,
+        )
+        state = GV4State.initial(config, next_player=Player.CONTROLLER)
+        state.next_adversary_tick = 0.2
+        seed_decodes(state, config, committed_decode_tokens=211)
+
+        action = controller_edge(environment, state)
+        child = environment.apply_controller_action_only(state, action)
+
+        self.assertIs(action.action.transition_kind, ControllerTransitionKind.BATCH)
+        self.assertFalse(action.action.evicted_request_ids)
+        self.assertFalse(action.action.preempted_request_ids)
+        self.assertEqual(child.now, 0.2)
+        self.assertEqual(child.decode_tokens_committed_total, 216)
+        self.assertIs(child.request(0).lifecycle, RequestLifecycle.STOPPED)
+        child.assert_valid(config)
+
     def test_facade_samples_and_applies_without_mutating_parent(self) -> None:
         config = make_config()
         env = GV4VirtualVidurMCTSEnvironment(

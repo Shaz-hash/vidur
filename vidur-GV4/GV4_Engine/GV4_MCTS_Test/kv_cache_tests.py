@@ -158,7 +158,12 @@ def _check_controller_kv_delta(
     )
 
     should_compare_immediate = (
-        action.transition_kind == ControllerTransitionKind.EVICT_ONLY
+        action.transition_kind
+        in {
+            ControllerTransitionKind.EVICT_ONLY,
+            ControllerTransitionKind.PREEMPT_ONLY,
+            ControllerTransitionKind.EVICT_AND_PREEMPT,
+        }
         and abs(child.now - parent.now) <= context.epsilon
     )
     if action.transition_kind == ControllerTransitionKind.BATCH:

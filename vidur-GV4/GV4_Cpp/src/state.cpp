@@ -27,6 +27,8 @@ void require_time(double value, const char* message) {
 bool is_inflight(RequestLifecycle lifecycle) {
     return lifecycle == RequestLifecycle::InflightPrefill ||
            lifecycle == RequestLifecycle::InflightDecode ||
+           lifecycle == RequestLifecycle::InflightRecompute ||
+           lifecycle == RequestLifecycle::PreemptPending ||
            lifecycle == RequestLifecycle::StopPending ||
            lifecycle == RequestLifecycle::DropPending;
 }
@@ -56,6 +58,8 @@ const char* lifecycle_name(RequestLifecycle lifecycle) {
         case RequestLifecycle::Completed: return "COMPLETED";
         case RequestLifecycle::Stopped: return "STOPPED";
         case RequestLifecycle::Dropped: return "DROPPED";
+        case RequestLifecycle::InflightRecompute: return "INFLIGHT_RECOMPUTE";
+        case RequestLifecycle::PreemptPending: return "PREEMPT_PENDING";
     }
     throw std::logic_error("unknown lifecycle");
 }
@@ -89,6 +93,12 @@ int InflightMicrobatch::total_decode_tokens() const {
     return total;
 }
 
+int InflightMicrobatch::total_recompute_tokens() const {
+    int total = 0;
+    for (const auto& allocation : allocations) total += allocation.recompute_tokens;
+    return total;
+}
+
 int RequestState::remaining_prefill_tokens() const {
     return original_prefill_tokens - committed_prefill_tokens - reserved_prefill_tokens;
 }
@@ -97,9 +107,21 @@ int RequestState::remaining_decode_tokens() const {
     return original_decode_tokens - committed_decode_tokens - reserved_decode_tokens;
 }
 
+int RequestState::logical_context_tokens() const {
+    return committed_prefill_tokens + committed_decode_tokens;
+}
+
+int RequestState::remaining_recompute_tokens() const {
+    return logical_context_tokens() - kv_computed_tokens - reserved_recompute_tokens;
+}
+
+bool RequestState::is_decode_phase() const {
+    return committed_prefill_tokens == original_prefill_tokens;
+}
+
 int RequestState::resident_tokens() const {
-    return committed_prefill_tokens + reserved_prefill_tokens +
-           committed_decode_tokens + reserved_decode_tokens;
+    return kv_computed_tokens + reserved_recompute_tokens +
+           reserved_prefill_tokens + reserved_decode_tokens;
 }
 
 bool RequestState::has_inflight_work() const {
@@ -239,9 +261,12 @@ void State::validate(const Config& config) const {
         for (const auto& allocation : batch.allocations) {
             require(allocation.request_id > previous_request_id,
                     "batch request IDs must be sorted and unique");
+            const int work_kinds = (allocation.prefill_tokens > 0 ? 1 : 0) +
+                                   (allocation.decode_tokens > 0 ? 1 : 0) +
+                                   (allocation.recompute_tokens > 0 ? 1 : 0);
             require(allocation.prefill_tokens >= 0 && allocation.decode_tokens >= 0 &&
-                        allocation.new_kv_blocks >= 0 && allocation.total_tokens() > 0 &&
-                        !(allocation.prefill_tokens && allocation.decode_tokens),
+                        allocation.recompute_tokens >= 0 &&
+                        allocation.new_kv_blocks >= 0 && work_kinds == 1,
                     "invalid batch allocation");
             previous_request_id = allocation.request_id;
         }
@@ -298,16 +323,32 @@ void State::validate(const Config& config) const {
                 "invalid original decode size");
         require(item.remaining_prefill_tokens() >= 0 && item.remaining_decode_tokens() >= 0,
                 "request work exceeds original token count");
-        require(item.committed_kv_blocks >= 0 && item.reserved_kv_blocks >= 0,
-                "request KV ownership is negative");
+        require(item.committed_prefill_tokens >= 0 &&
+                    item.reserved_prefill_tokens >= 0 &&
+                    item.committed_decode_tokens >= 0 &&
+                    item.reserved_decode_tokens >= 0 &&
+                    item.kv_computed_tokens >= 0 &&
+                    item.reserved_recompute_tokens >= 0 &&
+                    item.committed_kv_blocks >= 0 && item.reserved_kv_blocks >= 0,
+                "request token or KV accounting is negative");
+        require(item.remaining_recompute_tokens() >= 0,
+                "computed plus reserved KV exceeds logical context");
+        require((item.reserved_prefill_tokens == 0 &&
+                    item.reserved_decode_tokens == 0) ||
+                    (item.remaining_recompute_tokens() == 0 &&
+                     item.reserved_recompute_tokens == 0),
+                "new work started before KV recomputation finished");
         require(is_inflight(item.lifecycle) == item.has_inflight_work(),
                 "request lifecycle and batch link disagree");
         if (item.has_inflight_work()) {
-            require(item.reserved_prefill_tokens > 0 || item.reserved_decode_tokens > 0,
+            require(item.reserved_prefill_tokens > 0 ||
+                        item.reserved_decode_tokens > 0 ||
+                        item.reserved_recompute_tokens > 0,
                     "in-flight request has no reserved work");
         } else {
             require(item.reserved_prefill_tokens == 0 &&
                         item.reserved_decode_tokens == 0 &&
+                        item.reserved_recompute_tokens == 0 &&
                         item.reserved_kv_blocks == 0,
                     "non-in-flight request retains reservations");
         }
@@ -315,15 +356,30 @@ void State::validate(const Config& config) const {
             require(item.remaining_prefill_tokens() > 0,
                     "waiting prefill has no remaining work");
         } else if (item.lifecycle == RequestLifecycle::InflightPrefill) {
-            require(item.reserved_prefill_tokens > 0 && item.reserved_decode_tokens == 0,
+            require(item.reserved_prefill_tokens > 0 &&
+                        item.reserved_decode_tokens == 0 &&
+                        item.reserved_recompute_tokens == 0,
                     "in-flight prefill reservation is invalid");
         } else if (item.lifecycle == RequestLifecycle::WaitingDecode) {
             require(item.remaining_prefill_tokens() == 0 &&
                         item.remaining_decode_tokens() > 0,
                     "waiting decode progress is invalid");
         } else if (item.lifecycle == RequestLifecycle::InflightDecode) {
-            require(item.reserved_decode_tokens == 1 && item.reserved_prefill_tokens == 0,
+            require(item.reserved_decode_tokens == 1 &&
+                        item.reserved_prefill_tokens == 0 &&
+                        item.reserved_recompute_tokens == 0,
                     "in-flight decode must reserve exactly one token");
+        } else if (item.lifecycle == RequestLifecycle::InflightRecompute) {
+            require(item.reserved_recompute_tokens > 0 &&
+                        item.reserved_prefill_tokens == 0 &&
+                        item.reserved_decode_tokens == 0,
+                    "in-flight recompute must reserve only recomputation");
+        } else if (item.lifecycle == RequestLifecycle::PreemptPending) {
+            const int work_kinds = (item.reserved_prefill_tokens > 0 ? 1 : 0) +
+                                   (item.reserved_decode_tokens > 0 ? 1 : 0) +
+                                   (item.reserved_recompute_tokens > 0 ? 1 : 0);
+            require(work_kinds == 1,
+                    "preempt-pending request must retain one work kind");
         } else if (item.lifecycle == RequestLifecycle::Completed) {
             require(item.remaining_prefill_tokens() == 0 &&
                         item.remaining_decode_tokens() == 0,
@@ -339,12 +395,21 @@ void State::validate(const Config& config) const {
         }
         const bool active_decode = item.lifecycle == RequestLifecycle::WaitingDecode ||
                                    item.lifecycle == RequestLifecycle::InflightDecode ||
+                                   (item.lifecycle == RequestLifecycle::InflightRecompute &&
+                                    item.is_decode_phase()) ||
+                                   (item.lifecycle == RequestLifecycle::PreemptPending &&
+                                    (item.reserved_decode_tokens > 0 ||
+                                     (item.reserved_recompute_tokens > 0 &&
+                                      item.is_decode_phase()))) ||
                                    item.reserved_decode_tokens > 0;
         if (active_decode) require(item.next_decode_deadline != kUnsetTime,
                                    "active decode lacks deadline");
         if (is_terminal(item.lifecycle)) {
-            require(item.committed_kv_blocks == 0 && item.reserved_kv_blocks == 0,
-                    "terminal request retains KV blocks");
+            require(item.committed_kv_blocks == 0 &&
+                        item.reserved_kv_blocks == 0 &&
+                        item.kv_computed_tokens == 0 &&
+                        item.reserved_recompute_tokens == 0,
+                    "terminal request retains physical KV");
             require(item.terminal_reason != TerminalReason::None &&
                         item.terminal_time != kUnsetTime,
                     "terminal request lacks terminal bookkeeping");
@@ -379,6 +444,8 @@ void State::validate(const Config& config) const {
                     "request has no matching batch allocation");
             require(allocation_it->prefill_tokens == item.reserved_prefill_tokens &&
                         allocation_it->decode_tokens == item.reserved_decode_tokens &&
+                        allocation_it->recompute_tokens ==
+                            item.reserved_recompute_tokens &&
                         allocation_it->new_kv_blocks == item.reserved_kv_blocks,
                     "request reservations differ from batch allocation");
         }
@@ -402,7 +469,13 @@ void State::validate(const Config& config) const {
     if (decode_credits_available == 0) {
         for (const auto& item : requests) {
             require(item.lifecycle != RequestLifecycle::WaitingDecode &&
-                        item.lifecycle != RequestLifecycle::InflightDecode,
+                        item.lifecycle != RequestLifecycle::InflightDecode &&
+                        !(item.lifecycle == RequestLifecycle::InflightRecompute &&
+                          item.is_decode_phase()) &&
+                        !(item.lifecycle == RequestLifecycle::PreemptPending &&
+                          (item.reserved_decode_tokens > 0 ||
+                           (item.reserved_recompute_tokens > 0 &&
+                            item.is_decode_phase()))),
                     "zero available decode credit leaves active decode request");
         }
     }

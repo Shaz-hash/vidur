@@ -9,9 +9,9 @@ from typing import Any
 
 import numpy as np
 
-from GV4_Engine.GV4_Cpp import gv4_native as native
-from GV4_Engine.GV4_Cpp.runtime import config_from_python, environment_from_python
-from GV4_Engine.GV4_Cpp.uniform_parity import compare_uniform_search
+from GV4_Cpp import gv4_native as native
+from GV4_Cpp.runtime import config_from_python, environment_from_python
+from GV4_Cpp.uniform_parity import compare_uniform_search
 from GV4_Engine.GV4_MCTS_Test.config import GV4MCTSTestConfig, build_engine_config
 from GV4_Engine.GV4_MCTS_Test.timing import DeterministicTimingProvider
 from GV4_Engine.dnn_inference.dnn_features import GV4FeatureBuilder

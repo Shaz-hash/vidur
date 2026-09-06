@@ -23,6 +23,8 @@ enum class RequestLifecycle : int {
     Completed = 6,
     Stopped = 7,
     Dropped = 8,
+    InflightRecompute = 9,
+    PreemptPending = 10,
 };
 
 enum class TerminalReason : int {
@@ -51,13 +53,17 @@ struct BatchAllocation {
     int prefill_tokens = 0;
     int decode_tokens = 0;
     int new_kv_blocks = 0;
+    int recompute_tokens = 0;
 
-    [[nodiscard]] int total_tokens() const { return prefill_tokens + decode_tokens; }
+    [[nodiscard]] int total_tokens() const {
+        return prefill_tokens + decode_tokens + recompute_tokens;
+    }
     [[nodiscard]] bool operator==(const BatchAllocation& other) const {
         return request_id == other.request_id &&
                prefill_tokens == other.prefill_tokens &&
                decode_tokens == other.decode_tokens &&
-               new_kv_blocks == other.new_kv_blocks;
+               new_kv_blocks == other.new_kv_blocks &&
+               recompute_tokens == other.recompute_tokens;
     }
 };
 
@@ -75,6 +81,7 @@ struct InflightMicrobatch {
     [[nodiscard]] double final_completion_time() const;
     [[nodiscard]] int total_prefill_tokens() const;
     [[nodiscard]] int total_decode_tokens() const;
+    [[nodiscard]] int total_recompute_tokens() const;
 };
 
 struct RequestState {
@@ -91,6 +98,8 @@ struct RequestState {
     int reserved_prefill_tokens = 0;
     int committed_decode_tokens = 0;
     int reserved_decode_tokens = 0;
+    int kv_computed_tokens = 0;
+    int reserved_recompute_tokens = 0;
     int committed_kv_blocks = 0;
     int reserved_kv_blocks = 0;
     int inflight_microbatch_id = kNoId;
@@ -104,6 +113,9 @@ struct RequestState {
 
     [[nodiscard]] int remaining_prefill_tokens() const;
     [[nodiscard]] int remaining_decode_tokens() const;
+    [[nodiscard]] int logical_context_tokens() const;
+    [[nodiscard]] int remaining_recompute_tokens() const;
+    [[nodiscard]] bool is_decode_phase() const;
     [[nodiscard]] int resident_tokens() const;
     [[nodiscard]] bool has_inflight_work() const;
 };

@@ -33,6 +33,7 @@ def config_from_python(config: GV4EngineConfig) -> native.Config:
     result.max_prefill_chunk_tokens = config.scheduler.max_prefill_chunk_tokens
     result.max_inflight_microbatches = config.scheduler.max_inflight_microbatches
     result.inter_stage_queue_capacity = config.scheduler.inter_stage_queue_capacity
+    result.request_preemption_enabled = config.scheduler.request_preemption_enabled
 
     timing = config.timing
     result.adversary_tick_sec = timing.adversary_tick_sec
@@ -68,6 +69,9 @@ def config_from_python(config: GV4EngineConfig) -> native.Config:
     result.discount_reference_step_sec = config.reward.discount_reference_step_sec
 
     controller = native.ControllerActionConfig()
+    controller.preemption_rules = list(
+        config.controller_actions.preemption_rule_names
+    )
     controller.eviction_rules = list(config.controller_actions.eviction_rule_names)
     controller.prefill_budgets = list(config.controller_actions.prefill_budget_options)
     controller.ordering_heuristics = list(

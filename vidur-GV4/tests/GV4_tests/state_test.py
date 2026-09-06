@@ -137,8 +137,8 @@ class GV4StateTest(unittest.TestCase):
         self.assertEqual(state.next_adversary_tick, 1.25)
         self.assertIs(state.next_player, Player.CONTROLLER)
         self.assertEqual(state.config_manifest_sha256, config.manifest_sha256())
-        self.assertEqual(state.state_schema_version, "gv4_state_v3")
-        self.assertEqual(config.layout.feature_schema_version, "gv4_markov_v3")
+        self.assertEqual(state.state_schema_version, "gv4_state_v5")
+        self.assertEqual(config.layout.feature_schema_version, "gv4_markov_v5")
         self.assertEqual(
             [r.rank_ids for r in state.replicas],
             [
